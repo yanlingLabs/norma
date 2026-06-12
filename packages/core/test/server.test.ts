@@ -238,4 +238,22 @@ describe("daemon IPC", () => {
     expect(result).toBe("dead");
     [c1, c2, c3].forEach((c) => c.close());
   });
+
+  test("a >8KB frame is delivered intact (ConnWriter drain path)", async () => {
+    await boot();
+    const a = await TestClient.connect(daemon.socketPath);
+    const b = await TestClient.connect(daemon.socketPath);
+    await a.hello(harnessToken, "big-a");
+    await b.hello(harnessToken, "big-b");
+    const { result: created } = await a.request(METHODS.sessionCreate, { scope: "global" });
+    await a.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
+    await b.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
+    const big = "x".repeat(20_000);
+    await b.request(METHODS.sessionSend, { sessionId: created.sessionId, text: big });
+    const got = await a.waitForNotification((n) =>
+      n.method === METHODS.event && n.params.type === "user_message");
+    expect(got.params.text).toHaveLength(20_000);
+    expect(got.params.text).toBe(big);
+    a.close(); b.close();
+  });
 });
