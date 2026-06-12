@@ -44,7 +44,7 @@ export function startIpcServer(opts: {
             try {
               incoming = parseIncoming(JSON.parse(line));
             } catch {
-              throw new RpcFailure(-32700, "parse error");
+              throw new RpcFailure(ERR.PARSE_ERROR, "parse error");
             }
             if (incoming.kind !== "request") continue; // Phase 0: ignore client notifications
             id = incoming.msg.id;
@@ -54,7 +54,7 @@ export function startIpcServer(opts: {
             const e = err as Partial<RpcFailure>;
             socket.write(encodeLine({
               jsonrpc: "2.0", id,
-              error: { code: e.code ?? -32603, message: e.message ?? "internal error" },
+              error: { code: e.code ?? ERR.INTERNAL, message: e.message ?? "internal error" },
             }));
           }
         }
@@ -110,7 +110,7 @@ export function startIpcServer(opts: {
         return { seq: hub.send(socket.data.hubClient, p.sessionId, p.text) };
       }
       default:
-        throw new RpcFailure(-32601, `method not found: ${method}`);
+        throw new RpcFailure(ERR.METHOD_NOT_FOUND, `method not found: ${method}`);
     }
   }
 

@@ -71,4 +71,26 @@ describe("NormaClient against a hostile/fake server", () => {
     await expect(client.request(METHODS.sessionList)).rejects.toThrow(/timed out/);
     client.close();
   });
+
+  test("client rejects a malformed result for a validated method", async () => {
+    const sock = join(mkdtempSync(join(tmpdir(), "norma-fake2-")), "fake.sock");
+    Bun.listen({
+      unix: sock,
+      socket: {
+        data(s, chunk) {
+          for (const line of new TextDecoder().decode(chunk).split("\n").filter(Boolean)) {
+            const msg = JSON.parse(line);
+            if (msg.method === METHODS.hello) {
+              s.write(encodeLine({ jsonrpc: "2.0", id: msg.id, result: { ok: true, serverVersion: "fake", protocolVersion: PROTOCOL_VERSION } }));
+            } else if (msg.method === METHODS.sessionCreate) {
+              s.write(encodeLine({ jsonrpc: "2.0", id: msg.id, result: { sessionned: 42 } })); // wrong shape
+            }
+          }
+        },
+      },
+    });
+    const client = await NormaClient.connect({ socketPath: sock, token: "t", clientName: "v", timeoutMs: 500, onEvent: () => {} });
+    await expect(client.createSession("global")).rejects.toThrow(/invalid result/);
+    client.close();
+  });
 });

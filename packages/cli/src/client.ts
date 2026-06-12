@@ -1,5 +1,6 @@
 import {
   LineDecoder, encodeLine, METHODS, PROTOCOL_VERSION, SessionEvent,
+  SessionCreateResult, SessionAttachResult, SessionSendResult, SessionListResult,
 } from "@norma/protocol";
 
 export interface ConnectOptions {
@@ -72,17 +73,24 @@ export class NormaClient {
     });
   }
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private validated(schema: { safeParse(v: unknown): any }, raw: unknown, method: string): any {
+    const r = schema.safeParse(raw);
+    if (!r.success) throw new Error(`invalid result from server for ${method}`);
+    return r.data;
+  }
+
   async createSession(scope: string): Promise<string> {
-    return (await this.request(METHODS.sessionCreate, { scope })).sessionId;
+    return this.validated(SessionCreateResult, await this.request(METHODS.sessionCreate, { scope }), METHODS.sessionCreate).sessionId;
   }
   async attach(sessionId: string, fromSeq = 0): Promise<number> {
-    return (await this.request(METHODS.sessionAttach, { sessionId, fromSeq })).lastSeq;
+    return this.validated(SessionAttachResult, await this.request(METHODS.sessionAttach, { sessionId, fromSeq }), METHODS.sessionAttach).lastSeq;
   }
   async send(sessionId: string, text: string): Promise<number> {
-    return (await this.request(METHODS.sessionSend, { sessionId, text })).seq;
+    return this.validated(SessionSendResult, await this.request(METHODS.sessionSend, { sessionId, text }), METHODS.sessionSend).seq;
   }
-  async listSessions(): Promise<unknown> {
-    return this.request(METHODS.sessionList);
+  async listSessions() {
+    return this.validated(SessionListResult, await this.request(METHODS.sessionList), METHODS.sessionList);
   }
   close(): void { this.socket.end(); }
 }

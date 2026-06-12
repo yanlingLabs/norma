@@ -72,8 +72,13 @@ export function parseIncoming(raw: unknown): Incoming {
   return { kind: "response", msg: RpcResponse.parse(raw) };
 }
 
-// Error codes (spec §5) — reserve now, used by core later.
+// Error codes (spec §5): JSON-RPC reserved + Norma application codes.
 export const ERR = {
+  PARSE_ERROR: -32700,
+  INVALID_REQUEST: -32600,
+  METHOD_NOT_FOUND: -32601,
+  INVALID_PARAMS: -32602,
+  INTERNAL: -32603,
   UNAUTHORIZED: -32001,
   VERSION_MISMATCH: -32002,
   NOT_FOUND: -32004,

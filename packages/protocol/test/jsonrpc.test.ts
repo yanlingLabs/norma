@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { RpcRequest, RpcResponse, RpcNotification, parseIncoming } from "../src/jsonrpc";
+import { RpcRequest, RpcResponse, RpcNotification, parseIncoming, ERR } from "../src/jsonrpc";
 
 describe("jsonrpc envelopes", () => {
   test("valid request parses", () => {
@@ -62,5 +62,15 @@ describe("jsonrpc envelopes", () => {
 
   test("REQUESTS still reject id:null", () => {
     expect(() => RpcRequest.parse({ jsonrpc: "2.0", id: null, method: "m" })).toThrow();
+  });
+});
+
+describe("standard error codes", () => {
+  test("JSON-RPC reserved codes are exported", () => {
+    expect(ERR.PARSE_ERROR).toBe(-32700);
+    expect(ERR.INVALID_REQUEST).toBe(-32600);
+    expect(ERR.METHOD_NOT_FOUND).toBe(-32601);
+    expect(ERR.INVALID_PARAMS).toBe(-32602);
+    expect(ERR.INTERNAL).toBe(-32603);
   });
 });
