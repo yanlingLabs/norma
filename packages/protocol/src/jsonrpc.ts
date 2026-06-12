@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 export const RpcId = z.union([z.number(), z.string()]);
+export type RpcId = z.infer<typeof RpcId>;
 
 export const RpcRequest = z.object({
   jsonrpc: z.literal("2.0"),
@@ -14,7 +15,8 @@ export const RpcNotification = z.looseObject({
   jsonrpc: z.literal("2.0"),
   method: z.string(),
   params: z.unknown().optional(),
-}).refine((m) => !("id" in m), { message: "notifications must not carry an id" });
+}).refine((m) => !("id" in m), { message: "notifications must not carry an id" })
+  .transform(({ jsonrpc, method, params }) => ({ jsonrpc, method, params }));
 export type RpcNotification = z.infer<typeof RpcNotification>;
 
 export const RpcError = z.object({
@@ -22,11 +24,33 @@ export const RpcError = z.object({
   message: z.string(),
   data: z.unknown().optional(),
 });
+export type RpcError = z.infer<typeof RpcError>;
 
-export const RpcResponse = z.union([
-  z.object({ jsonrpc: z.literal("2.0"), id: RpcId, result: z.unknown() }),
-  z.object({ jsonrpc: z.literal("2.0"), id: RpcId, error: RpcError }),
-]);
+const RpcSuccessResponse = z.looseObject({
+  jsonrpc: z.literal("2.0"),
+  id: RpcId,
+  result: z.unknown(),
+});
+const RpcErrorResponse = z.looseObject({
+  jsonrpc: z.literal("2.0"),
+  id: RpcId,
+  error: RpcError,
+});
+
+export const RpcResponse = z
+  .union([RpcSuccessResponse, RpcErrorResponse])
+  .superRefine((m, ctx) => {
+    const hasResult = "result" in m && m.result !== undefined;
+    const hasError = "error" in m;
+    if (hasResult === hasError) {
+      ctx.addIssue({ code: "custom", message: "response must carry exactly one of result | error" });
+    }
+  })
+  .transform((m) =>
+    "error" in m
+      ? { jsonrpc: m.jsonrpc, id: m.id, error: m.error }
+      : { jsonrpc: m.jsonrpc, id: m.id, result: (m as { result: unknown }).result },
+  );
 export type RpcResponse = z.infer<typeof RpcResponse>;
 
 export type Incoming =
