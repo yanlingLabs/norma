@@ -4,7 +4,10 @@
   "private": true,
   "type": "module",
   "bin": { "norma": "./src/main.ts" },
-  "scripts": { "test": "bun test" },
+  "scripts": {
+    "test": "bun test",
+    "compile": "bun build --compile src/main.ts --outfile ../../dist/norma"
+  },
   "dependencies": {
     "@norma/protocol": "workspace:*",
     "@norma/core": "workspace:*"
