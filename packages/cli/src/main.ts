@@ -93,8 +93,48 @@ switch (cmdKey) {
     console.log(await daemonStatus());
     break;
   }
+  case "login": {
+    const { KeychainSecretStore, CodexAuthStore, runLoginFlow, CODEX, OPENAI_API_KEY_SECRET } = await import("@norma/core");
+    const secrets = new KeychainSecretStore();
+    if (process.argv.includes("--api-key")) {
+      process.stdout.write("Paste your OpenAI API key: ");
+      const key = (await new Promise<string>((r) => process.stdin.once("data", (d) => r(String(d))))).trim();
+      if (!key.startsWith("sk-")) { console.error("that does not look like an API key"); process.exit(1); }
+      await secrets.set(OPENAI_API_KEY_SECRET, key);
+      console.log(`${AQUA}API key stored in Keychain${RESET} — set provider type in ~/.norma/settings.json (openai-compatible)`);
+      break;
+    }
+    const tokens = await runLoginFlow({
+      clientId: CODEX.clientId,
+      authorizeUrl: CODEX.authorizeUrl,
+      tokenUrl: CODEX.tokenUrl,
+      callbackPort: CODEX.callbackPort,
+      scope: CODEX.scope,
+      openBrowser: async (url) => { Bun.spawn(["open", url]); },
+    });
+    await new CodexAuthStore(secrets).save(tokens);
+    console.log(`${AQUA}◍ signed in with ChatGPT${RESET} ${DIM}(account ${tokens.accountId ?? "unknown"})${RESET}`);
+    break;
+  }
+  case "logout": {
+    const { KeychainSecretStore } = await import("@norma/core");
+    const secrets = new KeychainSecretStore();
+    // Phase 1a simplification: SecretStore gains delete() in 1b — empty value de-authorizes everywhere today.
+    for (const name of ["codex-access-token", "codex-refresh-token", "codex-id-token", "codex-account-id", "codex-expires-at"]) {
+      await secrets.set(name, "");
+    }
+    console.log("signed out");
+    break;
+  }
+  case "provider": {
+    const { loadSettings, resolveNormaHome } = await import("@norma/core");
+    const s = loadSettings(join(resolveNormaHome(), "settings.json"));
+    console.log(`${AQUA}${s.provider.type}${RESET} ${DIM}model ${s.provider.model}${RESET}`);
+    break;
+  }
   default:
-    console.log(`norma (Phase 0) — commands:
+    console.log(`norma (Phase 1a) — commands:
   daemon run | daemon install | daemon uninstall | daemon status
-  ping | sessions | send <sessionId|new> <text> | watch <sessionId>`);
+  ping | sessions | send <sessionId|new> <text> | watch <sessionId>
+  login [--api-key] | logout | provider`);
 }
