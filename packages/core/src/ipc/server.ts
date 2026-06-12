@@ -3,12 +3,11 @@ import { z } from "zod";
 import {
   ERR, METHODS, PROTOCOL_VERSION, LineDecoder, encodeLine, parseIncoming,
   HelloParams, SessionCreateParams, SessionAttachParams, SessionSendParams,
-  type SessionEvent,
+  type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
 import type { SessionStore } from "../sessions/store";
 import { SessionHub, type HubClient } from "../sessions/hub";
-import { ConnWriter, type WritableSocket } from "./conn-writer";
 
 interface ConnState {
   decoder: LineDecoder;

@@ -1,6 +1,7 @@
 import {
   LineDecoder, encodeLine, METHODS, PROTOCOL_VERSION, SessionEvent,
   SessionCreateResult, SessionAttachResult, SessionSendResult, SessionListResult,
+  ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 
 export interface ConnectOptions {
@@ -17,6 +18,7 @@ export class NormaClient {
   private nextId = 1;
   private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
   private socket!: Awaited<ReturnType<typeof Bun.connect>>;
+  private writer!: ConnWriter;
   private timeoutMs: number;
 
   private constructor(timeoutMs = 5000) {
@@ -43,6 +45,9 @@ export class NormaClient {
             }
           }
         },
+        drain() {
+          client.writer.onDrain();
+        },
         close() {
           for (const p of client.pending.values()) p.reject(new Error("connection closed"));
           client.pending.clear();
@@ -50,6 +55,7 @@ export class NormaClient {
         error() {}, // close() follows and rejects pending; stub silences Bun's default stderr print
       },
     });
+    client.writer = new ConnWriter(client.socket as unknown as WritableSocket);
     await client.request(METHODS.hello, {
       protocolVersion: PROTOCOL_VERSION,
       role: opts.role ?? "harness",
@@ -61,7 +67,7 @@ export class NormaClient {
 
   request(method: string, params?: unknown): Promise<any> {
     const id = this.nextId++;
-    this.socket.write(encodeLine({ jsonrpc: "2.0", id, method, params }));
+    this.writer.enqueue(encodeLine({ jsonrpc: "2.0", id, method, params }));
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         if (this.pending.delete(id)) reject(new Error(`request timed out: ${method}`));

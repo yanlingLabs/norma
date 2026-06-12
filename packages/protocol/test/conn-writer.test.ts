@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ConnWriter } from "../src/ipc/conn-writer";
+import { ConnWriter } from "../src/conn-writer";
 
 function mockSocket(acceptBytes: number) {
   const accepted: number[] = [];

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LineDecoder, encodeLine, METHODS, PROTOCOL_VERSION } from "@norma/protocol";
+import { LineDecoder, encodeLine, METHODS, PROTOCOL_VERSION, ConnWriter, type WritableSocket } from "@norma/protocol";
 import { startDaemon, type RunningDaemon } from "../src/daemon";
 import { FileSecretStore } from "../src/auth/secret-store";
 
@@ -14,6 +14,7 @@ class TestClient {
   readonly notifications: any[] = [];
   readonly errors: any[] = [];
   private socket!: Awaited<ReturnType<typeof Bun.connect>>;
+  private writer!: ConnWriter;
 
   static async connect(socketPath: string): Promise<TestClient> {
     const c = new TestClient();
@@ -33,14 +34,18 @@ class TestClient {
             }
           }
         },
+        drain(_s) {
+          c.writer.onDrain();
+        },
       },
     });
+    c.writer = new ConnWriter(c.socket as unknown as WritableSocket);
     return c;
   }
 
   request(method: string, params?: unknown): Promise<any> {
     const id = this.nextId++;
-    this.socket.write(encodeLine({ jsonrpc: "2.0", id, method, params }));
+    this.writer.enqueue(encodeLine({ jsonrpc: "2.0", id, method, params }));
     return new Promise((resolve) => this.pending.set(id, resolve));
   }
 
