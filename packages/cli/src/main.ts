@@ -132,9 +132,27 @@ switch (cmdKey) {
     console.log(`${AQUA}${s.provider.type}${RESET} ${DIM}model ${s.provider.model}${RESET}`);
     break;
   }
+  case "provider-smoke": {
+    const { loadSettings, resolveNormaHome, createProvider, KeychainSecretStore } = await import("@norma/core");
+    const s = loadSettings(join(resolveNormaHome(), "settings.json"));
+    const active = await createProvider(s, new KeychainSecretStore());
+    const promptIdx = process.argv.indexOf("--prompt");
+    const prompt = promptIdx > 0 ? process.argv[promptIdx + 1]! : "Reply with exactly: norma provider smoke OK";
+    console.log(`${DIM}provider=${active.provider.id} model=${active.model}${RESET}`);
+    let text = "";
+    for await (const e of active.provider.streamTurn({
+      model: active.model,
+      input: [{ type: "message", role: "user", content: prompt }],
+    })) {
+      if (e.type === "text_delta") { text += e.delta; process.stdout.write(e.delta); }
+      else if (e.type === "error") { console.error(`\n${e.code}: ${e.message}`); process.exit(1); }
+      else if (e.type === "usage") console.log(`\n${DIM}usage: ${e.inputTokens} in / ${e.outputTokens} out${RESET}`);
+    }
+    process.exit(text.length > 0 ? 0 : 1);
+  }
   default:
     console.log(`norma (Phase 1a) — commands:
   daemon run | daemon install | daemon uninstall | daemon status
   ping | sessions | send <sessionId|new> <text> | watch <sessionId>
-  login [--api-key] | logout | provider`);
+  login [--api-key] | logout | provider | provider-smoke [--prompt <text>]`);
 }
