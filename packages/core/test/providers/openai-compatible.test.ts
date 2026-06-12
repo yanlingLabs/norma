@@ -68,4 +68,99 @@ describe("OpenAICompatibleProvider", () => {
     }));
     expect(body.input).toEqual([{ type: "function_call_output", call_id: "call_abc", output: "file1\nfile2" }]);
   });
+
+  test("consumer break mid-stream cancels the reader (no connection leak)", async () => {
+    // Bun's HTTP server does not propagate client-side reader.cancel() to the server-side
+    // ReadableStream.cancel() callback within a short window, so we spy on the client reader
+    // instead: patch globalThis.fetch to intercept reader.cancel() calls on the response body.
+    let cancelled = false;
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = Object.assign(
+      async function (...args: Parameters<typeof fetch>) {
+        const res = await origFetch(...args);
+        if (res.body) {
+          const origGetReader = res.body.getReader.bind(res.body);
+          (res.body as any).getReader = function () {
+            const reader = origGetReader();
+            const origCancel = reader.cancel.bind(reader);
+            (reader as any).cancel = function (...a: any[]) {
+              cancelled = true;
+              return origCancel(...a);
+            };
+            return reader;
+          };
+        }
+        return res;
+      },
+      { preconnect: origFetch.preconnect },
+    ) as typeof fetch;
+    server = Bun.serve({
+      port: 0,
+      fetch() {
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('data: {"type":"response.output_text.delta","delta":"a"}\n\n'));
+            // never close — simulates a long stream
+          },
+          cancel() {},
+        });
+        return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    try {
+      const p = new OpenAICompatibleProvider({ baseUrl: `http://localhost:${server.port}`, apiKey: "sk" });
+      for await (const e of p.streamTurn({ model: "m", input: [] })) {
+        if (e.type === "text_delta") break; // consumer bails early
+      }
+      await new Promise((r) => setTimeout(r, 50));
+      expect(cancelled).toBe(true);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("abort mid-stream yields done(aborted)", async () => {
+    server = Bun.serve({
+      port: 0,
+      fetch() {
+        let intervalId: ReturnType<typeof setInterval>;
+        const stream = new ReadableStream({
+          start(controller) {
+            intervalId = setInterval(() => {
+              try {
+                controller.enqueue(new TextEncoder().encode('data: {"type":"response.output_text.delta","delta":"a"}\n\n'));
+              } catch { clearInterval(intervalId); }
+            }, 10);
+          },
+          cancel() { clearInterval(intervalId); },
+        });
+        return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    const ctrl = new AbortController();
+    const p = new OpenAICompatibleProvider({ baseUrl: `http://localhost:${server.port}`, apiKey: "sk" });
+    const events: any[] = [];
+    for await (const e of p.streamTurn({ model: "m", input: [], signal: ctrl.signal })) {
+      events.push(e);
+      if (e.type === "text_delta") ctrl.abort();
+    }
+    expect(events.at(-1)).toEqual({ type: "done", stopReason: "aborted" });
+  });
+
+  test("connection refused yields a network error event", async () => {
+    const p = new OpenAICompatibleProvider({ baseUrl: "http://localhost:1", apiKey: "sk" });
+    const events: any[] = [];
+    for await (const e of p.streamTurn({ model: "m", input: [] })) events.push(e);
+    expect(events).toEqual([{ type: "error", code: "network", message: expect.any(String) }]);
+  });
+
+  test("403 maps to auth; 503 maps to server", async () => {
+    const base403 = serveSse("simple-text.sse", { status: 403 });
+    const p1 = new OpenAICompatibleProvider({ baseUrl: base403, apiKey: "sk" });
+    expect((await collect(p1.streamTurn({ model: "m", input: [] })))[0]).toMatchObject({ type: "error", code: "auth" });
+    server?.stop(true);
+    const base503 = serveSse("simple-text.sse", { status: 503 });
+    const p2 = new OpenAICompatibleProvider({ baseUrl: base503, apiKey: "sk" });
+    expect((await collect(p2.streamTurn({ model: "m", input: [] })))[0]).toMatchObject({ type: "error", code: "server" });
+  });
 });
