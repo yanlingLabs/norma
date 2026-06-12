@@ -1,0 +1,9 @@
+{
+  "seq": 7,
+  "sessionId": "s_fixture",
+  "ts": 1781270000000,
+  "type": "user_message",
+  "threadId": "main",
+  "text": "héllo \"world\" — done ✓",
+  "clientName": "cli-1"
+}
