@@ -1,0 +1,12 @@
+{
+  "name": "@norma/cli",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "bin": { "norma": "./src/main.ts" },
+  "scripts": { "test": "bun test" },
+  "dependencies": {
+    "@norma/protocol": "workspace:*",
+    "@norma/core": "workspace:*"
+  }
+}
