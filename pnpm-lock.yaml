@@ -33,6 +33,12 @@ importers:
         specifier: ^4.0.0
         version: 4.4.3
 
+  packages/plugin-sdk:
+    dependencies:
+      '@norma/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+
   packages/protocol:
     dependencies:
       zod:
