@@ -40,7 +40,12 @@ export function startIpcServer(opts: {
         for (const line of socket.data.decoder.push(chunk)) {
           let id: number | string | null = null;
           try {
-            const incoming = parseIncoming(JSON.parse(line));
+            let incoming: ReturnType<typeof parseIncoming>;
+            try {
+              incoming = parseIncoming(JSON.parse(line));
+            } catch {
+              throw new RpcFailure(-32700, "parse error");
+            }
             if (incoming.kind !== "request") continue; // Phase 0: ignore client notifications
             id = incoming.msg.id;
             const result = await handle(socket, incoming.msg.method, incoming.msg.params);

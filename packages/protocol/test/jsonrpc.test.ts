@@ -54,4 +54,13 @@ describe("jsonrpc envelopes", () => {
       expect(r.result).toEqual({ v: 1 });
     }
   });
+
+  test("error response with id:null parses (JSON-RPC parse-error frames)", () => {
+    const r = RpcResponse.parse({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
+    expect("error" in r && r.error.code).toBe(-32700);
+  });
+
+  test("REQUESTS still reject id:null", () => {
+    expect(() => RpcRequest.parse({ jsonrpc: "2.0", id: null, method: "m" })).toThrow();
+  });
 });

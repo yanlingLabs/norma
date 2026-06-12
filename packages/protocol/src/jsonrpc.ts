@@ -3,6 +3,9 @@ import { z } from "zod";
 export const RpcId = z.union([z.number(), z.string()]);
 export type RpcId = z.infer<typeof RpcId>;
 
+export const RpcResponseId = z.union([z.number(), z.string(), z.null()]);
+export type RpcResponseId = z.infer<typeof RpcResponseId>;
+
 export const RpcRequest = z.object({
   jsonrpc: z.literal("2.0"),
   id: RpcId,
@@ -26,18 +29,18 @@ export const RpcError = z.object({
 });
 export type RpcError = z.infer<typeof RpcError>;
 
-export type RpcSuccess = { jsonrpc: "2.0"; id: RpcId; result: unknown };
-export type RpcFailure = { jsonrpc: "2.0"; id: RpcId; error: RpcError };
+export type RpcSuccess = { jsonrpc: "2.0"; id: RpcResponseId; result: unknown };
+export type RpcFailure = { jsonrpc: "2.0"; id: RpcResponseId; error: RpcError };
 export type RpcResponseShape = RpcSuccess | RpcFailure;
 
 const RpcSuccessResponse = z.looseObject({
   jsonrpc: z.literal("2.0"),
-  id: RpcId,
+  id: RpcResponseId,
   result: z.unknown(),
 });
 const RpcErrorResponse = z.looseObject({
   jsonrpc: z.literal("2.0"),
-  id: RpcId,
+  id: RpcResponseId,
   error: RpcError,
 });
 

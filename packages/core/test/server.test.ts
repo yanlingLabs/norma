@@ -12,6 +12,7 @@ class TestClient {
   private nextId = 1;
   private pending = new Map<number, (msg: any) => void>();
   readonly notifications: any[] = [];
+  readonly errors: any[] = [];
   private socket!: Awaited<ReturnType<typeof Bun.connect>>;
 
   static async connect(socketPath: string): Promise<TestClient> {
@@ -25,6 +26,8 @@ class TestClient {
             if (msg.id !== undefined && c.pending.has(msg.id)) {
               c.pending.get(msg.id)!(msg);
               c.pending.delete(msg.id);
+            } else if (msg.id === null && msg.error) {
+              c.errors.push(msg);
             } else if (msg.method) {
               c.notifications.push(msg);
             }
@@ -126,5 +129,43 @@ describe("daemon IPC", () => {
     await a.waitForNotification((n) =>
       n.method === METHODS.event && n.params.type === "harness_detached" && n.params.clientName === "client-b");
     a.close();
+  });
+
+  test("attach to nonexistent session → NOT_FOUND; send without attach → NOT_FOUND", async () => {
+    await boot();
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "lost");
+    const attach = await c.request(METHODS.sessionAttach, { sessionId: "s_nope", fromSeq: 0 });
+    expect(attach.error.code).toBe(-32004);
+    const send = await c.request(METHODS.sessionSend, { sessionId: "s_nope", text: "x" });
+    expect(send.error.code).toBe(-32004);
+    c.close();
+  });
+
+  test("session.list returns the index shape", async () => {
+    await boot();
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "lister");
+    const created = await c.request(METHODS.sessionCreate, { scope: "global" });
+    const { result } = await c.request(METHODS.sessionList);
+    expect(result.sessions).toHaveLength(1);
+    expect(result.sessions[0]).toMatchObject({ sessionId: created.result.sessionId, scope: "global", lastSeq: 1 });
+    expect(result.sessions[0].createdAt).toBeGreaterThan(0);
+    c.close();
+  });
+
+  test("malformed JSON line gets an id:null error frame that our own schema accepts", async () => {
+    await boot();
+    const { RpcResponse } = await import("@norma/protocol");
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "garbler");
+    (c as any).socket.write(new TextEncoder().encode("THIS IS NOT JSON\n"));
+    await new Promise((r) => setTimeout(r, 50));
+    const frame = c.errors[0];
+    expect(frame).toBeTruthy();
+    expect(frame.id).toBeNull();
+    expect(() => RpcResponse.parse(frame)).not.toThrow();
+    expect(frame.error.code).toBe(-32700);
+    c.close();
   });
 });
