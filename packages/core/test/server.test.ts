@@ -154,6 +154,29 @@ describe("daemon IPC", () => {
     c.close();
   });
 
+  test("bad params yield INVALID_PARAMS (-32602) with sanitized message", async () => {
+    await boot();
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "zod");
+    const res = await c.request(METHODS.sessionCreate, { scope: "UPPER NOT VALID" });
+    expect(res.error.code).toBe(-32602);
+    expect(res.error.message).toContain("invalid params");
+    expect(res.error.message).not.toContain("regex"); // no internal zod dump
+    c.close();
+  });
+
+  test("second hello on an authed connection is rejected with INVALID_REQUEST", async () => {
+    await boot();
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "once");
+    const again = await c.hello(harnessToken, "twice");
+    expect(again.error.code).toBe(-32600);
+    // original auth still works:
+    const list = await c.request(METHODS.sessionList);
+    expect(list.result.sessions).toEqual([]);
+    c.close();
+  });
+
   test("malformed JSON line gets an id:null error frame that our own schema accepts", async () => {
     await boot();
     const { RpcResponse } = await import("@norma/protocol");

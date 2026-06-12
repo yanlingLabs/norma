@@ -1,4 +1,5 @@
 import { chmodSync } from "node:fs";
+import { ZodError } from "zod";
 import {
   ERR, METHODS, PROTOCOL_VERSION, LineDecoder, encodeLine, parseIncoming,
   HelloParams, SessionCreateParams, SessionAttachParams, SessionSendParams,
@@ -51,11 +52,17 @@ export function startIpcServer(opts: {
             const result = await handle(socket, incoming.msg.method, incoming.msg.params);
             socket.write(encodeLine({ jsonrpc: "2.0", id, result }));
           } catch (err) {
-            const e = err as Partial<RpcFailure>;
-            socket.write(encodeLine({
-              jsonrpc: "2.0", id,
-              error: { code: e.code ?? ERR.INTERNAL, message: e.message ?? "internal error" },
-            }));
+            let code: number;
+            let message: string;
+            if (err instanceof ZodError) {
+              code = ERR.INVALID_PARAMS;
+              message = `invalid params: ${err.issues.map((i) => i.path.join(".") || "(root)").join(", ")}`;
+            } else {
+              const e = err as Partial<RpcFailure>;
+              code = e.code ?? ERR.INTERNAL;
+              message = e.message ?? "internal error";
+            }
+            socket.write(encodeLine({ jsonrpc: "2.0", id, error: { code, message } }));
           }
         }
       },
@@ -65,6 +72,9 @@ export function startIpcServer(opts: {
 
   async function handle(socket: { write(d: Uint8Array): unknown; data: ConnState }, method: string, params: unknown): Promise<unknown> {
     if (method === METHODS.hello) {
+      if (socket.data.authedRole !== null) {
+        throw new RpcFailure(ERR.INVALID_REQUEST, "already authenticated — open a new connection to change role");
+      }
       const p = HelloParams.parse(params);
       if (p.protocolVersion !== PROTOCOL_VERSION) {
         throw new RpcFailure(ERR.VERSION_MISMATCH, `server speaks protocol v${PROTOCOL_VERSION}, client sent v${p.protocolVersion}`);
