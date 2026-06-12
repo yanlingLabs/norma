@@ -204,7 +204,12 @@ describe("daemon IPC", () => {
   test("pre-hello oversized line disconnects the client", async () => {
     await boot();
     const c = await TestClient.connect(daemon.socketPath);
-    (c as any).socket.write(new TextEncoder().encode("x".repeat(100_000))); // > 64KiB pre-auth cap, no newline
+    // >64KiB without a newline, in 8KB writes (Bun caps a single write at 8192 bytes)
+    const chunk = new TextEncoder().encode("x".repeat(8_000));
+    for (let i = 0; i < 9; i++) {
+      (c as any).socket.write(chunk);
+      await new Promise((r) => setTimeout(r, 5));
+    }
     await new Promise((r) => setTimeout(r, 100));
     const hello = c.hello(harnessToken, "late");
     const result = await Promise.race([hello, new Promise((r) => setTimeout(() => r("dead"), 300))]);
