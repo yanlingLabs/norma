@@ -11,3 +11,9 @@ node_modules/
 
 # Brainstorming mockups
 .superpowers/
+
+# Build artifacts
+dist/
+*.tsbuildinfo
+spikes/*/out/
+.build/
