@@ -29,4 +29,16 @@ describe("NDJSON framing", () => {
     const d = new LineDecoder(64);
     expect(() => d.push(new TextEncoder().encode("x".repeat(100)))).toThrow(/line too long/);
   });
+
+  test("blank lines are skipped (bare newline keep-alives, NDJSON blank separators)", () => {
+    const d = new LineDecoder();
+    expect(d.push(new TextEncoder().encode("\n"))).toEqual([]);
+    expect(d.push(new TextEncoder().encode('{"a":1}\n\n{"b":2}\n'))).toEqual(['{"a":1}', '{"b":2}']);
+  });
+
+  test("decoder is reset (not poisoned) after oversized-line throw", () => {
+    const d = new LineDecoder(8);
+    expect(() => d.push(new TextEncoder().encode("x".repeat(20)))).toThrow(/line too long/);
+    expect(d.push(new TextEncoder().encode('{"ok":1}\n'))).toEqual(['{"ok":1}']);
+  });
 });
