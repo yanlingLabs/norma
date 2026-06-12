@@ -1,5 +1,5 @@
 import { chmodSync } from "node:fs";
-import { ZodError } from "zod";
+import { z } from "zod";
 import {
   ERR, METHODS, PROTOCOL_VERSION, LineDecoder, encodeLine, parseIncoming,
   HelloParams, SessionCreateParams, SessionAttachParams, SessionSendParams,
@@ -28,6 +28,17 @@ export function startIpcServer(opts: {
 }): IpcServer {
   const hub = new SessionHub(opts.store);
 
+  function parseParams<S extends z.ZodTypeAny>(schema: S, params: unknown): z.infer<S> {
+    const result = schema.safeParse(params);
+    if (!result.success) {
+      throw new RpcFailure(
+        ERR.INVALID_PARAMS,
+        `invalid params: ${result.error.issues.map((i: z.ZodIssue) => i.path.join(".") || "(root)").join(", ")}`,
+      );
+    }
+    return result.data;
+  }
+
   const server = Bun.listen<ConnState>({
     unix: opts.socketPath,
     socket: {
@@ -52,16 +63,9 @@ export function startIpcServer(opts: {
             const result = await handle(socket, incoming.msg.method, incoming.msg.params);
             socket.write(encodeLine({ jsonrpc: "2.0", id, result }));
           } catch (err) {
-            let code: number;
-            let message: string;
-            if (err instanceof ZodError) {
-              code = ERR.INVALID_PARAMS;
-              message = `invalid params: ${err.issues.map((i) => i.path.join(".") || "(root)").join(", ")}`;
-            } else {
-              const e = err as Partial<RpcFailure>;
-              code = e.code ?? ERR.INTERNAL;
-              message = e.message ?? "internal error";
-            }
+            const e = err as Partial<RpcFailure>;
+            const code = e.code ?? ERR.INTERNAL;
+            const message = e.message ?? "internal error";
             socket.write(encodeLine({ jsonrpc: "2.0", id, error: { code, message } }));
           }
         }
@@ -75,7 +79,7 @@ export function startIpcServer(opts: {
       if (socket.data.authedRole !== null) {
         throw new RpcFailure(ERR.INVALID_REQUEST, "already authenticated — open a new connection to change role");
       }
-      const p = HelloParams.parse(params);
+      const p = parseParams(HelloParams, params);
       if (p.protocolVersion !== PROTOCOL_VERSION) {
         throw new RpcFailure(ERR.VERSION_MISMATCH, `server speaks protocol v${PROTOCOL_VERSION}, client sent v${p.protocolVersion}`);
       }
@@ -91,13 +95,13 @@ export function startIpcServer(opts: {
 
     switch (method) {
       case METHODS.sessionCreate: {
-        const p = SessionCreateParams.parse(params);
+        const p = parseParams(SessionCreateParams, params);
         return { sessionId: opts.store.createSession(p.scope) };
       }
       case METHODS.sessionList:
         return { sessions: opts.store.list() };
       case METHODS.sessionAttach: {
-        const p = SessionAttachParams.parse(params);
+        const p = parseParams(SessionAttachParams, params);
         const hubClient: HubClient = {
           clientName: socket.data.clientName,
           deliver(event: SessionEvent) {
@@ -115,7 +119,7 @@ export function startIpcServer(opts: {
         }
       }
       case METHODS.sessionSend: {
-        const p = SessionSendParams.parse(params);
+        const p = parseParams(SessionSendParams, params);
         if (!socket.data.hubClient) throw new RpcFailure(ERR.NOT_FOUND, "attach to the session first");
         return { seq: hub.send(socket.data.hubClient, p.sessionId, p.text) };
       }

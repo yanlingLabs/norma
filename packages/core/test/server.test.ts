@@ -177,6 +177,15 @@ describe("daemon IPC", () => {
     c.close();
   });
 
+  test("malformed hello params yield INVALID_PARAMS", async () => {
+    await boot();
+    const c = await TestClient.connect(daemon.socketPath);
+    const res = await c.request(METHODS.hello, { protocolVersion: "nope", role: "harness", token: "t", clientName: "x" });
+    expect(res.error.code).toBe(-32602);
+    expect(res.error.message).toContain("protocolVersion");
+    c.close();
+  });
+
   test("malformed JSON line gets an id:null error frame that our own schema accepts", async () => {
     await boot();
     const { RpcResponse } = await import("@norma/protocol");
