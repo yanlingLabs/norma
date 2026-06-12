@@ -43,6 +43,7 @@ describe("CodexOAuthProvider", () => {
   test("401 triggers ONE refresh then retry; refreshed token persisted", async () => {
     let calls = 0;
     let sawRefresh = false;
+    let retryHeaders: Record<string, string> = {};
     server = Bun.serve({
       port: 0,
       async fetch(req) {
@@ -53,6 +54,7 @@ describe("CodexOAuthProvider", () => {
         }
         calls++;
         if (calls === 1) return new Response("expired", { status: 401 });
+        retryHeaders = Object.fromEntries(req.headers.entries());
         return new Response(sse(), { headers: { "content-type": "text/event-stream" } });
       },
     });
@@ -67,6 +69,8 @@ describe("CodexOAuthProvider", () => {
     expect(sawRefresh).toBe(true);
     expect(events.at(-1)).toMatchObject({ type: "done" });
     expect((await authStore.load())?.accessToken).toBe("at_fresh");
+    expect(retryHeaders["chatgpt-account-id"]).toBe("acct_7");
+    expect(retryHeaders["authorization"]).toBe("Bearer at_fresh");
   });
 
   test("401 twice yields an auth error (no refresh loop)", async () => {

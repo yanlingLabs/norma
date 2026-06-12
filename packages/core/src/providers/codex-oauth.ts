@@ -61,7 +61,17 @@ export class CodexOAuthProvider implements Provider {
       res = await this.post(req, tokens);
       if (res.status === 401 && tokens.refreshToken) {
         try {
-          tokens = { ...tokens, ...(await refreshTokens(this.cfg.tokenUrl ?? CODEX.tokenUrl, CODEX.clientId, tokens.refreshToken)) };
+          const fresh = await refreshTokens(this.cfg.tokenUrl ?? CODEX.tokenUrl, CODEX.clientId, tokens.refreshToken);
+          tokens = {
+            ...tokens,
+            accessToken: fresh.accessToken,
+            expiresAt: fresh.expiresAt,
+            // refresh grants usually return no id_token and may not rotate the refresh token:
+            // never let nulls clobber known-good identity fields.
+            ...(fresh.refreshToken != null ? { refreshToken: fresh.refreshToken } : {}),
+            ...(fresh.idToken != null ? { idToken: fresh.idToken } : {}),
+            ...(fresh.accountId != null ? { accountId: fresh.accountId } : {}),
+          };
           await this.cfg.authStore.save(tokens);
           res = await this.post(req, tokens); // retry exactly once
         } catch {
