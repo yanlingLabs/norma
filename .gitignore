@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# Node
+node_modules/
+
+# Brainstorming mockups
+.superpowers/
