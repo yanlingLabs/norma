@@ -1,0 +1,35 @@
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import type { Role } from "@norma/protocol";
+import type { SecretStore } from "./secret-store";
+
+const TOKEN_NAMES: Record<string, string> = {
+  harness: "harness-token",
+  admin: "admin-token",
+};
+
+export class TokenAuthority {
+  constructor(private readonly store: SecretStore) {}
+
+  async ensureTokens(): Promise<{ harness: string; admin: string }> {
+    const out: Record<string, string> = {};
+    for (const [role, name] of Object.entries(TOKEN_NAMES)) {
+      let v = await this.store.get(name);
+      if (!v) {
+        v = randomBytes(32).toString("hex");
+        await this.store.set(name, v);
+      }
+      out[role] = v;
+    }
+    return out as { harness: string; admin: string };
+  }
+
+  async verify(role: Role, token: string): Promise<boolean> {
+    const name = TOKEN_NAMES[role];
+    if (!name) return false; // plugin tokens arrive in Phase 4
+    const expected = await this.store.get(name);
+    if (!expected) return false;
+    const a = Buffer.from(expected);
+    const b = Buffer.from(token);
+    return a.length === b.length && timingSafeEqual(a, b);
+  }
+}
