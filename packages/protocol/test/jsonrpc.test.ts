@@ -19,6 +19,10 @@ describe("jsonrpc envelopes", () => {
     expect("error" in err && err.error.code).toBe(-32001);
   });
 
+  test("notification WITH an id is rejected (refine must see unknown keys)", () => {
+    expect(() => RpcNotification.parse({ jsonrpc: "2.0", method: "m", id: 1 })).toThrow();
+  });
+
   test("parseIncoming discriminates request vs notification vs response", () => {
     expect(parseIncoming({ jsonrpc: "2.0", id: 1, method: "m" }).kind).toBe("request");
     expect(parseIncoming({ jsonrpc: "2.0", method: "m" }).kind).toBe("notification");

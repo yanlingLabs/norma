@@ -10,7 +10,7 @@ export const RpcRequest = z.object({
 });
 export type RpcRequest = z.infer<typeof RpcRequest>;
 
-export const RpcNotification = z.object({
+export const RpcNotification = z.looseObject({
   jsonrpc: z.literal("2.0"),
   method: z.string(),
   params: z.unknown().optional(),
