@@ -112,4 +112,15 @@ describe("pkce", () => {
     });
     await expect(flow).rejects.toThrow(/timed out/);
   });
+
+  test("occupied callback port yields a readable error", async () => {
+    const blocker = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("x") });
+    const blockerPort = blocker.port!;
+    await expect(runLoginFlow({
+      clientId: "x", authorizeUrl: "http://localhost:1/a", tokenUrl: "http://localhost:1/t",
+      callbackPort: blockerPort, scope: "openid",
+      openBrowser: async () => {},
+    })).rejects.toThrow(/another login in progress/);
+    blocker.stop(true);
+  });
 });

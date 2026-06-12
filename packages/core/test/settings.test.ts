@@ -28,4 +28,8 @@ describe("loadSettings", () => {
     const p = tmpSettings({ schemaVersion: 2, provider: { type: "telepathy" } });
     expect(() => loadSettings(p)).toThrow(/settings/);
   });
+
+  test("missing settings file throws a readable error", () => {
+    expect(() => loadSettings(join(mkdtempSync(join(tmpdir(), "norma-set-")), "settings.json"))).toThrow(/norma daemon run/);
+  });
 });

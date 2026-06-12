@@ -117,10 +117,10 @@ switch (cmdKey) {
     break;
   }
   case "logout": {
-    const { KeychainSecretStore } = await import("@norma/core");
+    const { KeychainSecretStore, CODEX_SECRET_NAMES } = await import("@norma/core");
     const secrets = new KeychainSecretStore();
     // Phase 1a simplification: SecretStore gains delete() in 1b — empty value de-authorizes everywhere today.
-    for (const name of ["codex-access-token", "codex-refresh-token", "codex-id-token", "codex-account-id", "codex-expires-at"]) {
+    for (const name of Object.values(CODEX_SECRET_NAMES)) {
       await secrets.set(name, "");
     }
     console.log("signed out");

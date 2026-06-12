@@ -15,7 +15,15 @@ export type Settings = z.infer<typeof Settings>;
 const DEFAULT_PROVIDER = { type: "codex-oauth", model: "gpt-5.2-codex" } as const;
 
 export function loadSettings(path: string): Settings {
-  const raw = JSON.parse(readFileSync(path, "utf8"));
+  let raw: any;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error(`settings file not found at ${path} — run \`norma daemon run\` once to initialize`);
+    }
+    throw err;
+  }
   if (raw.schemaVersion === 1) {
     const migrated: Settings = { schemaVersion: 2, provider: DEFAULT_PROVIDER };
     writeFileSync(path, JSON.stringify(migrated, null, 2) + "\n");

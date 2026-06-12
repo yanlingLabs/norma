@@ -67,22 +67,27 @@ export async function runLoginFlow(cfg: LoginConfig): Promise<OAuthTokens> {
   // before the `await codePromise` line is reached (e.g. state-mismatch path).
   codePromise.catch(() => {});
 
-  const server = Bun.serve({
-    port: cfg.callbackPort,
-    hostname: "127.0.0.1", // loopback only — the auth code must never be reachable from the LAN
-    fetch(req) {
-      const url = new URL(req.url);
-      if (url.pathname !== "/auth/callback") return new Response("not found", { status: 404 });
-      if (url.searchParams.get("state") !== state) {
-        rejectFlow(new Error("OAuth state mismatch — possible CSRF, aborting login"));
-        return new Response("state mismatch", { status: 400 });
-      }
-      const code = url.searchParams.get("code");
-      if (!code) { rejectFlow(new Error("callback missing code")); return new Response("missing code", { status: 400 }); }
-      resolveCode(code);
-      return new Response("Norma is signed in — you can close this tab.", { headers: { "content-type": "text/plain" } });
-    },
-  });
+  let server: ReturnType<typeof Bun.serve>;
+  try {
+    server = Bun.serve({
+      port: cfg.callbackPort,
+      hostname: "127.0.0.1", // loopback only — the auth code must never be reachable from the LAN
+      fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname !== "/auth/callback") return new Response("not found", { status: 404 });
+        if (url.searchParams.get("state") !== state) {
+          rejectFlow(new Error("OAuth state mismatch — possible CSRF, aborting login"));
+          return new Response("state mismatch", { status: 400 });
+        }
+        const code = url.searchParams.get("code");
+        if (!code) { rejectFlow(new Error("callback missing code")); return new Response("missing code", { status: 400 }); }
+        resolveCode(code);
+        return new Response("Norma is signed in — you can close this tab.", { headers: { "content-type": "text/plain" } });
+      },
+    });
+  } catch (err) {
+    throw new Error(`could not open the login callback on port ${cfg.callbackPort} — is another login in progress? (${(err as Error).message})`);
+  }
 
   const redirectUri = `http://localhost:${server.port}/auth/callback`;
   const authUrl = new URL(cfg.authorizeUrl);
