@@ -65,10 +65,10 @@ describe("daemon IPC", () => {
   let daemon: RunningDaemon;
   let harnessToken: string;
 
-  async function boot(): Promise<void> {
+  async function boot(serverOpts: { helloTimeoutMs?: number; maxConnections?: number } = {}): Promise<void> {
     const home = mkdtempSync(join(tmpdir(), "norma-daemon-"));
     const secrets = new FileSecretStore(join(home, "test-secrets"));
-    daemon = await startDaemon({ home, secrets });
+    daemon = await startDaemon({ home, secrets, server: serverOpts });
     harnessToken = daemon.tokens.harness;
   }
 
@@ -199,5 +199,38 @@ describe("daemon IPC", () => {
     expect(() => RpcResponse.parse(frame)).not.toThrow();
     expect(frame.error.code).toBe(-32700);
     c.close();
+  });
+
+  test("pre-hello oversized line disconnects the client", async () => {
+    await boot();
+    const c = await TestClient.connect(daemon.socketPath);
+    (c as any).socket.write(new TextEncoder().encode("x".repeat(100_000))); // > 64KiB pre-auth cap, no newline
+    await new Promise((r) => setTimeout(r, 100));
+    const hello = c.hello(harnessToken, "late");
+    const result = await Promise.race([hello, new Promise((r) => setTimeout(() => r("dead"), 300))]);
+    expect(result).toBe("dead");
+    c.close();
+  });
+
+  test("no hello within the deadline disconnects the client", async () => {
+    await boot({ helloTimeoutMs: 100 });
+    const c = await TestClient.connect(daemon.socketPath);
+    await new Promise((r) => setTimeout(r, 200));
+    const hello = c.hello(harnessToken, "tooslow");
+    const result = await Promise.race([hello, new Promise((r) => setTimeout(() => r("dead"), 300))]);
+    expect(result).toBe("dead");
+    c.close();
+  });
+
+  test("connection cap rejects the N+1th connection", async () => {
+    await boot({ maxConnections: 2 });
+    const c1 = await TestClient.connect(daemon.socketPath);
+    const c2 = await TestClient.connect(daemon.socketPath);
+    const c3 = await TestClient.connect(daemon.socketPath);
+    await new Promise((r) => setTimeout(r, 50));
+    const hello = c3.hello(harnessToken, "overflow");
+    const result = await Promise.race([hello, new Promise((r) => setTimeout(() => r("dead"), 300))]);
+    expect(result).toBe("dead");
+    [c1, c2, c3].forEach((c) => c.close());
   });
 });

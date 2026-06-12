@@ -3,7 +3,7 @@ import { acquireLock, type Lock } from "./lock";
 import { TokenAuthority } from "./auth/tokens";
 import { KeychainSecretStore, type SecretStore } from "./auth/secret-store";
 import { SessionStore } from "./sessions/store";
-import { startIpcServer, type IpcServer } from "./ipc/server";
+import { startIpcServer, type IpcServer, type IpcServerOptions } from "./ipc/server";
 
 export const CORE_VERSION = "0.0.1";
 
@@ -13,7 +13,11 @@ export interface RunningDaemon {
   stop(): void;
 }
 
-export async function startDaemon(opts: { home?: string; secrets?: SecretStore } = {}): Promise<RunningDaemon> {
+export async function startDaemon(opts: {
+  home?: string;
+  secrets?: SecretStore;
+  server?: Partial<Pick<IpcServerOptions, "helloTimeoutMs" | "maxConnections" | "preAuthMaxLine">>;
+} = {}): Promise<RunningDaemon> {
   const dirs = bootstrapNormaDir(opts.home ?? resolveNormaHome());
   const lock: Lock = await acquireLock(dirs.lockPath, dirs.socketPath);
 
@@ -26,6 +30,7 @@ export async function startDaemon(opts: { home?: string; secrets?: SecretStore }
     serverVersion: CORE_VERSION,
     tokens: authority,
     store,
+    ...opts.server,
   });
 
   console.error(`norma-core ${CORE_VERSION} listening on ${dirs.socketPath}`);

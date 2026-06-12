@@ -14,19 +14,30 @@ interface ConnState {
   authedRole: string | null;
   clientName: string;
   hubClient: HubClient | null;
+  helloTimer: ReturnType<typeof setTimeout> | null;
+}
+
+export interface IpcServerOptions {
+  socketPath: string;
+  serverVersion: string;
+  tokens: TokenAuthority;
+  store: SessionStore;
+  helloTimeoutMs?: number;   // default 5000
+  maxConnections?: number;   // default 64
+  preAuthMaxLine?: number;   // default 64 KiB
 }
 
 export interface IpcServer { stop(): void }
 
 class RpcFailure extends Error { constructor(public code: number, message: string) { super(message); } }
 
-export function startIpcServer(opts: {
-  socketPath: string;
-  serverVersion: string;
-  tokens: TokenAuthority;
-  store: SessionStore;
-}): IpcServer {
+export function startIpcServer(opts: IpcServerOptions): IpcServer {
   const hub = new SessionHub(opts.store);
+
+  const helloTimeoutMs = opts.helloTimeoutMs ?? 5000;
+  const maxConnections = opts.maxConnections ?? 64;
+  const preAuthMaxLine = opts.preAuthMaxLine ?? 64 * 1024;
+  let connections = 0;
 
   function parseParams<S extends z.ZodTypeAny>(schema: S, params: unknown): z.infer<S> {
     const result = schema.safeParse(params);
@@ -43,13 +54,34 @@ export function startIpcServer(opts: {
     unix: opts.socketPath,
     socket: {
       open(socket) {
-        socket.data = { decoder: new LineDecoder(), authedRole: null, clientName: "", hubClient: null };
+        if (connections >= maxConnections) {
+          // Bun requires socket.data to be assigned before close() fires.
+          // Set a sentinel so the close() guard can detect the capped case.
+          (socket as any).data = null;
+          socket.end();
+          return;
+        }
+        connections++;
+        socket.data = {
+          decoder: new LineDecoder(preAuthMaxLine),
+          authedRole: null,
+          clientName: "",
+          hubClient: null,
+          helloTimer: setTimeout(() => socket.end(), helloTimeoutMs),
+        };
       },
       close(socket) {
+        if (!socket.data) return; // rejected at cap before data was set (sentinel null)
+        connections--;
+        if (socket.data.helloTimer) clearTimeout(socket.data.helloTimer);
         if (socket.data.hubClient) hub.detach(socket.data.hubClient);
       },
       async data(socket, chunk) {
-        for (const line of socket.data.decoder.push(chunk)) {
+        let lines: string[];
+        try { lines = socket.data.decoder.push(chunk); }
+        catch { socket.end(); return; } // oversized line: hostile or broken peer
+
+        for (const line of lines) {
           let id: number | string | null = null;
           try {
             let incoming: ReturnType<typeof parseIncoming>;
@@ -88,6 +120,8 @@ export function startIpcServer(opts: {
       }
       socket.data.authedRole = p.role;
       socket.data.clientName = p.clientName;
+      if (socket.data.helloTimer) { clearTimeout(socket.data.helloTimer); socket.data.helloTimer = null; }
+      socket.data.decoder = new LineDecoder(); // authed: default 8 MiB line cap
       return { ok: true, serverVersion: opts.serverVersion, protocolVersion: PROTOCOL_VERSION };
     }
 
