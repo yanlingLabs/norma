@@ -16,7 +16,7 @@ describe("jsonrpc envelopes", () => {
   test("success and error responses parse", () => {
     expect(RpcResponse.parse({ jsonrpc: "2.0", id: 1, result: { ok: true } }).id).toBe(1);
     const err = RpcResponse.parse({ jsonrpc: "2.0", id: 2, error: { code: -32001, message: "unauthorized" } });
-    expect("error" in err && (err as { error: { code: number } }).error.code).toBe(-32001);
+    expect("error" in err && err.error.code).toBe(-32001);
   });
 
   test("notification WITH an id is rejected (refine must see unknown keys)", () => {
@@ -44,5 +44,14 @@ describe("jsonrpc envelopes", () => {
   test("notification strips unknown top-level keys (consistent with request)", () => {
     const parsed = RpcNotification.parse({ jsonrpc: "2.0", method: "m", extra: "x" });
     expect("extra" in parsed).toBe(false);
+  });
+
+  test("RpcResponse narrows without casts", () => {
+    const r = RpcResponse.parse({ jsonrpc: "2.0", id: 3, result: { v: 1 } });
+    if ("error" in r) {
+      expect(r.error.message).toBeString();
+    } else {
+      expect(r.result).toEqual({ v: 1 });
+    }
   });
 });

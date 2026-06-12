@@ -26,6 +26,10 @@ export const RpcError = z.object({
 });
 export type RpcError = z.infer<typeof RpcError>;
 
+export type RpcSuccess = { jsonrpc: "2.0"; id: RpcId; result: unknown };
+export type RpcFailure = { jsonrpc: "2.0"; id: RpcId; error: RpcError };
+export type RpcResponseShape = RpcSuccess | RpcFailure;
+
 const RpcSuccessResponse = z.looseObject({
   jsonrpc: z.literal("2.0"),
   id: RpcId,
@@ -46,9 +50,9 @@ export const RpcResponse = z
       ctx.addIssue({ code: "custom", message: "response must carry exactly one of result | error" });
     }
   })
-  .transform((m) =>
+  .transform((m): RpcResponseShape =>
     "error" in m
-      ? { jsonrpc: m.jsonrpc, id: m.id, error: m.error }
+      ? { jsonrpc: m.jsonrpc, id: m.id, error: (m as { error: RpcError }).error }
       : { jsonrpc: m.jsonrpc, id: m.id, result: (m as { result: unknown }).result },
   );
 export type RpcResponse = z.infer<typeof RpcResponse>;
