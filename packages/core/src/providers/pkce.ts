@@ -37,7 +37,11 @@ async function exchange(tokenUrl: string, params: Record<string, string>): Promi
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams(params).toString(),
   });
-  if (!res.ok) throw new Error(`token exchange failed: HTTP ${res.status}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    const snippet = body.slice(0, 200);
+    throw new Error(`token exchange failed: HTTP ${res.status}${snippet ? ` — ${snippet}` : ""}`);
+  }
   const j = (await res.json()) as { access_token: string; refresh_token?: string; id_token?: string; expires_in?: number };
   return {
     accessToken: j.access_token,
@@ -65,6 +69,7 @@ export async function runLoginFlow(cfg: LoginConfig): Promise<OAuthTokens> {
 
   const server = Bun.serve({
     port: cfg.callbackPort,
+    hostname: "127.0.0.1", // loopback only — the auth code must never be reachable from the LAN
     fetch(req) {
       const url = new URL(req.url);
       if (url.pathname !== "/auth/callback") return new Response("not found", { status: 404 });
@@ -93,7 +98,7 @@ export async function runLoginFlow(cfg: LoginConfig): Promise<OAuthTokens> {
 
   const timeout = setTimeout(() => rejectFlow(new Error("login timed out")), cfg.timeoutMs ?? 5 * 60_000);
   try {
-    await cfg.openBrowser(authUrl.toString());
+    cfg.openBrowser(authUrl.toString()).catch((e) => rejectFlow(new Error(`could not open browser: ${(e as Error).message}`)));
     const code = await codePromise;
     return await exchange(cfg.tokenUrl, {
       grant_type: "authorization_code",

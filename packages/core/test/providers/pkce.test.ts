@@ -89,4 +89,27 @@ describe("pkce", () => {
     expect(decodeAccountId(idToken)).toBe("acct_9");
     expect(decodeAccountId("not.a.jwt")).toBeNull();
   });
+
+  test("token exchange 400 error includes response body", async () => {
+    authServer = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(`{"error":"invalid_grant"}`, { status: 400, headers: { "content-type": "application/json" } });
+      },
+    });
+    await expect(
+      refreshTokens(`http://localhost:${authServer.port}/oauth/token`, "app_test", "bad_rt")
+    ).rejects.toThrow(/invalid_grant/);
+  });
+
+  test("timeout rejects flow and stops server", async () => {
+    const flow = runLoginFlow({
+      clientId: "x", authorizeUrl: "http://localhost:1/auth",
+      tokenUrl: "http://localhost:1/token",
+      callbackPort: 0, scope: "openid",
+      timeoutMs: 50,
+      openBrowser: async () => { await new Promise((r) => setTimeout(r, 5_000)); },
+    });
+    await expect(flow).rejects.toThrow(/timed out/);
+  });
 });
