@@ -17,3 +17,4 @@ dist/
 *.tsbuildinfo
 spikes/*/out/
 .build/
+*.bun-build
