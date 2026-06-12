@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { cpSync, mkdirSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SessionEvent } from "../src/events";
 
@@ -26,6 +26,7 @@ for (const [name, value] of Object.entries(fixtures)) {
 
 // 3. Sync fixtures into the Swift test bundle.
 const swiftFixDir = join(import.meta.dir, "..", "..", "..", "apple", "NormaProtocol", "Tests", "NormaProtocolTests", "Fixtures");
+rmSync(swiftFixDir, { recursive: true, force: true }); // delete-then-copy: no orphaned fixtures after variant renames
 mkdirSync(swiftFixDir, { recursive: true });
 cpSync(fixDir, swiftFixDir, { recursive: true });
 console.log(`generated: schema + ${Object.keys(fixtures).length} fixtures (synced to Swift test bundle)`);
