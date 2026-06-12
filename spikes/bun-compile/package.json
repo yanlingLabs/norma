@@ -1,0 +1,16 @@
+{
+  "name": "@norma-spike/bun-compile",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build --compile src/main.tsx --outfile out/spike",
+    "start": "bun run src/main.tsx"
+  },
+  "dependencies": {
+    "ink": "^5.0.0",
+    "react": "^18.3.0"
+  },
+  "devDependencies": {
+    "react-devtools-core": "*"
+  }
+}
