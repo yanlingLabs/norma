@@ -70,6 +70,29 @@ switch (cmdKey) {
     await new Promise(() => {}); // run until interrupted
     break; // unreachable, but keeps the switch uniform
   }
+  case "daemon install": {
+    const { installDaemon } = await import("./launchd");
+    // process.execPath = the bun binary in dev, the compiled `norma` binary in production.
+    const binary = process.execPath;
+    if (binary.endsWith("/bun")) {
+      console.error("daemon install requires the compiled norma binary (Task 16); in dev use: norma daemon run");
+      process.exit(1);
+    }
+    await installDaemon(binary, resolveNormaHome());
+    console.log(`${AQUA}installed launchd agent${RESET} — daemon starts at login and stays alive`);
+    break;
+  }
+  case "daemon uninstall": {
+    const { uninstallDaemon } = await import("./launchd");
+    await uninstallDaemon();
+    console.log("launchd agent removed");
+    break;
+  }
+  case "daemon status": {
+    const { daemonStatus } = await import("./launchd");
+    console.log(await daemonStatus());
+    break;
+  }
   default:
     console.log(`norma (Phase 0) — commands:
   daemon run | daemon install | daemon uninstall | daemon status
