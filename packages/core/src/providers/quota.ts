@@ -19,7 +19,10 @@ export class QuotaManager {
   state(): QuotaState {
     return Date.now() < this.limitedUntil ? { kind: "limited", resumeAt: this.limitedUntil } : { kind: "ok" };
   }
-  onStateChange(cb: (s: QuotaState) => void): void { this.listeners.push(cb); }
+  onStateChange(cb: (s: QuotaState) => void): () => void {
+    this.listeners.push(cb);
+    return () => { this.listeners = this.listeners.filter((l) => l !== cb); };
+  }
   private emit(): void { const s = this.state(); for (const l of this.listeners) l(s); }
 
   noteRateLimit(retryAfterMs: number): void {
@@ -64,13 +67,15 @@ export function withQuota(provider: Provider, q: QuotaManager): Provider {
         await q.waitIfLimited();
         await q.acquire();
         let rateLimited: ProviderEvent | null = null;
+        let yieldedAny = false;
         try {
           for await (const e of provider.streamTurn(req)) {
             if (e.type === "usage") q.accumulate(e.inputTokens, e.outputTokens);
-            if (e.type === "error" && e.code === "rate_limit" && attempt < q.maxRetries) {
+            if (e.type === "error" && e.code === "rate_limit" && attempt < q.maxRetries && !yieldedAny) {
               rateLimited = e;
               break; // retry outside the slot
             }
+            yieldedAny = true;
             yield e;
           }
         } finally {
