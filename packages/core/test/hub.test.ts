@@ -71,4 +71,43 @@ describe("SessionHub", () => {
     const stranger = fakeClient("stranger");
     expect(() => hub.send(stranger, id, "hi")).toThrow(/not attached/);
   });
+
+  test("re-attach to a second session moves the client (no ghost deliveries)", () => {
+    const { store, hub } = setup();
+    const s1 = store.createSession("global");
+    const s2 = store.createSession("global");
+    const mover = fakeClient("mover");
+    const watcher = fakeClient("watcher");
+    hub.attach(watcher, s1, 0);
+    hub.attach(mover, s1, 0);
+    hub.attach(mover, s2, 0); // move
+    const before = mover.received.length;
+    hub.send(watcher, s1, "only for s1");
+    expect(mover.received).toHaveLength(before); // no ghost delivery from s1
+    // watcher saw mover detach from s1:
+    expect(watcher.received.some((e) => e.type === "harness_detached" && e.clientName === "mover")).toBe(true);
+  });
+
+  test("a client whose deliver throws is evicted; others still receive events", () => {
+    const { store, hub } = setup();
+    const id = store.createSession("global");
+    const good = fakeClient("good");
+    let boom = false;
+    const bad: HubClient = { clientName: "bad", deliver() { if (boom) throw new Error("socket dead"); } };
+    hub.attach(good, id, 0);
+    hub.attach(bad, id, 0);
+    boom = true;
+    hub.send(good, id, "first");
+    // good got its own message AND bad's eviction notice:
+    expect(good.received.some((e) => e.type === "user_message" && e.text === "first")).toBe(true);
+    expect(good.received.some((e) => e.type === "harness_detached" && e.clientName === "bad")).toBe(true);
+    // bad is gone — further sends don't throw and don't deliver to it:
+    expect(() => hub.send(good, id, "second")).not.toThrow();
+  });
+
+  test("detach of a never-attached client is a no-op", () => {
+    const { store, hub } = setup();
+    store.createSession("global");
+    expect(() => hub.detach(fakeClient("nobody"))).not.toThrow();
+  });
 });

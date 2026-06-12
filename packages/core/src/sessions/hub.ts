@@ -13,6 +13,9 @@ export class SessionHub {
   constructor(private readonly store: SessionStore) {}
 
   attach(client: HubClient, sessionId: string, fromSeq: number): number {
+    // Defense-in-depth: a client can only be attached to one session — re-attach = move.
+    const prev = this.byClient.get(client);
+    if (prev && prev !== sessionId) this.detach(client);
     for (const e of this.store.read(sessionId, fromSeq)) client.deliver(e); // replay
     let set = this.attachments.get(sessionId);
     if (!set) { set = new Set(); this.attachments.set(sessionId, set); }
@@ -45,7 +48,18 @@ export class SessionHub {
 
   private appendAndBroadcast(sessionId: string, input: EventInput): SessionEvent {
     const event = this.store.append(sessionId, input);
-    for (const c of this.attachments.get(sessionId) ?? []) c.deliver(event);
+    const dead: HubClient[] = [];
+    for (const c of this.attachments.get(sessionId) ?? []) {
+      try { c.deliver(event); }
+      catch { dead.push(c); } // a broken deliver (e.g. dead socket) must not poison the fan-out
+    }
+    for (const c of dead) {
+      this.attachments.get(sessionId)?.delete(c);
+      this.byClient.delete(c);
+      this.appendAndBroadcast(sessionId, {
+        type: "harness_detached", sessionId, clientName: c.clientName,
+      }); // bounded recursion: each level evicts at least one client
+    }
     return event;
   }
 }
