@@ -36,4 +36,21 @@ describe("ResponsesSseParser", () => {
     const chunk = new TextEncoder().encode('event: response.shiny.new\ndata: {"type":"response.shiny.new"}\n\n');
     expect(p.push(chunk)).toEqual([]);
   });
+
+  test("CRLF line endings are normalized (proxy compat)", () => {
+    const p = new ResponsesSseParser();
+    const chunk = new TextEncoder().encode(
+      'event: response.output_text.delta\r\ndata: {"type":"response.output_text.delta","delta":"Hi"}\r\n\r\n'
+    );
+    expect(p.push(chunk)).toEqual([{ type: "text_delta", delta: "Hi" }]);
+  });
+
+  test("CRLF split across push boundaries still parses", () => {
+    const p = new ResponsesSseParser();
+    const full = 'data: {"type":"response.output_text.delta","delta":"Yo"}\r\n\r\n';
+    const bytes = new TextEncoder().encode(full);
+    const cut = full.indexOf("\r\n\r\n") + 1; // split between \r and \n
+    const out = [...p.push(bytes.subarray(0, cut)), ...p.push(bytes.subarray(cut)), ...p.finish()];
+    expect(out).toEqual([{ type: "text_delta", delta: "Yo" }]);
+  });
 });

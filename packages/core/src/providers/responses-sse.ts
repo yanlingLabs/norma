@@ -1,13 +1,17 @@
 import { ProviderEvent } from "./types";
 
-/** Incremental SSE frame splitter + Responses-API event mapper. */
+/**
+ * Incremental SSE frame splitter + Responses-API event mapper.
+ * One instance per request/turn — sawToolCall state does not reset between responses.
+ */
 export class ResponsesSseParser {
   private buf = "";
   private decoder = new TextDecoder();
   private sawToolCall = false;
 
   push(chunk: Uint8Array): ProviderEvent[] {
-    this.buf += this.decoder.decode(chunk, { stream: true });
+    // Normalize after appending so \r\n split across two push() calls is handled correctly.
+    this.buf = (this.buf + this.decoder.decode(chunk, { stream: true })).replace(/\r\n/g, "\n");
     const out: ProviderEvent[] = [];
     let idx: number;
     while ((idx = this.buf.indexOf("\n\n")) !== -1) {
