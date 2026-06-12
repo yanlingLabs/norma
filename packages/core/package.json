@@ -1,0 +1,9 @@
+{
+  "name": "@norma/core",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": { "test": "bun test" },
+  "dependencies": { "@norma/protocol": "workspace:*", "zod": "^4.0.0" }
+}
