@@ -2,10 +2,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { Role } from "@norma/protocol";
 import type { SecretStore } from "./secret-store";
 
-const TOKEN_NAMES: Record<string, string> = {
-  harness: "harness-token",
-  admin: "admin-token",
-};
+export const TOKEN_NAMES = { harness: "harness-token", admin: "admin-token" } as const;
 
 export class TokenAuthority {
   constructor(private readonly store: SecretStore) {}
@@ -24,7 +21,7 @@ export class TokenAuthority {
   }
 
   async verify(role: Role, token: string): Promise<boolean> {
-    const name = TOKEN_NAMES[role];
+    const name = (TOKEN_NAMES as Record<string, string | undefined>)[role];
     if (!name) return false; // plugin tokens arrive in Phase 4
     const expected = await this.store.get(name);
     if (!expected) return false;

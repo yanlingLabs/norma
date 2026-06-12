@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { resolveNormaHome, KeychainSecretStore, startDaemon } from "@norma/core";
+import { resolveNormaHome, KeychainSecretStore, startDaemon, TOKEN_NAMES } from "@norma/core";
 import { NormaClient } from "./client";
 
 const AQUA = "\x1b[38;2;53;214;232m";
@@ -7,7 +7,7 @@ const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
 
 async function getToken(): Promise<string> {
-  const t = await new KeychainSecretStore().get("harness-token");
+  const t = await new KeychainSecretStore().get(TOKEN_NAMES.harness);
   if (!t) throw new Error("no harness token — is the daemon installed? run: norma daemon run");
   return t;
 }
@@ -68,6 +68,7 @@ switch (cmdKey) {
     await c.attach(sessionId, 0);
     console.log(`${DIM}watching ${sessionId} — ctrl-c to stop${RESET}`);
     await new Promise(() => {}); // run until interrupted
+    break; // unreachable, but keeps the switch uniform
   }
   default:
     console.log(`norma (Phase 0) — commands:

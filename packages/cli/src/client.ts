@@ -7,6 +7,7 @@ export interface ConnectOptions {
   token: string;
   clientName: string;
   role?: "harness" | "admin";
+  timeoutMs?: number;
   onEvent: (event: SessionEvent) => void;
 }
 
@@ -15,9 +16,14 @@ export class NormaClient {
   private nextId = 1;
   private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
   private socket!: Awaited<ReturnType<typeof Bun.connect>>;
+  private timeoutMs: number;
+
+  private constructor(timeoutMs = 5000) {
+    this.timeoutMs = timeoutMs;
+  }
 
   static async connect(opts: ConnectOptions): Promise<NormaClient> {
-    const client = new NormaClient();
+    const client = new NormaClient(opts.timeoutMs ?? 5000);
     client.socket = await Bun.connect({
       unix: opts.socketPath,
       socket: {
@@ -30,7 +36,9 @@ export class NormaClient {
               if (msg.error) p.reject(new Error(`${msg.error.message} (code ${msg.error.code})`));
               else p.resolve(msg.result);
             } else if (msg.method === METHODS.event) {
-              opts.onEvent(SessionEvent.parse(msg.params));
+              const parsed = SessionEvent.safeParse(msg.params);
+              if (parsed.success) opts.onEvent(parsed.data);
+              // unknown/future event types are skipped for forward-compat
             }
           }
         },
@@ -38,6 +46,7 @@ export class NormaClient {
           for (const p of client.pending.values()) p.reject(new Error("connection closed"));
           client.pending.clear();
         },
+        error() {}, // close() follows and rejects pending; stub silences Bun's default stderr print
       },
     });
     await client.request(METHODS.hello, {
@@ -52,7 +61,15 @@ export class NormaClient {
   request(method: string, params?: unknown): Promise<any> {
     const id = this.nextId++;
     this.socket.write(encodeLine({ jsonrpc: "2.0", id, method, params }));
-    return new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending.delete(id)) reject(new Error(`request timed out: ${method}`));
+      }, this.timeoutMs);
+      this.pending.set(id, {
+        resolve: (v) => { clearTimeout(timer); resolve(v); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
+    });
   }
 
   async createSession(scope: string): Promise<string> {
