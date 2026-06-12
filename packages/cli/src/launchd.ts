@@ -8,7 +8,12 @@ export function plistPath(): string {
   return join(homedir(), "Library", "LaunchAgents", `${LAUNCHD_LABEL}.plist`);
 }
 
+function xmlEscape(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 export function renderPlist(opts: { binaryPath: string; normaHome: string }): string {
+  const home = xmlEscape(opts.normaHome);
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -16,16 +21,16 @@ export function renderPlist(opts: { binaryPath: string; normaHome: string }): st
   <key>Label</key><string>${LAUNCHD_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${opts.binaryPath}</string>
+    <string>${xmlEscape(opts.binaryPath)}</string>
     <string>daemon</string>
     <string>run</string>
   </array>
   <key>EnvironmentVariables</key>
-  <dict><key>NORMA_HOME</key><string>${opts.normaHome}</string></dict>
+  <dict><key>NORMA_HOME</key><string>${home}</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${join(opts.normaHome, "logs", "core.out.log")}</string>
-  <key>StandardErrorPath</key><string>${join(opts.normaHome, "logs", "core.err.log")}</string>
+  <key>StandardOutPath</key><string>${xmlEscape(join(opts.normaHome, "logs", "core.out.log"))}</string>
+  <key>StandardErrorPath</key><string>${xmlEscape(join(opts.normaHome, "logs", "core.err.log"))}</string>
 </dict>
 </plist>
 `;

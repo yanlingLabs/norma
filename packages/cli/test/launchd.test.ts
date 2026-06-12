@@ -15,5 +15,14 @@ describe("renderPlist", () => {
     expect(xml).toContain("<string>/Users/me/.norma/logs/core.out.log</string>");
     expect(xml).toContain("<string>/Users/me/.norma/logs/core.err.log</string>");
     expect(xml).not.toContain("~"); // launchd does not expand tildes
+    expect(xml).toContain("<key>NORMA_HOME</key>");
+    expect(xml).toContain("<string>/Users/me/.norma</string>");
+  });
+
+  test("xml-escapes special characters in paths", () => {
+    const xml = renderPlist({ binaryPath: "/a&b/norma", normaHome: "/home/x<y>/.norma" });
+    expect(xml).toContain("/a&amp;b/norma");
+    expect(xml).toContain("/home/x&lt;y&gt;/.norma");
+    expect(xml).not.toMatch(/<string>[^<]*&(?!amp;|lt;|gt;)/);
   });
 });
