@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { SessionEvent, type NewSessionEvent } from "@norma/protocol";
@@ -33,27 +33,71 @@ export class SessionStore {
     this.recoverAll();
   }
 
-  /** Index is disposable (spec §4.4): on open, validate each log's tail and resync last_seq. */
+  /** Index is disposable (spec §4.4): on open, scan log files on disk to rebuild the index,
+   *  then resync last_seq for all known sessions. Corrupt lines are skipped (not stopped at);
+   *  logs are rewritten only when bad lines were found, using a temp+rename atomic swap. */
   private recoverAll(): void {
+    // Pass 1: resync sessions already in sqlite
     const rows = this.db.query("SELECT session_id, scope FROM sessions").all() as { session_id: string; scope: string }[];
+    const known = new Set<string>();
     for (const r of rows) {
+      known.add(r.session_id);
       const path = this.logPath(r.scope, r.session_id);
       if (!existsSync(path)) continue;
-      const good = this.readGoodLines(path);
-      writeFileSync(path, good.map((l) => l + "\n").join("")); // drop truncated tail
+      const { good, sawBad } = this.readGoodLines(path);
+      if (sawBad) {
+        const tmp = path + ".repair";
+        writeFileSync(tmp, good.map((l) => l + "\n").join(""));
+        renameSync(tmp, path); // atomic: a crash never leaves a partial log
+      }
       const lastSeq = good.length ? (JSON.parse(good[good.length - 1]!) as SessionEvent).seq : 0;
       this.db.run("UPDATE sessions SET last_seq = ? WHERE session_id = ?", [lastSeq, r.session_id]);
     }
+
+    // Pass 2: scan filesystem for sessions not yet in sqlite (index rebuild from logs)
+    const sessionsDir = join(this.homeDir, "sessions");
+    let scopeDirs: string[];
+    try { scopeDirs = readdirSync(sessionsDir); } catch { return; }
+    for (const entry of scopeDirs) {
+      if (entry === "index.db" || entry.startsWith("index.db")) continue;
+      const scopeDir = join(sessionsDir, entry);
+      let files: string[];
+      try { files = readdirSync(scopeDir); } catch { continue; } // skip non-directories
+      const scope = entry;
+      for (const file of files) {
+        if (!file.endsWith(".jsonl")) continue;
+        const sessionId = file.slice(0, -6); // strip .jsonl
+        if (known.has(sessionId)) continue;
+        const path = join(scopeDir, file);
+        const { good, sawBad } = this.readGoodLines(path);
+        if (good.length === 0) continue;
+        if (sawBad) {
+          const tmp = path + ".repair";
+          writeFileSync(tmp, good.map((l) => l + "\n").join(""));
+          renameSync(tmp, path);
+        }
+        const firstEvent = JSON.parse(good[0]!) as SessionEvent;
+        const createdAt = firstEvent.ts;
+        const lastSeq = (JSON.parse(good[good.length - 1]!) as SessionEvent).seq;
+        this.db.run(
+          "INSERT INTO sessions (session_id, scope, created_at, last_seq) VALUES (?, ?, ?, ?)",
+          [sessionId, scope, createdAt, lastSeq],
+        );
+        known.add(sessionId);
+      }
+    }
   }
 
-  private readGoodLines(path: string): string[] {
+  /** Parse all lines, skipping (not stopping at) unparseable ones. */
+  private readGoodLines(path: string): { good: string[]; sawBad: boolean } {
     const lines = readFileSync(path, "utf8").split("\n").filter((l) => l.length > 0);
     const good: string[] = [];
+    let sawBad = false;
     for (const line of lines) {
       try { SessionEvent.parse(JSON.parse(line)); good.push(line); }
-      catch { break; } // first bad line: everything after is suspect
+      catch { sawBad = true; } // skip: a parseable line is a valid event regardless of position
     }
-    return good;
+    return { good, sawBad };
   }
 
   private logPath(scope: string, sessionId: string): string {
@@ -88,7 +132,7 @@ export class SessionStore {
     if (!row) throw new Error(`unknown session: ${sessionId}`);
     const path = this.logPath(row.scope, sessionId);
     if (!existsSync(path)) return [];
-    return this.readGoodLines(path)
+    return this.readGoodLines(path).good
       .map((l) => SessionEvent.parse(JSON.parse(l)))
       .filter((e) => e.seq > fromSeq);
   }

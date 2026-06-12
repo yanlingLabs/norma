@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, appendFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, appendFileSync, readFileSync, statSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionStore } from "../src/sessions/store";
@@ -68,5 +68,52 @@ describe("SessionStore", () => {
     const e = reopened.append(id, { type: "user_message", sessionId: id, threadId: "main", text: "after", clientName: "t" });
     expect(e.seq).toBe(3); // seq continues from last GOOD event
     expect(readFileSync(logPath, "utf8").endsWith("\n")).toBe(true);
+  });
+
+  test("corrupt MIDDLE line: events after it survive, file repaired", () => {
+    const { store, dir } = makeStore();
+    const id = store.createSession("global");
+    store.append(id, { type: "user_message", sessionId: id, threadId: "main", text: "one", clientName: "t" });
+    store.close();
+    const logPath = join(dir, "sessions", "global", `${id}.jsonl`);
+    const lines = readFileSync(logPath, "utf8").split("\n").filter(Boolean);
+    const withCorrupt = [lines[0]!, "GARBAGE {{{ not json", ...lines.slice(1)].join("\n") + "\n";
+    writeFileSync(logPath, withCorrupt);
+    const reopened = new SessionStore(dir);
+    const events = reopened.read(id);
+    expect(events).toHaveLength(2); // both good events preserved
+    expect(events[1]!).toMatchObject({ type: "user_message", text: "one" });
+    expect(readFileSync(logPath, "utf8")).not.toContain("GARBAGE");
+    reopened.close();
+  });
+
+  test("clean logs are not rewritten on open (mtime preserved)", async () => {
+    const { store, dir } = makeStore();
+    const id = store.createSession("global");
+    store.close();
+    const logPath = join(dir, "sessions", "global", `${id}.jsonl`);
+    const before = statSync(logPath).mtimeMs;
+    await new Promise((r) => setTimeout(r, 20));
+    new SessionStore(dir).close();
+    expect(statSync(logPath).mtimeMs).toBe(before);
+  });
+
+  test("index.db deletion: sessions rediscovered from logs", () => {
+    const { store, dir } = makeStore();
+    const id = store.createSession("global");
+    store.append(id, { type: "user_message", sessionId: id, threadId: "main", text: "x", clientName: "t" });
+    store.close();
+    rmSync(join(dir, "sessions", "index.db"));
+    // Also remove WAL/SHM files if present
+    for (const ext of ["-wal", "-shm"]) {
+      const f = join(dir, "sessions", "index.db" + ext);
+      try { rmSync(f); } catch { /* ignore if not present */ }
+    }
+    const reopened = new SessionStore(dir);
+    const rows = reopened.list();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ sessionId: id, scope: "global", lastSeq: 2 });
+    expect(reopened.read(id)).toHaveLength(2);
+    reopened.close();
   });
 });
