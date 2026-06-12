@@ -25,6 +25,7 @@ export function bootstrapNormaDir(home: string = resolveNormaHome()): NormaDirs 
   const settingsPath = join(home, "settings.json");
   if (!existsSync(settingsPath)) {
     writeFileSync(settingsPath, JSON.stringify({ schemaVersion: 1 }, null, 2) + "\n");
+    chmodSync(settingsPath, 0o600);
   }
 
   return {

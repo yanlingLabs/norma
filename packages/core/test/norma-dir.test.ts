@@ -34,4 +34,23 @@ describe("bootstrapNormaDir", () => {
     bootstrapNormaDir(home); // idempotent
     expect(JSON.parse(readFileSync(settingsPath, "utf8"))).toHaveProperty("custom", true);
   });
+
+  test("respects NORMA_HOME env override (no-arg call)", () => {
+    const saved = process.env.NORMA_HOME;
+    const home = mkdtempSync(join(tmpdir(), "norma-env-"));
+    try {
+      process.env.NORMA_HOME = home;
+      const dirs = bootstrapNormaDir(); // no explicit arg
+      expect(dirs.home).toBe(home);
+    } finally {
+      if (saved === undefined) delete process.env.NORMA_HOME;
+      else process.env.NORMA_HOME = saved;
+    }
+  });
+
+  test("settings.json is 0600", () => {
+    const home = tmpHome();
+    bootstrapNormaDir(home);
+    expect(statSync(join(home, "settings.json")).mode & 0o777).toBe(0o600);
+  });
 });
