@@ -1,0 +1,12 @@
+{
+  "name": "@norma/protocol",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "test": "bun test",
+    "generate": "bun run scripts/generate.ts"
+  },
+  "dependencies": { "zod": "^4.0.0" }
+}
