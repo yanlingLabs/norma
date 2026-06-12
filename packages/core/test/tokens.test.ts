@@ -29,4 +29,19 @@ describe("TokenAuthority", () => {
     expect(await auth.verify("harness", "wrong")).toBe(false);
     expect(await auth.verify("plugin", t.harness)).toBe(false); // no plugin tokens in Phase 0
   });
+
+  test("FileSecretStore writes 0600 files in a 0700 dir", async () => {
+    const dir = join(mkdtempSync(join(tmpdir(), "norma-secrets-")), "inner");
+    const store = new FileSecretStore(dir);
+    await store.set("probe", "v");
+    const { statSync } = await import("node:fs");
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
+    expect(statSync(join(dir, "probe")).mode & 0o777).toBe(0o600);
+  });
+
+  test("two authorities mint distinct tokens", async () => {
+    const a = await makeAuthority().ensureTokens();
+    const b = await makeAuthority().ensureTokens();
+    expect(a.harness).not.toBe(b.harness);
+  });
 });

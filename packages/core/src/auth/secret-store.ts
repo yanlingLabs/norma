@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export interface SecretStore {
@@ -20,14 +20,13 @@ export class KeychainSecretStore implements SecretStore {
 
 /** Test/CI store: 0600 files in a directory. Never used in production paths. */
 export class FileSecretStore implements SecretStore {
-  constructor(private readonly dir: string) { mkdirSync(dir, { recursive: true }); }
+  constructor(private readonly dir: string) { mkdirSync(dir, { recursive: true, mode: 0o700 }); }
   async get(name: string): Promise<string | null> {
     const p = join(this.dir, name);
     return existsSync(p) ? readFileSync(p, "utf8") : null;
   }
   async set(name: string, value: string): Promise<void> {
     const p = join(this.dir, name);
-    writeFileSync(p, value);
-    chmodSync(p, 0o600);
+    writeFileSync(p, value, { mode: 0o600 });
   }
 }

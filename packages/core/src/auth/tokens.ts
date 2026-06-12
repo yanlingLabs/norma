@@ -30,6 +30,7 @@ export class TokenAuthority {
     if (!expected) return false;
     const a = Buffer.from(expected);
     const b = Buffer.from(token);
+    // length guard needed before timingSafeEqual; safe because all tokens are fixed-length (64 hex chars)
     return a.length === b.length && timingSafeEqual(a, b);
   }
 }
