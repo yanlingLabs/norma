@@ -8,6 +8,8 @@
     "skipLibCheck": true,
     "types": ["bun"],
     "declaration": true,
-    "verbatimModuleSyntax": true
+    "declarationDir": "dist",
+    "verbatimModuleSyntax": true,
+    "jsx": "react-jsx"
   }
 }

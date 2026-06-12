@@ -7,7 +7,7 @@ xcuserdata/
 DerivedData/
 
 # Node
-node_modules/
+**/node_modules/
 
 # Brainstorming mockups
 .superpowers/
