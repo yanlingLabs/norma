@@ -6,7 +6,7 @@ describe("SessionEvent discriminated union", () => {
   const base = { seq: 1, sessionId: "s_abc", ts: 1781270000000 };
 
   test("user_message round-trips", () => {
-    const e = { ...base, type: "user_message", threadId: "main", text: "hi", source: "cli-1" } as const;
+    const e = { ...base, type: "user_message", threadId: "main", text: "hi", clientName: "cli-1" } as const;
     expect(SessionEvent.parse(e)).toEqual(e);
   });
 
@@ -15,12 +15,18 @@ describe("SessionEvent discriminated union", () => {
       { ...base, type: "session_created", scope: "global" },
       { ...base, type: "harness_attached", clientName: "orb" },
       { ...base, type: "harness_detached", clientName: "orb" },
-      { ...base, type: "user_message", threadId: "main", text: "x", source: "a" },
+      { ...base, type: "user_message", threadId: "main", text: "x", clientName: "a" },
     ] as const;
     for (const e of events) {
       const parsed = SessionEvent.parse(e);
       expect(parsed.type).toBe(e.type);
     }
+  });
+
+  test("user_message rejects empty text", () => {
+    expect(() =>
+      SessionEvent.parse({ ...base, type: "user_message", threadId: "main", text: "", clientName: "cli-1" })
+    ).toThrow();
   });
 
   test("unknown type rejected; missing discriminator rejected", () => {

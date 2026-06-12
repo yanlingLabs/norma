@@ -24,8 +24,8 @@ export const HarnessDetachedEvent = Base.extend({
 export const UserMessageEvent = Base.extend({
   type: z.literal("user_message"),
   threadId: z.string().min(1),
-  text: z.string(),
-  source: z.string().min(1), // clientName of the sending harness
+  text: z.string().min(1),
+  clientName: z.string().min(1),
 });
 
 export const SessionEvent = z.discriminatedUnion("type", [

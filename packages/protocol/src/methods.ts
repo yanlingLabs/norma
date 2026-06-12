@@ -19,7 +19,7 @@ export const HelloResult = z.object({
 });
 
 export const SessionCreateParams = z.object({
-  scope: z.string().regex(/^[a-z0-9][a-z0-9-]{0,40}$/),
+  scope: z.string().regex(/^[a-z0-9]([a-z0-9-]{0,39}[a-z0-9])?$/), // slug: no leading/trailing hyphen, ≤41 chars
 });
 export const SessionCreateResult = z.object({ sessionId: z.string() });
 
@@ -28,15 +28,15 @@ export const SessionListResult = z.object({
     sessionId: z.string(),
     scope: z.string(),
     createdAt: z.number().int(),
-    lastSeq: z.number().int(),
+    lastSeq: z.number().int().nonnegative(),
   })),
 });
 
 export const SessionAttachParams = z.object({
   sessionId: z.string(),
-  fromSeq: z.number().int().nonnegative().default(0),
+  fromSeq: z.number().int().nonnegative().optional().default(0),
 });
-export const SessionAttachResult = z.object({ ok: z.literal(true), lastSeq: z.number().int() });
+export const SessionAttachResult = z.object({ ok: z.literal(true), lastSeq: z.number().int().nonnegative() });
 
 export const SessionSendParams = z.object({
   sessionId: z.string(),
