@@ -8,6 +8,7 @@ import {
 import type { TokenAuthority } from "../auth/tokens";
 import type { SessionStore } from "../sessions/store";
 import { SessionHub, type HubClient } from "../sessions/hub";
+import { ConnWriter, type WritableSocket } from "./conn-writer";
 
 interface ConnState {
   decoder: LineDecoder;
@@ -15,6 +16,7 @@ interface ConnState {
   clientName: string;
   hubClient: HubClient | null;
   helloTimer: ReturnType<typeof setTimeout> | null;
+  writer: ConnWriter;
 }
 
 export interface IpcServerOptions {
@@ -68,7 +70,11 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
           clientName: "",
           hubClient: null,
           helloTimer: setTimeout(() => socket.end(), helloTimeoutMs),
+          writer: new ConnWriter(socket as unknown as WritableSocket),
         };
+      },
+      drain(socket) {
+        socket.data?.writer?.onDrain();
       },
       close(socket) {
         if (!socket.data) return; // rejected at cap before data was set (sentinel null)
@@ -93,12 +99,12 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
             if (incoming.kind !== "request") continue; // Phase 0: ignore client notifications
             id = incoming.msg.id;
             const result = await handle(socket, incoming.msg.method, incoming.msg.params);
-            socket.write(encodeLine({ jsonrpc: "2.0", id, result }));
+            socket.data.writer.enqueue(encodeLine({ jsonrpc: "2.0", id, result }));
           } catch (err) {
             const e = err as Partial<RpcFailure>;
             const code = e.code ?? ERR.INTERNAL;
             const message = e.message ?? "internal error";
-            socket.write(encodeLine({ jsonrpc: "2.0", id, error: { code, message } }));
+            socket.data.writer.enqueue(encodeLine({ jsonrpc: "2.0", id, error: { code, message } }));
           }
         }
       },
@@ -106,7 +112,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
   });
   chmodSync(opts.socketPath, 0o600);
 
-  async function handle(socket: { write(d: Uint8Array): unknown; data: ConnState }, method: string, params: unknown): Promise<unknown> {
+  async function handle(socket: { data: ConnState }, method: string, params: unknown): Promise<unknown> {
     if (method === METHODS.hello) {
       if (socket.data.authedRole !== null) {
         throw new RpcFailure(ERR.INVALID_REQUEST, "already authenticated — open a new connection to change role");
@@ -139,7 +145,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         const hubClient: HubClient = {
           clientName: socket.data.clientName,
           deliver(event: SessionEvent) {
-            socket.write(encodeLine({ jsonrpc: "2.0", method: METHODS.event, params: event }));
+            socket.data.writer.enqueue(encodeLine({ jsonrpc: "2.0", method: METHODS.event, params: event }));
           },
         };
         // Detach the old client before attaching a new one (re-attach = move semantics).
