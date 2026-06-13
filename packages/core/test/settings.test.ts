@@ -32,4 +32,20 @@ describe("loadSettings", () => {
   test("missing settings file throws a readable error", () => {
     expect(() => loadSettings(join(mkdtempSync(join(tmpdir(), "norma-set-")), "settings.json"))).toThrow(/norma daemon run/);
   });
+
+  test("legacy v1-app settings (no schemaVersion) migrate, preserving v1 keys", () => {
+    const p = tmpSettings({ webSearch: { provider: "disabled" } });
+    const s = loadSettings(p);
+    expect(s.schemaVersion).toBe(2);
+    expect(s.provider.type).toBe("codex-oauth");
+    const onDisk = JSON.parse(readFileSync(p, "utf8"));
+    expect(onDisk.webSearch).toEqual({ provider: "disabled" }); // v1 data preserved on disk
+    expect(onDisk.schemaVersion).toBe(2);
+  });
+
+  test("v1→v2 migration preserves unknown fields on disk", () => {
+    const p = tmpSettings({ schemaVersion: 1, custom: true });
+    loadSettings(p);
+    expect(JSON.parse(readFileSync(p, "utf8")).custom).toBe(true);
+  });
 });

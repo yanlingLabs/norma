@@ -24,10 +24,15 @@ export function loadSettings(path: string): Settings {
     }
     throw err;
   }
-  if (raw.schemaVersion === 1) {
-    const migrated: Settings = { schemaVersion: 2, provider: DEFAULT_PROVIDER };
+  if (raw.schemaVersion !== 2) {
+    // v1-or-legacy file (Phase 0 wrote {schemaVersion:1}; the retired v1 app wrote files with
+    // no schemaVersion at all — same directory on case-insensitive APFS). Migrate to v2,
+    // preserving unknown fields so nothing is silently lost.
+    const { schemaVersion: _legacy, ...preserved } = raw;
+    const migrated = { ...preserved, schemaVersion: 2 as const, provider: DEFAULT_PROVIDER };
     writeFileSync(path, JSON.stringify(migrated, null, 2) + "\n");
-    return migrated;
+    // zod v4 z.object() strips unknown keys by default (does NOT throw) — safe to parse migrated
+    return Settings.parse(migrated);
   }
   const parsed = Settings.safeParse(raw);
   if (!parsed.success) {
