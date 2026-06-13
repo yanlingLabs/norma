@@ -55,13 +55,24 @@ export const CODEX = {
 } as const;
 
 /**
- * Static Codex model list — last known set from v1 (CodexOAuthProvider.swift).
- * codex-rs fetches models dynamically from the backend at runtime; no static list
- * exists in the codex-rs source at the verified commit. This list reflects the
- * models v1 exposed and is the best available static approximation.
+ * Static Codex model list — verified live 2026-06-13 from /models?client_version=1.0.0.
+ *
+ * The backend returns only these slugs for ChatGPT-account auth (OAuth).
+ * The v1 static list (gpt-5.2-codex, gpt-5.1-codex, etc.) was stale; those models
+ * return HTTP 400 "not supported when using Codex with a ChatGPT account."
+ *
+ * Live fetch response: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "codex-auto-review"]
+ * Context windows and vision flags from /models payload field values.
+ * codex-rs fetches models dynamically; this list is the best available static set.
  * TODO-verify: add a live /models fetch path to keep this current.
  */
 export const CODEX_MODELS: ModelInfo[] = [
+  {
+    id: "gpt-5.5",
+    family: "gpt-5",
+    contextWindow: 272_000,
+    supportsVision: true,
+  },
   {
     id: "gpt-5.4",
     family: "gpt-5",
@@ -73,47 +84,5 @@ export const CODEX_MODELS: ModelInfo[] = [
     family: "gpt-5",
     contextWindow: 128_000,
     supportsVision: true,
-  },
-  {
-    id: "gpt-5.2",
-    family: "gpt-5",
-    contextWindow: 128_000,
-    supportsVision: true,
-  },
-  {
-    id: "gpt-5.2-codex",
-    family: "gpt-5",
-    contextWindow: 128_000,
-    supportsVision: false,
-  },
-  {
-    id: "gpt-5.1",
-    family: "gpt-5",
-    contextWindow: 128_000,
-    supportsVision: true,
-  },
-  {
-    id: "gpt-5.1-codex",
-    family: "gpt-5",
-    contextWindow: 128_000,
-    supportsVision: false,
-  },
-  {
-    id: "gpt-5.1-codex-max",
-    family: "gpt-5",
-    contextWindow: 128_000,
-    supportsVision: false,
-  },
-  {
-    id: "gpt-5.1-codex-mini",
-    family: "gpt-5",
-    contextWindow: 128_000,
-    supportsVision: false,
-  },
-  {
-    id: "gpt-5-codex",
-    family: "gpt-5",
-    contextWindow: 128_000,
-    supportsVision: false,
   },
 ];

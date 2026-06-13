@@ -15,7 +15,7 @@ describe("loadSettings", () => {
     const p = tmpSettings({ schemaVersion: 1 });
     const s = loadSettings(p);
     expect(s.schemaVersion).toBe(2);
-    expect(s.provider).toEqual({ type: "codex-oauth", model: "gpt-5.2-codex" });
+    expect(s.provider).toEqual({ type: "codex-oauth", model: "gpt-5.4-mini" });
     expect(JSON.parse(readFileSync(p, "utf8")).schemaVersion).toBe(2); // migration persisted
   });
 

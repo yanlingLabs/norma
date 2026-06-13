@@ -1,7 +1,7 @@
 import type { SecretStore } from "../auth/secret-store";
 import type { ModelInfo, Provider, ProviderEvent, TurnRequest } from "./types";
 import { ResponsesSseParser } from "./responses-sse";
-import { mapInput, mapTools, mapHttpError } from "./openai-compatible";
+import { buildRequestBody, mapHttpError } from "./openai-compatible";
 import { refreshTokens, type OAuthTokens } from "./pkce";
 import { CODEX, CODEX_MODELS } from "./codex-config";
 
@@ -84,7 +84,7 @@ export class CodexOAuthProvider implements Provider {
       yield { type: "error", code: "network", message: (err as Error).message };
       return;
     }
-    if (!res.ok) { yield mapHttpError(res.status, res.headers.get("retry-after")); return; }
+    if (!res.ok) { yield await mapHttpError(res.status, res.headers.get("retry-after"), res.text()); return; }
 
     const parser = new ResponsesSseParser();
     const reader = res.body!.getReader();
@@ -112,13 +112,7 @@ export class CodexOAuthProvider implements Provider {
         ...(tokens.accountId ? { "chatgpt-account-id": tokens.accountId } : {}),
         ...CODEX.headers,
       },
-      body: JSON.stringify({
-        model: req.model,
-        ...(req.instructions ? { instructions: req.instructions } : {}),
-        input: mapInput(req.input),
-        ...(req.tools?.length ? { tools: mapTools(req.tools) } : {}),
-        stream: true,
-      }),
+      body: JSON.stringify(buildRequestBody(req)),
       signal: req.signal,
     });
   }

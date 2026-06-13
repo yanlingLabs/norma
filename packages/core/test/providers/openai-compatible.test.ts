@@ -40,8 +40,12 @@ describe("OpenAICompatibleProvider", () => {
     expect(body.model).toBe("gpt-5.2");
     expect(body.stream).toBe(true);
     expect(body.instructions).toBe("be brief");
-    expect(body.input).toEqual([{ role: "user", content: "hi" }]);
+    expect(body.input).toEqual([{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }]);
     expect(body.tools).toEqual([{ type: "function", name: "bash", description: "run a command", parameters: { type: "object" }, strict: false }]);
+    expect(body.tool_choice).toBe("auto");
+    expect(body.parallel_tool_calls).toBe(true);
+    expect(body.store).toBe(false);
+    expect(body.include).toEqual([]);
   });
 
   test("401 yields an auth error event", async () => {
@@ -67,6 +71,8 @@ describe("OpenAICompatibleProvider", () => {
       input: [{ type: "tool_result", callId: "call_abc", output: "file1\nfile2" }],
     }));
     expect(body.input).toEqual([{ type: "function_call_output", call_id: "call_abc", output: "file1\nfile2" }]);
+    expect(body.tools).toEqual([]);
+    expect(body.tool_choice).toBe("auto");
   });
 
   test("consumer break mid-stream cancels the reader (no connection leak)", async () => {
