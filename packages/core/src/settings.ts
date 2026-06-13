@@ -12,7 +12,7 @@ export const Settings = z.object({
 });
 export type Settings = z.infer<typeof Settings>;
 
-const DEFAULT_PROVIDER = { type: "codex-oauth", model: "gpt-5.4-mini" } as const;
+const DEFAULT_PROVIDER = { type: "codex-oauth", model: "gpt-5.4" } as const;
 
 export function loadSettings(path: string): Settings {
   let raw: any;
