@@ -37,4 +37,18 @@ describe("buildSeatbeltProfile", () => {
     expect(p).toContain('(subpath "/tmp/we\\"ird")');
     expect(p).toContain('(subpath "/tmp/back\\\\slash")');
   });
+
+  test("empty writableRoots yields exactly cwd as the sole writable root (bash tool's call shape)", () => {
+    const cwd = realTmp();
+    const p = buildSeatbeltProfile({ cwd, writableRoots: [] });
+    // exactly one subpath rule, and it is cwd (the ?? [tmpdir()] default must NOT fire on [])
+    const subpaths = [...p.matchAll(/\(subpath "([^"]*)"\)/g)].map((m) => m[1]);
+    expect(subpaths).toEqual([cwd]);
+    expect(subpaths).toHaveLength(1);
+  });
+
+  test("sandboxAvailable reflects the platform", () => {
+    const { sandboxAvailable } = require("../../src/agent/sandbox");
+    expect(sandboxAvailable()).toBe(process.platform === "darwin");
+  });
 });
