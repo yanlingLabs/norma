@@ -53,6 +53,20 @@ describe("read tools", () => {
     expect(res).toEqual({ output: "sub/b.md", isError: false });
   });
 
+  test("glob cannot list outside the root via .. patterns", async () => {
+    const d = proj();
+    const res = await makeRegistry(d).execute("glob", { pattern: "../*" }, { cwd: d });
+    expect(res.isError === true || res.output === "").toBe(true);
+    expect(res.output).not.toContain("norma-tools-"); // sibling temp dirs must not leak
+  });
+
+  test("glob cannot list absolute paths outside the root", async () => {
+    const d = proj();
+    const res = await makeRegistry(d).execute("glob", { pattern: "/etc/h*" }, { cwd: d });
+    expect(res.isError === true || res.output === "").toBe(true);
+    expect(res.output).not.toContain("hosts");
+  });
+
   test("grep finds matches with file:line prefixes", async () => {
     const d = proj();
     const res = await makeRegistry(d).execute("grep", { pattern: "alpha", glob: "**/*" }, { cwd: d });

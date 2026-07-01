@@ -52,5 +52,6 @@ describe("write tools", () => {
     const { r, d } = setup();
     const res = await r.execute("edit", { path: "/etc/hosts", old_string: "localhost", new_string: "x" }, { cwd: d });
     expect(res.isError).toBe(true);
+    expect(res.output).toMatch(/outside the session directory/);
   });
 });

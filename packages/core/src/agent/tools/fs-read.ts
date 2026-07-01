@@ -22,7 +22,10 @@ export function registerReadTools(r: ToolRegistry): void {
       const glob = new Bun.Glob(pattern);
       const out: string[] = [];
       // explicit: symlinks must not let matches escape the scoped root
-      for await (const p of glob.scan({ cwd, onlyFiles: true, followSymlinks: false })) out.push(p);
+      // pattern is model-controlled: every match must stay inside the scoped root (same invariant as grep)
+      for await (const p of glob.scan({ cwd, onlyFiles: true, followSymlinks: false })) {
+        try { resolveWithin(cwd, p); out.push(p); } catch { /* outside root: never listed */ }
+      }
       return out.sort().join("\n");
     },
   });
