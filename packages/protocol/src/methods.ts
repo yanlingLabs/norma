@@ -6,6 +6,9 @@ export const PROTOCOL_VERSION = 0;
 export const Role = z.enum(["harness", "plugin", "admin"]);
 export type Role = z.infer<typeof Role>;
 
+export const ApprovalPolicy = z.enum(["ask", "auto"]);
+export type ApprovalPolicy = z.infer<typeof ApprovalPolicy>;
+
 export const HelloParams = z.object({
   protocolVersion: z.number().int(),
   role: Role,
@@ -20,6 +23,8 @@ export const HelloResult = z.object({
 
 export const SessionCreateParams = z.object({
   scope: z.string().regex(/^[a-z0-9]([a-z0-9-]{0,39}[a-z0-9])?$/), // slug: no leading/trailing hyphen, ≤41 chars
+  cwd: z.string().startsWith("/").optional(),        // absolute path; session working directory for tools
+  approvalPolicy: ApprovalPolicy.default("ask"),
 });
 export const SessionCreateResult = z.object({ sessionId: z.string() });
 
@@ -44,6 +49,13 @@ export const SessionSendParams = z.object({
 });
 export const SessionSendResult = z.object({ seq: z.number().int() });
 
+export const ApprovalRespondParams = z.object({
+  sessionId: z.string(),
+  callId: z.string().min(1),
+  approved: z.boolean(),
+});
+export const ApprovalRespondResult = z.object({ ok: z.literal(true), alreadyResolved: z.boolean() });
+
 /** Server → client notification: method "event", params = SessionEvent. */
 export const EventNotificationParams = SessionEvent;
 
@@ -53,5 +65,6 @@ export const METHODS = {
   sessionList: "session.list",
   sessionAttach: "session.attach",
   sessionSend: "session.send",
+  approvalRespond: "approval.respond",
   event: "event",
 } as const;

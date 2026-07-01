@@ -37,6 +37,26 @@ describe("SessionEvent discriminated union", () => {
   test("negative seq rejected", () => {
     expect(() => SessionEvent.parse({ ...base, seq: -1, type: "session_created", scope: "g" })).toThrow();
   });
+
+  test("agent event variants parse", () => {
+    const t = { ...base, threadId: "main" };
+    const events = [
+      { ...t, type: "turn_started" },
+      { ...t, type: "assistant_message", text: "done!" },
+      { ...t, type: "tool_call", callId: "c1", name: "read", argsJson: "{}" },
+      { ...t, type: "tool_result", callId: "c1", output: "contents", isError: false },
+      { ...t, type: "approval_requested", callId: "c2", toolName: "write", summary: "write hello.txt (24 bytes)" },
+      { ...t, type: "approval_resolved", callId: "c2", approved: true, by: "cli-p" },
+      { ...t, type: "turn_completed", stopReason: "end_turn", inputTokens: 100, outputTokens: 20 },
+      { ...t, type: "agent_error", message: "not signed in" },
+    ] as const;
+    for (const e of events) expect(SessionEvent.parse(e).type).toBe(e.type);
+  });
+
+  test("tool_result caps are enforced by schema shape only (output is plain string)", () => {
+    const e = { ...base, threadId: "main", type: "tool_result", callId: "c", output: "x".repeat(100), isError: true };
+    expect(SessionEvent.parse(e)).toMatchObject({ isError: true });
+  });
 });
 
 describe("hello method schemas", () => {

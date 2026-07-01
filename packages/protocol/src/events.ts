@@ -28,11 +28,41 @@ export const UserMessageEvent = Base.extend({
   clientName: z.string().min(1),
 });
 
+const ThreadBase = Base.extend({ threadId: z.string().min(1) });
+
+export const TurnStartedEvent = ThreadBase.extend({ type: z.literal("turn_started") });
+export const AssistantMessageEvent = ThreadBase.extend({ type: z.literal("assistant_message"), text: z.string() });
+export const ToolCallEvent = ThreadBase.extend({
+  type: z.literal("tool_call"), callId: z.string().min(1), name: z.string().min(1), argsJson: z.string(),
+});
+export const ToolResultEvent = ThreadBase.extend({
+  type: z.literal("tool_result"), callId: z.string().min(1), output: z.string(), isError: z.boolean(),
+});
+export const ApprovalRequestedEvent = ThreadBase.extend({
+  type: z.literal("approval_requested"), callId: z.string().min(1), toolName: z.string().min(1), summary: z.string(),
+});
+export const ApprovalResolvedEvent = ThreadBase.extend({
+  type: z.literal("approval_resolved"), callId: z.string().min(1), approved: z.boolean(), by: z.string().min(1),
+});
+export const TurnCompletedEvent = ThreadBase.extend({
+  type: z.literal("turn_completed"), stopReason: z.enum(["end_turn", "aborted", "error"]),
+  inputTokens: z.number().int().nonnegative(), outputTokens: z.number().int().nonnegative(),
+});
+export const AgentErrorEvent = ThreadBase.extend({ type: z.literal("agent_error"), message: z.string() });
+
 export const SessionEvent = z.discriminatedUnion("type", [
   SessionCreatedEvent,
   HarnessAttachedEvent,
   HarnessDetachedEvent,
   UserMessageEvent,
+  TurnStartedEvent,
+  AssistantMessageEvent,
+  ToolCallEvent,
+  ToolResultEvent,
+  ApprovalRequestedEvent,
+  ApprovalResolvedEvent,
+  TurnCompletedEvent,
+  AgentErrorEvent,
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 

@@ -4,6 +4,9 @@ import {
   SessionListResult,
   SessionAttachResult,
   SessionCreateParams,
+  ApprovalRespondParams,
+  ApprovalRespondResult,
+  METHODS,
 } from "../src/methods";
 
 describe("SessionAttachParams", () => {
@@ -53,5 +56,21 @@ describe("scope regex", () => {
   test("42-char scope rejected", () => {
     const slug = "a" + "b".repeat(40) + "c"; // 42 chars
     expect(() => SessionCreateParams.parse({ scope: slug })).toThrow();
+  });
+});
+
+describe("agent method schemas", () => {
+  test("approval.respond params/result", () => {
+    const p = ApprovalRespondParams.parse({ sessionId: "s_1", callId: "c1", approved: false });
+    expect(p.approved).toBe(false);
+    expect(ApprovalRespondResult.parse({ ok: true, alreadyResolved: false }).ok).toBe(true);
+    expect(METHODS.approvalRespond).toBe("approval.respond");
+  });
+
+  test("session.create accepts optional cwd (absolute) and approvalPolicy", () => {
+    const p = SessionCreateParams.parse({ scope: "global", cwd: "/tmp/x", approvalPolicy: "auto" });
+    expect(p.approvalPolicy).toBe("auto");
+    expect(SessionCreateParams.parse({ scope: "global" }).approvalPolicy).toBe("ask");
+    expect(() => SessionCreateParams.parse({ scope: "global", cwd: "relative/path" })).toThrow();
   });
 });
