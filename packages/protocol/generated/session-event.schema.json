@@ -150,6 +150,370 @@
         "clientName"
       ],
       "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "threadId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "turn_started"
+        }
+      },
+      "required": [
+        "seq",
+        "sessionId",
+        "ts",
+        "threadId",
+        "type"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "threadId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "assistant_message"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "seq",
+        "sessionId",
+        "ts",
+        "threadId",
+        "type",
+        "text"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "threadId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "tool_call"
+        },
+        "callId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "argsJson": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "seq",
+        "sessionId",
+        "ts",
+        "threadId",
+        "type",
+        "callId",
+        "name",
+        "argsJson"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "threadId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "tool_result"
+        },
+        "callId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "output": {
+          "type": "string"
+        },
+        "isError": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "seq",
+        "sessionId",
+        "ts",
+        "threadId",
+        "type",
+        "callId",
+        "output",
+        "isError"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "threadId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "approval_requested"
+        },
+        "callId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "toolName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "seq",
+        "sessionId",
+        "ts",
+        "threadId",
+        "type",
+        "callId",
+        "toolName",
+        "summary"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "threadId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "approval_resolved"
+        },
+        "callId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "approved": {
+          "type": "boolean"
+        },
+        "by": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "seq",
+        "sessionId",
+        "ts",
+        "threadId",
+        "type",
+        "callId",
+        "approved",
+        "by"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "threadId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "turn_completed"
+        },
+        "stopReason": {
+          "type": "string",
+          "enum": [
+            "end_turn",
+            "aborted",
+            "error"
+          ]
+        },
+        "inputTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "outputTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "seq",
+        "sessionId",
+        "ts",
+        "threadId",
+        "type",
+        "stopReason",
+        "inputTokens",
+        "outputTokens"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "threadId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "agent_error"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "seq",
+        "sessionId",
+        "ts",
+        "threadId",
+        "type",
+        "message"
+      ],
+      "additionalProperties": false
     }
   ]
 }

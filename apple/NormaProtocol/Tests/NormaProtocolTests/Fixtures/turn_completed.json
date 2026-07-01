@@ -1,0 +1,10 @@
+{
+  "seq": 7,
+  "sessionId": "s_fixture",
+  "ts": 1781270000000,
+  "threadId": "main",
+  "type": "turn_completed",
+  "stopReason": "end_turn",
+  "inputTokens": 12,
+  "outputTokens": 3
+}

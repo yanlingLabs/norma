@@ -1,0 +1,10 @@
+{
+  "seq": 7,
+  "sessionId": "s_fixture",
+  "ts": 1781270000000,
+  "threadId": "main",
+  "type": "tool_result",
+  "callId": "call_1",
+  "output": "line1\nline2",
+  "isError": false
+}

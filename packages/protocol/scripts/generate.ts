@@ -18,6 +18,14 @@ const fixtures: Record<string, unknown> = {
   "harness_attached": { ...base, type: "harness_attached", clientName: "orb" },
   "harness_detached": { ...base, type: "harness_detached", clientName: "orb" },
   "user_message": { ...base, type: "user_message", threadId: "main", text: "héllo \"world\" — done ✓", clientName: "cli-1" },
+  "turn_started": { ...base, threadId: "main", type: "turn_started" },
+  "assistant_message": { ...base, threadId: "main", type: "assistant_message", text: "done ✓" },
+  "tool_call": { ...base, threadId: "main", type: "tool_call", callId: "call_1", name: "read", argsJson: '{"path":"a.txt"}' },
+  "tool_result": { ...base, threadId: "main", type: "tool_result", callId: "call_1", output: "line1\nline2", isError: false },
+  "approval_requested": { ...base, threadId: "main", type: "approval_requested", callId: "call_2", toolName: "write", summary: "write a.txt" },
+  "approval_resolved": { ...base, threadId: "main", type: "approval_resolved", callId: "call_2", approved: true, by: "orb" },
+  "turn_completed": { ...base, threadId: "main", type: "turn_completed", stopReason: "end_turn", inputTokens: 12, outputTokens: 3 },
+  "agent_error": { ...base, threadId: "main", type: "agent_error", message: "provider unavailable" },
 };
 for (const [name, value] of Object.entries(fixtures)) {
   SessionEvent.parse(value); // fixtures must be valid by construction
