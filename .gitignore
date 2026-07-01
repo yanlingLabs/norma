@@ -18,3 +18,8 @@ dist/
 spikes/*/out/
 .build/
 *.bun-build
+
+# tsc must never emit alongside sources (bun runs .ts directly; compile via bun build)
+packages/*/src/**/*.js
+packages/*/test/**/*.js
+packages/*/**/*.d.ts
