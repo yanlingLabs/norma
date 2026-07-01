@@ -46,6 +46,11 @@ export class SessionHub {
     }).seq;
   }
 
+  /** Append an event and broadcast it — for server-side producers (agent engine). */
+  append(sessionId: string, input: EventInput): SessionEvent {
+    return this.appendAndBroadcast(sessionId, input);
+  }
+
   private appendAndBroadcast(sessionId: string, input: EventInput): SessionEvent {
     const event = this.store.append(sessionId, input);
     const dead: HubClient[] = [];
