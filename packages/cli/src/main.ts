@@ -7,6 +7,31 @@ const AQUA = "\x1b[38;2;53;214;232m";
 const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
 
+async function readSecret(promptText: string): Promise<string> {
+  process.stdout.write(promptText);
+  const stdin = process.stdin;
+  const wasRaw = stdin.isRaw;
+  if (stdin.isTTY) stdin.setRawMode(true);
+  stdin.resume();
+  let buf = "";
+  try {
+    for await (const chunk of stdin) {
+      const s = chunk.toString("utf8");
+      for (const ch of s) {
+        if (ch === "\r" || ch === "\n") { process.stdout.write("\n"); return buf; }
+        if (ch === "") { process.stdout.write("\n"); process.exit(130); } // Ctrl-C
+        if (ch === "" || ch === "\b") { if (buf.length) { buf = buf.slice(0, -1); process.stdout.write("\b \b"); } continue; }
+        buf += ch;
+        process.stdout.write("*");
+      }
+    }
+    return buf;
+  } finally {
+    if (stdin.isTTY) stdin.setRawMode(wasRaw ?? false);
+    stdin.pause();
+  }
+}
+
 async function getToken(): Promise<string> {
   const t = await new KeychainSecretStore().get(TOKEN_NAMES.harness);
   if (!t) throw new Error("no harness token — is the daemon installed? run: norma daemon run");
@@ -143,8 +168,7 @@ switch (cmdKey) {
     const { KeychainSecretStore, CodexAuthStore, runLoginFlow, CODEX, OPENAI_API_KEY_SECRET } = await import("@norma/core");
     const secrets = new KeychainSecretStore();
     if (process.argv.includes("--api-key")) {
-      process.stdout.write("Paste your OpenAI API key: ");
-      const key = (await new Promise<string>((r) => process.stdin.once("data", (d) => r(String(d))))).trim();
+      const key = (await readSecret("Paste your OpenAI API key: ")).trim();
       if (!key.startsWith("sk-")) { console.error("that does not look like an API key"); process.exit(1); }
       await secrets.set(OPENAI_API_KEY_SECRET, key);
       console.log(`${AQUA}API key stored in Keychain${RESET} — set provider type in ~/.norma/settings.json (openai-compatible)`);
