@@ -16,4 +16,13 @@ describe("FakeProvider", () => {
     expect(p.requests).toHaveLength(2);
     expect(p.requests[1]!.input).toHaveLength(1);
   });
+
+  test("recording a request with an AbortSignal does not throw", async () => {
+    const p = new FakeProvider([[{ type: "done", stopReason: "end_turn" }]]);
+    const ctrl = new AbortController();
+    const out = [];
+    for await (const e of p.streamTurn({ model: "m", input: [], signal: ctrl.signal })) out.push(e);
+    expect(out).toHaveLength(1);
+    expect(p.requests[0]!.signal).toBe(ctrl.signal); // reference preserved, not cloned
+  });
 });
