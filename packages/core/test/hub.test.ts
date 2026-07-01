@@ -129,4 +129,48 @@ describe("SessionHub", () => {
     hub.append(id, { type: "user_message", sessionId: id, threadId: "main", text: "y", clientName: "good" });
     expect(good.received.length).toBe(before + 1); // only the user_message, no second detached
   });
+
+  test("simultaneous multi-client death emits exactly one detached each, no duplicates", () => {
+    const { store, hub } = setup();
+    const id = store.createSession("global");
+    const good = fakeClient("good");
+    let alive = true;
+    const flaky1: HubClient = { clientName: "flaky1", deliver() { return alive; } };
+    const flaky2: HubClient = { clientName: "flaky2", deliver() { return alive; } };
+    hub.attach(good, id, 0);
+    hub.attach(flaky1, id, 0);
+    hub.attach(flaky2, id, 0);
+    alive = false; // both flaky clients die on the next delivery
+    hub.append(id, { type: "user_message", sessionId: id, threadId: "main", text: "boom", clientName: "good" });
+    const detached = good.received.filter((e) => e.type === "harness_detached");
+    const names = detached.map((e: any) => e.clientName).sort();
+    expect(names).toEqual(["flaky1", "flaky2"]); // exactly one each, no dupes
+  });
+
+  test("attach evicts a client that dies mid-replay — never left half-attached", () => {
+    const { store, hub } = setup();
+    const id = store.createSession("global");
+    const good = fakeClient("good");
+    hub.attach(good, id, 0); // history: session_created(1), harness_attached(2)
+    hub.send(good, id, "seed"); // seq 3 — gives the next attach's replay >1 event to die partway through
+
+    let deliverCount = 0;
+    const flaky: HubClient = {
+      clientName: "flaky",
+      deliver() { deliverCount++; return deliverCount < 2; }, // dies on the 2nd replayed event
+    };
+    hub.attach(flaky, id, 0);
+
+    // No other client should ever observe flaky as attached — a client that died mid-replay
+    // was never really attached, so there's no attach/detach churn to announce for it.
+    const flakyChurn = good.received.filter((e) => "clientName" in e && (e as any).clientName === "flaky");
+    expect(flakyChurn).toHaveLength(0);
+
+    // flaky must not be in the live attachment set: a follow-up append doesn't deliver to it,
+    // and doesn't emit a (second) detached for it either.
+    const before = good.received.length;
+    hub.append(id, { type: "user_message", sessionId: id, threadId: "main", text: "after", clientName: "good" });
+    expect(good.received.length).toBe(before + 1); // only the new message
+    expect(good.received.some((e) => e.type === "harness_detached" && (e as any).clientName === "flaky")).toBe(false);
+  });
 });

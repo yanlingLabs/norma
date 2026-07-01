@@ -16,7 +16,14 @@ export class SessionHub {
     // Defense-in-depth: a client can only be attached to one session — re-attach = move.
     const prev = this.byClient.get(client);
     if (prev && prev !== sessionId) this.detach(client);
-    for (const e of this.store.read(sessionId, fromSeq)) client.deliver(e); // replay
+    let lastSeq = fromSeq;
+    for (const e of this.store.read(sessionId, fromSeq)) {
+      // A client that dies mid-replay (e.g. a slow-consumer backlog cap trips) was never
+      // really attached — don't add it, don't announce it. Return the seq of the last event
+      // it successfully received so the caller still gets a coherent, non-sentinel lastSeq.
+      if (!client.deliver(e)) return lastSeq;
+      lastSeq = e.seq;
+    }
     let set = this.attachments.get(sessionId);
     if (!set) { set = new Set(); this.attachments.set(sessionId, set); }
     set.add(client);
@@ -61,7 +68,13 @@ export class SessionHub {
       if (!alive) dead.push(c);
     }
     for (const c of dead) {
-      this.attachments.get(sessionId)?.delete(c);
+      // May already be gone if a nested broadcast (triggered by this same drain) evicted it —
+      // e.g. two clients die in the same round; the first eviction's recursive harness_detached
+      // fan-out can itself find the second dead and evict it. Without this guard the outer loop
+      // would then process the second client again, double-evicting/double-announcing it.
+      const set = this.attachments.get(sessionId);
+      if (!set?.has(c)) continue;
+      set.delete(c);
       this.byClient.delete(c);
       this.appendAndBroadcast(sessionId, {
         type: "harness_detached", sessionId, clientName: c.clientName,
