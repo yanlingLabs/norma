@@ -7,3 +7,10 @@ export { createProvider, OPENAI_API_KEY_SECRET, type ActiveProvider } from "./pr
 export { CodexAuthStore, CODEX_SECRET_NAMES } from "./providers/codex-oauth";
 export { runLoginFlow } from "./providers/pkce";
 export { CODEX } from "./providers/codex-config";
+export { AgentEngine, type EngineConfig } from "./agent/engine";
+export { FakeProvider } from "./agent/fake-provider";
+export { ToolRegistry, type ToolDefinition, type ToolContext, type ToolOutcome } from "./agent/tools/registry";
+export { registerReadTools } from "./agent/tools/fs-read";
+export { registerWriteTools } from "./agent/tools/fs-write";
+export { PermissionGate, type GateDecision, type SessionApprovalPolicy } from "./agent/gate";
+export { ApprovalBroker, type ApprovalOutcome } from "./agent/approvals";

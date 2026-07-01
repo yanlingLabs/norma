@@ -2,12 +2,14 @@ import { chmodSync } from "node:fs";
 import { z } from "zod";
 import {
   ERR, METHODS, PROTOCOL_VERSION, LineDecoder, encodeLine, parseIncoming,
-  HelloParams, SessionCreateParams, SessionAttachParams, SessionSendParams,
+  HelloParams, SessionCreateParams, SessionAttachParams, SessionSendParams, ApprovalRespondParams,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
 import type { SessionStore } from "../sessions/store";
 import { SessionHub, type HubClient } from "../sessions/hub";
+import type { AgentEngine } from "../agent/engine";
+import type { ApprovalBroker } from "../agent/approvals";
 
 interface ConnState {
   decoder: LineDecoder;
@@ -23,6 +25,9 @@ export interface IpcServerOptions {
   serverVersion: string;
   tokens: TokenAuthority;
   store: SessionStore;
+  hub?: SessionHub;          // shared with the agent engine when the daemon wires one up
+  engine?: AgentEngine | null;
+  broker?: ApprovalBroker | null;
   helloTimeoutMs?: number;   // default 5000
   maxConnections?: number;   // default 64
   preAuthMaxLine?: number;   // default 64 KiB
@@ -33,7 +38,7 @@ export interface IpcServer { stop(): void }
 class RpcFailure extends Error { constructor(public code: number, message: string) { super(message); } }
 
 export function startIpcServer(opts: IpcServerOptions): IpcServer {
-  const hub = new SessionHub(opts.store);
+  const hub = opts.hub ?? new SessionHub(opts.store);
 
   const helloTimeoutMs = opts.helloTimeoutMs ?? 5000;
   const maxConnections = opts.maxConnections ?? 64;
@@ -135,7 +140,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
     switch (method) {
       case METHODS.sessionCreate: {
         const p = parseParams(SessionCreateParams, params);
-        return { sessionId: opts.store.createSession(p.scope) };
+        return { sessionId: opts.store.createSession(p.scope, { cwd: p.cwd, approvalPolicy: p.approvalPolicy }) };
       }
       case METHODS.sessionList:
         return { sessions: opts.store.list() };
@@ -160,7 +165,18 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       case METHODS.sessionSend: {
         const p = parseParams(SessionSendParams, params);
         if (!socket.data.hubClient) throw new RpcFailure(ERR.NOT_FOUND, "attach to the session first");
-        return { seq: hub.send(socket.data.hubClient, p.sessionId, p.text) };
+        const seq = hub.send(socket.data.hubClient, p.sessionId, p.text);
+        // Fire-and-forget: the response returns immediately and turn events stream separately.
+        // If a turn is already running, this message just lands in history for the next turn
+        // (full mid-turn steering is deferred).
+        if (opts.engine && !opts.engine.isRunning(p.sessionId)) {
+          opts.engine.runTurn(p.sessionId).catch((e) => console.error("turn failed:", e));
+        }
+        return { seq };
+      }
+      case METHODS.approvalRespond: {
+        const p = parseParams(ApprovalRespondParams, params);
+        return opts.broker?.resolve(p.sessionId, p.callId, p.approved, socket.data.clientName) ?? { ok: true, alreadyResolved: true };
       }
       default:
         throw new RpcFailure(ERR.METHOD_NOT_FOUND, `method not found: ${method}`);
