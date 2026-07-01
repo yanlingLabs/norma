@@ -148,8 +148,8 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         const p = parseParams(SessionAttachParams, params);
         const hubClient: HubClient = {
           clientName: socket.data.clientName,
-          deliver(event: SessionEvent) {
-            socket.data.writer.enqueue(encodeLine({ jsonrpc: "2.0", method: METHODS.event, params: event }));
+          deliver(event: SessionEvent): boolean {
+            return socket.data.writer.enqueue(encodeLine({ jsonrpc: "2.0", method: METHODS.event, params: event }));
           },
         };
         // Detach the old client before attaching a new one (re-attach = move semantics).

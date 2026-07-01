@@ -3,7 +3,7 @@ import type { SessionStore, EventInput } from "./store";
 
 export interface HubClient {
   clientName: string;
-  deliver(event: SessionEvent): void;
+  deliver(event: SessionEvent): boolean;
 }
 
 export class SessionHub {
@@ -55,8 +55,10 @@ export class SessionHub {
     const event = this.store.append(sessionId, input);
     const dead: HubClient[] = [];
     for (const c of this.attachments.get(sessionId) ?? []) {
-      try { c.deliver(event); }
-      catch { dead.push(c); } // a broken deliver (e.g. dead socket) must not poison the fan-out
+      let alive = false;
+      try { alive = c.deliver(event); }
+      catch { alive = false; } // a broken deliver (e.g. dead socket) must not poison the fan-out
+      if (!alive) dead.push(c);
     }
     for (const c of dead) {
       this.attachments.get(sessionId)?.delete(c);

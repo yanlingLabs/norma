@@ -74,7 +74,7 @@ describe("AgentEngine", () => {
     // watcher answers the approval as soon as it sees it:
     const watcher: HubClient = {
       clientName: "auto-denier",
-      deliver(e) { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, false, "auto-denier"); },
+      deliver(e) { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, false, "auto-denier"); return true; },
     };
     hub.attach(watcher, sessionId, 0);
     await engine.runTurn(sessionId);
@@ -104,7 +104,7 @@ describe("AgentEngine", () => {
 
   test("history: prior user/assistant messages are included as input", async () => {
     const { engine, store, hub, sessionId, provider } = setup([text("first"), text("second")]);
-    const client: HubClient = { clientName: "u", deliver() {} };
+    const client: HubClient = { clientName: "u", deliver() { return true; } };
     hub.attach(client, sessionId, 0);
     hub.send(client, sessionId, "question one");
     await engine.runTurn(sessionId);

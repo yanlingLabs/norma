@@ -8,7 +8,7 @@ import type { SessionEvent } from "@norma/protocol";
 
 function fakeClient(name: string): HubClient & { received: SessionEvent[] } {
   const received: SessionEvent[] = [];
-  return { clientName: name, received, deliver(e: SessionEvent) { received.push(e); } };
+  return { clientName: name, received, deliver(e: SessionEvent) { received.push(e); return true; } };
 }
 
 function setup() {
@@ -93,7 +93,7 @@ describe("SessionHub", () => {
     const id = store.createSession("global");
     const good = fakeClient("good");
     let boom = false;
-    const bad: HubClient = { clientName: "bad", deliver() { if (boom) throw new Error("socket dead"); } };
+    const bad: HubClient = { clientName: "bad", deliver() { if (boom) throw new Error("socket dead"); return true; } };
     hub.attach(good, id, 0);
     hub.attach(bad, id, 0);
     boom = true;
@@ -109,5 +109,24 @@ describe("SessionHub", () => {
     const { store, hub } = setup();
     store.createSession("global");
     expect(() => hub.detach(fakeClient("nobody"))).not.toThrow();
+  });
+
+  test("a client whose deliver returns false is evicted synchronously", () => {
+    const { store, hub } = setup();
+    const id = store.createSession("global");
+    const good = fakeClient("good");
+    let alive = true;
+    const flaky: HubClient = { clientName: "flaky", deliver() { return alive; } };
+    hub.attach(good, id, 0);
+    hub.attach(flaky, id, 0);
+    alive = false; // next delivery reports the client is dead
+    hub.append(id, { type: "user_message", sessionId: id, threadId: "main", text: "x", clientName: "good" });
+    // good sees its own message AND flaky's synchronous eviction notice:
+    expect(good.received.some((e) => e.type === "user_message" && e.text === "x")).toBe(true);
+    expect(good.received.some((e) => e.type === "harness_detached" && e.clientName === "flaky")).toBe(true);
+    // flaky is gone — a further append does not deliver to it and does not re-evict:
+    const before = good.received.length;
+    hub.append(id, { type: "user_message", sessionId: id, threadId: "main", text: "y", clientName: "good" });
+    expect(good.received.length).toBe(before + 1); // only the user_message, no second detached
   });
 });
