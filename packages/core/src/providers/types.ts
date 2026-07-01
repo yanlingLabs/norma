@@ -23,6 +23,7 @@ export interface ModelInfo {
 
 export type TurnInputItem =
   | { type: "message"; role: "user" | "assistant" | "system"; content: string }
+  | { type: "function_call"; callId: string; name: string; argsJson: string }
   | { type: "tool_result"; callId: string; output: string; isError?: boolean };
 
 export interface ToolSpec {

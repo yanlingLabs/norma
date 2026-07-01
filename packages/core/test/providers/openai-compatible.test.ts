@@ -75,6 +75,22 @@ describe("OpenAICompatibleProvider", () => {
     expect(body.tool_choice).toBe("auto");
   });
 
+  test("function_call history items map to Responses function_call entries", async () => {
+    let body: any;
+    const base = serveSse("simple-text.sse", { capture: (b) => { body = b; } });
+    const p = new OpenAICompatibleProvider({ baseUrl: base, apiKey: "sk" });
+    await collect(p.streamTurn({
+      model: "m",
+      input: [
+        { type: "message", role: "user", content: "list files" },
+        { type: "function_call", callId: "call_1", name: "glob", argsJson: '{"pattern":"*"}' },
+        { type: "tool_result", callId: "call_1", output: "a.txt" },
+      ],
+    }));
+    expect(body.input[1]).toEqual({ type: "function_call", call_id: "call_1", name: "glob", arguments: '{"pattern":"*"}' });
+    expect(body.input[2]).toEqual({ type: "function_call_output", call_id: "call_1", output: "a.txt" });
+  });
+
   test("consumer break mid-stream cancels the reader (no connection leak)", async () => {
     // Bun's HTTP server does not propagate client-side reader.cancel() to the server-side
     // ReadableStream.cancel() callback within a short window, so we spy on the client reader

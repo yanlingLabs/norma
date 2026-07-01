@@ -17,6 +17,10 @@ export interface OpenAICompatibleConfig {
  *
  * The flat-string content form ({role, content:"string"}) was rejected with HTTP 400
  * by the codex backend; structured content items are required.
+ *
+ * function_call → {type:"function_call", call_id, name, arguments} follows the same
+ * Responses API ResponseItem shape (not yet live-verified against the codex backend;
+ * the parity doc only covers message/function_call_output — Task 12's live gate confirms).
  */
 export function mapInput(items: TurnInputItem[]): unknown[] {
   return items.map((i) => {
@@ -25,6 +29,9 @@ export function mapInput(items: TurnInputItem[]): unknown[] {
       // assistant messages use output_text; user/system messages use input_text.
       const contentType = i.role === "assistant" ? "output_text" : "input_text";
       return { type: "message", role: i.role, content: [{ type: contentType, text: i.content }] };
+    }
+    if (i.type === "function_call") {
+      return { type: "function_call", call_id: i.callId, name: i.name, arguments: i.argsJson };
     }
     return { type: "function_call_output", call_id: i.callId, output: i.output };
   });
