@@ -125,4 +125,16 @@ describe("AgentEngine", () => {
     await expect(engine.runTurn(sessionId)).rejects.toThrow(/turn already running/);
     await first;
   });
+
+  test("tool-iteration cap ends the turn with agent_error", async () => {
+    const looping: ProviderEvent[] = [
+      { type: "tool_call", callId: "loop", name: "glob", argsJson: '{"pattern":"*"}' },
+      { type: "done", stopReason: "tool_calls" },
+    ];
+    const { engine, store, sessionId } = setup([looping]); // script repeats: same entry every iteration
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+    expect(events.some((e) => e.type === "agent_error" && (e as any).message.includes("iteration cap"))).toBe(true);
+    expect(events.find((e) => e.type === "turn_completed")).toMatchObject({ stopReason: "error" });
+  });
 });

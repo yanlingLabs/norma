@@ -109,10 +109,16 @@ export class AgentEngine {
           // resolves the approval as soon as it observes the event (see engine.test.ts) would
           // otherwise race broker.wait() and resolve into an empty pending-map slot, timing out.
           const waiting = this.cfg.broker.wait(sessionId, call.callId, this.cfg.approvalTimeoutMs ?? 5 * 60_000);
-          this.emit(sessionId, {
-            type: "approval_requested", sessionId, threadId, callId: call.callId, toolName: call.name,
-            summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
-          });
+          try {
+            this.emit(sessionId, {
+              type: "approval_requested", sessionId, threadId, callId: call.callId, toolName: call.name,
+              summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
+            });
+          } catch (err) {
+            // emit failed (e.g. disk): resolve the registered waiter now so it doesn't linger until timeout
+            this.cfg.broker.resolve(sessionId, call.callId, false, "emit-failure");
+            throw err;
+          }
           const res = await waiting;
           this.emit(sessionId, { type: "approval_resolved", sessionId, threadId, callId: call.callId, approved: res.approved, by: res.by });
           outcome = res.approved
