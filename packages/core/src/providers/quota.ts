@@ -51,9 +51,16 @@ export class QuotaManager {
     this.waiters.shift()?.();
   }
 
-  async waitIfLimited(): Promise<void> {
+  async waitIfLimited(signal?: AbortSignal): Promise<void> {
     const wait = this.limitedUntil - Date.now();
-    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    if (wait <= 0) return;
+    if (signal?.aborted) return;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(done, wait);
+      const onAbort = () => done();
+      function done() { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); resolve(); }
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
   }
 }
 
@@ -64,7 +71,7 @@ export function withQuota(provider: Provider, q: QuotaManager): Provider {
     models: () => provider.models(),
     async *streamTurn(req: TurnRequest): AsyncIterable<ProviderEvent> {
       for (let attempt = 0; ; attempt++) {
-        await q.waitIfLimited();
+        await q.waitIfLimited(req.signal);
         await q.acquire();
         let rateLimited: ProviderEvent | null = null;
         let yieldedAny = false;

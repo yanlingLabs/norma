@@ -60,4 +60,15 @@ describe("QuotaManager", () => {
     await drain(w.streamTurn({ model: "m", input: [] }));
     expect(q.usage()).toEqual({ inputTokens: 4, outputTokens: 2 });
   });
+
+  test("waitIfLimited returns promptly when the signal aborts during backoff", async () => {
+    const q = new QuotaManager({ maxConcurrent: 1 });
+    q.noteRateLimit(10_000); // limited for 10s
+    const ctrl = new AbortController();
+    const started = Date.now();
+    const p = q.waitIfLimited(ctrl.signal);
+    setTimeout(() => ctrl.abort(), 20);
+    await p;
+    expect(Date.now() - started).toBeLessThan(2000); // did not wait the full 10s
+  });
 });
