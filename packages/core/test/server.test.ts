@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LineDecoder, encodeLine, METHODS, PROTOCOL_VERSION, ConnWriter, type WritableSocket } from "@norma/protocol";
 import { startDaemon, type RunningDaemon } from "../src/daemon";
+import { startIpcServer } from "../src/ipc/server";
+import { SessionStore } from "../src/sessions/store";
 import { FileSecretStore } from "../src/auth/secret-store";
 import type { Provider } from "../src/providers/types";
 
@@ -279,7 +281,8 @@ describe("daemon IPC", () => {
     await boot({}, fake);
     const c = await TestClient.connect(daemon.socketPath);
     await c.hello(harnessToken, "asker");
-    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", approvalPolicy: "auto" });
+    const cwd = mkdtempSync(join(tmpdir(), "norma-turn-"));
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", cwd, approvalPolicy: "auto" });
     await c.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
     await c.request(METHODS.sessionSend, { sessionId: created.sessionId, text: "hello?" });
     const msg = await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "assistant_message");
@@ -319,5 +322,18 @@ describe("daemon IPC", () => {
     await new Promise((r) => setTimeout(r, 100));
     expect(c.notifications.some((n) => n.params?.type === "turn_started")).toBe(false);
     c.close();
+  });
+
+  test("startIpcServer refuses an engine without a shared hub", () => {
+    // Build a throwaway engine; we only need the constructor guard to fire.
+    expect(() => {
+      const store = new SessionStore(mkdtempSync(join(tmpdir(), "norma-guard-")));
+      startIpcServer({
+        socketPath: join(mkdtempSync(join(tmpdir(), "norma-guard-sock-")), "s.sock"),
+        serverVersion: "test", tokens: {} as any, store,
+        engine: {} as any, // engine present...
+        // ...no hub
+      });
+    }).toThrow(/hub/);
   });
 });

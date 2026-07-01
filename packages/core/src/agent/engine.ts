@@ -59,10 +59,16 @@ export class AgentEngine {
 
   private async turn(sessionId: string): Promise<void> {
     const meta = this.cfg.store.meta(sessionId);
-    const cwd = meta.cwd ?? process.cwd();
+    const threadId = MAIN_THREAD;
+    if (!meta.cwd) {
+      this.emit(sessionId, { type: "turn_started", sessionId, threadId });
+      this.emit(sessionId, { type: "agent_error", sessionId, threadId, message: "session has no working directory — create the session with a cwd" });
+      this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "error", inputTokens: 0, outputTokens: 0 });
+      return;
+    }
+    const cwd = meta.cwd;
     const input = this.historyInput(sessionId);
     const usage = { inputTokens: 0, outputTokens: 0 };
-    const threadId = MAIN_THREAD;
 
     this.emit(sessionId, { type: "turn_started", sessionId, threadId });
 

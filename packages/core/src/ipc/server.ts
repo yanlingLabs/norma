@@ -38,6 +38,9 @@ export interface IpcServer { stop(): void }
 class RpcFailure extends Error { constructor(public code: number, message: string) { super(message); } }
 
 export function startIpcServer(opts: IpcServerOptions): IpcServer {
+  if (opts.engine && !opts.hub) {
+    throw new Error("startIpcServer: an engine requires a shared hub (engine and server must broadcast through the same SessionHub)");
+  }
   const hub = opts.hub ?? new SessionHub(opts.store);
 
   const helloTimeoutMs = opts.helloTimeoutMs ?? 5000;

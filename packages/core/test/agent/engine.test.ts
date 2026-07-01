@@ -137,4 +137,14 @@ describe("AgentEngine", () => {
     expect(events.some((e) => e.type === "agent_error" && (e as any).message.includes("iteration cap"))).toBe(true);
     expect(events.find((e) => e.type === "turn_completed")).toMatchObject({ stopReason: "error" });
   });
+
+  test("a turn on a cwd-less session fails closed (no fallback to daemon cwd)", async () => {
+    const { engine, store } = setup([text("should not run")]);
+    const sessionId = store.createSession("global"); // no cwd, default policy
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+    expect(events.some((e) => e.type === "agent_error" && (e as any).message.includes("working directory"))).toBe(true);
+    expect(events.find((e) => e.type === "turn_completed")).toMatchObject({ stopReason: "error" });
+    expect(events.some((e) => e.type === "tool_call")).toBe(false);
+  });
 });
