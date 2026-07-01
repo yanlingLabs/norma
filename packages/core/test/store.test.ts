@@ -136,7 +136,7 @@ describe("SessionStore", () => {
     reopened.close();
   });
 
-  test("migration ALTER only swallows duplicate-column errors, not others", () => {
+  test("constructor throws if index.db path is unusable", () => {
     const { store, dir } = makeStore();
     store.close();
     // Corrupt the index db into a directory so re-open's ALTER hits a real (non-duplicate) error.
@@ -144,6 +144,29 @@ describe("SessionStore", () => {
     rmSync(join(dir, "sessions", "index.db"), { force: true });
     mkdirSync(join(dir, "sessions", "index.db")); // a directory where sqlite expects a file
     expect(() => new SessionStore(dir)).toThrow(); // must surface, not silently swallow
+  });
+
+  test("migration ALTER rethrows a genuine (non-duplicate-column) ALTER failure", () => {
+    const { store, dir } = makeStore();
+    store.close();
+    const dbPath = join(dir, "sessions", "index.db");
+    rmSync(dbPath, { force: true });
+    const { Database } = require("bun:sqlite");
+    const oldDb = new Database(dbPath);
+    // Pre-migration schema: no cwd/approval_policy columns, so CREATE TABLE IF NOT EXISTS
+    // is a no-op on reopen and the ALTER must actually run (and fail against the read-only file).
+    oldDb.run(`CREATE TABLE sessions (
+      session_id TEXT PRIMARY KEY, scope TEXT NOT NULL,
+      created_at INTEGER NOT NULL, last_seq INTEGER NOT NULL
+    )`);
+    oldDb.close();
+    const { chmodSync } = require("node:fs");
+    chmodSync(dbPath, 0o444);
+    try {
+      expect(() => new SessionStore(dir)).toThrow(/readonly database/);
+    } finally {
+      chmodSync(dbPath, 0o644); // restore so tmpdir cleanup doesn't hit EACCES
+    }
   });
 
   test("read returns fully-typed events without a second parse (behavior unchanged)", () => {
