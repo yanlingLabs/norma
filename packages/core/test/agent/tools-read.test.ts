@@ -74,4 +74,10 @@ describe("read tools", () => {
     expect((await r.execute("teleport", {}, { cwd: d })).isError).toBe(true);
     expect((await r.execute("read", { wrongField: 1 }, { cwd: d })).isError).toBe(true);
   });
+
+  test("grep rejects patterns longer than 256 chars (ReDoS bound)", async () => {
+    const d = proj();
+    const res = await makeRegistry(d).execute("grep", { pattern: "a".repeat(300), glob: "**/*" }, { cwd: d });
+    expect(res.isError).toBe(true);
+  });
 });

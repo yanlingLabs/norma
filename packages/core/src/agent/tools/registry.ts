@@ -44,7 +44,7 @@ export class ToolRegistry {
       if (out.length > MAX_OUTPUT) out = out.slice(0, MAX_OUTPUT) + `\n[truncated at ${MAX_OUTPUT} bytes]`;
       return { output: out, isError: false };
     } catch (err) {
-      return { output: (err as Error).message, isError: true };
+      return { output: err instanceof Error ? err.message : String(err), isError: true };
     }
   }
 }

@@ -1,5 +1,5 @@
 import { realpathSync } from "node:fs";
-import { isAbsolute, join, resolve, sep, dirname } from "node:path";
+import { isAbsolute, resolve, sep, dirname } from "node:path";
 
 /**
  * Resolve `p` (relative or absolute) and verify it stays within `root`.

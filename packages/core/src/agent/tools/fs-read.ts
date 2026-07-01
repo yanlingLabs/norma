@@ -21,7 +21,8 @@ export function registerReadTools(r: ToolRegistry): void {
     async run({ pattern }, { cwd }) {
       const glob = new Bun.Glob(pattern);
       const out: string[] = [];
-      for await (const p of glob.scan({ cwd, onlyFiles: true })) out.push(p);
+      // explicit: symlinks must not let matches escape the scoped root
+      for await (const p of glob.scan({ cwd, onlyFiles: true, followSymlinks: false })) out.push(p);
       return out.sort().join("\n");
     },
   });
@@ -29,17 +30,20 @@ export function registerReadTools(r: ToolRegistry): void {
   r.register({
     name: "grep",
     description: "Search file contents with a regular expression. Returns file:line:text matches.",
-    args: z.object({ pattern: z.string().min(1), glob: z.string().default("**/*") }),
+    args: z.object({ pattern: z.string().min(1).max(256), glob: z.string().default("**/*") }),
     async run({ pattern, glob: g }, { cwd }) {
+      // Pattern is model-controlled: length-capped as a cheap ReDoS bound.
+      // Full guard (linear-time engine or scan timeout) tracked in phase-1 carryover.
       const re = new RegExp(pattern);
       const scanner = new Bun.Glob(g);
       const hits: string[] = [];
-      for await (const p of scanner.scan({ cwd, onlyFiles: true })) {
+      for await (const p of scanner.scan({ cwd, onlyFiles: true, followSymlinks: false })) {
         let text: string;
-        try { text = readFileSync(resolveWithin(cwd, p), "utf8"); } catch { continue; }
+        const abs = resolveWithin(cwd, p);
+        try { text = readFileSync(abs, "utf8"); } catch { continue; }
         const lines = text.split("\n");
         for (let i = 0; i < lines.length; i++) {
-          if (re.test(lines[i]!)) hits.push(`${relative(cwd, resolveWithin(cwd, p))}:${i + 1}:${lines[i]}`);
+          if (re.test(lines[i]!)) hits.push(`${relative(cwd, abs)}:${i + 1}:${lines[i]}`);
           if (hits.length >= 200) return hits.join("\n") + "\n[match cap reached]";
         }
       }
