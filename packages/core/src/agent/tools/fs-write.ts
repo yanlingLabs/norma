@@ -13,7 +13,7 @@ export function registerWriteTools(r: ToolRegistry): void {
       const target = resolveWithin(cwd, path);
       mkdirSync(dirname(target), { recursive: true });
       writeFileSync(target, content);
-      return `wrote ${content.length} bytes to ${path}`;
+      return `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${path}`;
     },
   });
 

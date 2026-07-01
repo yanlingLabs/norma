@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync, realpathSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, realpathSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ToolRegistry } from "../../src/agent/tools/registry";
@@ -20,6 +20,13 @@ describe("write tools", () => {
     expect(readFileSync(join(d, "new/dir/hello.txt"), "utf8")).toBe("norma was here");
   });
 
+  test("write reports true UTF-8 byte count, not char count", async () => {
+    const { r, d } = setup();
+    const res = await r.execute("write", { path: "u.txt", content: "héllo 🌍" }, { cwd: d });
+    expect(res.isError).toBe(false);
+    expect(res.output).toContain("11 bytes"); // 8 chars, 11 utf-8 bytes
+  });
+
   test("edit replaces a unique occurrence; ambiguous or missing old_string errors", async () => {
     const { r, d } = setup();
     writeFileSync(join(d, "f.txt"), "one two two three");
@@ -35,8 +42,15 @@ describe("write tools", () => {
 
   test("writes outside cwd are refused", async () => {
     const { r, d } = setup();
+    rmSync("/tmp/evil.txt", { force: true });
     const res = await r.execute("write", { path: "/tmp/evil.txt", content: "x" }, { cwd: d });
     expect(res.isError).toBe(true);
     expect(existsSync("/tmp/evil.txt")).toBe(false);
+  });
+
+  test("edit outside cwd is refused", async () => {
+    const { r, d } = setup();
+    const res = await r.execute("edit", { path: "/etc/hosts", old_string: "localhost", new_string: "x" }, { cwd: d });
+    expect(res.isError).toBe(true);
   });
 });
