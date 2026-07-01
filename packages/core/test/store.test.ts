@@ -116,4 +116,23 @@ describe("SessionStore", () => {
     expect(reopened.read(id)).toHaveLength(2);
     reopened.close();
   });
+
+  test("createSession persists cwd and approvalPolicy; meta() returns them", () => {
+    const { store } = makeStore();
+    const id = store.createSession("global", { cwd: "/tmp/proj", approvalPolicy: "auto" });
+    expect(store.meta(id)).toEqual({ sessionId: id, scope: "global", cwd: "/tmp/proj", approvalPolicy: "auto" });
+    const plain = store.createSession("global");
+    expect(store.meta(plain)).toMatchObject({ cwd: null, approvalPolicy: "ask" });
+  });
+
+  test("meta survives index rebuild only for known columns", () => {
+    const { store, dir } = makeStore();
+    const id = store.createSession("global", { cwd: "/tmp/x", approvalPolicy: "auto" });
+    store.close();
+    rmSync(join(dir, "sessions", "index.db"));
+    const reopened = new SessionStore(dir);
+    // cwd/policy are index-only metadata: after index loss they reset to defaults (documented).
+    expect(reopened.meta(id)).toMatchObject({ cwd: null, approvalPolicy: "ask" });
+    reopened.close();
+  });
 });

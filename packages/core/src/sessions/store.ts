@@ -28,8 +28,14 @@ export class SessionStore {
       session_id TEXT PRIMARY KEY,
       scope TEXT NOT NULL,
       created_at INTEGER NOT NULL,
-      last_seq INTEGER NOT NULL
+      last_seq INTEGER NOT NULL,
+      cwd TEXT,
+      approval_policy TEXT NOT NULL DEFAULT 'ask'
     )`);
+    // Handle pre-existing index.db files by adding missing columns
+    for (const ddl of ["ALTER TABLE sessions ADD COLUMN cwd TEXT", "ALTER TABLE sessions ADD COLUMN approval_policy TEXT NOT NULL DEFAULT 'ask'"]) {
+      try { this.db.run(ddl); } catch { /* column already exists */ }
+    }
     this.recoverAll();
   }
 
@@ -79,8 +85,9 @@ export class SessionStore {
         const firstEvent = JSON.parse(good[0]!) as SessionEvent;
         const createdAt = firstEvent.ts;
         const lastSeq = (JSON.parse(good[good.length - 1]!) as SessionEvent).seq;
+        // cwd/approval_policy are index-only metadata: after index loss they reset to defaults.
         this.db.run(
-          "INSERT INTO sessions (session_id, scope, created_at, last_seq) VALUES (?, ?, ?, ?)",
+          "INSERT INTO sessions (session_id, scope, created_at, last_seq, cwd, approval_policy) VALUES (?, ?, ?, ?, NULL, 'ask')",
           [sessionId, scope, createdAt, lastSeq],
         );
         known.add(sessionId);
@@ -104,13 +111,13 @@ export class SessionStore {
     return join(this.homeDir, "sessions", scope, `${sessionId}.jsonl`);
   }
 
-  createSession(scope: string): string {
+  createSession(scope: string, opts: { cwd?: string; approvalPolicy?: "ask" | "auto" } = {}): string {
     if (!SCOPE_RE.test(scope)) throw new Error(`invalid scope: ${scope}`);
     const sessionId = `s_${randomBytes(6).toString("hex")}`;
     mkdirSync(join(this.homeDir, "sessions", scope), { recursive: true });
     this.db.run(
-      "INSERT INTO sessions (session_id, scope, created_at, last_seq) VALUES (?, ?, ?, 0)",
-      [sessionId, scope, Date.now()],
+      "INSERT INTO sessions (session_id, scope, created_at, last_seq, cwd, approval_policy) VALUES (?, ?, ?, 0, ?, ?)",
+      [sessionId, scope, Date.now(), opts.cwd ?? null, opts.approvalPolicy ?? "ask"],
     );
     this.append(sessionId, { type: "session_created", sessionId, scope });
     return sessionId;
@@ -141,6 +148,13 @@ export class SessionStore {
     return (this.db.query("SELECT session_id, scope, created_at, last_seq FROM sessions ORDER BY created_at").all() as
       { session_id: string; scope: string; created_at: number; last_seq: number }[])
       .map((r) => ({ sessionId: r.session_id, scope: r.scope, createdAt: r.created_at, lastSeq: r.last_seq }));
+  }
+
+  meta(sessionId: string): { sessionId: string; scope: string; cwd: string | null; approvalPolicy: "ask" | "auto" } {
+    const row = this.db.query("SELECT scope, cwd, approval_policy FROM sessions WHERE session_id = ?").get(sessionId) as
+      | { scope: string; cwd: string | null; approval_policy: string } | null;
+    if (!row) throw new Error(`unknown session: ${sessionId}`);
+    return { sessionId, scope: row.scope, cwd: row.cwd, approvalPolicy: row.approval_policy === "auto" ? "auto" : "ask" };
   }
 
   close(): void { this.db.close(); }
