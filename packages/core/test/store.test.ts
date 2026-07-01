@@ -135,4 +135,26 @@ describe("SessionStore", () => {
     expect(reopened.meta(id)).toMatchObject({ cwd: null, approvalPolicy: "ask" });
     reopened.close();
   });
+
+  test("migration ALTER only swallows duplicate-column errors, not others", () => {
+    const { store, dir } = makeStore();
+    store.close();
+    // Corrupt the index db into a directory so re-open's ALTER hits a real (non-duplicate) error.
+    const { rmSync, mkdirSync } = require("node:fs");
+    rmSync(join(dir, "sessions", "index.db"), { force: true });
+    mkdirSync(join(dir, "sessions", "index.db")); // a directory where sqlite expects a file
+    expect(() => new SessionStore(dir)).toThrow(); // must surface, not silently swallow
+  });
+
+  test("read returns fully-typed events without a second parse (behavior unchanged)", () => {
+    const { store } = makeStore();
+    const id = store.createSession("global");
+    store.append(id, { type: "user_message", sessionId: id, threadId: "main", text: "one", clientName: "t" });
+    store.append(id, { type: "user_message", sessionId: id, threadId: "main", text: "two", clientName: "t" });
+    const all = store.read(id);
+    const tail = store.read(id, all[0]!.seq);
+    expect(all.map((e) => e.type)).toEqual(["session_created", "user_message", "user_message"]);
+    expect(tail.every((e) => e.seq > all[0]!.seq)).toBe(true);
+    expect(tail).toHaveLength(2);
+  });
 });

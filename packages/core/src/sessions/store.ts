@@ -34,7 +34,11 @@ export class SessionStore {
     )`);
     // Handle pre-existing index.db files by adding missing columns
     for (const ddl of ["ALTER TABLE sessions ADD COLUMN cwd TEXT", "ALTER TABLE sessions ADD COLUMN approval_policy TEXT NOT NULL DEFAULT 'ask'"]) {
-      try { this.db.run(ddl); } catch { /* column already exists */ }
+      try { this.db.run(ddl); }
+      catch (e) {
+        // Idempotent migration: only a re-added column is expected. Anything else is a real failure.
+        if (!String((e as Error).message ?? e).includes("duplicate column")) throw e;
+      }
     }
     this.recoverAll();
   }
@@ -95,16 +99,23 @@ export class SessionStore {
     }
   }
 
-  /** Parse all lines, skipping (not stopping at) unparseable ones. */
-  private readGoodLines(path: string): { good: string[]; sawBad: boolean } {
+  /** Parse all lines, skipping (not stopping at) unparseable ones. Returns both the raw
+   *  good lines (used by recoverAll to rewrite the log verbatim) and the already-parsed
+   *  events (used by read(), so callers don't have to re-parse JSON they already parsed here). */
+  private readGoodLines(path: string): { good: string[]; parsed: SessionEvent[]; sawBad: boolean } {
     const lines = readFileSync(path, "utf8").split("\n").filter((l) => l.length > 0);
     const good: string[] = [];
+    const parsed: SessionEvent[] = [];
     let sawBad = false;
     for (const line of lines) {
-      try { SessionEvent.parse(JSON.parse(line)); good.push(line); }
+      try {
+        const event = SessionEvent.parse(JSON.parse(line));
+        good.push(line);
+        parsed.push(event);
+      }
       catch { sawBad = true; } // skip: a parseable line is a valid event regardless of position
     }
-    return { good, sawBad };
+    return { good, parsed, sawBad };
   }
 
   private logPath(scope: string, sessionId: string): string {
@@ -139,9 +150,7 @@ export class SessionStore {
     if (!row) throw new Error(`unknown session: ${sessionId}`);
     const path = this.logPath(row.scope, sessionId);
     if (!existsSync(path)) return [];
-    return this.readGoodLines(path).good
-      .map((l) => SessionEvent.parse(JSON.parse(l)))
-      .filter((e) => e.seq > fromSeq);
+    return this.readGoodLines(path).parsed.filter((e) => e.seq > fromSeq);
   }
 
   list(): SessionRow[] {
