@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { resolveNormaHome, KeychainSecretStore, startDaemon, TOKEN_NAMES } from "@norma/core";
+import { METHODS } from "@norma/protocol";
 import { NormaClient } from "./client";
 
 const AQUA = "\x1b[38;2;53;214;232m";
@@ -18,6 +19,51 @@ function socketPath(): string {
 
 async function connect(name: string, onEvent: (e: any) => void = () => {}): Promise<NormaClient> {
   return NormaClient.connect({ socketPath: socketPath(), token: await getToken(), clientName: name, onEvent });
+}
+
+// Headless agent mode: `norma -p "<prompt>" [--auto]`. Streams the turn to stdout and,
+// under the default "ask" approval policy, prompts on stdin for each tool approval.
+async function runHeadlessAgent(): Promise<void> {
+  const prompt = process.argv[3];
+  if (!prompt) {
+    console.error('usage: norma -p "<prompt>" [--auto]');
+    process.exit(1);
+  }
+  const auto = process.argv.includes("--auto");
+  const pending: string[] = []; // callIds awaiting a y/n on stdin, oldest first
+
+  const c = await connect("cli-p", (e) => {
+    if (e.type === "assistant_message") console.log(`${AQUA}${e.text}${RESET}`);
+    else if (e.type === "tool_call") console.log(`${DIM}⚙ ${e.name} ${e.argsJson.slice(0, 120)}${RESET}`);
+    else if (e.type === "tool_result") console.log(`${DIM}  ↳ ${e.isError ? "ERROR: " : ""}${e.output.split("\n")[0]?.slice(0, 120) ?? ""}${RESET}`);
+    else if (e.type === "approval_requested") {
+      process.stdout.write(`approve ${e.toolName}? ${DIM}${e.summary}${RESET} [y/N] `);
+      pending.push(e.callId);
+    } else if (e.type === "agent_error") {
+      console.error(`agent error: ${e.message}`);
+    } else if (e.type === "turn_completed") {
+      c.close();
+      process.exit(e.stopReason === "end_turn" ? 0 : 1);
+    }
+  });
+
+  const sessionId = await c.createSession("global", { cwd: process.cwd(), approvalPolicy: auto ? "auto" : "ask" });
+  await c.attach(sessionId);
+
+  if (!auto) {
+    process.stdin.on("data", async (d) => {
+      const yes = String(d).trim().toLowerCase() === "y";
+      const callId = pending.shift();
+      if (callId) await c.request(METHODS.approvalRespond, { sessionId, callId, approved: yes });
+    });
+  }
+
+  await c.send(sessionId, prompt);
+  await new Promise(() => {}); // exits via the turn_completed branch of onEvent above
+}
+
+if (process.argv[2] === "-p") {
+  await runHeadlessAgent(); // never resolves normally — exits via process.exit()
 }
 
 const argv = process.argv.slice(2);
@@ -151,8 +197,9 @@ switch (cmdKey) {
     process.exit(text.length > 0 ? 0 : 1);
   }
   default:
-    console.log(`norma (Phase 1a) — commands:
+    console.log(`norma (Phase 1b-i) — commands:
   daemon run | daemon install | daemon uninstall | daemon status
   ping | sessions | send <sessionId|new> <text> | watch <sessionId>
-  login [--api-key] | logout | provider | provider-smoke [--prompt <text>]`);
+  login [--api-key] | logout | provider | provider-smoke [--prompt <text>]
+  -p "<prompt>" [--auto]   headless agent turn (asks for tool approval unless --auto)`);
 }

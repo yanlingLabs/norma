@@ -86,8 +86,8 @@ export class NormaClient {
     return r.data;
   }
 
-  async createSession(scope: string): Promise<string> {
-    return this.validated(SessionCreateResult, await this.request(METHODS.sessionCreate, { scope }), METHODS.sessionCreate).sessionId;
+  async createSession(scope: string, opts?: { cwd?: string; approvalPolicy?: "ask" | "auto" }): Promise<string> {
+    return this.validated(SessionCreateResult, await this.request(METHODS.sessionCreate, { scope, ...opts }), METHODS.sessionCreate).sessionId;
   }
   async attach(sessionId: string, fromSeq = 0): Promise<number> {
     return this.validated(SessionAttachResult, await this.request(METHODS.sessionAttach, { sessionId, fromSeq }), METHODS.sessionAttach).lastSeq;
