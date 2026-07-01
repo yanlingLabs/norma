@@ -33,19 +33,22 @@ export function registerReadTools(r: ToolRegistry): void {
   r.register({
     name: "grep",
     description: "Search file contents with a regular expression. Returns file:line:text matches.",
-    args: z.object({ pattern: z.string().min(1).max(256), glob: z.string().default("**/*") }),
-    async run({ pattern, glob: g }, { cwd }) {
+    args: z.object({ pattern: z.string().min(1).max(256), glob: z.string().default("**/*"), budgetMs: z.number().int().positive().max(10_000).default(2000) }),
+    async run({ pattern, glob: g, budgetMs }, { cwd }) {
       // Pattern is model-controlled: length-capped as a cheap ReDoS bound.
       // Full guard (linear-time engine or scan timeout) tracked in phase-1 carryover.
       const re = new RegExp(pattern);
       const scanner = new Bun.Glob(g);
       const hits: string[] = [];
+      const deadline = Date.now() + budgetMs;
       for await (const p of scanner.scan({ cwd, onlyFiles: true, followSymlinks: false })) {
+        if (Date.now() > deadline) { hits.push("[scan time budget reached]"); return hits.join("\n"); }
         let text: string;
         const abs = resolveWithin(cwd, p);
         try { text = readFileSync(abs, "utf8"); } catch { continue; }
         const lines = text.split("\n");
         for (let i = 0; i < lines.length; i++) {
+          if (Date.now() > deadline) { hits.push("[scan time budget reached]"); return hits.join("\n"); }
           if (re.test(lines[i]!)) hits.push(`${relative(cwd, abs)}:${i + 1}:${lines[i]}`);
           if (hits.length >= 200) return hits.join("\n") + "\n[match cap reached]";
         }

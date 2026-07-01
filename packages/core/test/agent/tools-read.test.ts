@@ -94,4 +94,19 @@ describe("read tools", () => {
     const res = await makeRegistry(d).execute("grep", { pattern: "a".repeat(300), glob: "**/*" }, { cwd: d });
     expect(res.isError).toBe(true);
   });
+
+  test("grep returns a partial result under a wall-clock budget instead of hanging", async () => {
+    const d = proj();
+    const { writeFileSync } = require("node:fs");
+    // A line that makes (a+)+$ backtrack ~forever:
+    // Create it early in alphabetical order to be scanned soon
+    writeFileSync(join(d, "0-evil.txt"), "a".repeat(40) + "!\n");
+    // Create a large file to slow down the scan
+    writeFileSync(join(d, "zzz-large.txt"), "test line\n".repeat(10000));
+    const r = new ToolRegistry();
+    registerReadTools(r);
+    const res = await r.execute("grep", { pattern: "(a+)+$", glob: "**/*", budgetMs: 100 }, { cwd: d });
+    expect(res.isError).toBe(false);
+    expect(res.output).toContain("[scan time budget reached]");
+  });
 });
