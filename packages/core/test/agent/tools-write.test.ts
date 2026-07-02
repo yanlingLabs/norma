@@ -54,4 +54,21 @@ describe("write tools", () => {
     expect(res.isError).toBe(true);
     expect(res.output).toMatch(/outside the allowed directories/);
   });
+
+  test("write succeeds in a non-cwd allowed root", async () => {
+    const { r, d } = setup();
+    const b = realpathSync(mkdtempSync(join(tmpdir(), "norma-w2-")));
+    const res = await r.execute("write", { path: join(b, "made.txt"), content: "hi" }, { cwd: d, roots: [d, b] });
+    expect(res.isError).toBe(false);
+    expect(readFileSync(join(b, "made.txt"), "utf8")).toBe("hi");
+  });
+
+  test("write outside all roots errors and names request_directory", async () => {
+    const { r, d } = setup();
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), "norma-w3-")));
+    const res = await r.execute("write", { path: join(outside, "x.txt"), content: "y" }, { cwd: d, roots: [d] });
+    expect(res.isError).toBe(true);
+    expect(res.output).toMatch(/request_directory/);
+    expect(existsSync(join(outside, "x.txt"))).toBe(false);
+  });
 });

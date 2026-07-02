@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { resolveWithin } from "../paths";
+import { resolveWithinAny } from "../paths";
 import type { ToolRegistry } from "./registry";
 
 export function registerWriteTools(r: ToolRegistry): void {
@@ -9,8 +9,13 @@ export function registerWriteTools(r: ToolRegistry): void {
     name: "write",
     description: "Write a file (creates parent directories). Overwrites if it exists.",
     args: z.object({ path: z.string().min(1), content: z.string() }),
-    run({ path, content }, { cwd }) {
-      const target = resolveWithin(cwd, path);
+    run({ path, content }, { cwd, roots }) {
+      let target: string;
+      try {
+        target = resolveWithinAny(roots, path);
+      } catch (e) {
+        throw new Error(`${(e as Error).message} — call request_directory to ask the user for write access to that location`);
+      }
       mkdirSync(dirname(target), { recursive: true });
       writeFileSync(target, content);
       return `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${path}`;
@@ -21,8 +26,13 @@ export function registerWriteTools(r: ToolRegistry): void {
     name: "edit",
     description: "Replace an exact unique string in a file with a new string.",
     args: z.object({ path: z.string().min(1), old_string: z.string().min(1), new_string: z.string() }),
-    run({ path, old_string, new_string }, { cwd }) {
-      const target = resolveWithin(cwd, path);
+    run({ path, old_string, new_string }, { cwd, roots }) {
+      let target: string;
+      try {
+        target = resolveWithinAny(roots, path);
+      } catch (e) {
+        throw new Error(`${(e as Error).message} — call request_directory to ask the user for write access to that location`);
+      }
       const text = readFileSync(target, "utf8");
       const count = text.split(old_string).length - 1;
       if (count === 0) throw new Error(`old_string not found in ${path}`);
