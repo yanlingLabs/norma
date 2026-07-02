@@ -5,6 +5,7 @@ export interface ToolContext {
   cwd: string;
   roots: string[]; // allowed roots; roots[0] MUST be the primary cwd — relative tool paths resolve against it
   tmpDir?: string; // per-session scratch dir (sandbox writable root + child TMPDIR); bash uses it, other tools ignore
+  sessionId: string; // needed by request_directory (approvals/dirs are keyed per-session); other tools ignore it
 }
 export interface ToolOutcome { output: string; isError: boolean }
 

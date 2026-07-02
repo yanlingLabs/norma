@@ -128,10 +128,10 @@ export class AgentEngine {
           const res = await waiting;
           this.emit(sessionId, { type: "approval_resolved", sessionId, threadId, callId: call.callId, approved: res.approved, by: res.by });
           outcome = res.approved
-            ? await this.executeCall(call, cwd)
+            ? await this.executeCall(call, cwd, sessionId)
             : { output: `denied by ${res.by}`, isError: true };
         } else {
-          outcome = await this.executeCall(call, cwd);
+          outcome = await this.executeCall(call, cwd, sessionId);
         }
 
         this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
@@ -143,11 +143,11 @@ export class AgentEngine {
     this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "error", ...usage });
   }
 
-  private executeCall(call: { name: string; argsJson: string }, cwd: string): Promise<{ output: string; isError: boolean }> {
+  private executeCall(call: { name: string; argsJson: string }, cwd: string, sessionId: string): Promise<{ output: string; isError: boolean }> {
     let args: unknown;
     try { args = call.argsJson.length ? JSON.parse(call.argsJson) : {}; }
     catch { return Promise.resolve({ output: `tool arguments were not valid JSON`, isError: true }); }
-    // TODO(phase-1b-ii-b T11): replace with the session's real allowed-roots set.
-    return this.cfg.registry.execute(call.name, args, { cwd, roots: [cwd] });
+    // TODO(phase-1b-ii-b T11): replace roots:[cwd] with the session's real allowed-roots set (SessionDirectories).
+    return this.cfg.registry.execute(call.name, args, { cwd, roots: [cwd], sessionId });
   }
 }

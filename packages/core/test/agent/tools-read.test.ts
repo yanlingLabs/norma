@@ -40,37 +40,37 @@ describe("read tools", () => {
   test("read returns file contents; missing file is a tool error not a throw", async () => {
     const d = proj();
     const r = makeRegistry(d);
-    const ok = await r.execute("read", { path: "a.txt" }, { cwd: d, roots: [d] });
+    const ok = await r.execute("read", { path: "a.txt" }, { cwd: d, roots: [d], sessionId: "s1" });
     expect(ok).toEqual({ output: "alpha\nbeta\ngamma\n", isError: false });
-    const missing = await r.execute("read", { path: "nope.txt" }, { cwd: d, roots: [d] });
+    const missing = await r.execute("read", { path: "nope.txt" }, { cwd: d, roots: [d], sessionId: "s1" });
     expect(missing.isError).toBe(true);
     expect(missing.output).toContain("nope.txt");
   });
 
   test("glob lists matches as absolute paths under the root", async () => {
     const d = proj();
-    const res = await makeRegistry(d).execute("glob", { pattern: "**/*.md" }, { cwd: d, roots: [d] });
+    const res = await makeRegistry(d).execute("glob", { pattern: "**/*.md" }, { cwd: d, roots: [d], sessionId: "s1" });
     // glob now scans per-root (to support multiple roots) and returns full paths, not cwd-relative names.
     expect(res).toEqual({ output: join(d, "sub", "b.md"), isError: false });
   });
 
   test("glob cannot list outside the root via .. patterns", async () => {
     const d = proj();
-    const res = await makeRegistry(d).execute("glob", { pattern: "../*" }, { cwd: d, roots: [d] });
+    const res = await makeRegistry(d).execute("glob", { pattern: "../*" }, { cwd: d, roots: [d], sessionId: "s1" });
     expect(res.isError === true || res.output === "").toBe(true);
     expect(res.output).not.toContain("norma-tools-"); // sibling temp dirs must not leak
   });
 
   test("glob cannot list absolute paths outside the root", async () => {
     const d = proj();
-    const res = await makeRegistry(d).execute("glob", { pattern: "/etc/h*" }, { cwd: d, roots: [d] });
+    const res = await makeRegistry(d).execute("glob", { pattern: "/etc/h*" }, { cwd: d, roots: [d], sessionId: "s1" });
     expect(res.isError === true || res.output === "").toBe(true);
     expect(res.output).not.toContain("hosts");
   });
 
   test("grep finds matches with file:line prefixes", async () => {
     const d = proj();
-    const res = await makeRegistry(d).execute("grep", { pattern: "alpha", glob: "**/*" }, { cwd: d, roots: [d] });
+    const res = await makeRegistry(d).execute("grep", { pattern: "alpha", glob: "**/*" }, { cwd: d, roots: [d], sessionId: "s1" });
     expect(res.isError).toBe(false);
     expect(res.output).toContain("a.txt:1:alpha");
     expect(res.output).toContain("sub/b.md:2:contains alpha too");
@@ -78,7 +78,7 @@ describe("read tools", () => {
 
   test("path escape is refused as a tool error", async () => {
     const d = proj();
-    const res = await makeRegistry(d).execute("read", { path: "../../etc/hosts" }, { cwd: d, roots: [d] });
+    const res = await makeRegistry(d).execute("read", { path: "../../etc/hosts" }, { cwd: d, roots: [d], sessionId: "s1" });
     expect(res.isError).toBe(true);
     expect(res.output).toMatch(/outside/);
   });
@@ -86,13 +86,13 @@ describe("read tools", () => {
   test("unknown tool and bad args are tool errors", async () => {
     const d = proj();
     const r = makeRegistry(d);
-    expect((await r.execute("teleport", {}, { cwd: d, roots: [d] })).isError).toBe(true);
-    expect((await r.execute("read", { wrongField: 1 }, { cwd: d, roots: [d] })).isError).toBe(true);
+    expect((await r.execute("teleport", {}, { cwd: d, roots: [d], sessionId: "s1" })).isError).toBe(true);
+    expect((await r.execute("read", { wrongField: 1 }, { cwd: d, roots: [d], sessionId: "s1" })).isError).toBe(true);
   });
 
   test("grep rejects patterns longer than 256 chars (ReDoS bound)", async () => {
     const d = proj();
-    const res = await makeRegistry(d).execute("grep", { pattern: "a".repeat(300), glob: "**/*" }, { cwd: d, roots: [d] });
+    const res = await makeRegistry(d).execute("grep", { pattern: "a".repeat(300), glob: "**/*" }, { cwd: d, roots: [d], sessionId: "s1" });
     expect(res.isError).toBe(true);
   });
 
@@ -106,7 +106,7 @@ describe("read tools", () => {
     writeFileSync(join(d, "zzz-large.txt"), "test line\n".repeat(10000));
     const r = new ToolRegistry();
     registerReadTools(r);
-    const res = await r.execute("grep", { pattern: "(a+)+$", glob: "**/*", budgetMs: 100 }, { cwd: d, roots: [d] });
+    const res = await r.execute("grep", { pattern: "(a+)+$", glob: "**/*", budgetMs: 100 }, { cwd: d, roots: [d], sessionId: "s1" });
     expect(res.isError).toBe(false);
     expect(res.output).toContain("[scan time budget reached]");
   });
@@ -116,7 +116,7 @@ describe("read tools", () => {
     const b = realpathSync(mkdtempSync(join(tmpdir(), "norma-read2-")));
     writeFileSync(join(b, "extra.txt"), "alpha in b\n");
     const r = makeRegistry(a); // registers read tools
-    const ctx = { cwd: a, roots: [a, b] };
+    const ctx = { cwd: a, roots: [a, b], sessionId: "s1" };
     expect((await r.execute("read", { path: join(b, "extra.txt") }, ctx)).output).toContain("alpha in b");
     const g = await r.execute("grep", { pattern: "alpha", glob: "**/*" }, ctx);
     expect(g.output).toContain("a.txt:1:"); // from root a
@@ -129,7 +129,7 @@ describe("read tools", () => {
   test("glob does not leak OS paths from an absolute recursive pattern outside roots", async () => {
     const d = proj();
     const r = makeRegistry(d);
-    const res = await r.execute("glob", { pattern: "/etc/**", budgetMs: 1500 }, { cwd: d, roots: [d] });
+    const res = await r.execute("glob", { pattern: "/etc/**", budgetMs: 1500 }, { cwd: d, roots: [d], sessionId: "s1" });
     expect(res.output).not.toContain("/etc/"); // no out-of-root OS path leaks (match or error)
     // and it does not hang: (the await returning is itself the proof)
   });
@@ -137,7 +137,7 @@ describe("read tools", () => {
   test("grep does not leak OS error paths from an absolute recursive glob outside roots", async () => {
     const d = proj();
     const r = makeRegistry(d);
-    const res = await r.execute("grep", { pattern: ".", glob: "/etc/**", budgetMs: 1500 }, { cwd: d, roots: [d] });
+    const res = await r.execute("grep", { pattern: ".", glob: "/etc/**", budgetMs: 1500 }, { cwd: d, roots: [d], sessionId: "s1" });
     expect(res.output).not.toMatch(/\/etc\//);
   });
 });

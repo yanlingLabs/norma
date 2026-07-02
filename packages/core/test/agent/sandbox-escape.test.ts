@@ -23,7 +23,7 @@ d("sandbox escape probes are contained", () => {
     const cwd = proj();
     const probe = "/tmp/norma-osascript-escape.txt";
     rmSync(probe, { force: true });
-    await reg().execute("bash", { command: `osascript -e 'do shell script "echo pwned > ${probe}"' 2>&1 || echo osa-failed`, timeoutMs: 8000 }, { cwd, roots: [cwd] });
+    await reg().execute("bash", { command: `osascript -e 'do shell script "echo pwned > ${probe}"' 2>&1 || echo osa-failed`, timeoutMs: 8000 }, { cwd, roots: [cwd], sessionId: "s1" });
     expect(existsSync(probe)).toBe(false); // no out-of-band write landed
   });
 
@@ -31,7 +31,7 @@ d("sandbox escape probes are contained", () => {
     const cwd = proj();
     const probe = "/tmp/norma-launchctl-escape.txt";
     rmSync(probe, { force: true });
-    await reg().execute("bash", { command: `launchctl submit -l norma-escape -- /bin/sh -c "echo pwned > ${probe}" 2>&1 || echo submit-failed`, timeoutMs: 8000 }, { cwd, roots: [cwd] });
+    await reg().execute("bash", { command: `launchctl submit -l norma-escape -- /bin/sh -c "echo pwned > ${probe}" 2>&1 || echo submit-failed`, timeoutMs: 8000 }, { cwd, roots: [cwd], sessionId: "s1" });
     await new Promise((r) => setTimeout(r, 500));
     expect(existsSync(probe)).toBe(false);
     rmSync(probe, { force: true });
