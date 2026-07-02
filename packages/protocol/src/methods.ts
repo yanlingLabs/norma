@@ -3,6 +3,9 @@ import { SessionEvent } from "./events";
 
 export const PROTOCOL_VERSION = 0;
 
+/** An absolute directory path that is not the filesystem root (guards against a whole-fs writable fence). */
+export const AbsoluteDirPath = z.string().startsWith("/").refine((p) => p !== "/", { message: "path must not be the filesystem root '/'" });
+
 export const Role = z.enum(["harness", "plugin", "admin"]);
 export type Role = z.infer<typeof Role>;
 
@@ -23,10 +26,10 @@ export const HelloResult = z.object({
 
 export const SessionCreateParams = z.object({
   scope: z.string().regex(/^[a-z0-9]([a-z0-9-]{0,39}[a-z0-9])?$/), // slug: no leading/trailing hyphen, ≤41 chars
-  cwd: z.string().startsWith("/").optional(),        // absolute path; session working directory for tools
+  cwd: AbsoluteDirPath.optional(),        // absolute path (not '/'); session working directory for tools
   approvalPolicy: ApprovalPolicy.default("ask"),
 });
-export const SessionCreateResult = z.object({ sessionId: z.string() });
+export const SessionCreateResult = z.object({ sessionId: z.string(), trusted: z.boolean() });
 
 export const SessionListResult = z.object({
   sessions: z.array(z.object({
@@ -62,8 +65,11 @@ export const SessionAddDirParams = z.object({
   persist: z.boolean().default(false),
 });
 export const SessionAddDirResult = z.object({ ok: z.literal(true), roots: z.array(z.string()) });
-export const SessionSetCwdParams = z.object({ sessionId: z.string(), cwd: z.string().startsWith("/") });
+export const SessionSetCwdParams = z.object({ sessionId: z.string(), cwd: AbsoluteDirPath });
 export const SessionSetCwdResult = z.object({ ok: z.literal(true), cwd: z.string() });
+
+export const TrustDirParams = z.object({ path: AbsoluteDirPath });
+export const TrustDirResult = z.object({ ok: z.literal(true), trusted: z.literal(true) });
 
 /** Server → client notification: method "event", params = SessionEvent. */
 export const EventNotificationParams = SessionEvent;
@@ -77,5 +83,6 @@ export const METHODS = {
   approvalRespond: "approval.respond",
   sessionAddDir: "session.addDir",
   sessionSetCwd: "session.setCwd",
+  trustDir: "daemon.trustDir",
   event: "event",
 } as const;

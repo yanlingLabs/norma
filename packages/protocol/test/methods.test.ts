@@ -4,10 +4,13 @@ import {
   SessionListResult,
   SessionAttachResult,
   SessionCreateParams,
+  SessionCreateResult,
   ApprovalRespondParams,
   ApprovalRespondResult,
   SessionAddDirParams,
   SessionSetCwdParams,
+  TrustDirParams,
+  TrustDirResult,
   METHODS,
 } from "../src/methods";
 
@@ -85,5 +88,30 @@ describe("directory method schemas", () => {
     expect(SessionSetCwdParams.parse({ sessionId: "s1", cwd: "/abs" }).cwd).toBe("/abs");
     expect(METHODS.sessionAddDir).toBe("session.addDir");
     expect(METHODS.sessionSetCwd).toBe("session.setCwd");
+  });
+});
+
+describe("SessionCreateResult.trusted", () => {
+  test("SessionCreateResult carries trusted", () => {
+    expect(SessionCreateResult.parse({ sessionId: "s1", trusted: false }).trusted).toBe(false);
+    expect(() => SessionCreateResult.parse({ sessionId: "s1" })).toThrow(); // trusted now required
+  });
+});
+
+describe("daemon.trustDir", () => {
+  test("daemon.trustDir params/result + method string", () => {
+    expect(TrustDirParams.parse({ path: "/Users/x/proj" }).path).toBe("/Users/x/proj");
+    expect(() => TrustDirParams.parse({ path: "rel" })).toThrow();   // must be absolute
+    expect(() => TrustDirParams.parse({ path: "/" })).toThrow();     // reject filesystem root
+    expect(TrustDirResult.parse({ ok: true, trusted: true }).trusted).toBe(true);
+    expect(METHODS.trustDir).toBe("daemon.trustDir");
+  });
+});
+
+describe("cwd '/' rejection", () => {
+  test("cwd '/' is rejected for create and setCwd (whole-fs guard)", () => {
+    expect(() => SessionCreateParams.parse({ scope: "global", cwd: "/" })).toThrow();
+    expect(() => SessionSetCwdParams.parse({ sessionId: "s1", cwd: "/" })).toThrow();
+    expect(SessionCreateParams.parse({ scope: "global", cwd: "/Users/x" }).cwd).toBe("/Users/x");
   });
 });
