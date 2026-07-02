@@ -86,4 +86,28 @@ d("BackgroundTaskRegistry", () => {
     await sleep(500);
     for (const t of reg.list("s1")) expect(["killed", "exited"]).toContain(t.status);
   });
+
+  test("ring overflow: read() never redelivers already-seen output (cursor stays correct)", async () => {
+    const cwd = realDir();
+    const events: any[] = [];
+    const reg = new BackgroundTaskRegistry({
+      emit: (_s, e) => events.push(e),
+      spawnCtx: () => ({ cwd, roots: [cwd], tmpDir: sessionTmpDir("s_ov") }),
+      killGraceMs: 300, ringCap: 25, // tiny: each 11-byte line overflows quickly
+    });
+    const id = reg.start("s1", "for i in 1 2 3 4 5; do echo LINE-$i; sleep 0.15; done");
+    let assembled = "";
+    for (let n = 0; n < 8; n++) {
+      await new Promise((r) => setTimeout(r, 150));
+      const { chunk } = reg.read("s1", id);
+      // strip the one-time drop note before accumulating:
+      assembled += chunk.replace("[background output ring full — oldest output dropped]\n", "");
+    }
+    // no line label should appear twice from redelivered stale output:
+    for (const label of ["LINE-1", "LINE-2", "LINE-3", "LINE-4", "LINE-5"]) {
+      const occurrences = assembled.split(label).length - 1;
+      expect(occurrences).toBeLessThanOrEqual(1); // each seen at most once across all reads (some may be dropped by the ring, never duplicated)
+    }
+    expect(reg.read("s1", id).status).toBeDefined();
+  });
 });

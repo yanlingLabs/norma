@@ -11,7 +11,7 @@ const DEPRECATION_RE = /^sandbox-exec: .*deprecated.*$/gim;
 interface Task {
   taskId: string; sessionId: string; command: string;
   child: ChildProcess; status: "running" | "exited" | "killed"; exitCode: number | null;
-  ring: string; cursor: number; ringDropped: boolean; startedAt: number;
+  ring: string; cursor: number; ringDropped: boolean; dropNoted: boolean; startedAt: number;
   coalescer: OutputCoalescer;
 }
 
@@ -19,12 +19,17 @@ export interface BgDeps {
   emit: (sessionId: string, event: NewSessionEvent) => void;
   spawnCtx: (sessionId: string) => { cwd: string; roots: string[]; tmpDir: string };
   killGraceMs?: number;
+  ringCap?: number;
 }
 
 export class BackgroundTaskRegistry {
   private tasks = new Map<string, Task>();
   private readonly killGraceMs: number;
-  constructor(private readonly deps: BgDeps) { this.killGraceMs = deps.killGraceMs ?? 2000; }
+  private readonly ringCap: number;
+  constructor(private readonly deps: BgDeps) {
+    this.killGraceMs = deps.killGraceMs ?? 2000;
+    this.ringCap = deps.ringCap ?? RING_CAP;
+  }
 
   private own(sessionId: string, taskId: string): Task {
     const t = this.tasks.get(taskId);
@@ -48,19 +53,21 @@ export class BackgroundTaskRegistry {
       cwd: realCwd, stdio: ["ignore", "pipe", "pipe"], detached: true, env: { ...process.env, TMPDIR: scratch },
     });
     const taskId = `bg_${randomBytes(6).toString("hex")}`;
+    // TODO(T3): drop the `as unknown as NewSessionEvent` casts below once bg_task_* land in the SessionEvent union.
     const coalescer = new OutputCoalescer((chunk) =>
       this.deps.emit(sessionId, { type: "bg_task_output", sessionId, threadId: "main", taskId, chunk } as unknown as NewSessionEvent));
-    const task: Task = { taskId, sessionId, command, child, status: "running", exitCode: null, ring: "", cursor: 0, ringDropped: false, startedAt: Date.now(), coalescer };
+    const task: Task = { taskId, sessionId, command, child, status: "running", exitCode: null, ring: "", cursor: 0, ringDropped: false, dropNoted: false, startedAt: Date.now(), coalescer };
     this.tasks.set(taskId, task);
 
     const onData = (d: Buffer) => {
       const s = d.toString("utf8").replace(DEPRECATION_RE, "");
       if (s.length === 0) return;
       task.ring += s;
-      if (task.ring.length > RING_CAP) {
-        task.ring = task.ring.slice(task.ring.length - RING_CAP);
-        task.cursor = Math.max(0, task.cursor - (task.ring.length)); // clamp; recomputed on read
-        if (!task.ringDropped) { task.ringDropped = true; task.ring = "[background output ring full — oldest output dropped]\n" + task.ring; }
+      if (task.ring.length > this.ringCap) {
+        const trimmed = task.ring.length - this.ringCap; // bytes actually dropped from the front
+        task.ring = task.ring.slice(trimmed);
+        task.cursor = Math.max(0, task.cursor - trimmed);
+        task.ringDropped = true; // note surfaced once in read(), not stored in the ring (keeps cursor math clean)
       }
       task.coalescer.push(s);
     };
@@ -82,8 +89,9 @@ export class BackgroundTaskRegistry {
   read(sessionId: string, taskId: string): { chunk: string; status: string; exitCode: number | null } {
     const t = this.own(sessionId, taskId);
     const start = Math.min(t.cursor, t.ring.length);
-    const chunk = t.ring.slice(start);
+    let chunk = t.ring.slice(start);
     t.cursor = t.ring.length;
+    if (t.ringDropped && !t.dropNoted) { t.dropNoted = true; chunk = "[background output ring full — oldest output dropped]\n" + chunk; }
     return { chunk, status: t.status, exitCode: t.exitCode };
   }
 
