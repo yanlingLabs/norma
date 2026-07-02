@@ -63,12 +63,17 @@ function readDirs(path: string): string[] {
   }
 }
 
-/** Merge additionalDirectories across user → project → local scopes (Claude-Code-style). */
-export function loadPermissionDirs(homeDir: string, projectDir?: string): string[] {
-  const sources = [join(homeDir, "settings.json")];
+/**
+ * Merge additionalDirectories across scopes (Claude-Code-style). The COMMITTED
+ * <projectDir>/.norma/settings.json is honored ONLY when `projectTrusted` — a repo
+ * can't silently widen the fence until the user trusts the folder. The user's
+ * ~/.norma/settings.json and the gitignored settings.local.json are always honored.
+ */
+export function loadPermissionDirs(homeDir: string, projectDir?: string, projectTrusted = false): string[] {
+  const sources = [join(homeDir, "settings.json")]; // user global — always
   if (projectDir) {
-    sources.push(join(projectDir, ".norma", "settings.json"));
-    sources.push(join(projectDir, ".norma", "settings.local.json"));
+    if (projectTrusted) sources.push(join(projectDir, ".norma", "settings.json")); // committed — trust-gated
+    sources.push(join(projectDir, ".norma", "settings.local.json")); // local, gitignored — always
   }
   const merged: string[] = [];
   for (const src of sources) {

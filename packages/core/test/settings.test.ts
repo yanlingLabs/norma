@@ -74,14 +74,16 @@ describe("permission directories", () => {
     expect(loadSettings(p).permissions?.additionalDirectories).toEqual(["~/x"]);
   });
 
-  test("loadPermissionDirs merges user + project + local, expands ~, dedups", () => {
+  test("loadPermissionDirs merges user + project + local, expands ~, dedups (trusted project)", () => {
     const home = mkdtempSync(join(tmpdir(), "norma-perm-home-"));
     const project = mkdtempSync(join(tmpdir(), "norma-perm-proj-"));
     wf(join(home, "settings.json"), JSON.stringify({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, permissions: { additionalDirectories: ["~/shared"] } }));
     mkdirSync(join(project, ".norma"), { recursive: true });
     wf(join(project, ".norma", "settings.json"), JSON.stringify({ permissions: { additionalDirectories: ["/opt/data", "~/shared"] } }));
     wf(join(project, ".norma", "settings.local.json"), JSON.stringify({ permissions: { additionalDirectories: ["/tmp/local-grant"] } }));
-    const dirs = loadPermissionDirs(home, project);
+    // committed .norma/settings.json only merges when the project is trusted — see
+    // "loadPermissionDirs trust gating" below for the untrusted-gates-it-out coverage.
+    const dirs = loadPermissionDirs(home, project, true);
     const { homedir } = require("node:os");
     expect(dirs).toContain(join(homedir(), "shared"));
     expect(dirs).toContain("/opt/data");
@@ -101,5 +103,51 @@ describe("permission directories", () => {
     addLocalDir(project, "/opt/two");
     const local = JSON.parse(require("node:fs").readFileSync(join(project, ".norma", "settings.local.json"), "utf8"));
     expect(local.permissions.additionalDirectories).toEqual(["/opt/one", "/opt/two"]);
+  });
+});
+
+describe("loadPermissionDirs trust gating", () => {
+  function scaffold() {
+    const home = mkdtempSync(join(tmpdir(), "norma-tg-home-"));
+    const project = mkdtempSync(join(tmpdir(), "norma-tg-proj-"));
+    mkdirSync(join(project, ".norma"), { recursive: true });
+    wf(join(home, "settings.json"), JSON.stringify({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, permissions: { additionalDirectories: ["/opt/user-dir"] } }));
+    wf(join(project, ".norma", "settings.json"), JSON.stringify({ permissions: { additionalDirectories: ["/opt/committed-dir"] } }));       // committed → trust-gated
+    wf(join(project, ".norma", "settings.local.json"), JSON.stringify({ permissions: { additionalDirectories: ["/opt/local-dir"] } }));    // gitignored → always
+    return { home, project };
+  }
+
+  test("UNtrusted project: committed settings.json is IGNORED; user + local still apply", () => {
+    const { home, project } = scaffold();
+    const dirs = loadPermissionDirs(home, project, false);
+    expect(dirs).toContain("/opt/user-dir");    // user global — always
+    expect(dirs).toContain("/opt/local-dir");   // local gitignored — always
+    expect(dirs).not.toContain("/opt/committed-dir"); // committed — gated out when untrusted
+  });
+
+  test("TRUSTED project: committed settings.json now applies", () => {
+    const { home, project } = scaffold();
+    const dirs = loadPermissionDirs(home, project, true);
+    expect(dirs).toContain("/opt/committed-dir");
+    expect(dirs).toContain("/opt/user-dir");
+    expect(dirs).toContain("/opt/local-dir");
+  });
+
+  test("SECURITY: an untrusted committed settings.json cannot self-grant a broad root", () => {
+    const home = mkdtempSync(join(tmpdir(), "norma-tg-h2-"));
+    const project = mkdtempSync(join(tmpdir(), "norma-tg-p2-"));
+    mkdirSync(join(project, ".norma"), { recursive: true });
+    wf(join(project, ".norma", "settings.json"), JSON.stringify({ permissions: { additionalDirectories: ["/", "~"] } }));
+    const { homedir } = require("node:os");
+    const untrusted = loadPermissionDirs(home, project, false);
+    expect(untrusted).not.toContain("/");
+    expect(untrusted).not.toContain(homedir());
+    const trusted = loadPermissionDirs(home, project, true);
+    expect(trusted).toContain("/"); // only once the user trusts the folder
+  });
+
+  test("default projectTrusted is false (fail-closed)", () => {
+    const { home, project } = scaffold();
+    expect(loadPermissionDirs(home, project)).not.toContain("/opt/committed-dir");
   });
 });
