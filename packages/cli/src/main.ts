@@ -63,30 +63,31 @@ async function connect(name: string, onEvent: (e: any) => void = () => {}): Prom
   return NormaClient.connect({ socketPath: socketPath(), token: await getToken(), clientName: name, onEvent });
 }
 
-// -p teardown: mirrors Claude Code's headless grace-kill. Any bg tasks still running when the
-// turn completes get a grace period (NORMA_BG_PRINT_WAIT_MS, default 5000ms; 0 = poll until none
-// are running rather than racing a fixed timer) before we force-kill whatever remains.
-async function endHeadlessTurn(c: NormaClient, sessionId: string, wdTimer: ReturnType<typeof setInterval> | undefined, exitCode: number): Promise<void> {
-  if (wdTimer) clearInterval(wdTimer); // normal completion — stop watching for a stall that didn't happen
-  const running = (await c.bgList(sessionId)).filter((t) => t.status === "running");
-  if (running.length) {
-    const waitMs = Number(process.env.NORMA_BG_PRINT_WAIT_MS ?? 5000);
-    if (waitMs > 0) {
-      await new Promise((r) => setTimeout(r, waitMs));
-    } else {
-      while ((await c.bgList(sessionId)).some((t) => t.status === "running")) {
-        await new Promise((r) => setTimeout(r, 200));
-      }
-    }
-    await c.bgKillAll(sessionId);
-  }
-  c.close();
-  process.exit(exitCode);
-}
-
 // Headless agent mode: `norma -p "<prompt>" [--auto]`. Streams the turn to stdout and,
 // under the default "ask" approval policy, prompts on stdin for each tool approval.
 async function runHeadlessAgent(): Promise<void> {
+  // -p teardown: mirrors Claude Code's headless grace-kill. Any bg tasks still running when the
+  // turn completes get a grace period (NORMA_BG_PRINT_WAIT_MS, default 5000ms; 0 = poll until none
+  // are running rather than racing a fixed timer) before we force-kill whatever remains.
+  async function endHeadlessTurn(c: NormaClient, sessionId: string, wdTimer: ReturnType<typeof setInterval> | undefined, exitCode: number): Promise<void> {
+    if (exiting) return;
+    exiting = true;
+    if (wdTimer) clearInterval(wdTimer); // normal completion — stop watching for a stall that didn't happen
+    const running = (await c.bgList(sessionId)).filter((t) => t.status === "running");
+    if (running.length) {
+      const waitMs = Number(process.env.NORMA_BG_PRINT_WAIT_MS ?? 5000);
+      if (waitMs > 0) {
+        await new Promise((r) => setTimeout(r, waitMs));
+      } else {
+        while ((await c.bgList(sessionId)).some((t) => t.status === "running")) {
+          await new Promise((r) => setTimeout(r, 200));
+        }
+      }
+      await c.bgKillAll(sessionId);
+    }
+    c.close();
+    process.exit(exitCode);
+  }
   const prompt = process.argv[3];
   if (!prompt) {
     console.error('usage: norma -p "<prompt>" [--auto]');
@@ -97,6 +98,7 @@ async function runHeadlessAgent(): Promise<void> {
   let sessionId = ""; // set below, before send() — turn_completed can only fire after that
   const wd: WatchdogState = { turnRunning: false, toolsInFlight: 0, approvalsPending: 0, lastEventAt: Date.now() };
   let wdTimer: ReturnType<typeof setInterval> | undefined; // started once the turn is sent; cleared on completion/stall
+  let exiting = false; // guard to ensure a single exit path wins, not a race between stall watchdog and endHeadlessTurn
 
   const c = await connect("cli-p", (e) => {
     applyEvent(wd, e, Date.now());
@@ -144,6 +146,8 @@ async function runHeadlessAgent(): Promise<void> {
   const thresholdMs = Number(process.env.NORMA_TURN_STALL_MS ?? 180000);
   wdTimer = setInterval(() => {
     if (isStalled(wd, Date.now(), thresholdMs)) {
+      if (exiting) return;
+      exiting = true;
       clearInterval(wdTimer);
       console.error(`\n[stalled: no progress for ${Math.round((Date.now() - wd.lastEventAt) / 1000)}s — aborting]`);
       void c.interrupt(sessionId).finally(() => process.exit(2));
