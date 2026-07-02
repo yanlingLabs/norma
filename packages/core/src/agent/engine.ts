@@ -31,6 +31,7 @@ export interface EngineConfig {
 export class AgentEngine {
   private runningTurns = new Set<string>();
   private steerQueue = new Map<string, string[]>();
+  private aborters = new Map<string, AbortController>();
   constructor(private readonly cfg: EngineConfig) {}
 
   /** True while a turn is executing for the session. */
@@ -39,12 +40,23 @@ export class AgentEngine {
   async runTurn(sessionId: string): Promise<void> {
     if (this.runningTurns.has(sessionId)) throw new Error(`turn already running for ${sessionId}`);
     this.runningTurns.add(sessionId);
+    const ac = new AbortController();
+    this.aborters.set(sessionId, ac);
     try {
-      await this.turn(sessionId);
+      await this.turn(sessionId, ac.signal);
     } finally {
       this.runningTurns.delete(sessionId);
+      this.aborters.delete(sessionId);
       this.steerQueue.delete(sessionId);
     }
+  }
+
+  /** Abort the in-flight turn for a session, if any. Idempotent — safe to call when idle. */
+  interrupt(sessionId: string): { wasRunning: boolean } {
+    const ac = this.aborters.get(sessionId);
+    if (!ac) return { wasRunning: false };
+    ac.abort();
+    return { wasRunning: true };
   }
 
   /**
@@ -61,7 +73,8 @@ export class AgentEngine {
       q.push(text); this.steerQueue.set(sessionId, q);
       return { injected: true };
     }
-    void this.runTurn(sessionId).catch(() => {}); // start a turn; the user_message is already in history
+    // start a turn; the user_message is already in history
+    void this.runTurn(sessionId).catch((e) => console.error("steer turn failed:", e));
     return { injected: false };
   }
 
@@ -80,7 +93,7 @@ export class AgentEngine {
     return input;
   }
 
-  private async turn(sessionId: string): Promise<void> {
+  private async turn(sessionId: string, signal: AbortSignal): Promise<void> {
     const meta = this.cfg.store.meta(sessionId);
     const threadId = MAIN_THREAD;
     if (!meta.cwd) {
@@ -108,6 +121,7 @@ export class AgentEngine {
         instructions: SYSTEM_PROMPT,
         input,
         tools: this.cfg.registry.specs(),
+        signal,
       })) {
         if (ev.type === "text_delta") textBuf += ev.delta;
         else if (ev.type === "tool_call") calls.push(ev);
@@ -127,7 +141,10 @@ export class AgentEngine {
 
       if (stop !== "tool_calls" || calls.length === 0) {
         const pending = this.steerQueue.get(sessionId);
-        if (pending && pending.length) { continue; } // a steer landed as we finished → drain at next iteration top, keep going
+        // A steer landed as we finished → drain at next iteration top, keep going. But an
+        // interrupt must win: an aborted turn ends now with turn_completed(aborted) even if a
+        // steer is queued (it stays queued for the next runTurn, e.g. via steer()'s own restart).
+        if (stop !== "aborted" && pending && pending.length) { continue; }
         this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: stop === "aborted" ? "aborted" : "end_turn", ...usage });
         return;
       }
@@ -156,10 +173,10 @@ export class AgentEngine {
           const res = await waiting;
           this.emit(sessionId, { type: "approval_resolved", sessionId, threadId, callId: call.callId, approved: res.approved, by: res.by });
           outcome = res.approved
-            ? await this.executeCall(call, cwd, sessionId)
+            ? await this.executeCall(call, cwd, sessionId, signal)
             : { output: `denied by ${res.by}`, isError: true };
         } else {
-          outcome = await this.executeCall(call, cwd, sessionId);
+          outcome = await this.executeCall(call, cwd, sessionId, signal);
         }
 
         this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
@@ -171,12 +188,12 @@ export class AgentEngine {
     this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "error", ...usage });
   }
 
-  private executeCall(call: { name: string; argsJson: string }, cwd: string, sessionId: string): Promise<{ output: string; isError: boolean }> {
+  private executeCall(call: { name: string; argsJson: string }, cwd: string, sessionId: string, signal: AbortSignal): Promise<{ output: string; isError: boolean }> {
     let args: unknown;
     try { args = call.argsJson.length ? JSON.parse(call.argsJson) : {}; }
     catch { return Promise.resolve({ output: `tool arguments were not valid JSON`, isError: true }); }
     const roots = this.cfg.dirs.roots(sessionId);
     const tmpDir = sessionTmpDir(sessionId);
-    return this.cfg.registry.execute(call.name, args, { cwd, roots, tmpDir, sessionId });
+    return this.cfg.registry.execute(call.name, args, { cwd, roots, tmpDir, sessionId, signal });
   }
 }

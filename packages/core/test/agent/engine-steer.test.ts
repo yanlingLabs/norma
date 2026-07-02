@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { SessionEvent } from "@norma/protocol";
 import { SessionStore } from "../../src/sessions/store";
 import { SessionHub } from "../../src/sessions/hub";
 import { ToolRegistry } from "../../src/agent/tools/registry";
@@ -14,8 +15,9 @@ import { SessionDirectories } from "../../src/agent/dirs";
 import { GatedProvider, deferred } from "../../src/agent/test-providers";
 import type { Provider } from "../../src/providers/types";
 
-// Mirrors packages/core/test/agent/engine.test.ts's setup().
-function setupEngine(provider: Provider) {
+// Mirrors packages/core/test/agent/engine.test.ts's setup(). Exported so other engine test
+// files (e.g. engine-interrupt.test.ts) can reuse the same harness instead of duplicating it.
+export function setupEngine(provider: Provider) {
   const home = mkdtempSync(join(tmpdir(), "norma-engine-steer-"));
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-steer-cwd-")));
   const store = new SessionStore(home);
@@ -33,7 +35,12 @@ function setupEngine(provider: Provider) {
     approvalTimeoutMs: 500,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: "auto" });
-  return { engine, store, hub, broker, sessionId, cwd, dirs };
+  // Collect every SessionEvent broadcast for this session (live, via a hub subscriber) so
+  // tests can assert on emitted events (e.g. turn_completed's stopReason) without re-reading
+  // the store themselves.
+  const events: SessionEvent[] = [];
+  hub.attach({ clientName: "test-observer", deliver: (e) => { events.push(e); return true; } }, sessionId, 0);
+  return { engine, store, hub, broker, sessionId, cwd, dirs, events };
 }
 
 describe("engine steering", () => {
