@@ -12,4 +12,10 @@ describe("sessionTmpDir", () => {
     expect(a).toBe(realpathSync(a)); // canonical
     expect(a).not.toBe(b);
   });
+
+  test("rejects a sessionId with path-traversal characters", () => {
+    expect(() => sessionTmpDir("a/../../etc-poc")).toThrow(/invalid sessionId/);
+    expect(() => sessionTmpDir("../evil")).toThrow(/invalid sessionId/);
+    expect(() => sessionTmpDir("s_ok123")).not.toThrow(); // real session-id shape passes
+  });
 });

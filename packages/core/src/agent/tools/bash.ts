@@ -12,7 +12,7 @@ const MAX_CAPTURE = 256 * 1024; // hard bound before the registry's own 64KB cap
 export function registerBashTool(r: ToolRegistry): void {
   r.register({
     name: "bash",
-    description: "Run a shell command in the session directory. Confined by a macOS sandbox: writes are limited to the session directory and network is disabled. Combined stdout+stderr is returned with the exit code.",
+    description: "Run a shell command in the session directory. Confined by a macOS sandbox: writes are limited to the session directory and network is disabled. Combined stdout+stderr is returned with the exit code. Note: bare mktemp may fail under the sandbox (macOS ignores $TMPDIR); use $TMPDIR explicitly, e.g. mktemp \"$TMPDIR/XXXXXX\".",
     args: z.object({
       command: z.string().min(1),
       timeoutMs: z.number().int().positive().max(MAX_TIMEOUT_MS).optional(),
@@ -22,7 +22,7 @@ export function registerBashTool(r: ToolRegistry): void {
         throw new Error("bash is unavailable: macOS sandbox-exec not found on this host");
       }
       const realCwd = realpathSync(cwd);
-      const scratch = tmpDir ?? realCwd; // engine always supplies a session tmp; fall back to cwd
+      const scratch = realpathSync(tmpDir ?? realCwd); // engine always supplies a session tmp; fall back to cwd
       const writable = [...new Set([realCwd, ...roots.map((r) => realpathSync(r)), scratch])];
       const profile = buildSeatbeltProfile({
         cwd: realCwd,
