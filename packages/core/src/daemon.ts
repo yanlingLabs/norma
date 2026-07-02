@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { bootstrapNormaDir, resolveNormaHome } from "./norma-dir";
 import { acquireLock, type Lock } from "./lock";
 import { TokenAuthority } from "./auth/tokens";
@@ -17,6 +18,7 @@ import { PermissionGate } from "./agent/gate";
 import { ApprovalBroker } from "./agent/approvals";
 import { AgentEngine } from "./agent/engine";
 import { SessionDirectories } from "./agent/dirs";
+import { TrustStore } from "./agent/trust";
 
 export const CORE_VERSION = "0.0.1";
 
@@ -45,11 +47,12 @@ export async function startDaemon(opts: {
   const hub = new SessionHub(store);
 
   const normaHome = dirs.home;
+  const trustStore = new TrustStore(join(normaHome, "trust.json"));
   // Built unconditionally (needs only store, no provider) so the server's session.addDir /
   // setCwd handlers always have live roots to work with, even when the agent is disabled.
   const sessionDirs = new SessionDirectories((sid) => {
     const m = store.meta(sid);
-    return m.cwd ? [m.cwd, ...loadPermissionDirs(normaHome, m.cwd)] : [];
+    return m.cwd ? [m.cwd, ...loadPermissionDirs(normaHome, m.cwd, trustStore.isTrusted(m.cwd))] : [];
   });
 
   let agentProvider = opts.agentProvider;
@@ -95,6 +98,7 @@ export async function startDaemon(opts: {
     engine,
     broker,
     dirs: sessionDirs,
+    trust: trustStore,
     ...opts.server,
   });
 

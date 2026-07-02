@@ -3,7 +3,7 @@ import { z } from "zod";
 import {
   ERR, METHODS, PROTOCOL_VERSION, LineDecoder, encodeLine, parseIncoming,
   HelloParams, SessionCreateParams, SessionAttachParams, SessionSendParams, ApprovalRespondParams,
-  SessionAddDirParams, SessionSetCwdParams,
+  SessionAddDirParams, SessionSetCwdParams, TrustDirParams,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
@@ -12,6 +12,7 @@ import { SessionHub, type HubClient } from "../sessions/hub";
 import type { AgentEngine } from "../agent/engine";
 import type { ApprovalBroker } from "../agent/approvals";
 import type { SessionDirectories } from "../agent/dirs";
+import type { TrustStore } from "../agent/trust";
 import { addLocalDir } from "../settings";
 
 interface ConnState {
@@ -32,6 +33,7 @@ export interface IpcServerOptions {
   engine?: AgentEngine | null;
   broker?: ApprovalBroker | null;
   dirs?: SessionDirectories; // live allowed-roots per session; addDir/setCwd need it
+  trust?: TrustStore;        // per-directory trust; session.create result + daemon.trustDir
   helloTimeoutMs?: number;   // default 5000
   maxConnections?: number;   // default 64
   preAuthMaxLine?: number;   // default 64 KiB
@@ -147,7 +149,9 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
     switch (method) {
       case METHODS.sessionCreate: {
         const p = parseParams(SessionCreateParams, params);
-        return { sessionId: opts.store.createSession(p.scope, { cwd: p.cwd, approvalPolicy: p.approvalPolicy }) };
+        const sessionId = opts.store.createSession(p.scope, { cwd: p.cwd, approvalPolicy: p.approvalPolicy });
+        const trusted = p.cwd ? (opts.trust?.isTrusted(p.cwd) ?? false) : false;
+        return { sessionId, trusted };
       }
       case METHODS.sessionList:
         return { sessions: opts.store.list() };
@@ -187,10 +191,15 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       }
       case METHODS.sessionAddDir: {
         const p = parseParams(SessionAddDirParams, params);
+        let meta: ReturnType<SessionStore["meta"]>;
+        try {
+          meta = opts.store.meta(p.sessionId); // throws for unknown session
+        } catch (e) {
+          throw new RpcFailure(ERR.NOT_FOUND, (e as Error).message);
+        }
         opts.dirs?.add(p.sessionId, p.path);
-        const cwd = opts.store.meta(p.sessionId).cwd;
-        const persisted = p.persist && cwd !== null;
-        if (persisted) addLocalDir(cwd!, p.path);
+        const persisted = p.persist && meta.cwd !== null;
+        if (persisted) addLocalDir(meta.cwd!, p.path);
         hub.append(p.sessionId, { type: "directory_added", sessionId: p.sessionId, threadId: "main", path: p.path, persisted });
         return { ok: true, roots: opts.dirs?.roots(p.sessionId) ?? [] };
       }
@@ -198,6 +207,11 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         const p = parseParams(SessionSetCwdParams, params);
         opts.store.setCwd(p.sessionId, p.cwd);
         return { ok: true, cwd: p.cwd };
+      }
+      case METHODS.trustDir: {
+        const p = parseParams(TrustDirParams, params);
+        opts.trust?.trust(p.path);
+        return { ok: true, trusted: true };
       }
       default:
         throw new RpcFailure(ERR.METHOD_NOT_FOUND, `method not found: ${method}`);

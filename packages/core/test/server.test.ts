@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, realpathSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LineDecoder, encodeLine, METHODS, PROTOCOL_VERSION, ConnWriter, type WritableSocket } from "@norma/protocol";
+import { LineDecoder, encodeLine, METHODS, PROTOCOL_VERSION, ConnWriter, ERR, type WritableSocket } from "@norma/protocol";
 import { startDaemon, type RunningDaemon } from "../src/daemon";
 import { startIpcServer } from "../src/ipc/server";
 import { SessionStore } from "../src/sessions/store";
@@ -398,5 +398,51 @@ describe("daemon IPC", () => {
         // ...no hub
       });
     }).toThrow(/hub/);
+  });
+
+  test("session.create reports trusted=false for an untrusted dir, true after daemon.trustDir", async () => {
+    await boot({});
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "truster");
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-trust-cwd-")));
+    const created = (await c.request(METHODS.sessionCreate, { scope: "global", cwd })).result;
+    expect(created.trusted).toBe(false);
+    const t = (await c.request(METHODS.trustDir, { path: cwd })).result;
+    expect(t).toEqual({ ok: true, trusted: true });
+    const created2 = (await c.request(METHODS.sessionCreate, { scope: "global", cwd })).result;
+    expect(created2.trusted).toBe(true); // now trusted (persisted)
+    c.close();
+  });
+
+  test("committed additionalDirectories apply only after the folder is trusted", async () => {
+    await boot({});
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "truster2");
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-trust-cwd2-")));
+    const granted = realpathSync(mkdtempSync(join(tmpdir(), "norma-committed-")));
+    mkdirSync(join(cwd, ".norma"), { recursive: true });
+    writeFileSync(join(cwd, ".norma", "settings.json"), JSON.stringify({ permissions: { additionalDirectories: [granted] } }));
+    const s = (await c.request(METHODS.sessionCreate, { scope: "global", cwd })).result.sessionId;
+    await c.request(METHODS.sessionAttach, { sessionId: s, fromSeq: 0 });
+    // Untrusted: committed dir NOT in roots (roots come back via addDir echo of the full set)
+    const before = (await c.request(METHODS.sessionAddDir, { sessionId: s, path: cwd })).result.roots; // add cwd (noop-ish), read roots
+    expect(before).not.toContain(granted);
+    await c.request(METHODS.trustDir, { path: cwd });
+    const after = (await c.request(METHODS.sessionAddDir, { sessionId: s, path: cwd })).result.roots;
+    expect(after).toContain(granted); // committed dir now present
+    c.close();
+  });
+
+  test("session.addDir on an unknown session fails and adds no dangling entry", async () => {
+    await boot({});
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "adder-bad");
+    const res = await c.request(METHODS.sessionAddDir, {
+      sessionId: "s_does_not_exist",
+      path: realpathSync(mkdtempSync(join(tmpdir(), "norma-x-"))),
+    });
+    expect(res.error).toBeTruthy();
+    expect(res.error.code).toBe(ERR.NOT_FOUND);
+    c.close();
   });
 });
