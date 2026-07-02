@@ -27,6 +27,9 @@ const fixtures: Record<string, unknown> = {
   "turn_completed": { ...base, threadId: "main", type: "turn_completed", stopReason: "end_turn", inputTokens: 12, outputTokens: 3 },
   "agent_error": { ...base, threadId: "main", type: "agent_error", message: "provider unavailable" },
   "directory_added": { ...base, threadId: "main", type: "directory_added", path: "/opt/data", persisted: true },
+  "bg_task_started": { ...base, threadId: "main", type: "bg_task_started", taskId: "bg_a1", command: "npm run dev" },
+  "bg_task_output":  { ...base, threadId: "main", type: "bg_task_output",  taskId: "bg_a1", chunk: "listening on :3000\n" },
+  "bg_task_exited":  { ...base, threadId: "main", type: "bg_task_exited",  taskId: "bg_a1", exitCode: 0, killed: false },
 };
 for (const [name, value] of Object.entries(fixtures)) {
   SessionEvent.parse(value); // fixtures must be valid by construction

@@ -558,6 +558,151 @@
         "persisted"
       ],
       "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "threadId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "bg_task_started"
+        },
+        "taskId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "command": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "seq",
+        "sessionId",
+        "ts",
+        "threadId",
+        "type",
+        "taskId",
+        "command"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "threadId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "bg_task_output"
+        },
+        "taskId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "chunk": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "seq",
+        "sessionId",
+        "ts",
+        "threadId",
+        "type",
+        "taskId",
+        "chunk"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "threadId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "bg_task_exited"
+        },
+        "taskId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "exitCode": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "killed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "seq",
+        "sessionId",
+        "ts",
+        "threadId",
+        "type",
+        "taskId",
+        "exitCode",
+        "killed"
+      ],
+      "additionalProperties": false
     }
   ]
 }

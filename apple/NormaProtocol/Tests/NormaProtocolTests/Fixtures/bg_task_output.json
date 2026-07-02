@@ -1,0 +1,9 @@
+{
+  "seq": 7,
+  "sessionId": "s_fixture",
+  "ts": 1781270000000,
+  "threadId": "main",
+  "type": "bg_task_output",
+  "taskId": "bg_a1",
+  "chunk": "listening on :3000\n"
+}

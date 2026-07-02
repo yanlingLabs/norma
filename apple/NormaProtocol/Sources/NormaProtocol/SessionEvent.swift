@@ -14,6 +14,9 @@ public enum SessionEvent: Codable, Equatable {
     case turnCompleted(TurnCompleted)
     case agentError(AgentError)
     case directoryAdded(DirectoryAdded)
+    case bgTaskStarted(BgTaskStarted)
+    case bgTaskOutput(BgTaskOutput)
+    case bgTaskExited(BgTaskExited)
 
     public struct SessionCreated: Codable, Equatable {
         public let seq: Int
@@ -127,6 +130,34 @@ public enum SessionEvent: Codable, Equatable {
         public let persisted: Bool
     }
 
+    public struct BgTaskStarted: Codable, Equatable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let taskId: String
+        public let command: String
+    }
+
+    public struct BgTaskOutput: Codable, Equatable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let taskId: String
+        public let chunk: String
+    }
+
+    public struct BgTaskExited: Codable, Equatable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let taskId: String
+        public let exitCode: Int?
+        public let killed: Bool
+    }
+
     private enum Discriminator: String, Codable {
         case session_created
         case harness_attached
@@ -141,6 +172,9 @@ public enum SessionEvent: Codable, Equatable {
         case turn_completed
         case agent_error
         case directory_added
+        case bg_task_started
+        case bg_task_output
+        case bg_task_exited
     }
 
     private enum TypeKey: String, CodingKey { case type }
@@ -161,6 +195,9 @@ public enum SessionEvent: Codable, Equatable {
         case .turn_completed:       self = .turnCompleted(try TurnCompleted(from: decoder))
         case .agent_error:          self = .agentError(try AgentError(from: decoder))
         case .directory_added:      self = .directoryAdded(try DirectoryAdded(from: decoder))
+        case .bg_task_started:      self = .bgTaskStarted(try BgTaskStarted(from: decoder))
+        case .bg_task_output:       self = .bgTaskOutput(try BgTaskOutput(from: decoder))
+        case .bg_task_exited:       self = .bgTaskExited(try BgTaskExited(from: decoder))
         }
     }
 
@@ -218,6 +255,18 @@ public enum SessionEvent: Codable, Equatable {
             try v.encode(to: encoder)
             var c = encoder.container(keyedBy: TypeKey.self)
             try c.encode(Discriminator.directory_added.rawValue, forKey: .type)
+        case .bgTaskStarted(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.bg_task_started.rawValue, forKey: .type)
+        case .bgTaskOutput(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.bg_task_output.rawValue, forKey: .type)
+        case .bgTaskExited(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.bg_task_exited.rawValue, forKey: .type)
         }
     }
 }
