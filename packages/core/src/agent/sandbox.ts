@@ -25,13 +25,21 @@ export function buildSeatbeltProfile(opts: SandboxOptions): string {
   const roots = [opts.cwd, ...(opts.writableRoots ?? [tmpdir()])].map(canon);
   const writeRules = roots.map((r) => `  (subpath "${sbplString(r)}")`).join("\n");
   const network = opts.allowNetwork ? "(allow network*)" : "(deny network*)";
+  // Minimal mach services: deny blanket lookup so open/launchctl/osascript can't
+  // ask a privileged, unsandboxed service to act out-of-band on our behalf.
+  const machRules = [
+    "com.apple.system.notification_center",
+    "com.apple.system.logger",
+    "com.apple.CoreServices.coreservicesd",
+  ].map((s) => `  (global-name "${sbplString(s)}")`).join("\n");
   return `(version 1)
 (deny default)
 (allow process-exec)
 (allow process-fork)
 (allow signal (target self))
 (allow sysctl-read)
-(allow mach-lookup)
+(allow mach-lookup
+${machRules})
 (allow file-read*)
 (allow file-write*
 ${writeRules})
