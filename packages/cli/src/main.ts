@@ -221,6 +221,25 @@ switch (cmdKey) {
     c.close();
     break;
   }
+  case "steer": {
+    const sessionId = process.argv[3];
+    const text = process.argv.slice(4).join(" ");
+    if (!sessionId || !text) { console.error("usage: norma steer <sessionId> <text…>"); process.exit(1); }
+    const c = await connect("cli-steer");
+    const result = await c.steer(sessionId, text);
+    console.log(`${AQUA}steered${RESET} ${result.injected ? "(injected)" : "(queued for next turn)"}`);
+    c.close();
+    break;
+  }
+  case "interrupt": {
+    const sessionId = process.argv[3];
+    if (!sessionId) { console.error("usage: norma interrupt <sessionId>"); process.exit(1); }
+    const c = await connect("cli-interrupt");
+    const result = await c.interrupt(sessionId);
+    console.log(`${AQUA}interrupted${RESET} ${result.wasRunning ? "(was running)" : "(nothing running)"}`);
+    c.close();
+    break;
+  }
   case "bg": {
     const bgSub = process.argv[3];
     const bgSessionId = process.argv[4];
@@ -341,9 +360,10 @@ switch (cmdKey) {
     process.exit(text.length > 0 ? 0 : 1);
   }
   default:
-    console.log(`norma (Phase 1b-i) — commands:
+    console.log(`norma (Phase 1b-ii-d) — commands:
   daemon run | daemon install | daemon uninstall | daemon status
   ping | sessions | send <sessionId|new> <text> | watch <sessionId> | add-dir <sessionId> <path> [--persist] | cd <sessionId> <path>
+  steer <sessionId> <text> | interrupt <sessionId>
   trust <dir> [--list]
   bg list <session> | bg peek <session> <taskId> | bg kill <session> <taskId>
   login [--api-key] | logout | provider | provider-smoke [--prompt <text>]

@@ -76,6 +76,17 @@ describe("NormaClient", () => {
     expect((await client.bgKillAll(sessionId)).killed).toBe(0);
     client.close();
   });
+
+  test("steer/interrupt client methods round-trip", async () => {
+    await boot();
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "si", onEvent: () => {} });
+    const { sessionId } = await client.createSession("global", { cwd: mkdtempSync(join(tmpdir(), "norma-si-")), approvalPolicy: "auto" });
+    // idle interrupt → wasRunning:false
+    expect((await client.interrupt(sessionId)).wasRunning).toBe(false);
+    // steer with no running turn → injected:false (starts a turn)
+    expect((await client.steer(sessionId, "hi")).injected).toBe(false);
+    client.close();
+  });
 });
 
 describe("NormaClient against a hostile/fake server", () => {

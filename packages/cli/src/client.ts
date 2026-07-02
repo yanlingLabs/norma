@@ -3,6 +3,7 @@ import {
   SessionCreateResult, SessionAttachResult, SessionSendResult, SessionListResult,
   SessionAddDirResult, SessionSetCwdResult, TrustDirResult,
   BgListResult, BgPeekResult, BgKillResult, BgKillAllResult,
+  SessionSteerResult, SessionInterruptResult,
   ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 
@@ -121,6 +122,14 @@ export class NormaClient {
   }
   async bgKillAll(sessionId: string): Promise<{ ok: true; killed: number }> {
     return this.validated(BgKillAllResult, await this.request(METHODS.bgKillAll, { sessionId }), METHODS.bgKillAll);
+  }
+  async steer(sessionId: string, text: string): Promise<{ injected: boolean }> {
+    const r = this.validated(SessionSteerResult, await this.request(METHODS.sessionSteer, { sessionId, text }), METHODS.sessionSteer);
+    return { injected: r.injected };
+  }
+  async interrupt(sessionId: string): Promise<{ wasRunning: boolean }> {
+    const r = this.validated(SessionInterruptResult, await this.request(METHODS.sessionInterrupt, { sessionId }), METHODS.sessionInterrupt);
+    return { wasRunning: r.wasRunning };
   }
   close(): void { this.socket.end(); }
 }
