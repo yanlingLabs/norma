@@ -19,7 +19,7 @@ export function registerBashTool(r: ToolRegistry, deps: { bgRegistry?: Backgroun
       timeoutMs: z.number().int().positive().max(MAX_TIMEOUT_MS).optional(),
       runInBackground: z.boolean().optional(),
     }),
-    async run({ command, timeoutMs, runInBackground }, { cwd, roots, tmpDir, sessionId }) {
+    async run({ command, timeoutMs, runInBackground }, { cwd, roots, tmpDir, sessionId, signal }) {
       if (runInBackground) {
         if (!deps.bgRegistry) throw new Error("background tasks are not available in this context");
         return `background task ${deps.bgRegistry.start(sessionId, command)} started`;
@@ -72,16 +72,35 @@ export function registerBashTool(r: ToolRegistry, deps: { bgRegistry?: Backgroun
           }
         }, timeout);
 
+        let aborted = false;
+        const onAbort = () => {
+          aborted = true;
+          // Same group-kill as the timeout path — reaps the whole process
+          // group so an interrupted session.turn doesn't leave orphans.
+          try {
+            process.kill(-child.pid!, "SIGKILL");
+          } catch {
+            /* group already gone */
+          }
+        };
+        if (signal) {
+          if (signal.aborted) onAbort();
+          else signal.addEventListener("abort", onAbort, { once: true });
+        }
+
         const finish = (code: number | null) => {
           clearTimeout(timer);
+          signal?.removeEventListener("abort", onAbort);
           const merged = buf.replace(DEPRECATION_RE, "").replace(/\n{3,}/g, "\n\n").trimEnd()
             + (truncated ? "\n[output truncated at 256KB]" : "");
-          resolve(timedOut ? `${merged}\n[timed out after ${timeout}ms, killed]` : `${merged}\n[exit ${code}]`);
+          if (aborted) resolve(`${merged}\n[aborted]`);
+          else resolve(timedOut ? `${merged}\n[timed out after ${timeout}ms, killed]` : `${merged}\n[exit ${code}]`);
         };
 
         child.on("close", (code) => finish(code));
         child.on("error", (err) => {
           clearTimeout(timer);
+          signal?.removeEventListener("abort", onAbort);
           resolve(`failed to launch sandboxed bash: ${(err as Error).message}\n[exit -1]`);
         });
       });

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { ToolRegistry } from "../../src/agent/tools/registry";
 import { registerBashTool } from "../../src/agent/tools/bash";
 import { sandboxAvailable } from "../../src/agent/sandbox";
+import { sessionTmpDir } from "../../src/agent/session-tmp";
 
 function proj(): string { return realpathSync(mkdtempSync(join(tmpdir(), "norma-bash-"))); }
 function reg(): ToolRegistry { const r = new ToolRegistry(); registerBashTool(r); return r; }
@@ -98,5 +99,21 @@ d("bash tool (sandboxed)", () => {
     expect(res.output).not.toMatch(/DVT/);
     expect(res.output).not.toMatch(/from confstr\(3\)/);
     expect(res.output).not.toMatch(/Failed to start fs event stream/);
+  });
+
+  test("bash aborts its child when the context signal fires", async () => {
+    const cwd = proj();
+    const ac = new AbortController();
+    const started = Date.now();
+    const p = reg().execute("bash", { command: "sleep 30" }, { cwd, roots: [cwd], tmpDir: sessionTmpDir("s_ab"), sessionId: "s1", signal: ac.signal });
+    await new Promise((r) => setTimeout(r, 300));
+    ac.abort();
+    const res = await p;
+    expect(Date.now() - started).toBeLessThan(5000); // returned promptly, not after 30s
+    expect(res.output).toMatch(/abort|killed/i);
+    // no orphaned sleep (group-killed) — pgrep check as in 1b-ii-a:
+    const { execSync } = await import("node:child_process");
+    const orphans = (() => { try { return execSync("pgrep -f 'sleep 30'").toString().trim(); } catch { return ""; } })();
+    expect(orphans).toBe("");
   });
 });
