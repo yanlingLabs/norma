@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolveNormaHome, KeychainSecretStore, startDaemon, TOKEN_NAMES } from "@norma/core";
 import { METHODS } from "@norma/protocol";
 import { NormaClient } from "./client";
+import { applyEvent, isStalled, type WatchdogState } from "./watchdog";
 
 const AQUA = "\x1b[38;2;53;214;232m";
 const DIM = "\x1b[2m";
@@ -65,7 +66,8 @@ async function connect(name: string, onEvent: (e: any) => void = () => {}): Prom
 // -p teardown: mirrors Claude Code's headless grace-kill. Any bg tasks still running when the
 // turn completes get a grace period (NORMA_BG_PRINT_WAIT_MS, default 5000ms; 0 = poll until none
 // are running rather than racing a fixed timer) before we force-kill whatever remains.
-async function endHeadlessTurn(c: NormaClient, sessionId: string, exitCode: number): Promise<void> {
+async function endHeadlessTurn(c: NormaClient, sessionId: string, wdTimer: ReturnType<typeof setInterval> | undefined, exitCode: number): Promise<void> {
+  if (wdTimer) clearInterval(wdTimer); // normal completion — stop watching for a stall that didn't happen
   const running = (await c.bgList(sessionId)).filter((t) => t.status === "running");
   if (running.length) {
     const waitMs = Number(process.env.NORMA_BG_PRINT_WAIT_MS ?? 5000);
@@ -93,8 +95,11 @@ async function runHeadlessAgent(): Promise<void> {
   const auto = process.argv.includes("--auto");
   const pending: string[] = []; // callIds awaiting a y/n on stdin, oldest first
   let sessionId = ""; // set below, before send() — turn_completed can only fire after that
+  const wd: WatchdogState = { turnRunning: false, toolsInFlight: 0, approvalsPending: 0, lastEventAt: Date.now() };
+  let wdTimer: ReturnType<typeof setInterval> | undefined; // started once the turn is sent; cleared on completion/stall
 
   const c = await connect("cli-p", (e) => {
+    applyEvent(wd, e, Date.now());
     if (e.type === "assistant_message") console.log(`${AQUA}${e.text}${RESET}`);
     else if (e.type === "tool_call") console.log(`${DIM}⚙ ${e.name} ${e.argsJson.slice(0, 120)}${RESET}`);
     else if (e.type === "tool_result") console.log(`${DIM}  ↳ ${e.isError ? "ERROR: " : ""}${e.output.split("\n")[0]?.slice(0, 120) ?? ""}${RESET}`);
@@ -108,7 +113,7 @@ async function runHeadlessAgent(): Promise<void> {
     else if (e.type === "agent_error") {
       console.error(`agent error: ${e.message}`);
     } else if (e.type === "turn_completed") {
-      void endHeadlessTurn(c, sessionId, e.stopReason === "end_turn" ? 0 : 1);
+      void endHeadlessTurn(c, sessionId, wdTimer, e.stopReason === "end_turn" ? 0 : 1);
     }
   });
 
@@ -131,6 +136,21 @@ async function runHeadlessAgent(): Promise<void> {
   }
 
   await c.send(sessionId, prompt);
+
+  // Stall watchdog: if the turn is running with nothing in flight (no tool executing, no
+  // approval awaiting a human) and no event has landed for thresholdMs, assume the agent/turn
+  // is wedged and abort rather than hang forever. Polled on a 5s tick against the pure
+  // isStalled() check — see watchdog.ts for the (deterministically tested) logic.
+  const thresholdMs = Number(process.env.NORMA_TURN_STALL_MS ?? 180000);
+  wdTimer = setInterval(() => {
+    if (isStalled(wd, Date.now(), thresholdMs)) {
+      clearInterval(wdTimer);
+      console.error(`\n[stalled: no progress for ${Math.round((Date.now() - wd.lastEventAt) / 1000)}s — aborting]`);
+      void c.interrupt(sessionId).finally(() => process.exit(2));
+    }
+  }, 5000);
+  wdTimer.unref?.(); // don't let the poll tick keep the process alive after normal completion
+
   await new Promise(() => {}); // exits via the turn_completed branch of onEvent above
 }
 
