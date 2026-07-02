@@ -17,12 +17,18 @@ export function registerBashTool(r: ToolRegistry): void {
       command: z.string().min(1),
       timeoutMs: z.number().int().positive().max(MAX_TIMEOUT_MS).optional(),
     }),
-    async run({ command, timeoutMs }, { cwd }) {
+    async run({ command, timeoutMs }, { cwd, roots, tmpDir }) {
       if (!sandboxAvailable()) {
         throw new Error("bash is unavailable: macOS sandbox-exec not found on this host");
       }
       const realCwd = realpathSync(cwd);
-      const profile = buildSeatbeltProfile({ cwd: realCwd, writableRoots: [], allowNetwork: false });
+      const scratch = tmpDir ?? realCwd; // engine always supplies a session tmp; fall back to cwd
+      const writable = [...new Set([realCwd, ...roots.map((r) => realpathSync(r)), scratch])];
+      const profile = buildSeatbeltProfile({
+        cwd: realCwd,
+        writableRoots: writable.filter((r) => r !== realCwd),
+        allowNetwork: false,
+      });
       const timeout = timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
       return await new Promise<string>((resolve) => {
@@ -30,6 +36,7 @@ export function registerBashTool(r: ToolRegistry): void {
           cwd: realCwd,
           stdio: ["ignore", "pipe", "pipe"],
           detached: true,
+          env: { ...process.env, TMPDIR: scratch },
         });
 
         let buf = "";

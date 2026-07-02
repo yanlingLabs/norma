@@ -66,4 +66,23 @@ d("bash tool (sandboxed)", () => {
     await new Promise((r) => setTimeout(r, 300));
     expect(existsSync(join(cwd, "survived.txt"))).toBe(false);
   });
+
+  test("bash can write to $TMPDIR (session temp) but not system /tmp", async () => {
+    const cwd = proj();
+    const res = await reg().execute("bash", { command: 'echo scratch > "$TMPDIR/probe.txt" && cat "$TMPDIR/probe.txt"' }, { cwd, roots: [cwd] });
+    expect(res.isError).toBe(false);
+    expect(res.output).toContain("scratch");
+    expect(res.output).toContain("[exit 0]");
+    const outside = await reg().execute("bash", { command: "echo x > /tmp/norma-should-fail.txt", timeoutMs: 5000 }, { cwd, roots: [cwd] });
+    expect(existsSync("/tmp/norma-should-fail.txt")).toBe(false);
+    expect(outside.output).not.toContain("[exit 0]");
+  });
+
+  test("bash can write to an extra allowed root", async () => {
+    const cwd = proj();
+    const extra = realpathSync(mkdtempSync(join(tmpdir(), "norma-bash-extra-")));
+    const res = await reg().execute("bash", { command: `echo hi > ${extra}/in-extra.txt` }, { cwd, roots: [cwd, extra] });
+    expect(res.isError).toBe(false);
+    expect(existsSync(join(extra, "in-extra.txt"))).toBe(true);
+  });
 });

@@ -4,6 +4,7 @@ import type { ToolSpec } from "../../providers/types";
 export interface ToolContext {
   cwd: string;
   roots: string[]; // allowed roots; roots[0] MUST be the primary cwd — relative tool paths resolve against it
+  tmpDir?: string; // per-session scratch dir (sandbox writable root + child TMPDIR); bash uses it, other tools ignore
 }
 export interface ToolOutcome { output: string; isError: boolean }
 
