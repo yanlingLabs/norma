@@ -19,3 +19,4 @@ export { PermissionGate, type GateDecision, type SessionApprovalPolicy } from ".
 export { ApprovalBroker, type ApprovalOutcome } from "./agent/approvals";
 export { SessionDirectories } from "./agent/dirs";
 export { sessionTmpDir } from "./agent/session-tmp";
+export { TrustStore } from "./agent/trust";
