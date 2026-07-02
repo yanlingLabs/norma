@@ -59,4 +59,19 @@ describe("request_directory", () => {
     const res = await r.execute("request_directory", { path: target }, ctx);
     expect(res.isError).toBe(true);
   });
+
+  test("persist:true with no project dir — adds to live roots, emits persisted:false, does not throw, does not persist", async () => {
+    const { r, broker, dirs, events, ctx } = setup(null); // no project dir
+    const target = realpathSync(mkdtempSync(join(tmpdir(), "norma-rd-noproj-")));
+    const p = r.execute("request_directory", { path: target, persist: true }, ctx);
+    await new Promise((res) => setTimeout(res, 20));
+    const ask = events.find((e) => e.type === "approval_requested");
+    broker.resolve("s1", ask.callId, true, "user");
+    const res = await p;
+    expect(res.isError).toBe(false); // did not throw
+    expect(dirs.has("s1", target)).toBe(true); // added to LIVE roots
+    const da = events.find((e) => e.type === "directory_added");
+    expect(da).toBeTruthy();
+    expect(da.persisted).toBe(false); // NOT persisted (no project dir)
+  });
 });
