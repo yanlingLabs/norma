@@ -2,6 +2,7 @@ import {
   LineDecoder, encodeLine, METHODS, PROTOCOL_VERSION, SessionEvent,
   SessionCreateResult, SessionAttachResult, SessionSendResult, SessionListResult,
   SessionAddDirResult, SessionSetCwdResult, TrustDirResult,
+  BgListResult, BgPeekResult, BgKillResult, BgKillAllResult,
   ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 
@@ -108,6 +109,18 @@ export class NormaClient {
   }
   async setCwd(sessionId: string, cwd: string): Promise<string> {
     return this.validated(SessionSetCwdResult, await this.request(METHODS.sessionSetCwd, { sessionId, cwd }), METHODS.sessionSetCwd).cwd;
+  }
+  async bgList(sessionId: string): Promise<Array<{ taskId: string; command: string; status: string; exitCode: number | null; startedAt: number }>> {
+    return this.validated(BgListResult, await this.request(METHODS.bgList, { sessionId }), METHODS.bgList).tasks;
+  }
+  async bgPeek(sessionId: string, taskId: string): Promise<{ chunk: string; status: string; exitCode: number | null }> {
+    return this.validated(BgPeekResult, await this.request(METHODS.bgPeek, { sessionId, taskId }), METHODS.bgPeek);
+  }
+  async bgKill(sessionId: string, taskId: string): Promise<{ ok: true }> {
+    return this.validated(BgKillResult, await this.request(METHODS.bgKill, { sessionId, taskId }), METHODS.bgKill);
+  }
+  async bgKillAll(sessionId: string): Promise<{ ok: true; killed: number }> {
+    return this.validated(BgKillAllResult, await this.request(METHODS.bgKillAll, { sessionId }), METHODS.bgKillAll);
   }
   close(): void { this.socket.end(); }
 }

@@ -65,6 +65,17 @@ describe("NormaClient", () => {
     expect(second.trusted).toBe(true);
     client.close();
   });
+
+  test("bg client methods round-trip", async () => {
+    if (process.platform !== "darwin") { return; }
+    await boot();
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "bg", onEvent: () => {} });
+    const { sessionId } = await client.createSession("global", { cwd: mkdtempSync(join(tmpdir(), "norma-cli-bg-")), approvalPolicy: "auto" });
+    // no tasks yet:
+    expect((await client.bgList(sessionId)).length).toBe(0);
+    expect((await client.bgKillAll(sessionId)).killed).toBe(0);
+    client.close();
+  });
 });
 
 describe("NormaClient against a hostile/fake server", () => {

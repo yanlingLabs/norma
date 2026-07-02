@@ -62,6 +62,26 @@ async function connect(name: string, onEvent: (e: any) => void = () => {}): Prom
   return NormaClient.connect({ socketPath: socketPath(), token: await getToken(), clientName: name, onEvent });
 }
 
+// -p teardown: mirrors Claude Code's headless grace-kill. Any bg tasks still running when the
+// turn completes get a grace period (NORMA_BG_PRINT_WAIT_MS, default 5000ms; 0 = poll until none
+// are running rather than racing a fixed timer) before we force-kill whatever remains.
+async function endHeadlessTurn(c: NormaClient, sessionId: string, exitCode: number): Promise<void> {
+  const running = (await c.bgList(sessionId)).filter((t) => t.status === "running");
+  if (running.length) {
+    const waitMs = Number(process.env.NORMA_BG_PRINT_WAIT_MS ?? 5000);
+    if (waitMs > 0) {
+      await new Promise((r) => setTimeout(r, waitMs));
+    } else {
+      while ((await c.bgList(sessionId)).some((t) => t.status === "running")) {
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    }
+    await c.bgKillAll(sessionId);
+  }
+  c.close();
+  process.exit(exitCode);
+}
+
 // Headless agent mode: `norma -p "<prompt>" [--auto]`. Streams the turn to stdout and,
 // under the default "ask" approval policy, prompts on stdin for each tool approval.
 async function runHeadlessAgent(): Promise<void> {
@@ -72,6 +92,7 @@ async function runHeadlessAgent(): Promise<void> {
   }
   const auto = process.argv.includes("--auto");
   const pending: string[] = []; // callIds awaiting a y/n on stdin, oldest first
+  let sessionId = ""; // set below, before send() — turn_completed can only fire after that
 
   const c = await connect("cli-p", (e) => {
     if (e.type === "assistant_message") console.log(`${AQUA}${e.text}${RESET}`);
@@ -81,17 +102,20 @@ async function runHeadlessAgent(): Promise<void> {
       process.stdout.write(`approve ${e.toolName}? ${DIM}${e.summary}${RESET} [y/N] `);
       pending.push(e.callId);
     } else if (e.type === "directory_added") console.log(`${DIM}+ dir ${e.path}${e.persisted ? " (remembered)" : ""}${RESET}`);
+    else if (e.type === "bg_task_started") console.log(`${DIM}▶ bg ${e.taskId} started: ${e.command.slice(0, 80)}${RESET}`);
+    else if (e.type === "bg_task_output") process.stdout.write(`${DIM}${e.chunk}${RESET}`);
+    else if (e.type === "bg_task_exited") console.log(`${DIM}■ bg ${e.taskId} exited (${e.killed ? "killed" : "exit " + e.exitCode})${RESET}`);
     else if (e.type === "agent_error") {
       console.error(`agent error: ${e.message}`);
     } else if (e.type === "turn_completed") {
-      c.close();
-      process.exit(e.stopReason === "end_turn" ? 0 : 1);
+      void endHeadlessTurn(c, sessionId, e.stopReason === "end_turn" ? 0 : 1);
     }
   });
 
   const cwd = process.cwd();
-  const { sessionId, trusted } = await c.createSession("global", { cwd, approvalPolicy: auto ? "auto" : "ask" });
-  if (!trusted) {
+  const created = await c.createSession("global", { cwd, approvalPolicy: auto ? "auto" : "ask" });
+  sessionId = created.sessionId;
+  if (!created.trusted) {
     const wantTrust = process.argv.includes("--trust")
       || (process.stdout.isTTY && !process.argv.includes("--no-trust") && (await askYesNo(`Do you trust the files in ${cwd}? Norma may grant directory access declared there. [y/N] `)));
     if (wantTrust) { await c.trustDir(cwd); console.log(`${DIM}trusted ${cwd}${RESET}`); }
@@ -197,6 +221,34 @@ switch (cmdKey) {
     c.close();
     break;
   }
+  case "bg": {
+    const bgSub = process.argv[3];
+    const bgSessionId = process.argv[4];
+    const bgTaskId = process.argv[5];
+    if (!bgSessionId || (bgSub !== "list" && !bgTaskId)) {
+      console.error("usage: norma bg list <session> | bg peek <session> <taskId> | bg kill <session> <taskId>");
+      process.exit(1);
+    }
+    const c = await connect("cli-bg");
+    if (bgSub === "list") {
+      const tasks = await c.bgList(bgSessionId);
+      for (const t of tasks) console.log(`${AQUA}${t.taskId}${RESET} ${DIM}${t.status} · ${t.command.slice(0, 80)}${RESET}`);
+      if (tasks.length === 0) console.log(`${DIM}(no bg tasks)${RESET}`);
+    } else if (bgSub === "peek") {
+      const r = await c.bgPeek(bgSessionId, bgTaskId!);
+      console.log(`${AQUA}${r.status}${RESET} ${DIM}exit=${r.exitCode ?? "-"}${RESET}`);
+      if (r.chunk) process.stdout.write(r.chunk);
+    } else if (bgSub === "kill") {
+      await c.bgKill(bgSessionId, bgTaskId!);
+      console.log(`${AQUA}killed ${bgTaskId}${RESET}`);
+    } else {
+      console.error("usage: norma bg list <session> | bg peek <session> <taskId> | bg kill <session> <taskId>");
+      c.close();
+      process.exit(1);
+    }
+    c.close();
+    break;
+  }
   case "watch": {
     const sessionId = process.argv[3];
     if (!sessionId) { console.error("usage: norma watch <sessionId>"); process.exit(1); }
@@ -293,6 +345,7 @@ switch (cmdKey) {
   daemon run | daemon install | daemon uninstall | daemon status
   ping | sessions | send <sessionId|new> <text> | watch <sessionId> | add-dir <sessionId> <path> [--persist] | cd <sessionId> <path>
   trust <dir> [--list]
+  bg list <session> | bg peek <session> <taskId> | bg kill <session> <taskId>
   login [--api-key] | logout | provider | provider-smoke [--prompt <text>]
   -p "<prompt>" [--auto] [--trust|--no-trust]   headless agent turn (asks for tool approval unless --auto)`);
 }
