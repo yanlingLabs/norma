@@ -55,4 +55,25 @@ d("background tools", () => {
     const out = await r.execute("bash_output", { taskId: "bg_nope" }, ctx(cwd));
     expect(out.isError).toBe(true);
   });
+
+  test("bash_output/bash_kill on another session's task are errors (tool-layer session scoping)", async () => {
+    const { r, cwd } = setup();
+    const started = await r.execute("bash", { command: "sleep 5", runInBackground: true }, ctx(cwd)); // ctx = sessionId "s1"
+    const taskId = started.output.match(/bg_[0-9a-f]+/)![0];
+    const foreignCtx = { cwd, roots: [cwd], tmpDir: sessionTmpDir("s_bgt"), sessionId: "s2" };
+    expect((await r.execute("bash_output", { taskId }, foreignCtx)).isError).toBe(true);
+    expect((await r.execute("bash_kill", { taskId }, foreignCtx)).isError).toBe(true);
+    await r.execute("bash_kill", { taskId }, ctx(cwd)); // clean up as the real owner
+  });
+
+  test("bash_output filter keeps only matching lines", async () => {
+    const { r, cwd } = setup();
+    const started = await r.execute("bash", { command: "echo apple; echo banana; echo apricot; sleep 0.2", runInBackground: true }, ctx(cwd));
+    const taskId = started.output.match(/bg_[0-9a-f]+/)![0];
+    await sleep(500);
+    const out = await r.execute("bash_output", { taskId, filter: "^ap" }, ctx(cwd));
+    expect(out.output).toContain("apple");
+    expect(out.output).toContain("apricot");
+    expect(out.output).not.toContain("banana"); // filtered out
+  });
 });
