@@ -1,6 +1,7 @@
 import {
   LineDecoder, encodeLine, METHODS, PROTOCOL_VERSION, SessionEvent,
   SessionCreateResult, SessionAttachResult, SessionSendResult, SessionListResult,
+  SessionAddDirResult, SessionSetCwdResult,
   ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 
@@ -97,6 +98,12 @@ export class NormaClient {
   }
   async listSessions() {
     return this.validated(SessionListResult, await this.request(METHODS.sessionList), METHODS.sessionList);
+  }
+  async addDir(sessionId: string, path: string, persist = false): Promise<string[]> {
+    return this.validated(SessionAddDirResult, await this.request(METHODS.sessionAddDir, { sessionId, path, persist }), METHODS.sessionAddDir).roots;
+  }
+  async setCwd(sessionId: string, cwd: string): Promise<string> {
+    return this.validated(SessionSetCwdResult, await this.request(METHODS.sessionSetCwd, { sessionId, cwd }), METHODS.sessionSetCwd).cwd;
   }
   close(): void { this.socket.end(); }
 }

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startDaemon, FileSecretStore, type RunningDaemon } from "@norma/core";
@@ -38,6 +38,20 @@ describe("NormaClient", () => {
     await expect(NormaClient.connect({
       socketPath: daemon.socketPath, token: "wrong", clientName: "x", onEvent: () => {},
     })).rejects.toThrow(/invalid token/);
+  });
+
+  test("client can add a directory and receive directory_added", async () => {
+    await boot();
+    const events: any[] = [];
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "cli", onEvent: (e) => events.push(e) });
+    const sessionId = await client.createSession("global", { cwd: mkdtempSync(join(tmpdir(), "norma-cli-cwd-")) });
+    await client.attach(sessionId);
+    const extra = mkdtempSync(join(tmpdir(), "norma-cli-extra-"));
+    const roots = await client.addDir(sessionId, extra);
+    expect(roots).toContain(realpathSync(extra));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(events.some((e) => e.type === "directory_added")).toBe(true);
+    client.close();
   });
 });
 

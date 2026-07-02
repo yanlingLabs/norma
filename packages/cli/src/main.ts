@@ -64,7 +64,8 @@ async function runHeadlessAgent(): Promise<void> {
     else if (e.type === "approval_requested") {
       process.stdout.write(`approve ${e.toolName}? ${DIM}${e.summary}${RESET} [y/N] `);
       pending.push(e.callId);
-    } else if (e.type === "agent_error") {
+    } else if (e.type === "directory_added") console.log(`${DIM}+ dir ${e.path}${e.persisted ? " (remembered)" : ""}${RESET}`);
+    else if (e.type === "agent_error") {
       console.error(`agent error: ${e.message}`);
     } else if (e.type === "turn_completed") {
       c.close();
@@ -126,6 +127,26 @@ switch (cmdKey) {
     await c.attach(sessionId);
     await c.send(sessionId, text);
     console.log(`${AQUA}sent to ${sessionId}${RESET}`);
+    c.close();
+    break;
+  }
+  case "add-dir": {
+    const sessionId = process.argv[3];
+    const path = process.argv[4];
+    if (!sessionId || !path) { console.error("usage: norma add-dir <sessionId> <path> [--persist]"); process.exit(1); }
+    const c = await connect("cli-add-dir");
+    const roots = await c.addDir(sessionId, path, process.argv.includes("--persist"));
+    console.log(`${AQUA}+ dir ${path} → ${roots.length} roots${RESET}`);
+    c.close();
+    break;
+  }
+  case "cd": {
+    const sessionId = process.argv[3];
+    const cwd = process.argv[4];
+    if (!sessionId || !cwd) { console.error("usage: norma cd <sessionId> <path>"); process.exit(1); }
+    const c = await connect("cli-cd");
+    const newCwd = await c.setCwd(sessionId, cwd);
+    console.log(`${AQUA}cwd → ${newCwd}${RESET}`);
     c.close();
     break;
   }
@@ -223,7 +244,7 @@ switch (cmdKey) {
   default:
     console.log(`norma (Phase 1b-i) — commands:
   daemon run | daemon install | daemon uninstall | daemon status
-  ping | sessions | send <sessionId|new> <text> | watch <sessionId>
+  ping | sessions | send <sessionId|new> <text> | watch <sessionId> | add-dir <sessionId> <path> [--persist] | cd <sessionId> <path>
   login [--api-key] | logout | provider | provider-smoke [--prompt <text>]
   -p "<prompt>" [--auto]   headless agent turn (asks for tool approval unless --auto)`);
 }
