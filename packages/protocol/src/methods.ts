@@ -74,6 +74,16 @@ export const TrustDirResult = z.object({ ok: z.literal(true), trusted: z.literal
 /** Server → client notification: method "event", params = SessionEvent. */
 export const EventNotificationParams = SessionEvent;
 
+export const BgTaskSummary = z.object({ taskId: z.string(), command: z.string(), status: z.string(), exitCode: z.number().int().nullable(), startedAt: z.number() });
+export const BgListParams = z.object({ sessionId: z.string() });
+export const BgListResult = z.object({ tasks: z.array(BgTaskSummary) });
+export const BgPeekParams = z.object({ sessionId: z.string(), taskId: z.string().min(1) });
+export const BgPeekResult = z.object({ chunk: z.string(), status: z.string(), exitCode: z.number().int().nullable() });
+export const BgKillParams = z.object({ sessionId: z.string(), taskId: z.string().min(1) });
+export const BgKillResult = z.object({ ok: z.literal(true) });
+export const BgKillAllParams = z.object({ sessionId: z.string() });
+export const BgKillAllResult = z.object({ ok: z.literal(true), killed: z.number().int().nonnegative() });
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -85,4 +95,8 @@ export const METHODS = {
   sessionSetCwd: "session.setCwd",
   trustDir: "daemon.trustDir",
   event: "event",
+  bgList: "bg.list",
+  bgPeek: "bg.peek",
+  bgKill: "bg.kill",
+  bgKillAll: "bg.killAll",
 } as const;

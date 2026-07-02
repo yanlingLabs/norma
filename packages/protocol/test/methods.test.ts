@@ -11,6 +11,11 @@ import {
   SessionSetCwdParams,
   TrustDirParams,
   TrustDirResult,
+  BgListParams,
+  BgPeekParams,
+  BgKillParams,
+  BgKillAllParams,
+  BgListResult,
   METHODS,
 } from "../src/methods";
 
@@ -113,5 +118,16 @@ describe("cwd '/' rejection", () => {
     expect(() => SessionCreateParams.parse({ scope: "global", cwd: "/" })).toThrow();
     expect(() => SessionSetCwdParams.parse({ sessionId: "s1", cwd: "/" })).toThrow();
     expect(SessionCreateParams.parse({ scope: "global", cwd: "/Users/x" }).cwd).toBe("/Users/x");
+  });
+});
+
+describe("bg.* method schemas", () => {
+  test("bg.* method schemas", () => {
+    expect(BgListParams.parse({ sessionId: "s1" }).sessionId).toBe("s1");
+    expect(BgPeekParams.parse({ sessionId: "s1", taskId: "bg_a" }).taskId).toBe("bg_a");
+    expect(BgKillParams.parse({ sessionId: "s1", taskId: "bg_a" }).taskId).toBe("bg_a");
+    expect(BgKillAllParams.parse({ sessionId: "s1" }).sessionId).toBe("s1");
+    expect(BgListResult.parse({ tasks: [{ taskId: "bg_a", command: "sleep 5", status: "running", exitCode: null, startedAt: 1 }] }).tasks).toHaveLength(1);
+    expect([METHODS.bgList, METHODS.bgPeek, METHODS.bgKill, METHODS.bgKillAll]).toEqual(["bg.list", "bg.peek", "bg.kill", "bg.killAll"]);
   });
 });
