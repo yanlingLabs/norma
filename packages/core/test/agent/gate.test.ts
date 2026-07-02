@@ -34,4 +34,13 @@ describe("PermissionGate v1", () => {
     expect(gate.evaluate("bash", "ask")).toBe("ask");
     expect(gate.evaluate("bash", "auto")).toBe("allow");
   });
+
+  test("bash_output is read-only: always allowed", () => {
+    expect(gate.evaluate("bash_output", "ask")).toBe("allow");
+  });
+
+  test("bash_kill is mutating: ask under ask-policy, allow under auto-policy", () => {
+    expect(gate.evaluate("bash_kill", "ask")).toBe("ask");
+    expect(gate.evaluate("bash_kill", "auto")).toBe("allow");
+  });
 });

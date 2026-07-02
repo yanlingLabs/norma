@@ -3,21 +3,27 @@ import { realpathSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { buildSeatbeltProfile, sandboxAvailable } from "../sandbox";
 import type { ToolRegistry } from "./registry";
+import type { BackgroundTaskRegistry } from "../bg-registry";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 600_000;
 const DEPRECATION_RE = /^sandbox-exec: .*deprecated.*$/gim;
 const MAX_CAPTURE = 256 * 1024; // hard bound before the registry's own 64KB cap; prevents OOM on chatty long runs
 
-export function registerBashTool(r: ToolRegistry): void {
+export function registerBashTool(r: ToolRegistry, deps: { bgRegistry?: BackgroundTaskRegistry } = {}): void {
   r.register({
     name: "bash",
-    description: "Run a shell command in the session directory. Confined by a macOS sandbox: writes are limited to the session directory and network is disabled. Combined stdout+stderr is returned with the exit code. Note: bare mktemp may fail under the sandbox (macOS ignores $TMPDIR); use $TMPDIR explicitly, e.g. mktemp \"$TMPDIR/XXXXXX\".",
+    description: "Run a shell command in the session directory. Confined by a macOS sandbox: writes are limited to the session directory and network is disabled. Combined stdout+stderr is returned with the exit code. Note: bare mktemp may fail under the sandbox (macOS ignores $TMPDIR); use $TMPDIR explicitly, e.g. mktemp \"$TMPDIR/XXXXXX\". Set runInBackground: true to launch long-running commands without blocking; poll output with bash_output and stop them with bash_kill.",
     args: z.object({
       command: z.string().min(1),
       timeoutMs: z.number().int().positive().max(MAX_TIMEOUT_MS).optional(),
+      runInBackground: z.boolean().optional(),
     }),
-    async run({ command, timeoutMs }, { cwd, roots, tmpDir }) {
+    async run({ command, timeoutMs, runInBackground }, { cwd, roots, tmpDir, sessionId }) {
+      if (runInBackground) {
+        if (!deps.bgRegistry) throw new Error("background tasks are not available in this context");
+        return `background task ${deps.bgRegistry.start(sessionId, command)} started`;
+      }
       if (!sandboxAvailable()) {
         throw new Error("bash is unavailable: macOS sandbox-exec not found on this host");
       }

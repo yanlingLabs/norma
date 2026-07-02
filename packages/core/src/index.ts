@@ -13,6 +13,7 @@ export { ToolRegistry, type ToolDefinition, type ToolContext, type ToolOutcome }
 export { registerReadTools } from "./agent/tools/fs-read";
 export { registerWriteTools } from "./agent/tools/fs-write";
 export { registerBashTool } from "./agent/tools/bash";
+export { registerBackgroundTools } from "./agent/tools/background";
 export { registerRequestDirTool, type RequestDirDeps } from "./agent/tools/request-dir";
 export { buildSeatbeltProfile, sandboxAvailable } from "./agent/sandbox";
 export { PermissionGate, type GateDecision, type SessionApprovalPolicy } from "./agent/gate";

@@ -1,8 +1,8 @@
 export type GateDecision = "allow" | "ask";
 export type SessionApprovalPolicy = "ask" | "auto";
 
-const READ_ONLY = new Set(["read", "glob", "grep"]);
-const MUTATING = new Set(["write", "edit", "bash"]);
+const READ_ONLY = new Set(["read", "glob", "grep", "bash_output"]);
+const MUTATING = new Set(["write", "edit", "bash", "bash_kill"]);
 const SELF_GATING = new Set(["request_directory"]);
 
 /**
