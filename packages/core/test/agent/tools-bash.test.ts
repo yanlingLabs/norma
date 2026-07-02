@@ -14,7 +14,8 @@ const d = darwin ? describe : describe.skip;
 
 d("bash tool (sandboxed)", () => {
   test("runs a command and reports stdout + exit 0", async () => {
-    const res = await reg().execute("bash", { command: "echo hello-norma" }, { cwd: proj() });
+    const cwd = proj();
+    const res = await reg().execute("bash", { command: "echo hello-norma" }, { cwd, roots: [cwd] });
     expect(res.isError).toBe(false);
     expect(res.output).toContain("hello-norma");
     expect(res.output).toContain("[exit 0]");
@@ -22,7 +23,7 @@ d("bash tool (sandboxed)", () => {
 
   test("can write inside the session cwd", async () => {
     const cwd = proj();
-    const res = await reg().execute("bash", { command: "echo in-cwd > made.txt && cat made.txt" }, { cwd });
+    const res = await reg().execute("bash", { command: "echo in-cwd > made.txt && cat made.txt" }, { cwd, roots: [cwd] });
     expect(res.isError).toBe(false);
     expect(existsSync(join(cwd, "made.txt"))).toBe(true);
     expect(res.output).toContain("in-cwd");
@@ -32,19 +33,21 @@ d("bash tool (sandboxed)", () => {
     const cwd = proj();
     const sibling = proj(); // a different temp dir, not a writable root of `cwd`'s sandbox
     const target = join(sibling, "escaped.txt");
-    const res = await reg().execute("bash", { command: `echo pwned > ${target}` }, { cwd });
+    const res = await reg().execute("bash", { command: `echo pwned > ${target}` }, { cwd, roots: [cwd] });
     // command runs but the write is denied → nonzero exit, file absent
     expect(existsSync(target)).toBe(false);
     expect(res.output).not.toContain("[exit 0]");
   });
 
   test("kills a command that exceeds the timeout", async () => {
-    const res = await reg().execute("bash", { command: "sleep 5", timeoutMs: 300 }, { cwd: proj() });
+    const cwd = proj();
+    const res = await reg().execute("bash", { command: "sleep 5", timeoutMs: 300 }, { cwd, roots: [cwd] });
     expect(res.output).toMatch(/timed out/);
   });
 
   test("bad args are a tool error, not a throw", async () => {
-    const res = await reg().execute("bash", { command: "" }, { cwd: proj() });
+    const cwd = proj();
+    const res = await reg().execute("bash", { command: "" }, { cwd, roots: [cwd] });
     expect(res.isError).toBe(true);
   });
 
@@ -54,7 +57,7 @@ d("bash tool (sandboxed)", () => {
     const res = await reg().execute(
       "bash",
       { command: "(sleep 30 && touch survived.txt) & echo backgrounded", timeoutMs: 400 },
-      { cwd },
+      { cwd, roots: [cwd] },
     );
     const elapsed = Date.now() - started;
     expect(elapsed).toBeLessThan(4000); // MUST NOT block for the child's 30s lifetime

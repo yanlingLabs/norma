@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { ToolSpec } from "../../providers/types";
 
-export interface ToolContext { cwd: string }
+export interface ToolContext { cwd: string; roots: string[] }
 export interface ToolOutcome { output: string; isError: boolean }
 
 export interface ToolDefinition<S extends z.ZodTypeAny = z.ZodTypeAny> {

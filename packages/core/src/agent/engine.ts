@@ -147,6 +147,7 @@ export class AgentEngine {
     let args: unknown;
     try { args = call.argsJson.length ? JSON.parse(call.argsJson) : {}; }
     catch { return Promise.resolve({ output: `tool arguments were not valid JSON`, isError: true }); }
-    return this.cfg.registry.execute(call.name, args, { cwd });
+    // TODO(phase-1b-ii-b T11): replace with the session's real allowed-roots set.
+    return this.cfg.registry.execute(call.name, args, { cwd, roots: [cwd] });
   }
 }
