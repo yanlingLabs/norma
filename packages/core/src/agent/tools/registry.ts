@@ -1,7 +1,10 @@
 import { z } from "zod";
 import type { ToolSpec } from "../../providers/types";
 
-export interface ToolContext { cwd: string; roots: string[] }
+export interface ToolContext {
+  cwd: string;
+  roots: string[]; // allowed roots; roots[0] MUST be the primary cwd — relative tool paths resolve against it
+}
 export interface ToolOutcome { output: string; isError: boolean }
 
 export interface ToolDefinition<S extends z.ZodTypeAny = z.ZodTypeAny> {

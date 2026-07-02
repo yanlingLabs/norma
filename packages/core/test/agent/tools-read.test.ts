@@ -125,4 +125,19 @@ describe("read tools", () => {
     writeFileSync(join(outside, "secret.txt"), "x");
     expect((await r.execute("read", { path: join(outside, "secret.txt") }, ctx)).isError).toBe(true);
   });
+
+  test("glob does not leak OS paths from an absolute recursive pattern outside roots", async () => {
+    const d = proj();
+    const r = makeRegistry(d);
+    const res = await r.execute("glob", { pattern: "/etc/**", budgetMs: 1500 }, { cwd: d, roots: [d] });
+    expect(res.output).not.toContain("/etc/"); // no out-of-root OS path leaks (match or error)
+    // and it does not hang: (the await returning is itself the proof)
+  });
+
+  test("grep does not leak OS error paths from an absolute recursive glob outside roots", async () => {
+    const d = proj();
+    const r = makeRegistry(d);
+    const res = await r.execute("grep", { pattern: ".", glob: "/etc/**", budgetMs: 1500 }, { cwd: d, roots: [d] });
+    expect(res.output).not.toMatch(/\/etc\//);
+  });
 });
