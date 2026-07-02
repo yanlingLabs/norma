@@ -49,6 +49,23 @@ describe("loadSettings", () => {
     loadSettings(p);
     expect(JSON.parse(readFileSync(p, "utf8")).custom).toBe(true);
   });
+
+  test("v1→v2 migration preserves a permissions block in the parsed result", () => {
+    const p = tmpSettings({ schemaVersion: 1, permissions: { additionalDirectories: ["~/kept", "/opt/kept"] } });
+    const s = loadSettings(p);
+    expect(s.schemaVersion).toBe(2);
+    expect(s.permissions?.additionalDirectories).toEqual(["~/kept", "/opt/kept"]);
+    // and on disk:
+    const onDisk = JSON.parse(require("node:fs").readFileSync(p, "utf8"));
+    expect(onDisk.permissions.additionalDirectories).toEqual(["~/kept", "/opt/kept"]);
+  });
+
+  test("legacy no-schemaVersion file with permissions migrates and keeps them", () => {
+    const p = tmpSettings({ webSearch: { provider: "disabled" }, permissions: { additionalDirectories: ["/opt/x"] } });
+    const s = loadSettings(p);
+    expect(s.schemaVersion).toBe(2);
+    expect(s.permissions?.additionalDirectories).toEqual(["/opt/x"]);
+  });
 });
 
 describe("permission directories", () => {
