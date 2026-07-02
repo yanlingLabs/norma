@@ -11,6 +11,7 @@ import type { Provider } from "./providers/types";
 import { ToolRegistry } from "./agent/tools/registry";
 import { registerReadTools } from "./agent/tools/fs-read";
 import { registerWriteTools } from "./agent/tools/fs-write";
+import { registerBashTool } from "./agent/tools/bash";
 import { PermissionGate } from "./agent/gate";
 import { ApprovalBroker } from "./agent/approvals";
 import { AgentEngine } from "./agent/engine";
@@ -59,6 +60,7 @@ export async function startDaemon(opts: {
     const registry = new ToolRegistry();
     registerReadTools(registry);
     registerWriteTools(registry);
+    registerBashTool(registry);
     broker = new ApprovalBroker();
     engine = new AgentEngine({
       store, hub, registry, broker,

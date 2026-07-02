@@ -2,7 +2,7 @@ export type GateDecision = "allow" | "ask";
 export type SessionApprovalPolicy = "ask" | "auto";
 
 const READ_ONLY = new Set(["read", "glob", "grep"]);
-const MUTATING = new Set(["write", "edit"]);
+const MUTATING = new Set(["write", "edit", "bash"]);
 
 /**
  * v1 policy matrix (spec §4.10 arrives fully in 1b-ii with the AI reviewer):

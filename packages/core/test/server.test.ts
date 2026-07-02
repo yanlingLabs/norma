@@ -324,6 +324,26 @@ describe("daemon IPC", () => {
     c.close();
   });
 
+  test("bash tool runs end-to-end through a daemon-wired engine (auto policy)", async () => {
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const { existsSync } = await import("node:fs");
+    if (process.platform !== "darwin") return; // sandbox-exec required
+    const fake = new FakeProvider([
+      [{ type: "tool_call", callId: "b1", name: "bash", argsJson: JSON.stringify({ command: "echo hi > out.txt" }) }, { type: "done", stopReason: "tool_calls" }],
+      [{ type: "text_delta", delta: "done" }, { type: "done", stopReason: "end_turn" }],
+    ]);
+    await boot({}, fake);
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "bash-runner");
+    const cwd = mkdtempSync(join(tmpdir(), "norma-bashwire-"));
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", cwd, approvalPolicy: "auto" });
+    await c.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
+    await c.request(METHODS.sessionSend, { sessionId: created.sessionId, text: "make out.txt" });
+    await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "turn_completed");
+    expect(existsSync(join(cwd, "out.txt"))).toBe(true);
+    c.close();
+  });
+
   test("startIpcServer refuses an engine without a shared hub", () => {
     // Build a throwaway engine; we only need the constructor guard to fire.
     expect(() => {

@@ -21,4 +21,10 @@ describe("PermissionGate v1", () => {
   test("unknown tools always ask (fail-closed toward the human)", () => {
     expect(gate.evaluate("mystery", "auto")).toBe("ask");
   });
+
+  test("bash is a mutating tool: ask under ask-policy, allow under auto", () => {
+    const gate = new PermissionGate();
+    expect(gate.evaluate("bash", "ask")).toBe("ask");
+    expect(gate.evaluate("bash", "auto")).toBe("allow");
+  });
 });
