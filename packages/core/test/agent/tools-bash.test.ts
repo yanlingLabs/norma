@@ -94,9 +94,9 @@ d("bash tool (sandboxed)", () => {
     }, { cwd, roots: [cwd] });
     expect(res.output).toContain("COMMIT_OK");
     expect(res.output).toContain("[exit 0]");
-    // the regression: no spurious sandbox-denial noise from xcrun/dirhelper:
-    expect(res.output).not.toMatch(/Operation not permitted/);
-    expect(res.output).not.toMatch(/errno=/);
-    expect(res.output).not.toMatch(/confstr\(\) failed/);
+    // these DVT/confstr(3) lines appear iff com.apple.bsd.dirhelper is missing from the sandbox mach allowlist — real regression guard
+    expect(res.output).not.toMatch(/DVT/);
+    expect(res.output).not.toMatch(/from confstr\(3\)/);
+    expect(res.output).not.toMatch(/Failed to start fs event stream/);
   });
 });
