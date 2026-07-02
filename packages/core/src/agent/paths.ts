@@ -1,22 +1,31 @@
 import { realpathSync } from "node:fs";
 import { isAbsolute, resolve, sep, dirname } from "node:path";
 
-/**
- * Resolve `p` (relative or absolute) and verify it stays within `root`.
- * Symlink-hardened for existing paths; for not-yet-existing paths the nearest
- * existing ancestor is realpathed. Throws on escape.
- */
-export function resolveWithin(root: string, p: string): string {
-  const rootReal = realpathSync(root);
-  const target = isAbsolute(p) ? resolve(p) : resolve(rootReal, p);
-  // realpath the deepest existing ancestor to defeat symlink escapes
+function canonAncestor(target: string): string {
   let probe = target;
   while (true) {
-    try { probe = realpathSync(probe); break; }
-    catch { const parent = dirname(probe); if (parent === probe) break; probe = parent; }
+    try { return realpathSync(probe); }
+    catch { const parent = dirname(probe); if (parent === probe) return probe; probe = parent; }
   }
-  if (probe !== rootReal && !probe.startsWith(rootReal + sep)) {
-    throw new Error(`path is outside the session directory: ${p}`);
+}
+
+/**
+ * Resolve `p` (relative → roots[0]) and verify it stays within ANY root.
+ * Symlink-hardened: the deepest existing ancestor is realpathed before the
+ * containment check. Throws on escape.
+ */
+export function resolveWithinAny(roots: string[], p: string): string {
+  if (roots.length === 0) throw new Error("no allowed directories configured");
+  const reals = roots.map((r) => realpathSync(r));
+  const target = isAbsolute(p) ? resolve(p) : resolve(reals[0]!, p);
+  const probe = canonAncestor(target);
+  for (const root of reals) {
+    if (probe === root || probe.startsWith(root + sep)) return target;
   }
-  return target;
+  throw new Error(`path is outside the allowed directories: ${p}`);
+}
+
+/** Single-root convenience wrapper (unchanged behavior for existing callers). */
+export function resolveWithin(root: string, p: string): string {
+  return resolveWithinAny([root], p);
 }
