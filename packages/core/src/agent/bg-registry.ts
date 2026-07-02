@@ -26,9 +26,20 @@ export class BackgroundTaskRegistry {
   private tasks = new Map<string, Task>();
   private readonly killGraceMs: number;
   private readonly ringCap: number;
+  // Set by killAll() (whole-daemon shutdown only — never by killAllForSession). Child processes
+  // report their exit asynchronously, often after the caller (daemon.stop()) has already closed
+  // the SessionStore; emitting into a torn-down hub at that point would throw "closed database"
+  // from an unrelated event-loop tick. Once shutting down, nobody is listening anyway, so drop
+  // further events instead of forwarding them.
+  private stopped = false;
   constructor(private readonly deps: BgDeps) {
     this.killGraceMs = deps.killGraceMs ?? 2000;
     this.ringCap = deps.ringCap ?? RING_CAP;
+  }
+
+  private emit(sessionId: string, event: NewSessionEvent): void {
+    if (this.stopped) return;
+    this.deps.emit(sessionId, event);
   }
 
   private own(sessionId: string, taskId: string): Task {
@@ -54,7 +65,7 @@ export class BackgroundTaskRegistry {
     });
     const taskId = `bg_${randomBytes(6).toString("hex")}`;
     const coalescer = new OutputCoalescer((chunk) =>
-      this.deps.emit(sessionId, { type: "bg_task_output", sessionId, threadId: "main", taskId, chunk }));
+      this.emit(sessionId, { type: "bg_task_output", sessionId, threadId: "main", taskId, chunk }));
     const task: Task = { taskId, sessionId, command, child, status: "running", exitCode: null, ring: "", cursor: 0, ringDropped: false, dropNoted: false, startedAt: Date.now(), coalescer };
     this.tasks.set(taskId, task);
 
@@ -76,12 +87,12 @@ export class BackgroundTaskRegistry {
       task.coalescer.dispose();
       if (task.status !== "killed") task.status = "exited";
       task.exitCode = code;
-      this.deps.emit(sessionId, { type: "bg_task_exited", sessionId, threadId: "main", taskId, exitCode: code, killed: task.status === "killed" });
+      this.emit(sessionId, { type: "bg_task_exited", sessionId, threadId: "main", taskId, exitCode: code, killed: task.status === "killed" });
     });
     child.on("error", () => { task.coalescer.dispose(); task.status = "exited"; task.exitCode = -1;
-      this.deps.emit(sessionId, { type: "bg_task_exited", sessionId, threadId: "main", taskId, exitCode: -1, killed: false }); });
+      this.emit(sessionId, { type: "bg_task_exited", sessionId, threadId: "main", taskId, exitCode: -1, killed: false }); });
 
-    this.deps.emit(sessionId, { type: "bg_task_started", sessionId, threadId: "main", taskId, command });
+    this.emit(sessionId, { type: "bg_task_started", sessionId, threadId: "main", taskId, command });
     return taskId;
   }
 
@@ -110,5 +121,8 @@ export class BackgroundTaskRegistry {
   killAllForSession(sessionId: string): void {
     for (const t of this.tasks.values()) if (t.sessionId === sessionId && t.status === "running") this.kill(sessionId, t.taskId);
   }
-  killAll(): void { for (const t of this.tasks.values()) if (t.status === "running") this.kill(t.sessionId, t.taskId); }
+  killAll(): void {
+    this.stopped = true;
+    for (const t of this.tasks.values()) if (t.status === "running") this.kill(t.sessionId, t.taskId);
+  }
 }

@@ -14,11 +14,14 @@ import { registerReadTools } from "./agent/tools/fs-read";
 import { registerWriteTools } from "./agent/tools/fs-write";
 import { registerBashTool } from "./agent/tools/bash";
 import { registerRequestDirTool } from "./agent/tools/request-dir";
+import { registerBackgroundTools } from "./agent/tools/background";
 import { PermissionGate } from "./agent/gate";
 import { ApprovalBroker } from "./agent/approvals";
 import { AgentEngine } from "./agent/engine";
 import { SessionDirectories } from "./agent/dirs";
 import { TrustStore } from "./agent/trust";
+import { BackgroundTaskRegistry } from "./agent/bg-registry";
+import { sessionTmpDir } from "./agent/session-tmp";
 
 export const CORE_VERSION = "0.0.1";
 
@@ -55,6 +58,17 @@ export async function startDaemon(opts: {
     return m.cwd ? [m.cwd, ...loadPermissionDirs(normaHome, m.cwd, trustStore.isTrusted(m.cwd))] : [];
   });
 
+  // Built unconditionally (needs only store/sessionDirs, no provider) so background tasks
+  // spawned before the agent is enabled (or during tests without a provider) still have a
+  // registry to land in; the bg.* IPC handlers work regardless of agentProvider.
+  const bgRegistry = new BackgroundTaskRegistry({
+    emit: (sid, e) => hub.append(sid, e),
+    spawnCtx: (sid) => {
+      const m = store.meta(sid);
+      return { cwd: m.cwd!, roots: sessionDirs.roots(sid), tmpDir: sessionTmpDir(sid) };
+    },
+  });
+
   let agentProvider = opts.agentProvider;
   if (agentProvider === undefined) {
     try {
@@ -73,7 +87,8 @@ export async function startDaemon(opts: {
     const registry = new ToolRegistry();
     registerReadTools(registry);
     registerWriteTools(registry);
-    registerBashTool(registry);
+    registerBashTool(registry, { bgRegistry });
+    registerBackgroundTools(registry, { bgRegistry });
     broker = new ApprovalBroker();
     registerRequestDirTool(registry, {
       broker,
@@ -99,6 +114,7 @@ export async function startDaemon(opts: {
     broker,
     dirs: sessionDirs,
     trust: trustStore,
+    bg: bgRegistry,
     ...opts.server,
   });
 
@@ -106,7 +122,7 @@ export async function startDaemon(opts: {
   return {
     socketPath: dirs.socketPath,
     tokens,
-    stop() { server.stop(); store.close(); lock.release(); },
+    stop() { server.stop(); bgRegistry.killAll(); store.close(); lock.release(); },
   };
 }
 

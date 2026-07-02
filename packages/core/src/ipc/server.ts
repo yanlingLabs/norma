@@ -4,6 +4,7 @@ import {
   ERR, METHODS, PROTOCOL_VERSION, LineDecoder, encodeLine, parseIncoming,
   HelloParams, SessionCreateParams, SessionAttachParams, SessionSendParams, ApprovalRespondParams,
   SessionAddDirParams, SessionSetCwdParams, TrustDirParams,
+  BgListParams, BgPeekParams, BgKillParams, BgKillAllParams,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
@@ -13,6 +14,7 @@ import type { AgentEngine } from "../agent/engine";
 import type { ApprovalBroker } from "../agent/approvals";
 import type { SessionDirectories } from "../agent/dirs";
 import type { TrustStore } from "../agent/trust";
+import type { BackgroundTaskRegistry } from "../agent/bg-registry";
 import { addLocalDir } from "../settings";
 
 interface ConnState {
@@ -34,6 +36,7 @@ export interface IpcServerOptions {
   broker?: ApprovalBroker | null;
   dirs?: SessionDirectories; // live allowed-roots per session; addDir/setCwd need it
   trust?: TrustStore;        // per-directory trust; session.create result + daemon.trustDir
+  bg?: BackgroundTaskRegistry; // background bash tasks; bg.list/peek/kill/killAll
   helloTimeoutMs?: number;   // default 5000
   maxConnections?: number;   // default 64
   preAuthMaxLine?: number;   // default 64 KiB
@@ -212,6 +215,35 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         const p = parseParams(TrustDirParams, params);
         opts.trust?.trust(p.path);
         return { ok: true, trusted: true };
+      }
+      case METHODS.bgList: {
+        const p = parseParams(BgListParams, params);
+        return { tasks: opts.bg?.list(p.sessionId) ?? [] };
+      }
+      case METHODS.bgPeek: {
+        const p = parseParams(BgPeekParams, params);
+        if (!opts.bg) throw new RpcFailure(ERR.NOT_FOUND, "background tasks unavailable");
+        try {
+          return opts.bg.read(p.sessionId, p.taskId);
+        } catch (e) {
+          throw new RpcFailure(ERR.NOT_FOUND, (e as Error).message);
+        }
+      }
+      case METHODS.bgKill: {
+        const p = parseParams(BgKillParams, params);
+        if (!opts.bg) throw new RpcFailure(ERR.NOT_FOUND, "background tasks unavailable");
+        try {
+          opts.bg.kill(p.sessionId, p.taskId);
+        } catch (e) {
+          throw new RpcFailure(ERR.NOT_FOUND, (e as Error).message);
+        }
+        return { ok: true };
+      }
+      case METHODS.bgKillAll: {
+        const p = parseParams(BgKillAllParams, params);
+        const killed = opts.bg?.list(p.sessionId).filter((t) => t.status === "running").length ?? 0;
+        opts.bg?.killAllForSession(p.sessionId);
+        return { ok: true, killed };
       }
       default:
         throw new RpcFailure(ERR.METHOD_NOT_FOUND, `method not found: ${method}`);

@@ -445,4 +445,30 @@ describe("daemon IPC", () => {
     expect(res.error.code).toBe(ERR.NOT_FOUND);
     c.close();
   });
+
+  test("bg.list/peek/kill over the socket", async () => {
+    if (process.platform !== "darwin") return;
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-bgsrv-")));
+    const fake = new FakeProvider([
+      [{ type: "tool_call", callId: "b1", name: "bash", argsJson: JSON.stringify({ command: "echo hi; sleep 2", runInBackground: true }) }, { type: "done", stopReason: "tool_calls" }],
+      [{ type: "text_delta", delta: "started" }, { type: "done", stopReason: "end_turn" }],
+    ]);
+    await boot({}, fake);
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "bg");
+    const s = (await c.request(METHODS.sessionCreate, { scope: "global", cwd, approvalPolicy: "auto" })).result.sessionId;
+    await c.request(METHODS.sessionAttach, { sessionId: s, fromSeq: 0 });
+    await c.request(METHODS.sessionSend, { sessionId: s, text: "run bg" });
+    await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "bg_task_started");
+    const list = (await c.request(METHODS.bgList, { sessionId: s })).result;
+    expect(list.tasks.length).toBe(1);
+    const taskId = list.tasks[0].taskId;
+    await new Promise((r) => setTimeout(r, 300));
+    const peek = (await c.request(METHODS.bgPeek, { sessionId: s, taskId })).result;
+    expect(peek.chunk).toContain("hi");
+    const kill = (await c.request(METHODS.bgKill, { sessionId: s, taskId })).result;
+    expect(kill).toEqual({ ok: true });
+    c.close();
+  });
 });
