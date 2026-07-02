@@ -20,3 +20,4 @@ export { ApprovalBroker, type ApprovalOutcome } from "./agent/approvals";
 export { SessionDirectories } from "./agent/dirs";
 export { sessionTmpDir } from "./agent/session-tmp";
 export { TrustStore } from "./agent/trust";
+export { BackgroundTaskRegistry, type BgDeps } from "./agent/bg-registry";
