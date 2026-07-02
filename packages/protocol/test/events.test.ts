@@ -65,7 +65,7 @@ describe("SessionEvent discriminated union", () => {
       { ...base, threadId: "main", type: "bg_task_exited", taskId: "bg_a1", exitCode: 0, killed: false },
       { ...base, threadId: "main", type: "bg_task_exited", taskId: "bg_a1", exitCode: null, killed: true },
     ]) {
-      expect(SessionEvent.parse(e).type).toBe(e.type);
+      expect(SessionEvent.parse(e).type).toBe(e.type as SessionEvent["type"]);
     }
   });
 
