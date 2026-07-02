@@ -30,6 +30,7 @@ export interface EngineConfig {
 
 export class AgentEngine {
   private runningTurns = new Set<string>();
+  private steerQueue = new Map<string, string[]>();
   constructor(private readonly cfg: EngineConfig) {}
 
   /** True while a turn is executing for the session. */
@@ -42,7 +43,26 @@ export class AgentEngine {
       await this.turn(sessionId);
     } finally {
       this.runningTurns.delete(sessionId);
+      this.steerQueue.delete(sessionId);
     }
+  }
+
+  /**
+   * Inject a user message into a session. If a turn is running, the message is queued and
+   * drained into the next round's input (steering it mid-turn); otherwise a new turn is
+   * started so the message reaches the model. The message is always appended to history
+   * immediately (via hub.append) regardless of which path is taken.
+   */
+  steer(sessionId: string, text: string): { injected: boolean } {
+    // Surface as a user_message (history + all harnesses) — clientName "steer".
+    this.cfg.hub.append(sessionId, { type: "user_message", sessionId, threadId: MAIN_THREAD, text, clientName: "steer" });
+    if (this.isRunning(sessionId)) {
+      const q = this.steerQueue.get(sessionId) ?? [];
+      q.push(text); this.steerQueue.set(sessionId, q);
+      return { injected: true };
+    }
+    void this.runTurn(sessionId).catch(() => {}); // start a turn; the user_message is already in history
+    return { injected: false };
   }
 
   private emit(sessionId: string, event: NewSessionEvent): SessionEvent {
@@ -76,6 +96,9 @@ export class AgentEngine {
     this.emit(sessionId, { type: "turn_started", sessionId, threadId });
 
     for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
+      const steers = this.steerQueue.get(sessionId);
+      if (steers && steers.length) { for (const t of steers) input.push({ type: "message", role: "user", content: t }); steers.length = 0; }
+
       let textBuf = "";
       const calls: Extract<ProviderEvent, { type: "tool_call" }>[] = [];
       let stop: "end_turn" | "tool_calls" | "aborted" | null = null;
@@ -103,6 +126,8 @@ export class AgentEngine {
       }
 
       if (stop !== "tool_calls" || calls.length === 0) {
+        const pending = this.steerQueue.get(sessionId);
+        if (pending && pending.length) { continue; } // a steer landed as we finished → drain at next iteration top, keep going
         this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: stop === "aborted" ? "aborted" : "end_turn", ...usage });
         return;
       }
