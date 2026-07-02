@@ -31,6 +31,11 @@ export function buildSeatbeltProfile(opts: SandboxOptions): string {
     "com.apple.system.notification_center",
     "com.apple.system.logger",
     "com.apple.CoreServices.coreservicesd",
+    // Resolves per-user temp/cache dir paths for confstr(_CS_DARWIN_USER_TEMP_DIR/_CACHE_DIR),
+    // which xcrun/git-CLT-stubs (and swift, xcodebuild) call into on every invocation. Without
+    // this, those tools still exit 0 but spam stderr with confstr()/DVT FSEvents noise that
+    // reads like a real failure. Grants no spawning — safe, defense-in-depth stays intact.
+    "com.apple.bsd.dirhelper",
   ].map((s) => `  (global-name "${sbplString(s)}")`).join("\n");
   return `(version 1)
 (deny default)

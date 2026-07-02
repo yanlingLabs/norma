@@ -85,4 +85,18 @@ d("bash tool (sandboxed)", () => {
     expect(res.isError).toBe(false);
     expect(existsSync(join(extra, "in-extra.txt"))).toBe(true);
   });
+
+  test("git runs through the sandbox with clean output (no spurious permission errors)", async () => {
+    const cwd = proj();
+    const res = await reg().execute("bash", {
+      command: `git init -q && git -c user.email=a@b.c -c user.name=n commit --allow-empty -q -m init && echo COMMIT_OK && git --version`,
+      timeoutMs: 20000,
+    }, { cwd, roots: [cwd] });
+    expect(res.output).toContain("COMMIT_OK");
+    expect(res.output).toContain("[exit 0]");
+    // the regression: no spurious sandbox-denial noise from xcrun/dirhelper:
+    expect(res.output).not.toMatch(/Operation not permitted/);
+    expect(res.output).not.toMatch(/errno=/);
+    expect(res.output).not.toMatch(/confstr\(\) failed/);
+  });
 });
