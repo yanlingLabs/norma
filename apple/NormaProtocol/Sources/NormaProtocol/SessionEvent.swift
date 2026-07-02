@@ -13,6 +13,7 @@ public enum SessionEvent: Codable, Equatable {
     case approvalResolved(ApprovalResolved)
     case turnCompleted(TurnCompleted)
     case agentError(AgentError)
+    case directoryAdded(DirectoryAdded)
 
     public struct SessionCreated: Codable, Equatable {
         public let seq: Int
@@ -117,6 +118,15 @@ public enum SessionEvent: Codable, Equatable {
         public let message: String
     }
 
+    public struct DirectoryAdded: Codable, Equatable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let path: String
+        public let persisted: Bool
+    }
+
     private enum Discriminator: String, Codable {
         case session_created
         case harness_attached
@@ -130,6 +140,7 @@ public enum SessionEvent: Codable, Equatable {
         case approval_resolved
         case turn_completed
         case agent_error
+        case directory_added
     }
 
     private enum TypeKey: String, CodingKey { case type }
@@ -149,6 +160,7 @@ public enum SessionEvent: Codable, Equatable {
         case .approval_resolved:    self = .approvalResolved(try ApprovalResolved(from: decoder))
         case .turn_completed:       self = .turnCompleted(try TurnCompleted(from: decoder))
         case .agent_error:          self = .agentError(try AgentError(from: decoder))
+        case .directory_added:      self = .directoryAdded(try DirectoryAdded(from: decoder))
         }
     }
 
@@ -202,6 +214,10 @@ public enum SessionEvent: Codable, Equatable {
             try v.encode(to: encoder)
             var c = encoder.container(keyedBy: TypeKey.self)
             try c.encode(Discriminator.agent_error.rawValue, forKey: .type)
+        case .directoryAdded(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.directory_added.rawValue, forKey: .type)
         }
     }
 }

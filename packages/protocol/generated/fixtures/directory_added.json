@@ -1,0 +1,9 @@
+{
+  "seq": 7,
+  "sessionId": "s_fixture",
+  "ts": 1781270000000,
+  "threadId": "main",
+  "type": "directory_added",
+  "path": "/opt/data",
+  "persisted": true
+}

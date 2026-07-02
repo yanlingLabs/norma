@@ -26,6 +26,7 @@ const fixtures: Record<string, unknown> = {
   "approval_resolved": { ...base, threadId: "main", type: "approval_resolved", callId: "call_2", approved: true, by: "orb" },
   "turn_completed": { ...base, threadId: "main", type: "turn_completed", stopReason: "end_turn", inputTokens: 12, outputTokens: 3 },
   "agent_error": { ...base, threadId: "main", type: "agent_error", message: "provider unavailable" },
+  "directory_added": { ...base, threadId: "main", type: "directory_added", path: "/opt/data", persisted: true },
 };
 for (const [name, value] of Object.entries(fixtures)) {
   SessionEvent.parse(value); // fixtures must be valid by construction
