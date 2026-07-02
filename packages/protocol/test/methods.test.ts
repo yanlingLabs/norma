@@ -16,6 +16,10 @@ import {
   BgKillParams,
   BgKillAllParams,
   BgListResult,
+  SessionSteerParams,
+  SessionInterruptParams,
+  SessionSteerResult,
+  SessionInterruptResult,
   METHODS,
 } from "../src/methods";
 
@@ -129,5 +133,16 @@ describe("bg.* method schemas", () => {
     expect(BgKillAllParams.parse({ sessionId: "s1" }).sessionId).toBe("s1");
     expect(BgListResult.parse({ tasks: [{ taskId: "bg_a", command: "sleep 5", status: "running", exitCode: null, startedAt: 1 }] }).tasks).toHaveLength(1);
     expect([METHODS.bgList, METHODS.bgPeek, METHODS.bgKill, METHODS.bgKillAll]).toEqual(["bg.list", "bg.peek", "bg.kill", "bg.killAll"]);
+  });
+});
+
+describe("session.steer / session.interrupt schemas", () => {
+  test("session.steer / session.interrupt schemas", () => {
+    expect(SessionSteerParams.parse({ sessionId: "s1", text: "hi" }).text).toBe("hi");
+    expect(() => SessionSteerParams.parse({ sessionId: "s1", text: "" })).toThrow();
+    expect(SessionSteerResult.parse({ ok: true, injected: true }).injected).toBe(true);
+    expect(SessionInterruptParams.parse({ sessionId: "s1" }).sessionId).toBe("s1");
+    expect(SessionInterruptResult.parse({ ok: true, wasRunning: false }).wasRunning).toBe(false);
+    expect([METHODS.sessionSteer, METHODS.sessionInterrupt]).toEqual(["session.steer", "session.interrupt"]);
   });
 });

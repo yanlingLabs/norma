@@ -84,6 +84,11 @@ export const BgKillResult = z.object({ ok: z.literal(true) });
 export const BgKillAllParams = z.object({ sessionId: z.string() });
 export const BgKillAllResult = z.object({ ok: z.literal(true), killed: z.number().int().nonnegative() });
 
+export const SessionSteerParams = z.object({ sessionId: z.string(), text: z.string().min(1) });
+export const SessionSteerResult = z.object({ ok: z.literal(true), injected: z.boolean() });
+export const SessionInterruptParams = z.object({ sessionId: z.string() });
+export const SessionInterruptResult = z.object({ ok: z.literal(true), wasRunning: z.boolean() });
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -99,4 +104,6 @@ export const METHODS = {
   bgPeek: "bg.peek",
   bgKill: "bg.kill",
   bgKillAll: "bg.killAll",
+  sessionSteer: "session.steer",
+  sessionInterrupt: "session.interrupt",
 } as const;
