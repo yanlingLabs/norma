@@ -5,6 +5,7 @@ import {
   HelloParams, SessionCreateParams, SessionAttachParams, SessionSendParams, ApprovalRespondParams,
   SessionAddDirParams, SessionSetCwdParams, TrustDirParams,
   BgListParams, BgPeekParams, BgKillParams, BgKillAllParams,
+  SessionSteerParams, SessionInterruptParams,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
@@ -187,6 +188,16 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
           opts.engine.runTurn(p.sessionId).catch((e) => console.error("turn failed:", e));
         }
         return { seq };
+      }
+      case METHODS.sessionSteer: {
+        const p = parseParams(SessionSteerParams, params);
+        if (!opts.engine) return { ok: true, injected: false };
+        return { ok: true, ...opts.engine.steer(p.sessionId, p.text) };
+      }
+      case METHODS.sessionInterrupt: {
+        const p = parseParams(SessionInterruptParams, params);
+        if (!opts.engine) return { ok: true, wasRunning: false };
+        return { ok: true, ...opts.engine.interrupt(p.sessionId) };
       }
       case METHODS.approvalRespond: {
         const p = parseParams(ApprovalRespondParams, params);

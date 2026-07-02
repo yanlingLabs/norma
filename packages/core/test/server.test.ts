@@ -471,4 +471,92 @@ describe("daemon IPC", () => {
     expect(kill).toEqual({ ok: true });
     c.close();
   });
+
+  test("session.interrupt aborts a running turn (wasRunning:true, turn_completed aborted)", async () => {
+    const { AbortAwaitProvider } = await import("../src/agent/test-providers");
+    await boot({}, new AbortAwaitProvider());
+    const c = await TestClient.connect(daemon.socketPath); await c.hello(harnessToken, "int");
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-int-")));
+    const s = (await c.request(METHODS.sessionCreate, { scope: "global", cwd, approvalPolicy: "auto" })).result.sessionId;
+    await c.request(METHODS.sessionAttach, { sessionId: s, fromSeq: 0 });
+    await c.request(METHODS.sessionSend, { sessionId: s, text: "go" });
+    await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "turn_started");
+    const r = (await c.request(METHODS.sessionInterrupt, { sessionId: s })).result;
+    expect(r).toEqual({ ok: true, wasRunning: true });
+    await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "turn_completed" && n.params.stopReason === "aborted");
+    c.close();
+  });
+
+  test("session.interrupt with no running turn is a no-op (wasRunning:false)", async () => {
+    const { AbortAwaitProvider } = await import("../src/agent/test-providers");
+    await boot({}, new AbortAwaitProvider());
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "int-idle");
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-int-idle-")));
+    const s = (await c.request(METHODS.sessionCreate, { scope: "global", cwd, approvalPolicy: "auto" })).result.sessionId;
+    const r = (await c.request(METHODS.sessionInterrupt, { sessionId: s })).result;
+    expect(r).toEqual({ ok: true, wasRunning: false });
+    c.close();
+  });
+
+  test("session.steer injects into a running turn (injected:true) and emits user_message", async () => {
+    const { GatedProvider, deferred } = await import("../src/agent/test-providers");
+    const gate = deferred();
+    const gated = new GatedProvider(
+      [
+        [{ type: "text_delta", delta: "first" }, { type: "done", stopReason: "end_turn" }],
+        [{ type: "text_delta", delta: "second" }, { type: "done", stopReason: "end_turn" }],
+      ],
+      [gate.promise, null],
+    );
+    await boot({}, gated);
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "steerer");
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-steer-")));
+    const s = (await c.request(METHODS.sessionCreate, { scope: "global", cwd, approvalPolicy: "auto" })).result.sessionId;
+    await c.request(METHODS.sessionAttach, { sessionId: s, fromSeq: 0 });
+    await c.request(METHODS.sessionSend, { sessionId: s, text: "go" });
+    await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "turn_started");
+    const r = (await c.request(METHODS.sessionSteer, { sessionId: s, text: "wait, actually..." })).result;
+    expect(r).toEqual({ ok: true, injected: true });
+    const msg = await c.waitForNotification((n) =>
+      n.method === METHODS.event && n.params.type === "user_message" && n.params.clientName === "steer");
+    expect(msg.params.text).toBe("wait, actually...");
+    gate.resolve();
+    await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "turn_completed");
+    c.close();
+  });
+
+  test("session.steer with no running turn starts one (injected:false) and emits user_message", async () => {
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const fake = new FakeProvider([[
+      { type: "text_delta", delta: "sure" },
+      { type: "done", stopReason: "end_turn" },
+    ]]);
+    await boot({}, fake);
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "steerer-idle");
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-steer-idle-")));
+    const s = (await c.request(METHODS.sessionCreate, { scope: "global", cwd, approvalPolicy: "auto" })).result.sessionId;
+    await c.request(METHODS.sessionAttach, { sessionId: s, fromSeq: 0 });
+    const r = (await c.request(METHODS.sessionSteer, { sessionId: s, text: "start please" })).result;
+    expect(r).toEqual({ ok: true, injected: false });
+    const msg = await c.waitForNotification((n) =>
+      n.method === METHODS.event && n.params.type === "user_message" && n.params.clientName === "steer");
+    expect(msg.params.text).toBe("start please");
+    await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "turn_completed");
+    c.close();
+  });
+
+  test("session.steer/interrupt without an engine degrade gracefully", async () => {
+    await boot(); // no provider → no engine
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "no-engine");
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global" });
+    const steer = (await c.request(METHODS.sessionSteer, { sessionId: created.sessionId, text: "hi" })).result;
+    expect(steer).toEqual({ ok: true, injected: false });
+    const interrupt = (await c.request(METHODS.sessionInterrupt, { sessionId: created.sessionId })).result;
+    expect(interrupt).toEqual({ ok: true, wasRunning: false });
+    c.close();
+  });
 });
