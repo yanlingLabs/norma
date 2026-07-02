@@ -22,6 +22,13 @@ describe("PermissionGate v1", () => {
     expect(gate.evaluate("mystery", "auto")).toBe("ask");
   });
 
+  test("request_directory self-gates via its own ApprovalBroker prompt (the engine gate must not also ask — would double-prompt); fail-closed is preserved for genuinely unknown tools", () => {
+    expect(gate.evaluate("request_directory", "ask")).toBe("allow");
+    expect(gate.evaluate("request_directory", "auto")).toBe("allow");
+    expect(gate.evaluate("mystery", "ask")).toBe("ask");
+    expect(gate.evaluate("mystery", "auto")).toBe("ask");
+  });
+
   test("bash is a mutating tool: ask under ask-policy, allow under auto", () => {
     const gate = new PermissionGate();
     expect(gate.evaluate("bash", "ask")).toBe("ask");

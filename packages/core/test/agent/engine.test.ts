@@ -8,6 +8,7 @@ import { SessionHub, type HubClient } from "../../src/sessions/hub";
 import { ToolRegistry } from "../../src/agent/tools/registry";
 import { registerReadTools } from "../../src/agent/tools/fs-read";
 import { registerWriteTools } from "../../src/agent/tools/fs-write";
+import { registerRequestDirTool } from "../../src/agent/tools/request-dir";
 import { PermissionGate } from "../../src/agent/gate";
 import { ApprovalBroker } from "../../src/agent/approvals";
 import { AgentEngine } from "../../src/agent/engine";
@@ -26,6 +27,13 @@ function setup(script: ProviderEvent[][], policy: "ask" | "auto" = "auto", extra
   const broker = new ApprovalBroker();
   const provider = new FakeProvider(script);
   const dirs = new SessionDirectories(() => [cwd, ...extraRoots]);
+  registerRequestDirTool(registry, {
+    broker,
+    dirs,
+    emit: (sid, e) => hub.append(sid, e), // matches production wiring (daemon.ts)
+    projectDir: () => null,
+    approvalTimeoutMs: 500,
+  });
   const engine = new AgentEngine({
     store, hub, registry, broker,
     gate: new PermissionGate(),
@@ -160,5 +168,25 @@ describe("AgentEngine", () => {
     expect(events.some((e) => e.type === "agent_error" && (e as any).message.includes("working directory"))).toBe(true);
     expect(events.find((e) => e.type === "turn_completed")).toMatchObject({ stopReason: "error" });
     expect(events.some((e) => e.type === "tool_call")).toBe(false);
+  });
+
+  test("request_directory self-gates: exactly one approval_requested (not a gate prompt plus the tool's own), and approving it grants the dir", async () => {
+    const outsideDir = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-outside-")));
+    const { engine, store, hub, broker, sessionId, dirs } = setup([
+      [{ type: "tool_call", callId: "c1", name: "request_directory", argsJson: JSON.stringify({ path: outsideDir }) }, done("tool_calls")],
+      text("granted"),
+    ], "ask"); // "ask" policy: if the gate still double-prompted request_directory, this is where it would show up
+    const watcher: HubClient = {
+      clientName: "auto-approver",
+      deliver(e) { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, true, "auto-approver"); return true; },
+    };
+    hub.attach(watcher, sessionId, 0);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+    const approvalRequests = events.filter((e) => e.type === "approval_requested");
+    expect(approvalRequests.length).toBe(1); // one prompt, not two (no engine-level gate prompt + the tool's own)
+    expect(approvalRequests[0]).toMatchObject({ toolName: "request_directory" });
+    expect(dirs.has(sessionId, outsideDir)).toBe(true);
+    expect(events.find((e) => e.type === "tool_result")).toMatchObject({ isError: false });
   });
 });

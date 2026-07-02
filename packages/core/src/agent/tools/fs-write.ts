@@ -9,7 +9,7 @@ export function registerWriteTools(r: ToolRegistry): void {
     name: "write",
     description: "Write a file (creates parent directories). Overwrites if it exists.",
     args: z.object({ path: z.string().min(1), content: z.string() }),
-    run({ path, content }, { cwd, roots }) {
+    run({ path, content }, { roots }) {
       let target: string;
       try {
         target = resolveWithinAny(roots, path);
@@ -26,7 +26,7 @@ export function registerWriteTools(r: ToolRegistry): void {
     name: "edit",
     description: "Replace an exact unique string in a file with a new string.",
     args: z.object({ path: z.string().min(1), old_string: z.string().min(1), new_string: z.string() }),
-    run({ path, old_string, new_string }, { cwd, roots }) {
+    run({ path, old_string, new_string }, { roots }) {
       let target: string;
       try {
         target = resolveWithinAny(roots, path);
