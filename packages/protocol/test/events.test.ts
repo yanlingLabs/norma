@@ -53,6 +53,11 @@ describe("SessionEvent discriminated union", () => {
     for (const e of events) expect(SessionEvent.parse(e).type).toBe(e.type);
   });
 
+  test("directory_added variant parses", () => {
+    const e = { ...base, threadId: "main", type: "directory_added", path: "/opt/data", persisted: true };
+    expect(SessionEvent.parse(e)).toMatchObject({ type: "directory_added", path: "/opt/data", persisted: true });
+  });
+
   test("tool_result caps are enforced by schema shape only (output is plain string)", () => {
     const e = { ...base, threadId: "main", type: "tool_result", callId: "c", output: "x".repeat(100), isError: true };
     expect(SessionEvent.parse(e)).toMatchObject({ isError: true });

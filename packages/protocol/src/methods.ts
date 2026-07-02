@@ -56,6 +56,15 @@ export const ApprovalRespondParams = z.object({
 });
 export const ApprovalRespondResult = z.object({ ok: z.literal(true), alreadyResolved: z.boolean() });
 
+export const SessionAddDirParams = z.object({
+  sessionId: z.string(),
+  path: z.string().min(1),
+  persist: z.boolean().default(false),
+});
+export const SessionAddDirResult = z.object({ ok: z.literal(true), roots: z.array(z.string()) });
+export const SessionSetCwdParams = z.object({ sessionId: z.string(), cwd: z.string().startsWith("/") });
+export const SessionSetCwdResult = z.object({ ok: z.literal(true), cwd: z.string() });
+
 /** Server → client notification: method "event", params = SessionEvent. */
 export const EventNotificationParams = SessionEvent;
 
@@ -66,5 +75,7 @@ export const METHODS = {
   sessionAttach: "session.attach",
   sessionSend: "session.send",
   approvalRespond: "approval.respond",
+  sessionAddDir: "session.addDir",
+  sessionSetCwd: "session.setCwd",
   event: "event",
 } as const;

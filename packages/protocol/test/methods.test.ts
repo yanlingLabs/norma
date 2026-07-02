@@ -6,6 +6,8 @@ import {
   SessionCreateParams,
   ApprovalRespondParams,
   ApprovalRespondResult,
+  SessionAddDirParams,
+  SessionSetCwdParams,
   METHODS,
 } from "../src/methods";
 
@@ -72,5 +74,16 @@ describe("agent method schemas", () => {
     expect(p.approvalPolicy).toBe("auto");
     expect(SessionCreateParams.parse({ scope: "global" }).approvalPolicy).toBe("ask");
     expect(() => SessionCreateParams.parse({ scope: "global", cwd: "relative/path" })).toThrow();
+  });
+});
+
+describe("directory method schemas", () => {
+  test("session.addDir / session.setCwd params", () => {
+    expect(SessionAddDirParams.parse({ sessionId: "s1", path: "/x", persist: true }).persist).toBe(true);
+    expect(SessionAddDirParams.parse({ sessionId: "s1", path: "/x" }).persist).toBe(false);
+    expect(() => SessionSetCwdParams.parse({ sessionId: "s1", cwd: "rel" })).toThrow();
+    expect(SessionSetCwdParams.parse({ sessionId: "s1", cwd: "/abs" }).cwd).toBe("/abs");
+    expect(METHODS.sessionAddDir).toBe("session.addDir");
+    expect(METHODS.sessionSetCwd).toBe("session.setCwd");
   });
 });

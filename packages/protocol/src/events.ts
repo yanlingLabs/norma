@@ -49,6 +49,11 @@ export const TurnCompletedEvent = ThreadBase.extend({
   inputTokens: z.number().int().nonnegative(), outputTokens: z.number().int().nonnegative(),
 });
 export const AgentErrorEvent = ThreadBase.extend({ type: z.literal("agent_error"), message: z.string() });
+export const DirectoryAddedEvent = ThreadBase.extend({
+  type: z.literal("directory_added"),
+  path: z.string().min(1),
+  persisted: z.boolean(),
+});
 
 export const SessionEvent = z.discriminatedUnion("type", [
   SessionCreatedEvent,
@@ -63,6 +68,7 @@ export const SessionEvent = z.discriminatedUnion("type", [
   ApprovalResolvedEvent,
   TurnCompletedEvent,
   AgentErrorEvent,
+  DirectoryAddedEvent,
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 
