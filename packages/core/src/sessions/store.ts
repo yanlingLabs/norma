@@ -159,6 +159,10 @@ export class SessionStore {
       .map((r) => ({ sessionId: r.session_id, scope: r.scope, createdAt: r.created_at, lastSeq: r.last_seq }));
   }
 
+  setCwd(sessionId: string, cwd: string): void {
+    this.db.run("UPDATE sessions SET cwd = ? WHERE session_id = ?", [cwd, sessionId]);
+  }
+
   meta(sessionId: string): { sessionId: string; scope: string; cwd: string | null; approvalPolicy: "ask" | "auto" } {
     const row = this.db.query("SELECT scope, cwd, approval_policy FROM sessions WHERE session_id = ?").get(sessionId) as
       | { scope: string; cwd: string | null; approval_policy: string } | null;

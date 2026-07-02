@@ -5,6 +5,8 @@ import type { Provider, ProviderEvent, TurnInputItem } from "../providers/types"
 import type { ToolRegistry } from "./tools/registry";
 import type { PermissionGate } from "./gate";
 import type { ApprovalBroker } from "./approvals";
+import type { SessionDirectories } from "./dirs";
+import { sessionTmpDir } from "./session-tmp";
 
 const MAIN_THREAD = "main";
 const MAX_TOOL_ITERATIONS = 24; // runaway guard until 1b-ii budgets land
@@ -21,6 +23,7 @@ export interface EngineConfig {
   registry: ToolRegistry;
   gate: PermissionGate;
   broker: ApprovalBroker;
+  dirs: SessionDirectories;
   provider: { provider: Provider; model: string };
   approvalTimeoutMs?: number; // default 5 min
 }
@@ -147,7 +150,8 @@ export class AgentEngine {
     let args: unknown;
     try { args = call.argsJson.length ? JSON.parse(call.argsJson) : {}; }
     catch { return Promise.resolve({ output: `tool arguments were not valid JSON`, isError: true }); }
-    // TODO(phase-1b-ii-b T11): replace roots:[cwd] with the session's real allowed-roots set (SessionDirectories).
-    return this.cfg.registry.execute(call.name, args, { cwd, roots: [cwd], sessionId });
+    const roots = this.cfg.dirs.roots(sessionId);
+    const tmpDir = sessionTmpDir(sessionId);
+    return this.cfg.registry.execute(call.name, args, { cwd, roots, tmpDir, sessionId });
   }
 }

@@ -2,7 +2,7 @@ export { startDaemon, CORE_VERSION, type RunningDaemon } from "./daemon";
 export { bootstrapNormaDir, resolveNormaHome } from "./norma-dir";
 export { FileSecretStore, KeychainSecretStore } from "./auth/secret-store";
 export { TOKEN_NAMES } from "./auth/tokens";
-export { loadSettings, type Settings } from "./settings";
+export { loadSettings, loadPermissionDirs, addLocalDir, type Settings } from "./settings";
 export { createProvider, OPENAI_API_KEY_SECRET, type ActiveProvider } from "./providers/manager";
 export { CodexAuthStore, CODEX_SECRET_NAMES } from "./providers/codex-oauth";
 export { runLoginFlow } from "./providers/pkce";
@@ -13,6 +13,9 @@ export { ToolRegistry, type ToolDefinition, type ToolContext, type ToolOutcome }
 export { registerReadTools } from "./agent/tools/fs-read";
 export { registerWriteTools } from "./agent/tools/fs-write";
 export { registerBashTool } from "./agent/tools/bash";
+export { registerRequestDirTool, type RequestDirDeps } from "./agent/tools/request-dir";
 export { buildSeatbeltProfile, sandboxAvailable } from "./agent/sandbox";
 export { PermissionGate, type GateDecision, type SessionApprovalPolicy } from "./agent/gate";
 export { ApprovalBroker, type ApprovalOutcome } from "./agent/approvals";
+export { SessionDirectories } from "./agent/dirs";
+export { sessionTmpDir } from "./agent/session-tmp";

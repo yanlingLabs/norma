@@ -12,9 +12,10 @@ import { PermissionGate } from "../../src/agent/gate";
 import { ApprovalBroker } from "../../src/agent/approvals";
 import { AgentEngine } from "../../src/agent/engine";
 import { FakeProvider } from "../../src/agent/fake-provider";
+import { SessionDirectories } from "../../src/agent/dirs";
 import type { ProviderEvent } from "../../src/providers/types";
 
-function setup(script: ProviderEvent[][], policy: "ask" | "auto" = "auto") {
+function setup(script: ProviderEvent[][], policy: "ask" | "auto" = "auto", extraRoots: string[] = []) {
   const home = mkdtempSync(join(tmpdir(), "norma-engine-"));
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-cwd-")));
   const store = new SessionStore(home);
@@ -24,14 +25,16 @@ function setup(script: ProviderEvent[][], policy: "ask" | "auto" = "auto") {
   registerWriteTools(registry);
   const broker = new ApprovalBroker();
   const provider = new FakeProvider(script);
+  const dirs = new SessionDirectories(() => [cwd, ...extraRoots]);
   const engine = new AgentEngine({
     store, hub, registry, broker,
     gate: new PermissionGate(),
     provider: { provider, model: "fake-1" },
+    dirs,
     approvalTimeoutMs: 500,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: policy });
-  return { engine, store, hub, broker, sessionId, cwd, provider };
+  return { engine, store, hub, broker, sessionId, cwd, provider, dirs };
 }
 
 const done = (reason: "end_turn" | "tool_calls"): ProviderEvent => ({ type: "done", stopReason: reason });
@@ -136,6 +139,17 @@ describe("AgentEngine", () => {
     const events = store.read(sessionId);
     expect(events.some((e) => e.type === "agent_error" && (e as any).message.includes("iteration cap"))).toBe(true);
     expect(events.find((e) => e.type === "turn_completed")).toMatchObject({ stopReason: "error" });
+  });
+
+  test("engine threads allowed roots into tools; write in an additional root succeeds", async () => {
+    const extraRoot = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-extra-")));
+    const target = join(extraRoot, "in-extra.txt");
+    const { engine, sessionId } = setup([
+      [{ type: "tool_call", callId: "c1", name: "write", argsJson: JSON.stringify({ path: target, content: "norma was here" }) }, done("tool_calls")],
+      text("wrote it!"),
+    ], "auto", [extraRoot]);
+    await engine.runTurn(sessionId);
+    expect(readFileSync(target, "utf8")).toBe("norma was here");
   });
 
   test("a turn on a cwd-less session fails closed (no fallback to daemon cwd)", async () => {

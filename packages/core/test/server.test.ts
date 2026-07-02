@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LineDecoder, encodeLine, METHODS, PROTOCOL_VERSION, ConnWriter, type WritableSocket } from "@norma/protocol";
@@ -341,6 +341,49 @@ describe("daemon IPC", () => {
     await c.request(METHODS.sessionSend, { sessionId: created.sessionId, text: "make out.txt" });
     await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "turn_completed");
     expect(existsSync(join(cwd, "out.txt"))).toBe(true);
+    c.close();
+  });
+
+  test("session.addDir widens roots; bash can then write the added dir", async () => {
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    if (process.platform !== "darwin") return; // sandbox-exec required
+    const added = mkdtempSync(join(tmpdir(), "norma-added-"));
+    const fake = new FakeProvider([
+      [{ type: "tool_call", callId: "b1", name: "bash", argsJson: JSON.stringify({ command: `echo hi > ${added}/f.txt` }) }, { type: "done", stopReason: "tool_calls" }],
+      [{ type: "text_delta", delta: "done" }, { type: "done", stopReason: "end_turn" }],
+    ]);
+    await boot({}, fake);
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "adder");
+    const cwd = mkdtempSync(join(tmpdir(), "norma-adder-cwd-"));
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", cwd, approvalPolicy: "auto" });
+    await c.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
+    const add = await c.request(METHODS.sessionAddDir, { sessionId: created.sessionId, path: added });
+    expect(add.result.roots).toContain(realpathSync(added));
+    await c.request(METHODS.sessionSend, { sessionId: created.sessionId, text: "write in added dir" });
+    await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "turn_completed");
+    expect(existsSync(join(added, "f.txt"))).toBe(true);
+    c.close();
+  });
+
+  test("session.setCwd changes the dir a new turn runs in", async () => {
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const fake = new FakeProvider([
+      [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "moved.txt", content: "here" }) }, { type: "done", stopReason: "tool_calls" }],
+      [{ type: "text_delta", delta: "done" }, { type: "done", stopReason: "end_turn" }],
+    ]);
+    await boot({}, fake);
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "mover");
+    const cwd1 = mkdtempSync(join(tmpdir(), "norma-cwd1-"));
+    const cwd2 = mkdtempSync(join(tmpdir(), "norma-cwd2-"));
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", cwd: cwd1, approvalPolicy: "auto" });
+    await c.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
+    const setCwd = await c.request(METHODS.sessionSetCwd, { sessionId: created.sessionId, cwd: cwd2 });
+    expect(setCwd.result).toEqual({ ok: true, cwd: cwd2 });
+    await c.request(METHODS.sessionSend, { sessionId: created.sessionId, text: "write moved" });
+    await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "turn_completed");
+    expect(existsSync(join(cwd2, "moved.txt"))).toBe(true);
     c.close();
   });
 

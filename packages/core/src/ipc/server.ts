@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   ERR, METHODS, PROTOCOL_VERSION, LineDecoder, encodeLine, parseIncoming,
   HelloParams, SessionCreateParams, SessionAttachParams, SessionSendParams, ApprovalRespondParams,
+  SessionAddDirParams, SessionSetCwdParams,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
@@ -10,6 +11,8 @@ import type { SessionStore } from "../sessions/store";
 import { SessionHub, type HubClient } from "../sessions/hub";
 import type { AgentEngine } from "../agent/engine";
 import type { ApprovalBroker } from "../agent/approvals";
+import type { SessionDirectories } from "../agent/dirs";
+import { addLocalDir } from "../settings";
 
 interface ConnState {
   decoder: LineDecoder;
@@ -28,6 +31,7 @@ export interface IpcServerOptions {
   hub?: SessionHub;          // shared with the agent engine when the daemon wires one up
   engine?: AgentEngine | null;
   broker?: ApprovalBroker | null;
+  dirs?: SessionDirectories; // live allowed-roots per session; addDir/setCwd need it
   helloTimeoutMs?: number;   // default 5000
   maxConnections?: number;   // default 64
   preAuthMaxLine?: number;   // default 64 KiB
@@ -180,6 +184,20 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       case METHODS.approvalRespond: {
         const p = parseParams(ApprovalRespondParams, params);
         return opts.broker?.resolve(p.sessionId, p.callId, p.approved, socket.data.clientName) ?? { ok: true, alreadyResolved: true };
+      }
+      case METHODS.sessionAddDir: {
+        const p = parseParams(SessionAddDirParams, params);
+        opts.dirs?.add(p.sessionId, p.path);
+        const cwd = opts.store.meta(p.sessionId).cwd;
+        const persisted = p.persist && cwd !== null;
+        if (persisted) addLocalDir(cwd!, p.path);
+        hub.append(p.sessionId, { type: "directory_added", sessionId: p.sessionId, threadId: "main", path: p.path, persisted });
+        return { ok: true, roots: opts.dirs?.roots(p.sessionId) ?? [] };
+      }
+      case METHODS.sessionSetCwd: {
+        const p = parseParams(SessionSetCwdParams, params);
+        opts.store.setCwd(p.sessionId, p.cwd);
+        return { ok: true, cwd: p.cwd };
       }
       default:
         throw new RpcFailure(ERR.METHOD_NOT_FOUND, `method not found: ${method}`);

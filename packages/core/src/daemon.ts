@@ -5,16 +5,18 @@ import { KeychainSecretStore, type SecretStore } from "./auth/secret-store";
 import { SessionStore } from "./sessions/store";
 import { SessionHub } from "./sessions/hub";
 import { startIpcServer, type IpcServer, type IpcServerOptions } from "./ipc/server";
-import { loadSettings } from "./settings";
+import { loadSettings, loadPermissionDirs } from "./settings";
 import { createProvider } from "./providers/manager";
 import type { Provider } from "./providers/types";
 import { ToolRegistry } from "./agent/tools/registry";
 import { registerReadTools } from "./agent/tools/fs-read";
 import { registerWriteTools } from "./agent/tools/fs-write";
 import { registerBashTool } from "./agent/tools/bash";
+import { registerRequestDirTool } from "./agent/tools/request-dir";
 import { PermissionGate } from "./agent/gate";
 import { ApprovalBroker } from "./agent/approvals";
 import { AgentEngine } from "./agent/engine";
+import { SessionDirectories } from "./agent/dirs";
 
 export const CORE_VERSION = "0.0.1";
 
@@ -42,6 +44,14 @@ export async function startDaemon(opts: {
   const store = new SessionStore(dirs.home);
   const hub = new SessionHub(store);
 
+  const normaHome = dirs.home;
+  // Built unconditionally (needs only store, no provider) so the server's session.addDir /
+  // setCwd handlers always have live roots to work with, even when the agent is disabled.
+  const sessionDirs = new SessionDirectories((sid) => {
+    const m = store.meta(sid);
+    return m.cwd ? [m.cwd, ...loadPermissionDirs(normaHome, m.cwd)] : [];
+  });
+
   let agentProvider = opts.agentProvider;
   if (agentProvider === undefined) {
     try {
@@ -62,9 +72,16 @@ export async function startDaemon(opts: {
     registerWriteTools(registry);
     registerBashTool(registry);
     broker = new ApprovalBroker();
+    registerRequestDirTool(registry, {
+      broker,
+      dirs: sessionDirs,
+      emit: (sid, e) => hub.append(sid, e),
+      projectDir: (sid) => store.meta(sid).cwd,
+    });
     engine = new AgentEngine({
       store, hub, registry, broker,
       gate: new PermissionGate(),
+      dirs: sessionDirs,
       provider: agentProvider,
     });
   }
@@ -77,6 +94,7 @@ export async function startDaemon(opts: {
     hub,
     engine,
     broker,
+    dirs: sessionDirs,
     ...opts.server,
   });
 
