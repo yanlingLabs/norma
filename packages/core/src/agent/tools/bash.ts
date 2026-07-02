@@ -1,11 +1,13 @@
 import { z } from "zod";
 import { realpathSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { buildSeatbeltProfile, sandboxAvailable } from "../sandbox";
 import type { ToolRegistry } from "./registry";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 600_000;
 const DEPRECATION_RE = /^sandbox-exec: .*deprecated.*$/gim;
+const MAX_CAPTURE = 256 * 1024; // hard bound before the registry's own 64KB cap; prevents OOM on chatty long runs
 
 export function registerBashTool(r: ToolRegistry): void {
   r.register({
@@ -23,25 +25,53 @@ export function registerBashTool(r: ToolRegistry): void {
       const profile = buildSeatbeltProfile({ cwd: realCwd, writableRoots: [], allowNetwork: false });
       const timeout = timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-      const proc = Bun.spawn(
-        ["/usr/bin/sandbox-exec", "-p", profile, "/bin/bash", "-c", command],
-        { cwd: realCwd, stdout: "pipe", stderr: "pipe", stdin: "ignore" },
-      );
+      return await new Promise<string>((resolve) => {
+        const child = spawn("/usr/bin/sandbox-exec", ["-p", profile, "/bin/bash", "-c", command], {
+          cwd: realCwd,
+          stdio: ["ignore", "pipe", "pipe"],
+          detached: true,
+        });
 
-      let timedOut = false;
-      const timer = setTimeout(() => { timedOut = true; proc.kill(9); }, timeout);
-      try {
-        const [out, err, exitCode] = await Promise.all([
-          new Response(proc.stdout).text(),
-          new Response(proc.stderr).text(),
-          proc.exited,
-        ]);
-        const merged = (out + err).replace(DEPRECATION_RE, "").replace(/\n{3,}/g, "\n\n").trimEnd();
-        if (timedOut) return `${merged}\n[timed out after ${timeout}ms, killed]`;
-        return `${merged}\n[exit ${exitCode}]`;
-      } finally {
-        clearTimeout(timer);
-      }
+        let buf = "";
+        let truncated = false;
+        const append = (d: Buffer) => {
+          if (truncated) return;
+          buf += d.toString("utf8");
+          if (buf.length > MAX_CAPTURE) {
+            buf = buf.slice(0, MAX_CAPTURE);
+            truncated = true;
+          }
+        };
+        child.stdout.on("data", append);
+        child.stderr.on("data", append);
+
+        let timedOut = false;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          // Negative pid targets the whole process group. `detached: true` made
+          // this child its own group leader (setsid), so this also reaps
+          // sandbox-exec, bash, and any forked/backgrounded grandchildren —
+          // closing all pipe fds so stream collection unblocks promptly.
+          try {
+            process.kill(-child.pid!, "SIGKILL");
+          } catch {
+            /* group already gone */
+          }
+        }, timeout);
+
+        const finish = (code: number | null) => {
+          clearTimeout(timer);
+          const merged = buf.replace(DEPRECATION_RE, "").replace(/\n{3,}/g, "\n\n").trimEnd()
+            + (truncated ? "\n[output truncated at 256KB]" : "");
+          resolve(timedOut ? `${merged}\n[timed out after ${timeout}ms, killed]` : `${merged}\n[exit ${code}]`);
+        };
+
+        child.on("close", (code) => finish(code));
+        child.on("error", (err) => {
+          clearTimeout(timer);
+          resolve(`failed to launch sandboxed bash: ${(err as Error).message}\n[exit -1]`);
+        });
+      });
     },
   });
 }

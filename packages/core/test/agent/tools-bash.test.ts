@@ -47,4 +47,20 @@ d("bash tool (sandboxed)", () => {
     const res = await reg().execute("bash", { command: "" }, { cwd: proj() });
     expect(res.isError).toBe(true);
   });
+
+  test("a backgrounded child does not hang the call past the timeout", async () => {
+    const cwd = proj();
+    const started = Date.now();
+    const res = await reg().execute(
+      "bash",
+      { command: "(sleep 30 && touch survived.txt) & echo backgrounded", timeoutMs: 400 },
+      { cwd },
+    );
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeLessThan(4000); // MUST NOT block for the child's 30s lifetime
+    expect(res.output).toMatch(/timed out/);
+    // the killed background job never gets to create the file:
+    await new Promise((r) => setTimeout(r, 300));
+    expect(existsSync(join(cwd, "survived.txt"))).toBe(false);
+  });
 });
