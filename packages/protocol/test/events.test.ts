@@ -58,6 +58,17 @@ describe("SessionEvent discriminated union", () => {
     expect(SessionEvent.parse(e)).toMatchObject({ type: "directory_added", path: "/opt/data", persisted: true });
   });
 
+  test("bg_task_* variants parse", () => {
+    for (const e of [
+      { ...base, threadId: "main", type: "bg_task_started", taskId: "bg_a1", command: "sleep 5" },
+      { ...base, threadId: "main", type: "bg_task_output", taskId: "bg_a1", chunk: "line1\n" },
+      { ...base, threadId: "main", type: "bg_task_exited", taskId: "bg_a1", exitCode: 0, killed: false },
+      { ...base, threadId: "main", type: "bg_task_exited", taskId: "bg_a1", exitCode: null, killed: true },
+    ]) {
+      expect(SessionEvent.parse(e).type).toBe(e.type);
+    }
+  });
+
   test("tool_result caps are enforced by schema shape only (output is plain string)", () => {
     const e = { ...base, threadId: "main", type: "tool_result", callId: "c", output: "x".repeat(100), isError: true };
     expect(SessionEvent.parse(e)).toMatchObject({ isError: true });

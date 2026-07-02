@@ -55,6 +55,10 @@ export const DirectoryAddedEvent = ThreadBase.extend({
   persisted: z.boolean(),
 });
 
+export const BgTaskStartedEvent = ThreadBase.extend({ type: z.literal("bg_task_started"), taskId: z.string().min(1), command: z.string() });
+export const BgTaskOutputEvent = ThreadBase.extend({ type: z.literal("bg_task_output"), taskId: z.string().min(1), chunk: z.string() });
+export const BgTaskExitedEvent = ThreadBase.extend({ type: z.literal("bg_task_exited"), taskId: z.string().min(1), exitCode: z.number().int().nullable(), killed: z.boolean() });
+
 export const SessionEvent = z.discriminatedUnion("type", [
   SessionCreatedEvent,
   HarnessAttachedEvent,
@@ -69,6 +73,9 @@ export const SessionEvent = z.discriminatedUnion("type", [
   TurnCompletedEvent,
   AgentErrorEvent,
   DirectoryAddedEvent,
+  BgTaskStartedEvent,
+  BgTaskOutputEvent,
+  BgTaskExitedEvent,
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 

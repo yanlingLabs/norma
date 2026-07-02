@@ -53,9 +53,8 @@ export class BackgroundTaskRegistry {
       cwd: realCwd, stdio: ["ignore", "pipe", "pipe"], detached: true, env: { ...process.env, TMPDIR: scratch },
     });
     const taskId = `bg_${randomBytes(6).toString("hex")}`;
-    // TODO(T3): drop the `as unknown as NewSessionEvent` casts below once bg_task_* land in the SessionEvent union.
     const coalescer = new OutputCoalescer((chunk) =>
-      this.deps.emit(sessionId, { type: "bg_task_output", sessionId, threadId: "main", taskId, chunk } as unknown as NewSessionEvent));
+      this.deps.emit(sessionId, { type: "bg_task_output", sessionId, threadId: "main", taskId, chunk }));
     const task: Task = { taskId, sessionId, command, child, status: "running", exitCode: null, ring: "", cursor: 0, ringDropped: false, dropNoted: false, startedAt: Date.now(), coalescer };
     this.tasks.set(taskId, task);
 
@@ -77,12 +76,12 @@ export class BackgroundTaskRegistry {
       task.coalescer.dispose();
       if (task.status !== "killed") task.status = "exited";
       task.exitCode = code;
-      this.deps.emit(sessionId, { type: "bg_task_exited", sessionId, threadId: "main", taskId, exitCode: code, killed: task.status === "killed" } as unknown as NewSessionEvent);
+      this.deps.emit(sessionId, { type: "bg_task_exited", sessionId, threadId: "main", taskId, exitCode: code, killed: task.status === "killed" });
     });
     child.on("error", () => { task.coalescer.dispose(); task.status = "exited"; task.exitCode = -1;
-      this.deps.emit(sessionId, { type: "bg_task_exited", sessionId, threadId: "main", taskId, exitCode: -1, killed: false } as unknown as NewSessionEvent); });
+      this.deps.emit(sessionId, { type: "bg_task_exited", sessionId, threadId: "main", taskId, exitCode: -1, killed: false }); });
 
-    this.deps.emit(sessionId, { type: "bg_task_started", sessionId, threadId: "main", taskId, command } as unknown as NewSessionEvent);
+    this.deps.emit(sessionId, { type: "bg_task_started", sessionId, threadId: "main", taskId, command });
     return taskId;
   }
 
