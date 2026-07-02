@@ -1,7 +1,7 @@
 import {
   LineDecoder, encodeLine, METHODS, PROTOCOL_VERSION, SessionEvent,
   SessionCreateResult, SessionAttachResult, SessionSendResult, SessionListResult,
-  SessionAddDirResult, SessionSetCwdResult,
+  SessionAddDirResult, SessionSetCwdResult, TrustDirResult,
   ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 
@@ -87,8 +87,12 @@ export class NormaClient {
     return r.data;
   }
 
-  async createSession(scope: string, opts?: { cwd?: string; approvalPolicy?: "ask" | "auto" }): Promise<string> {
-    return this.validated(SessionCreateResult, await this.request(METHODS.sessionCreate, { scope, ...opts }), METHODS.sessionCreate).sessionId;
+  async createSession(scope: string, opts?: { cwd?: string; approvalPolicy?: "ask" | "auto" }): Promise<{ sessionId: string; trusted: boolean }> {
+    const r = this.validated(SessionCreateResult, await this.request(METHODS.sessionCreate, { scope, ...opts }), METHODS.sessionCreate);
+    return { sessionId: r.sessionId, trusted: r.trusted };
+  }
+  async trustDir(path: string): Promise<boolean> {
+    return this.validated(TrustDirResult, await this.request(METHODS.trustDir, { path }), METHODS.trustDir).trusted;
   }
   async attach(sessionId: string, fromSeq = 0): Promise<number> {
     return this.validated(SessionAttachResult, await this.request(METHODS.sessionAttach, { sessionId, fromSeq }), METHODS.sessionAttach).lastSeq;

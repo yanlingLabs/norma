@@ -25,7 +25,7 @@ describe("NormaClient", () => {
       clientName: "cli-test",
       onEvent: (e) => events.push(e),
     });
-    const sessionId = await client.createSession("global");
+    const { sessionId } = await client.createSession("global");
     await client.attach(sessionId);
     await client.send(sessionId, "ping");
     await new Promise((r) => setTimeout(r, 50));
@@ -44,13 +44,25 @@ describe("NormaClient", () => {
     await boot();
     const events: any[] = [];
     const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "cli", onEvent: (e) => events.push(e) });
-    const sessionId = await client.createSession("global", { cwd: mkdtempSync(join(tmpdir(), "norma-cli-cwd-")) });
+    const { sessionId } = await client.createSession("global", { cwd: mkdtempSync(join(tmpdir(), "norma-cli-cwd-")) });
     await client.attach(sessionId);
     const extra = mkdtempSync(join(tmpdir(), "norma-cli-extra-"));
     const roots = await client.addDir(sessionId, extra);
     expect(roots).toContain(realpathSync(extra));
     await new Promise((r) => setTimeout(r, 30));
     expect(events.some((e) => e.type === "directory_added")).toBe(true);
+    client.close();
+  });
+
+  test("createSession returns trusted; trustDir makes a later create trusted", async () => {
+    await boot();
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "t", onEvent: () => {} });
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-cli-trust-")));
+    const first = await client.createSession("global", { cwd });
+    expect(first.trusted).toBe(false);
+    expect(await client.trustDir(cwd)).toBe(true);
+    const second = await client.createSession("global", { cwd });
+    expect(second.trusted).toBe(true);
     client.close();
   });
 });

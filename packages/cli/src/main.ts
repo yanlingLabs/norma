@@ -1,4 +1,5 @@
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
 import { resolveNormaHome, KeychainSecretStore, startDaemon, TOKEN_NAMES } from "@norma/core";
 import { METHODS } from "@norma/protocol";
 import { NormaClient } from "./client";
@@ -30,6 +31,21 @@ async function readSecret(promptText: string): Promise<string> {
     if (stdin.isTTY) stdin.setRawMode(wasRaw ?? false);
     stdin.pause();
   }
+}
+
+// Single y/N question on stdin, reusing the same non-raw "read a chunk, check for a leading y"
+// pattern the approval_requested prompt below uses. TTY-guarded by callers; resolves false on EOF.
+async function askYesNo(promptText: string): Promise<boolean> {
+  process.stdout.write(promptText);
+  const stdin = process.stdin;
+  return new Promise((resolvePromise) => {
+    const onData = (d: Buffer) => { cleanup(); resolvePromise(String(d).trim().toLowerCase() === "y"); };
+    const onEnd = () => { cleanup(); resolvePromise(false); };
+    function cleanup() { stdin.off("data", onData); stdin.off("end", onEnd); }
+    stdin.once("data", onData);
+    stdin.once("end", onEnd);
+    stdin.resume();
+  });
 }
 
 async function getToken(): Promise<string> {
@@ -73,7 +89,13 @@ async function runHeadlessAgent(): Promise<void> {
     }
   });
 
-  const sessionId = await c.createSession("global", { cwd: process.cwd(), approvalPolicy: auto ? "auto" : "ask" });
+  const cwd = process.cwd();
+  const { sessionId, trusted } = await c.createSession("global", { cwd, approvalPolicy: auto ? "auto" : "ask" });
+  if (!trusted) {
+    const wantTrust = process.argv.includes("--trust")
+      || (process.stdout.isTTY && !process.argv.includes("--no-trust") && (await askYesNo(`Do you trust the files in ${cwd}? Norma may grant directory access declared there. [y/N] `)));
+    if (wantTrust) { await c.trustDir(cwd); console.log(`${DIM}trusted ${cwd}${RESET}`); }
+  }
   await c.attach(sessionId);
 
   if (!auto) {
@@ -123,7 +145,7 @@ switch (cmdKey) {
     const text = args.slice(1).join(" ");
     if (!target || !text) { console.error("usage: norma send <sessionId|new> <text…>"); process.exit(1); }
     const c = await connect("cli-send");
-    const sessionId = target === "new" ? await c.createSession("global") : target;
+    const sessionId = target === "new" ? (await c.createSession("global")).sessionId : target;
     await c.attach(sessionId);
     await c.send(sessionId, text);
     console.log(`${AQUA}sent to ${sessionId}${RESET}`);
@@ -138,6 +160,31 @@ switch (cmdKey) {
     const roots = await c.addDir(sessionId, path, process.argv.includes("--persist"));
     console.log(`${AQUA}+ dir ${path} → ${roots.length} roots${RESET}`);
     c.close();
+    break;
+  }
+  case "trust": {
+    const arg = process.argv[3];
+    if (arg === "--list") {
+      // Protocol has no daemon.trustList method (kept minimal) — read ~/.norma/trust.json directly.
+      const trustPath = join(resolveNormaHome(), "trust.json");
+      let dirs: string[] = [];
+      if (existsSync(trustPath)) {
+        try {
+          const raw = JSON.parse(readFileSync(trustPath, "utf8"));
+          dirs = Array.isArray(raw?.trustedDirs) ? raw.trustedDirs.map(String) : [];
+        } catch { /* corrupt/unreadable file — treat as empty */ }
+      }
+      if (dirs.length === 0) console.log("(none)");
+      else for (const d of dirs) console.log(d);
+    } else if (arg) {
+      const c = await connect("cli-trust");
+      await c.trustDir(resolve(arg));
+      console.log(`${AQUA}trusted ${resolve(arg)}${RESET}`);
+      c.close();
+    } else {
+      console.error("usage: norma trust <dir> | norma trust --list");
+      process.exit(1);
+    }
     break;
   }
   case "cd": {
@@ -245,6 +292,7 @@ switch (cmdKey) {
     console.log(`norma (Phase 1b-i) — commands:
   daemon run | daemon install | daemon uninstall | daemon status
   ping | sessions | send <sessionId|new> <text> | watch <sessionId> | add-dir <sessionId> <path> [--persist] | cd <sessionId> <path>
+  trust <dir> [--list]
   login [--api-key] | logout | provider | provider-smoke [--prompt <text>]
-  -p "<prompt>" [--auto]   headless agent turn (asks for tool approval unless --auto)`);
+  -p "<prompt>" [--auto] [--trust|--no-trust]   headless agent turn (asks for tool approval unless --auto)`);
 }
