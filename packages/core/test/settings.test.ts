@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadSettings } from "../src/settings";
+import { loadSettings, loadPermissionDirs, addLocalDir } from "../src/settings";
+import { mkdirSync, writeFileSync as wf } from "node:fs";
 
 function tmpSettings(content: unknown): string {
   const p = join(mkdtempSync(join(tmpdir(), "norma-set-")), "settings.json");
@@ -47,5 +48,41 @@ describe("loadSettings", () => {
     const p = tmpSettings({ schemaVersion: 1, custom: true });
     loadSettings(p);
     expect(JSON.parse(readFileSync(p, "utf8")).custom).toBe(true);
+  });
+});
+
+describe("permission directories", () => {
+  test("Settings accepts an optional permissions.additionalDirectories block", () => {
+    const p = tmpSettings({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, permissions: { additionalDirectories: ["~/x"] } });
+    expect(loadSettings(p).permissions?.additionalDirectories).toEqual(["~/x"]);
+  });
+
+  test("loadPermissionDirs merges user + project + local, expands ~, dedups", () => {
+    const home = mkdtempSync(join(tmpdir(), "norma-perm-home-"));
+    const project = mkdtempSync(join(tmpdir(), "norma-perm-proj-"));
+    wf(join(home, "settings.json"), JSON.stringify({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, permissions: { additionalDirectories: ["~/shared"] } }));
+    mkdirSync(join(project, ".norma"), { recursive: true });
+    wf(join(project, ".norma", "settings.json"), JSON.stringify({ permissions: { additionalDirectories: ["/opt/data", "~/shared"] } }));
+    wf(join(project, ".norma", "settings.local.json"), JSON.stringify({ permissions: { additionalDirectories: ["/tmp/local-grant"] } }));
+    const dirs = loadPermissionDirs(home, project);
+    const { homedir } = require("node:os");
+    expect(dirs).toContain(join(homedir(), "shared"));
+    expect(dirs).toContain("/opt/data");
+    expect(dirs).toContain("/tmp/local-grant");
+    expect(dirs.filter((d) => d === join(homedir(), "shared"))).toHaveLength(1); // deduped
+  });
+
+  test("loadPermissionDirs tolerates missing files and missing blocks", () => {
+    const home = mkdtempSync(join(tmpdir(), "norma-perm-h2-"));
+    expect(loadPermissionDirs(home)).toEqual([]); // nothing configured
+  });
+
+  test("addLocalDir appends to settings.local.json without duplicates", () => {
+    const project = mkdtempSync(join(tmpdir(), "norma-perm-add-"));
+    addLocalDir(project, "/opt/one");
+    addLocalDir(project, "/opt/one"); // dup ignored
+    addLocalDir(project, "/opt/two");
+    const local = JSON.parse(require("node:fs").readFileSync(join(project, ".norma", "settings.local.json"), "utf8"));
+    expect(local.permissions.additionalDirectories).toEqual(["/opt/one", "/opt/two"]);
   });
 });
