@@ -12,6 +12,7 @@ export { FakeProvider } from "./agent/fake-provider";
 export { ToolRegistry, type ToolDefinition, type ToolContext, type ToolOutcome } from "./agent/tools/registry";
 export { registerReadTools } from "./agent/tools/fs-read";
 export { registerWriteTools } from "./agent/tools/fs-write";
+export { registerNotebookTool } from "./agent/tools/notebook";
 export { registerBashTool } from "./agent/tools/bash";
 export { registerBackgroundTools } from "./agent/tools/background";
 export { registerRequestDirTool, type RequestDirDeps } from "./agent/tools/request-dir";
