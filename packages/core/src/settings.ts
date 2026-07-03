@@ -26,6 +26,10 @@ export const Settings = z.object({
     model: z.string().optional(),
     allow: z.array(z.string()).optional(),
   }).optional(),
+  plugins: z.object({
+    enabled: z.array(z.string()).optional(),
+    disabled: z.array(z.string()).optional(),
+  }).optional(),
 });
 export type Settings = z.infer<typeof Settings>;
 
@@ -56,6 +60,11 @@ export function loadSettings(path: string): Settings {
     throw new Error(`settings.json is invalid: ${parsed.error.issues.map((i) => i.path.join(".")).join(", ")} — fix or delete ${path}`);
   }
   return parsed.data;
+}
+
+export function saveSettings(path: string, s: Settings): void {
+  Settings.parse(s); // validate before writing — never persist an invalid settings file
+  writeFileSync(path, JSON.stringify(s, null, 2) + "\n");
 }
 
 function expandTilde(p: string): string {

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadSettings, loadPermissionDirs, addLocalDir, Settings } from "../src/settings";
+import { loadSettings, loadPermissionDirs, addLocalDir, saveSettings, Settings } from "../src/settings";
 import { mkdirSync, writeFileSync as wf } from "node:fs";
 
 function tmpSettings(content: unknown): string {
@@ -86,6 +86,33 @@ describe("loadSettings", () => {
     const s = loadSettings(p);
     expect(s.schemaVersion).toBe(2);
     expect(s.reviewer).toBeUndefined();
+  });
+
+  test("plugins config parses; absent → undefined", () => {
+    const s = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, plugins: { enabled: ["a"], disabled: ["b"] } });
+    expect(s.plugins).toEqual({ enabled: ["a"], disabled: ["b"] });
+    expect(Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" } }).plugins).toBeUndefined();
+  });
+
+  test("legacy migration keeps working with plugins field absent", () => {
+    const p = tmpSettings({ webSearch: { provider: "disabled" } });
+    const s = loadSettings(p);
+    expect(s.schemaVersion).toBe(2);
+    expect(s.plugins).toBeUndefined();
+  });
+});
+
+describe("saveSettings", () => {
+  test("writes a file that loadSettings round-trips", () => {
+    const p = join(mkdtempSync(join(tmpdir(), "norma-save-")), "settings.json");
+    const s: Settings = { schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, plugins: { enabled: ["a"] } };
+    saveSettings(p, s);
+    expect(loadSettings(p)).toEqual(s);
+  });
+
+  test("throws on an invalid object (bad schemaVersion) and does not write", () => {
+    const p = join(mkdtempSync(join(tmpdir(), "norma-save-")), "settings.json");
+    expect(() => saveSettings(p, { schemaVersion: 1, provider: { type: "codex-oauth", model: "gpt-5.4" } } as unknown as Settings)).toThrow();
   });
 });
 
