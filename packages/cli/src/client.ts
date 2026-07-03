@@ -4,7 +4,7 @@ import {
   SessionAddDirResult, SessionSetCwdResult, TrustDirResult,
   BgListResult, BgPeekResult, BgKillResult, BgKillAllResult,
   SessionSteerResult, SessionInterruptResult, SessionCompactResult, SkillsListResult,
-  PluginsListResult,
+  PluginsListResult, AskUserRespondResult, TaskListResult,
   ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 
@@ -145,6 +145,12 @@ export class NormaClient {
   }
   async pluginsList(): Promise<{ ok: true; plugins: Array<{ name: string; description?: string; version?: string; skills: string[]; hasMcp: boolean; mcpEnabled: boolean; disabled: boolean }> }> {
     return this.validated(PluginsListResult, await this.request(METHODS.pluginsList, {}), METHODS.pluginsList);
+  }
+  async askUserRespond(params: { sessionId: string; callId: string; answers: Record<string, string> }): Promise<{ ok: true; alreadyResolved: boolean }> {
+    return this.validated(AskUserRespondResult, await this.request(METHODS.askUserRespond, params), METHODS.askUserRespond);
+  }
+  async taskList(params: { sessionId: string }): Promise<{ ok: true; tasks: Array<{ id: string; subject: string; status: "pending" | "in_progress" | "completed"; activeForm?: string }> }> {
+    return this.validated(TaskListResult, await this.request(METHODS.taskList, params), METHODS.taskList);
   }
   close(): void { this.socket.end(); }
 }

@@ -5,10 +5,12 @@ import { METHODS } from "@norma/protocol";
 import { NormaClient } from "./client";
 import { applyEvent, isStalled, type WatchdogState } from "./watchdog";
 import { installPlugin, removePluginDir, removePluginFromSettings, setPluginEnabled } from "./plugin-cli";
+import { parseQuestionAnswer } from "./questions";
 
 const AQUA = "\x1b[38;2;53;214;232m";
 const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
+const TASK_ICONS: Record<string, string> = { pending: "☐", in_progress: "◐", completed: "☑" };
 
 async function readSecret(promptText: string): Promise<string> {
   process.stdout.write(promptText);
@@ -43,6 +45,22 @@ async function askYesNo(promptText: string): Promise<boolean> {
   return new Promise((resolvePromise) => {
     const onData = (d: Buffer) => { cleanup(); resolvePromise(String(d).trim().toLowerCase() === "y"); };
     const onEnd = () => { cleanup(); resolvePromise(false); };
+    function cleanup() { stdin.off("data", onData); stdin.off("end", onEnd); }
+    stdin.once("data", onData);
+    stdin.once("end", onEnd);
+    stdin.resume();
+  });
+}
+
+// Reads one line of free-form text from stdin — same one-shot "data"/"end" pattern as askYesNo,
+// but returns the raw trimmed text instead of parsing y/n. Used for ask_user question answers.
+// TTY-guarded by callers; resolves "" on EOF.
+async function readLine(promptText: string): Promise<string> {
+  process.stdout.write(promptText);
+  const stdin = process.stdin;
+  return new Promise((resolvePromise) => {
+    const onData = (d: Buffer) => { cleanup(); resolvePromise(String(d).trim()); };
+    const onEnd = () => { cleanup(); resolvePromise(""); };
     function cleanup() { stdin.off("data", onData); stdin.off("end", onEnd); }
     stdin.once("data", onData);
     stdin.once("end", onEnd);
@@ -120,7 +138,27 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
     else if (e.type === "bg_task_started") console.log(`${DIM}▶ bg ${e.taskId} started: ${e.command.slice(0, 80)}${RESET}`);
     else if (e.type === "bg_task_output") process.stdout.write(`${DIM}${e.chunk}${RESET}`);
     else if (e.type === "bg_task_exited") console.log(`${DIM}■ bg ${e.taskId} exited (${e.killed ? "killed" : "exit " + e.exitCode})${RESET}`);
-    else if (e.type === "agent_error") {
+    else if (e.type === "question_asked") {
+      // No TTY → skip rendering entirely (do NOT block reading stdin); the QuestionBroker
+      // times out server-side and the engine proceeds with its "best judgment" fallback.
+      if (process.stdin.isTTY) {
+        void (async () => {
+          const answers: Record<string, string> = {};
+          for (const q of e.questions) {
+            console.log(`\n${AQUA}${q.header}${RESET} — ${q.question}`);
+            q.options.forEach((o: { label: string; description?: string }, i: number) => {
+              console.log(`  ${i + 1}) ${o.label}${o.description ? ` ${DIM}${o.description}${RESET}` : ""}`);
+            });
+            console.log(`  ${q.options.length + 1}) Other (type your answer)`);
+            const input = await readLine(q.multiSelect ? "choose (comma-separated numbers or text): " : "choose (number or text): ");
+            answers[q.question] = parseQuestionAnswer(input, q.options.map((o: { label: string }) => o.label), q.multiSelect);
+          }
+          await c.askUserRespond({ sessionId, callId: e.callId, answers });
+        })();
+      }
+    } else if (e.type === "task_updated") {
+      console.log(`${DIM}${TASK_ICONS[e.task.status]} ${e.task.subject}${RESET}`);
+    } else if (e.type === "agent_error") {
       console.error(`agent error: ${e.message}`);
     } else if (e.type === "turn_completed") {
       void endHeadlessTurn(c, sessionId, wdTimer, e.stopReason === "end_turn" ? 0 : 1);
