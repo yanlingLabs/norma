@@ -651,4 +651,44 @@ describe("daemon IPC", () => {
     expect(result).toEqual({ ok: true, servers: [{ name: "fake", status: "connected", toolNames: ["echo"], source: "user" }] });
     c.close();
   });
+
+  test("mcp.list({cwd}) ensures + surfaces a trusted project's servers (source \"project\"); mcp.list({}) shows only user servers", async () => {
+    if (process.platform !== "darwin") return; // spawns a child process
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const fixture = join(import.meta.dir, "agent", "mcp", "fake-mcp-server.ts");
+    const home = mkdtempSync(join(tmpdir(), "norma-daemon-"));
+    writeFileSync(join(home, "settings.json"), JSON.stringify({
+      schemaVersion: 2,
+      provider: { type: "codex-oauth", model: "gpt-5.4" },
+      mcpServers: { fake: { command: "bun", args: ["run", fixture] } },
+    }, null, 2));
+    const secrets = new FileSecretStore(join(home, "test-secrets"));
+    const fake = new FakeProvider([[{ type: "text_delta", delta: "hi" }, { type: "done", stopReason: "end_turn" }]]);
+    daemon = await startDaemon({ home, secrets, agentProvider: { provider: fake, model: "fake-1" } });
+    harnessToken = daemon.tokens.harness;
+
+    const projectDir = realpathSync(mkdtempSync(join(tmpdir(), "norma-mcp-project-")));
+    writeFileSync(join(projectDir, ".mcp.json"), JSON.stringify({ mcpServers: { proj: { command: "bun", args: ["run", fixture] } } }));
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "mcp-lister-project");
+
+    // No cwd: only the user-configured server.
+    const noCwd = (await c.request(METHODS.mcpList, {})).result;
+    expect(noCwd).toEqual({ ok: true, servers: [{ name: "fake", status: "connected", toolNames: ["echo"], source: "user" }] });
+
+    // Untrusted project cwd: ensureProject is a no-op, so the project server is absent.
+    const untrusted = (await c.request(METHODS.mcpList, { cwd: projectDir })).result;
+    expect(untrusted.servers.find((s: any) => s.name === "proj")).toBeUndefined();
+
+    await c.request(METHODS.trustDir, { path: projectDir });
+
+    // Trusted now: mcp.list starts the project's servers (ensureProject) and shows them.
+    const { result } = await c.request(METHODS.mcpList, { cwd: projectDir });
+    expect(result.ok).toBe(true);
+    expect(result.servers).toContainEqual({ name: "proj", status: "connected", toolNames: ["echo"], source: "project" });
+    expect(result.servers).toContainEqual({ name: "fake", status: "connected", toolNames: ["echo"], source: "user" });
+
+    c.close();
+  });
 });

@@ -303,10 +303,10 @@ if (import.meta.main) {
   }
   case "mcp": {
     const c = await connect("cli-mcp");
-    const servers = await c.listMcp();
+    const servers = await c.listMcp(process.cwd());
     if (!servers.length) console.log("no MCP servers configured");
     for (const s of servers) {
-      console.log(`${AQUA}${s.name}${RESET}  ${DIM}(${s.status})${RESET}  ${s.toolNames.map((t) => `mcp__${s.name}__${t}`).join(", ")}`);
+      console.log(`${AQUA}${s.name}${RESET}  ${DIM}(${s.source}, ${s.status})${RESET}  ${s.toolNames.map((t) => `mcp__${s.name}__${t}`).join(", ")}`);
     }
     c.close();
     process.exit(0);

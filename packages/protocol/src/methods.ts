@@ -110,8 +110,9 @@ export const McpServerStatusSchema = z.object({
   name: z.string(),
   status: z.enum(["connected", "failed"]),
   toolNames: z.array(z.string()),
+  source: z.enum(["user", "project"]),
 });
-export const McpListParams = z.object({});
+export const McpListParams = z.object({ cwd: z.string().optional() });
 export const McpListResult = z.object({ ok: z.literal(true), servers: z.array(McpServerStatusSchema) });
 
 export const METHODS = {

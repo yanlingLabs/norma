@@ -138,8 +138,8 @@ export class NormaClient {
   async listSkills(cwd?: string): Promise<Array<{ name: string; description: string; source: string; path: string }>> {
     return this.validated(SkillsListResult, await this.request(METHODS.skillsList, { cwd }), METHODS.skillsList).skills;
   }
-  async listMcp(): Promise<Array<{ name: string; status: string; toolNames: string[] }>> {
-    const r = await this.request(METHODS.mcpList, {});
+  async listMcp(cwd?: string): Promise<Array<{ name: string; status: string; toolNames: string[]; source: string }>> {
+    const r = await this.request(METHODS.mcpList, { cwd });
     return r.servers;
   }
   close(): void { this.socket.end(); }

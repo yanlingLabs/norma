@@ -214,8 +214,9 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         return { ok: true, skills: opts.skills.list({ cwd: p.cwd ?? null }) };
       }
       case METHODS.mcpList: {
-        parseParams(McpListParams, params);
-        return { ok: true, servers: opts.mcp?.list() ?? [] };
+        const p = parseParams(McpListParams, params);
+        if (p.cwd) await opts.mcp?.ensureProject(p.cwd);
+        return { ok: true, servers: opts.mcp?.list(p.cwd) ?? [] };
       }
       case METHODS.approvalRespond: {
         const p = parseParams(ApprovalRespondParams, params);
