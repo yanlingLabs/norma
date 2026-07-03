@@ -20,6 +20,7 @@ import { McpManager } from "./agent/mcp/manager";
 import { PermissionGate } from "./agent/gate";
 import { ApprovalBroker } from "./agent/approvals";
 import { AgentEngine } from "./agent/engine";
+import { BashReviewer } from "./agent/reviewer";
 import { Compactor } from "./agent/compactor";
 import { SessionDirectories } from "./agent/dirs";
 import { TrustStore } from "./agent/trust";
@@ -98,8 +99,9 @@ export async function startDaemon(opts: {
     registerBashTool(registry, { bgRegistry });
     registerBackgroundTools(registry, { bgRegistry });
     registerSkillTools(registry, { skills: skillStore });
+    const settings = loadSettings(dirs.settingsPath);
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
-    await mcp.startAll(loadSettings(dirs.settingsPath).mcpServers ?? {});
+    await mcp.startAll(settings.mcpServers ?? {});
     broker = new ApprovalBroker();
     registerRequestDirTool(registry, {
       broker,
@@ -108,6 +110,10 @@ export async function startDaemon(opts: {
       projectDir: (sid) => store.meta(sid).cwd,
     });
     const compactor = new Compactor({ provider: agentProvider, store, hub });
+    // Default ON: the reviewer is built unless settings.reviewer.enabled is explicitly false.
+    const reviewerCfg = settings.reviewer;
+    const reviewer =
+      reviewerCfg?.enabled === false ? undefined : new BashReviewer({ provider: agentProvider, model: reviewerCfg?.model });
     engine = new AgentEngine({
       store, hub, registry, broker,
       gate: new PermissionGate(),
@@ -116,6 +122,9 @@ export async function startDaemon(opts: {
       assembler,
       compactor,
       mcp: mcp ?? undefined,
+      reviewer,
+      reviewerEnabled: reviewerCfg?.enabled,
+      reviewerAllow: reviewerCfg?.allow ?? [],
     });
   }
 

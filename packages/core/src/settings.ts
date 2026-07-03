@@ -21,6 +21,11 @@ export const Settings = z.object({
     args: z.array(z.string()).optional(),
     env: z.record(z.string(), z.string()).optional(),
   })).optional(),
+  reviewer: z.object({
+    enabled: z.boolean().optional(),
+    model: z.string().optional(),
+    allow: z.array(z.string()).optional(),
+  }).optional(),
 });
 export type Settings = z.infer<typeof Settings>;
 

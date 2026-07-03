@@ -74,6 +74,19 @@ describe("loadSettings", () => {
     const none = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" } });
     expect(none.mcpServers).toBeUndefined();
   });
+
+  test("reviewer config parses; absent → undefined", () => {
+    const s = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, reviewer: { enabled: true, model: "gpt-5.4-mini", allow: ["git status"] } });
+    expect(s.reviewer).toEqual({ enabled: true, model: "gpt-5.4-mini", allow: ["git status"] });
+    expect(Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" } }).reviewer).toBeUndefined();
+  });
+
+  test("legacy migration keeps working with reviewer field absent", () => {
+    const p = tmpSettings({ webSearch: { provider: "disabled" } });
+    const s = loadSettings(p);
+    expect(s.schemaVersion).toBe(2);
+    expect(s.reviewer).toBeUndefined();
+  });
 });
 
 describe("permission directories", () => {

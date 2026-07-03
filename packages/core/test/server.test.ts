@@ -76,8 +76,21 @@ describe("daemon IPC", () => {
   async function boot(
     serverOpts: { helloTimeoutMs?: number; maxConnections?: number } = {},
     provider?: Provider,
+    // Pre-seed settings.json (e.g. `{ reviewer: { enabled: false } }`) before the daemon reads
+    // it — used by tests that exercise the "auto"-policy bash path with a scripted FakeProvider,
+    // where the (default-on) safety reviewer would otherwise consume the same provider's
+    // single-track script queue meant for the turn itself. Reviewer *behavior* has its own
+    // dedicated coverage in test/agent/engine-reviewer.test.ts.
+    settingsOverride?: Record<string, unknown>,
   ): Promise<void> {
     const home = mkdtempSync(join(tmpdir(), "norma-daemon-"));
+    if (settingsOverride) {
+      writeFileSync(join(home, "settings.json"), JSON.stringify({
+        schemaVersion: 2,
+        provider: { type: "codex-oauth", model: "gpt-5.4" },
+        ...settingsOverride,
+      }));
+    }
     const secrets = new FileSecretStore(join(home, "test-secrets"));
     daemon = await startDaemon({
       home, secrets, server: serverOpts,
@@ -332,7 +345,7 @@ describe("daemon IPC", () => {
       [{ type: "tool_call", callId: "b1", name: "bash", argsJson: JSON.stringify({ command: "echo hi > out.txt" }) }, { type: "done", stopReason: "tool_calls" }],
       [{ type: "text_delta", delta: "done" }, { type: "done", stopReason: "end_turn" }],
     ]);
-    await boot({}, fake);
+    await boot({}, fake, { reviewer: { enabled: false } }); // this test wires bash, not the reviewer
     const c = await TestClient.connect(daemon.socketPath);
     await c.hello(harnessToken, "bash-runner");
     const cwd = mkdtempSync(join(tmpdir(), "norma-bashwire-"));
@@ -352,7 +365,7 @@ describe("daemon IPC", () => {
       [{ type: "tool_call", callId: "b1", name: "bash", argsJson: JSON.stringify({ command: `echo hi > ${added}/f.txt` }) }, { type: "done", stopReason: "tool_calls" }],
       [{ type: "text_delta", delta: "done" }, { type: "done", stopReason: "end_turn" }],
     ]);
-    await boot({}, fake);
+    await boot({}, fake, { reviewer: { enabled: false } }); // this test wires addDir/bash, not the reviewer
     const c = await TestClient.connect(daemon.socketPath);
     await c.hello(harnessToken, "adder");
     const cwd = mkdtempSync(join(tmpdir(), "norma-adder-cwd-"));
@@ -454,7 +467,7 @@ describe("daemon IPC", () => {
       [{ type: "tool_call", callId: "b1", name: "bash", argsJson: JSON.stringify({ command: "echo hi; sleep 2", runInBackground: true }) }, { type: "done", stopReason: "tool_calls" }],
       [{ type: "text_delta", delta: "started" }, { type: "done", stopReason: "end_turn" }],
     ]);
-    await boot({}, fake);
+    await boot({}, fake, { reviewer: { enabled: false } }); // this test wires bg tasks, not the reviewer
     const c = await TestClient.connect(daemon.socketPath);
     await c.hello(harnessToken, "bg");
     const s = (await c.request(METHODS.sessionCreate, { scope: "global", cwd, approvalPolicy: "auto" })).result.sessionId;
