@@ -20,12 +20,15 @@ import { registerToolSearchTool } from "./agent/tools/toolsearch";
 import { registerAskUserTool } from "./agent/tools/ask-user";
 import { registerTaskTools } from "./agent/tools/tasks";
 import { registerPlanTool } from "./agent/tools/plan";
+import { registerNotebookTool } from "./agent/tools/notebook";
+import { registerWorktreeTools } from "./agent/tools/worktree";
 import { McpManager } from "./agent/mcp/manager";
 import { PermissionGate } from "./agent/gate";
 import { ApprovalBroker } from "./agent/approvals";
 import { QuestionBroker } from "./agent/questions";
 import { TaskStore } from "./agent/task-store";
 import { PlanBroker } from "./agent/plans";
+import { WorktreeManager } from "./agent/worktree";
 import { AgentEngine } from "./agent/engine";
 import { BashReviewer } from "./agent/reviewer";
 import { Compactor } from "./agent/compactor";
@@ -133,6 +136,9 @@ export async function startDaemon(opts: {
     registerTaskTools(registry, { tasks: taskStore });
     plans = new PlanBroker();
     registerPlanTool(registry);
+    registerNotebookTool(registry);
+    const worktrees = new WorktreeManager({ baseRef: settings?.worktree?.baseRef });
+    registerWorktreeTools(registry);
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
     await mcp.startAll(settings?.mcpServers ?? {});
     // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled && !disabled);
@@ -167,6 +173,7 @@ export async function startDaemon(opts: {
       tasks: taskStore ?? undefined,
       plans: plans ?? undefined,
       setPolicy: (sid, pol) => store.setApprovalPolicy(sid, pol),
+      worktrees,
       reviewer,
       reviewerEnabled: reviewerCfg?.enabled,
       reviewerAllow: reviewerCfg?.allow ?? [],

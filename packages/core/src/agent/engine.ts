@@ -14,6 +14,7 @@ import type { ContextAssembler } from "./context";
 import type { Compactor } from "./compactor";
 import type { McpManager } from "./mcp/manager";
 import { bashLooksSafe, type BashReviewer } from "./reviewer";
+import type { WorktreeManager } from "./worktree";
 
 const MAIN_THREAD = "main";
 const MAX_TOOL_ITERATIONS = 24; // runaway guard until 1b-ii budgets land
@@ -65,6 +66,12 @@ export interface EngineConfig {
   // set, since that's what lets a same-turn follow-up call see the new mode immediately.
   plans?: PlanBroker;
   setPolicy?: (sessionId: string, policy: "ask" | "auto" | "plan") => Promise<void> | void;
+  // Worktree isolation (1d-iii): optional — absent means enter_worktree/exit_worktree fall to
+  // their own placeholder run() (tools/worktree.ts) rather than the bridge below. When set, the
+  // bridge mutates the turn's local `cwd` (now `let`, not `const`) SAME-TURN, so a follow-up tool
+  // call later in this same turn resolves into (or back out of) the worktree immediately — it
+  // also persists via store.setCwd/dirs.add so the NEXT turn sees it too.
+  worktrees?: WorktreeManager;
 }
 
 export class AgentEngine {
@@ -199,7 +206,10 @@ export class AgentEngine {
       this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "error", inputTokens: 0, outputTokens: 0 });
       return;
     }
-    const cwd = meta.cwd;
+    // `let`, not `const`: the enter/exit_worktree bridge below reassigns this SAME-TURN so a
+    // follow-up tool call later in this turn's dispatch loop resolves into (or back out of) the
+    // worktree without waiting for the next turn's store.meta() re-read.
+    let cwd = meta.cwd;
     // Trust-gated project .mcp.json bring-up, BEFORE the turn_started emit: this can spawn
     // subprocesses (slow), and a project server that's already started/recorded is a no-op, so
     // doing it here (rather than after turn_started) keeps the -p watchdog from tripping on a
@@ -304,6 +314,8 @@ export class AgentEngine {
           });
         } else if (call.name === "exit_plan_mode" && this.cfg.plans && meta.approvalPolicy === "plan") {
           outcome = await this.runPlanBridge(call, sessionId, threadId, meta);
+        } else if ((call.name === "enter_worktree" || call.name === "exit_worktree") && this.cfg.worktrees) {
+          outcome = this.runWorktreeBridge(call, sessionId, threadId, cwd, (next) => { cwd = next; });
         } else if (
           decision === "allow" && call.name === "bash" && this.cfg.reviewer &&
           this.cfg.reviewerEnabled !== false && meta.approvalPolicy === "auto"
@@ -435,6 +447,54 @@ export class AgentEngine {
       output: `Plan rejected: ${reason}. Stay in plan mode and revise your plan, then call exit_plan_mode again.`,
       isError: false,
     };
+  }
+
+  /** enter_worktree/exit_worktree's bridge — wired ONLY when cfg.worktrees is set (see the
+   *  else-if guard at the call site); otherwise both tools fall through to executeCall's
+   *  placeholder run (tools/worktree.ts). Synchronous (WorktreeManager's git calls are
+   *  Bun.spawnSync), unlike the approval/plan bridges above which wait on a broker.
+   *  `setCwd` persists the switch to the SessionStore so it also survives into the next turn;
+   *  `onCwd` mutates the dispatch loop's local `cwd` (now `let`) so a follow-up call LATER IN
+   *  THIS SAME TURN resolves into (or back out of) the worktree immediately. A thrown manager
+   *  error (e.g. dirty worktree on remove, not a git repo, already in a worktree) becomes an
+   *  isError outcome rather than propagating and failing the whole turn. */
+  private runWorktreeBridge(
+    call: { callId: string; name: string; argsJson: string },
+    sessionId: string,
+    threadId: string,
+    cwd: string,
+    onCwd: (next: string) => void,
+  ): { output: string; isError: boolean } {
+    const worktrees = this.cfg.worktrees!;
+    try {
+      if (call.name === "enter_worktree") {
+        let name: string | undefined;
+        try { name = JSON.parse(call.argsJson || "{}").name; } catch { /* ignore — name stays undefined */ }
+        const wt = worktrees.enter(sessionId, cwd, name);
+        this.cfg.store.setCwd(sessionId, wt.dir);
+        this.cfg.dirs.add(sessionId, wt.dir);
+        onCwd(wt.dir); // SAME-TURN: subsequent calls in this turn resolve into the worktree
+        this.emit(sessionId, { type: "worktree_entered", sessionId, threadId, name: wt.name, path: wt.dir, branch: wt.branch });
+        return {
+          output: `Entered worktree ${wt.name} at ${wt.dir} on branch ${wt.branch}. You're now working in an isolated copy; the original repo is untouched.`,
+          isError: false,
+        };
+      }
+      let action: "keep" | "remove" = "keep";
+      try { const a = JSON.parse(call.argsJson || "{}"); if (a.action === "remove") action = "remove"; } catch { /* default to keep */ }
+      const res = worktrees.exit(sessionId, action);
+      this.cfg.store.setCwd(sessionId, res.originalCwd);
+      onCwd(res.originalCwd); // SAME-TURN revert
+      this.emit(sessionId, { type: "worktree_exited", sessionId, threadId, name: res.name, action, removed: res.removed });
+      return {
+        output: action === "remove"
+          ? `Left and removed worktree ${res.name}.`
+          : `Left worktree ${res.name}; branch ${res.branch} kept — merge or PR it when ready.`,
+        isError: false,
+      };
+    } catch (e) {
+      return { output: (e as Error).message, isError: true };
+    }
   }
 
   private executeCall(
