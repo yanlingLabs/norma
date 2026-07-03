@@ -22,6 +22,9 @@ import {
   SessionInterruptResult,
   SessionCompactParams,
   SessionCompactResult,
+  SkillMetaSchema,
+  SkillsListParams,
+  SkillsListResult,
   METHODS,
 } from "../src/methods";
 
@@ -158,5 +161,18 @@ describe("session.compact schema", () => {
     expect(() => SessionCompactResult.parse({ ok: true, compacted: true, uptoSeq: -1, summaryChars: 0 })).toThrow();
     expect(() => SessionCompactResult.parse({ ok: true, compacted: true, uptoSeq: 0, summaryChars: -1 })).toThrow();
     expect(METHODS.sessionCompact).toBe("session.compact");
+  });
+});
+
+describe("skills.list schema", () => {
+  test("skills.list params/result + method string", () => {
+    expect(SkillsListParams.parse({}).cwd).toBeUndefined();
+    expect(SkillsListParams.parse({ cwd: "/tmp/x" }).cwd).toBe("/tmp/x");
+    const meta = SkillMetaSchema.parse({ name: "greet", description: "Say hi", source: "user", path: "/x/SKILL.md" });
+    expect(meta.source).toBe("user");
+    expect(() => SkillMetaSchema.parse({ name: "greet", description: "Say hi", source: "bogus", path: "/x" })).toThrow();
+    const r = SkillsListResult.parse({ ok: true, skills: [meta] });
+    expect(r.skills).toHaveLength(1);
+    expect(METHODS.skillsList).toBe("skills.list");
   });
 });

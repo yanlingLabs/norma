@@ -3,7 +3,7 @@ import {
   SessionCreateResult, SessionAttachResult, SessionSendResult, SessionListResult,
   SessionAddDirResult, SessionSetCwdResult, TrustDirResult,
   BgListResult, BgPeekResult, BgKillResult, BgKillAllResult,
-  SessionSteerResult, SessionInterruptResult, SessionCompactResult,
+  SessionSteerResult, SessionInterruptResult, SessionCompactResult, SkillsListResult,
   ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 
@@ -134,6 +134,9 @@ export class NormaClient {
   async compact(sessionId: string): Promise<{ compacted: boolean; uptoSeq: number; summaryChars: number }> {
     const r = this.validated(SessionCompactResult, await this.request(METHODS.sessionCompact, { sessionId }), METHODS.sessionCompact);
     return { compacted: r.compacted, uptoSeq: r.uptoSeq, summaryChars: r.summaryChars };
+  }
+  async listSkills(cwd?: string): Promise<Array<{ name: string; description: string; source: string; path: string }>> {
+    return this.validated(SkillsListResult, await this.request(METHODS.skillsList, { cwd }), METHODS.skillsList).skills;
   }
   close(): void { this.socket.end(); }
 }

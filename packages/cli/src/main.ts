@@ -293,6 +293,14 @@ if (import.meta.main) {
     c.close();
     process.exit(0);
   }
+  case "skills": {
+    const c = await connect("cli-skills");
+    const rows = await c.listSkills(process.cwd());
+    if (!rows.length) console.log("no skills installed");
+    for (const s of rows) console.log(`${AQUA}${s.name}${RESET}  ${DIM}(${s.source})${RESET}  — ${s.description}`);
+    c.close();
+    process.exit(0);
+  }
   case "bg": {
     const bgSub = process.argv[3];
     const bgSessionId = process.argv[4];
@@ -446,6 +454,7 @@ if (import.meta.main) {
   steer <sessionId> <text> | interrupt <sessionId> | compact <sessionId>
   resume [id] [msg]   list sessions, or continue an existing one
   trust <dir> [--list]
+  skills                                          list discovered skills for this directory
   bg list <session> | bg peek <session> <taskId> | bg kill <session> <taskId>
   login [--api-key] | logout | provider | provider-smoke [--prompt <text>]
   init                                            generate/update NORMA.md by surveying the project

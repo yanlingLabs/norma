@@ -125,6 +125,7 @@ export async function startDaemon(opts: {
     dirs: sessionDirs,
     trust: trustStore,
     bg: bgRegistry,
+    skills: skillStore,
     ...opts.server,
   });
 

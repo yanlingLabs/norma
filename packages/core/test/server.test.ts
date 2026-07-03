@@ -603,4 +603,30 @@ describe("daemon IPC", () => {
     expect(checkpoint.params.summary.length).toBe(r.summaryChars);
     c.close();
   });
+
+  test("skills.list returns [] when no skills are installed", async () => {
+    await boot(); // no provider → default temp home has no user/project skills
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "no-skills");
+    const { result } = await c.request(METHODS.skillsList, {});
+    expect(result).toEqual({ ok: true, skills: [] });
+    c.close();
+  });
+
+  test("skills.list discovers a user skill over the socket (the daemon wires its one skillStore into the server)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "norma-daemon-"));
+    mkdirSync(join(home, "skills", "greet"), { recursive: true });
+    writeFileSync(join(home, "skills", "greet", "SKILL.md"), "---\nname: greet\ndescription: Say hi\n---\nSay hello warmly.\n");
+    const secrets = new FileSecretStore(join(home, "test-secrets"));
+    daemon = await startDaemon({ home, secrets, agentProvider: null });
+    harnessToken = daemon.tokens.harness;
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "skills-lister");
+    const { result } = await c.request(METHODS.skillsList, {});
+    expect(result.ok).toBe(true);
+    expect(result.skills).toHaveLength(1);
+    expect(result.skills[0]).toMatchObject({ name: "greet", description: "Say hi", source: "user" });
+    c.close();
+  });
 });

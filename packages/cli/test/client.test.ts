@@ -96,6 +96,13 @@ describe("NormaClient", () => {
     client.close();
   });
 
+  test("listSkills client method round-trip (no skills installed)", async () => {
+    await boot();
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "sk", onEvent: () => {} });
+    expect(await client.listSkills(process.cwd())).toEqual([]);
+    client.close();
+  });
+
   test("init prompt reaches the session (canned NORMA.md-generation prompt)", async () => {
     const { INIT_PROMPT } = await import("../src/main");
     expect(INIT_PROMPT).toMatch(/NORMA\.md/i);

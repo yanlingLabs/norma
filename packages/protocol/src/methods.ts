@@ -97,6 +97,15 @@ export const SessionCompactResult = z.object({
   summaryChars: z.number().int().nonnegative(),
 });
 
+export const SkillMetaSchema = z.object({
+  name: z.string(),
+  description: z.string(),
+  source: z.enum(["project", "user", "self", "plugin"]),
+  path: z.string(),
+});
+export const SkillsListParams = z.object({ cwd: z.string().optional() });
+export const SkillsListResult = z.object({ ok: z.literal(true), skills: z.array(SkillMetaSchema) });
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -115,4 +124,5 @@ export const METHODS = {
   sessionSteer: "session.steer",
   sessionInterrupt: "session.interrupt",
   sessionCompact: "session.compact",
+  skillsList: "skills.list",
 } as const;

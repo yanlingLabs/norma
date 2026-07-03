@@ -5,7 +5,7 @@ import {
   HelloParams, SessionCreateParams, SessionAttachParams, SessionSendParams, ApprovalRespondParams,
   SessionAddDirParams, SessionSetCwdParams, TrustDirParams,
   BgListParams, BgPeekParams, BgKillParams, BgKillAllParams,
-  SessionSteerParams, SessionInterruptParams, SessionCompactParams,
+  SessionSteerParams, SessionInterruptParams, SessionCompactParams, SkillsListParams,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
@@ -16,6 +16,7 @@ import type { ApprovalBroker } from "../agent/approvals";
 import type { SessionDirectories } from "../agent/dirs";
 import type { TrustStore } from "../agent/trust";
 import type { BackgroundTaskRegistry } from "../agent/bg-registry";
+import type { SkillStore } from "../agent/skills";
 import { addLocalDir } from "../settings";
 
 interface ConnState {
@@ -38,6 +39,7 @@ export interface IpcServerOptions {
   dirs?: SessionDirectories; // live allowed-roots per session; addDir/setCwd need it
   trust?: TrustStore;        // per-directory trust; session.create result + daemon.trustDir
   bg?: BackgroundTaskRegistry; // background bash tasks; bg.list/peek/kill/killAll
+  skills?: SkillStore;       // discovered SKILL.md skills; skills.list
   helloTimeoutMs?: number;   // default 5000
   maxConnections?: number;   // default 64
   preAuthMaxLine?: number;   // default 64 KiB
@@ -203,6 +205,11 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         const p = parseParams(SessionCompactParams, params);
         if (!opts.engine) return { ok: true, compacted: false, uptoSeq: 0, summaryChars: 0 };
         return { ok: true, ...(await opts.engine.compact(p.sessionId)) };
+      }
+      case METHODS.skillsList: {
+        const p = parseParams(SkillsListParams, params);
+        if (!opts.skills) return { ok: true, skills: [] };
+        return { ok: true, skills: opts.skills.list({ cwd: p.cwd ?? null }) };
       }
       case METHODS.approvalRespond: {
         const p = parseParams(ApprovalRespondParams, params);
