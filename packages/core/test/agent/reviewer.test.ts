@@ -22,6 +22,12 @@ describe("bashLooksSafe", () => {
     expect(bashLooksSafe("git status", ["git status"])).toBe(true);
     expect(bashLooksSafe("mytool", ["mytool"])).toBe(true);
   });
+  test("command-runner / destructive argv0 are NOT bypassed (must be reviewed)", () => {
+    expect(bashLooksSafe("env rm -rf .")).toBe(false);   // env defeats the allowlist
+    expect(bashLooksSafe("env FOO=1 ls")).toBe(false);
+    expect(bashLooksSafe("find . -delete")).toBe(false);
+    expect(bashLooksSafe("find . -name x")).toBe(false);
+  });
 });
 
 describe("BashReviewer", () => {
