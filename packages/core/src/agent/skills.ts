@@ -70,11 +70,13 @@ export class SkillStore {
   private readonly normaHome: string;
   private readonly trust: TrustStore;
   private readonly bodyBytes: number;
+  private readonly disabledPlugins: string[];
 
-  constructor(deps: { normaHome: string; trust: TrustStore; caps?: { bodyBytes?: number } }) {
+  constructor(deps: { normaHome: string; trust: TrustStore; caps?: { bodyBytes?: number }; plugins?: { disabled?: string[] } }) {
     this.normaHome = deps.normaHome;
     this.trust = deps.trust;
     this.bodyBytes = deps.caps?.bodyBytes ?? 32768;
+    this.disabledPlugins = deps.plugins?.disabled ?? [];
   }
 
   /** All discovered skills (parsed, unfiltered by name), in precedence order: project, user, self, plugin. */
@@ -93,6 +95,7 @@ export class SkillStore {
       plugins = readdirSync(join(this.normaHome, "plugins"), { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
     } catch { /* no plugins dir */ }
     for (const plugin of plugins) {
+      if (this.disabledPlugins.includes(plugin)) continue;
       for (const s of scanRoot(join(this.normaHome, "plugins", plugin, "skills"), "plugin")) {
         all.push({ ...s, name: `${plugin}:${s.name}` }); // the one place plugin names get namespaced
       }

@@ -87,4 +87,28 @@ describe("SkillStore", () => {
     expect(s.list({ cwd: null })).toEqual([]);
     expect(s.load("nope", { cwd: null })).toBeNull();
   });
+
+  test("a disabled plugin's skills are not discovered; others unaffected", () => {
+    const { home, trust } = setup();
+    writeSkill(join(home, "plugins", "on", "skills"), "hi", "hi", "Say hi", "Hi there!");
+    writeSkill(join(home, "plugins", "off", "skills"), "bye", "bye", "Say bye", "Goodbye!");
+
+    const store = new SkillStore({ normaHome: home, trust, plugins: { disabled: ["off"] } });
+    const names = store.list({ cwd: null }).map((s) => s.name);
+
+    expect(names).toContain("on:hi");
+    expect(names).not.toContain("off:bye");
+  });
+
+  test("without disabled plugins dep, all plugin skills are discovered (unchanged behavior)", () => {
+    const { home, trust } = setup();
+    writeSkill(join(home, "plugins", "on", "skills"), "hi", "hi", "Say hi", "Hi there!");
+    writeSkill(join(home, "plugins", "off", "skills"), "bye", "bye", "Say bye", "Goodbye!");
+
+    const store = new SkillStore({ normaHome: home, trust });
+    const names = store.list({ cwd: null }).map((s) => s.name);
+
+    expect(names).toContain("on:hi");
+    expect(names).toContain("off:bye");
+  });
 });
