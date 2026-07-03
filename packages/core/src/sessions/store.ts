@@ -122,7 +122,7 @@ export class SessionStore {
     return join(this.homeDir, "sessions", scope, `${sessionId}.jsonl`);
   }
 
-  createSession(scope: string, opts: { cwd?: string; approvalPolicy?: "ask" | "auto" } = {}): string {
+  createSession(scope: string, opts: { cwd?: string; approvalPolicy?: "ask" | "auto" | "plan" } = {}): string {
     if (!SCOPE_RE.test(scope)) throw new Error(`invalid scope: ${scope}`);
     const sessionId = `s_${randomBytes(6).toString("hex")}`;
     mkdirSync(join(this.homeDir, "sessions", scope), { recursive: true });
@@ -163,11 +163,20 @@ export class SessionStore {
     this.db.run("UPDATE sessions SET cwd = ? WHERE session_id = ?", [cwd, sessionId]);
   }
 
-  meta(sessionId: string): { sessionId: string; scope: string; cwd: string | null; approvalPolicy: "ask" | "auto" } {
+  /** Deterministic on an unknown session: throws so the IPC server can map it to NOT_FOUND
+   *  (unlike setCwd, which silently no-ops — approval policy changes must not fail silently). */
+  setApprovalPolicy(sessionId: string, policy: "ask" | "auto" | "plan"): void {
+    const res = this.db.run("UPDATE sessions SET approval_policy = ? WHERE session_id = ?", [policy, sessionId]);
+    if (res.changes === 0) throw new Error(`unknown session: ${sessionId}`);
+  }
+
+  meta(sessionId: string): { sessionId: string; scope: string; cwd: string | null; approvalPolicy: "ask" | "auto" | "plan" } {
     const row = this.db.query("SELECT scope, cwd, approval_policy FROM sessions WHERE session_id = ?").get(sessionId) as
       | { scope: string; cwd: string | null; approval_policy: string } | null;
     if (!row) throw new Error(`unknown session: ${sessionId}`);
-    return { sessionId, scope: row.scope, cwd: row.cwd, approvalPolicy: row.approval_policy === "auto" ? "auto" : "ask" };
+    const p = row.approval_policy;
+    const approvalPolicy: "ask" | "auto" | "plan" = p === "auto" ? "auto" : p === "plan" ? "plan" : "ask";
+    return { sessionId, scope: row.scope, cwd: row.cwd, approvalPolicy };
   }
 
   close(): void { this.db.close(); }

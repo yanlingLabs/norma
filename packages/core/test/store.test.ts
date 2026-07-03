@@ -169,6 +169,26 @@ describe("SessionStore", () => {
     }
   });
 
+  test("setApprovalPolicy round-trips all three values (THE TRAP: plan must not read back as ask)", () => {
+    const { store } = makeStore();
+    const id = store.createSession("global");
+    for (const p of ["auto", "plan", "ask"] as const) {
+      store.setApprovalPolicy(id, p);
+      expect(store.meta(id).approvalPolicy).toBe(p);
+    }
+  });
+
+  test("createSession with plan", () => {
+    const { store } = makeStore();
+    const id = store.createSession("global", { approvalPolicy: "plan" });
+    expect(store.meta(id).approvalPolicy).toBe("plan");
+  });
+
+  test("setApprovalPolicy on unknown session throws", () => {
+    const { store } = makeStore();
+    expect(() => store.setApprovalPolicy("nope", "plan")).toThrow();
+  });
+
   test("read returns fully-typed events without a second parse (behavior unchanged)", () => {
     const { store } = makeStore();
     const id = store.createSession("global");
