@@ -7,6 +7,7 @@ export interface ToolContext {
   tmpDir?: string; // per-session scratch dir (sandbox writable root + child TMPDIR); bash uses it, other tools ignore
   sessionId: string; // needed by request_directory (approvals/dirs are keyed per-session); other tools ignore it
   signal?: AbortSignal; // aborts when the turn is interrupted; long-running tools (bash) should honor it
+  markSkillLoaded?: (name: string) => void; // set by the engine; the Skill tool calls it to pin a loaded skill for the session
 }
 export interface ToolOutcome { output: string; isError: boolean }
 
