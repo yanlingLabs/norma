@@ -12,6 +12,11 @@ import type { ContextAssembler } from "./context";
 const MAIN_THREAD = "main";
 const MAX_TOOL_ITERATIONS = 24; // runaway guard until 1b-ii budgets land
 
+type Checkpoint = Extract<SessionEvent, { type: "checkpoint" }>;
+function isCheckpoint(e: SessionEvent): e is Checkpoint {
+  return e.type === "checkpoint";
+}
+
 export const SYSTEM_PROMPT = [
   "You are Norma, an agentic assistant running on the user's Mac.",
   "You operate inside a session working directory; file tool paths are relative to it.",
@@ -84,13 +89,23 @@ export class AgentEngine {
     return this.cfg.hub.append(sessionId, event); // hub.append: store.append + broadcast (added below)
   }
 
+  /** Builds the turn's starting input from history: if the session has been compacted (a
+   *  `checkpoint` event exists), the input opens with the checkpoint's summary in place of the
+   *  messages it covers, followed only by messages after its `uptoSeq` — this is what actually
+   *  shrinks the model's context after compaction. With no checkpoint, behavior is unchanged:
+   *  the full user/assistant message history. */
   private historyInput(sessionId: string): TurnInputItem[] {
+    const events = this.cfg.store.read(sessionId);
+    const lastCp = [...events].reverse().find(isCheckpoint);
     const input: TurnInputItem[] = [];
-    for (const e of this.cfg.store.read(sessionId)) {
+    if (lastCp) input.push({ type: "message", role: "user", content: "[Summary of earlier conversation]\n" + lastCp.summary });
+    const uptoSeq = lastCp ? lastCp.uptoSeq : 0;
+    for (const e of events) {
+      if (e.seq <= uptoSeq) continue;
       if (e.type === "user_message") input.push({ type: "message", role: "user", content: e.text });
       else if (e.type === "assistant_message") input.push({ type: "message", role: "assistant", content: e.text });
       // Prior turns' tool calls are summarized by their assistant_message; current-turn
-      // call/result items are threaded in-memory below. Compaction-aware assembly is 1c.
+      // call/result items are threaded in-memory below.
     }
     return input;
   }
