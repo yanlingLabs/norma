@@ -1,0 +1,41 @@
+{
+  "type": "question_asked",
+  "sessionId": "s_1",
+  "threadId": "t_1",
+  "seq": 10,
+  "ts": 1700000000000,
+  "callId": "call_1",
+  "questions": [
+    {
+      "question": "Which codename?",
+      "header": "Codename",
+      "options": [
+        {
+          "label": "Falcon"
+        },
+        {
+          "label": "Osprey",
+          "description": "the bird"
+        }
+      ],
+      "multiSelect": false
+    },
+    {
+      "question": "Which features?",
+      "header": "Features",
+      "options": [
+        {
+          "label": "A",
+          "description": "first"
+        },
+        {
+          "label": "B"
+        },
+        {
+          "label": "C"
+        }
+      ],
+      "multiSelect": true
+    }
+  ]
+}

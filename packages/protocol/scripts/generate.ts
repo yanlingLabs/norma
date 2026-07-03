@@ -31,6 +31,11 @@ const fixtures: Record<string, unknown> = {
   "bg_task_output":  { ...base, threadId: "main", type: "bg_task_output",  taskId: "bg_a1", chunk: "listening on :3000\n" },
   "bg_task_exited":  { ...base, threadId: "main", type: "bg_task_exited",  taskId: "bg_a1", exitCode: 0, killed: false },
   checkpoint: { ...base, type: "checkpoint", threadId: "main", summary: "Earlier: set up the repo; decided to use Bun.", uptoSeq: 5 },
+  question_asked: { type: "question_asked", sessionId: "s_1", threadId: "t_1", seq: 10, ts: 1700000000000, callId: "call_1",
+    questions: [{ question: "Which codename?", header: "Codename", options: [{ label: "Falcon" }, { label: "Osprey", description: "the bird" }], multiSelect: false },
+                { question: "Which features?", header: "Features", options: [{ label: "A", description: "first" }, { label: "B" }, { label: "C" }], multiSelect: true }] },
+  question_resolved: { type: "question_resolved", sessionId: "s_1", threadId: "t_1", seq: 11, ts: 1700000000001, callId: "call_1", answers: { "Which codename?": "Osprey", "Which features?": "A, C" }, by: "cli" },
+  task_updated: { type: "task_updated", sessionId: "s_1", threadId: "t_1", seq: 12, ts: 1700000000002, task: { id: "1", subject: "rename the project", status: "in_progress", activeForm: "Renaming the project" } },
 };
 for (const [name, value] of Object.entries(fixtures)) {
   SessionEvent.parse(value); // fixtures must be valid by construction

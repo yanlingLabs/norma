@@ -63,6 +63,27 @@ export const CheckpointEvent = ThreadBase.extend({
   type: z.literal("checkpoint"), summary: z.string(), uptoSeq: z.number().int().nonnegative(),
 });
 
+export const QuestionOptionSchema = z.object({ label: z.string().min(1), description: z.string().optional() });
+export const QuestionSchema = z.object({
+  question: z.string().min(1), header: z.string().min(1).max(12),
+  options: z.array(QuestionOptionSchema).min(2).max(4), multiSelect: z.boolean(),
+});
+export const TaskSchema = z.object({
+  id: z.string().min(1), subject: z.string().min(1),
+  status: z.enum(["pending", "in_progress", "completed"]), activeForm: z.string().optional(),
+});
+export type QuestionOption = z.infer<typeof QuestionOptionSchema>;
+export type Question = z.infer<typeof QuestionSchema>;
+export type Task = z.infer<typeof TaskSchema>;
+
+export const QuestionAskedEvent = ThreadBase.extend({
+  type: z.literal("question_asked"), callId: z.string().min(1), questions: z.array(QuestionSchema).min(1).max(4),
+});
+export const QuestionResolvedEvent = ThreadBase.extend({
+  type: z.literal("question_resolved"), callId: z.string().min(1), answers: z.record(z.string(), z.string()), by: z.string().min(1),
+});
+export const TaskUpdatedEvent = ThreadBase.extend({ type: z.literal("task_updated"), task: TaskSchema });
+
 export const SessionEvent = z.discriminatedUnion("type", [
   SessionCreatedEvent,
   HarnessAttachedEvent,
@@ -81,6 +102,9 @@ export const SessionEvent = z.discriminatedUnion("type", [
   BgTaskOutputEvent,
   BgTaskExitedEvent,
   CheckpointEvent,
+  QuestionAskedEvent,
+  QuestionResolvedEvent,
+  TaskUpdatedEvent,
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 

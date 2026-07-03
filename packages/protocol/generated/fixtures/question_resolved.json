@@ -1,0 +1,13 @@
+{
+  "type": "question_resolved",
+  "sessionId": "s_1",
+  "threadId": "t_1",
+  "seq": 11,
+  "ts": 1700000000001,
+  "callId": "call_1",
+  "answers": {
+    "Which codename?": "Osprey",
+    "Which features?": "A, C"
+  },
+  "by": "cli"
+}

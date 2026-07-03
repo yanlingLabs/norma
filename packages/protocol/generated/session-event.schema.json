@@ -748,6 +748,218 @@
         "uptoSeq"
       ],
       "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "threadId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "question_asked"
+        },
+        "callId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "questions": {
+          "minItems": 1,
+          "maxItems": 4,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "question": {
+                "type": "string",
+                "minLength": 1
+              },
+              "header": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 12
+              },
+              "options": {
+                "minItems": 2,
+                "maxItems": 4,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "label": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "description": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "label"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "multiSelect": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "question",
+              "header",
+              "options",
+              "multiSelect"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "seq",
+        "sessionId",
+        "ts",
+        "threadId",
+        "type",
+        "callId",
+        "questions"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "threadId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "question_resolved"
+        },
+        "callId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "answers": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "by": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "seq",
+        "sessionId",
+        "ts",
+        "threadId",
+        "type",
+        "callId",
+        "answers",
+        "by"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "threadId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "task_updated"
+        },
+        "task": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "subject": {
+              "type": "string",
+              "minLength": 1
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "in_progress",
+                "completed"
+              ]
+            },
+            "activeForm": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "subject",
+            "status"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "seq",
+        "sessionId",
+        "ts",
+        "threadId",
+        "type",
+        "task"
+      ],
+      "additionalProperties": false
     }
   ]
 }

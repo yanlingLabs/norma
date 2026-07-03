@@ -7,6 +7,10 @@ import {
   SessionCreateResult,
   ApprovalRespondParams,
   ApprovalRespondResult,
+  AskUserRespondParams,
+  AskUserRespondResult,
+  TaskListParams,
+  TaskListResult,
   SessionAddDirParams,
   SessionSetCwdParams,
   TrustDirParams,
@@ -198,5 +202,22 @@ describe("plugins.list schema", () => {
 
   test("McpServerStatusSchema.source is widened to include \"plugin\"", () => {
     expect(McpServerStatusSchema.parse({ name: "x", status: "connected", toolNames: [], source: "plugin" }).source).toBe("plugin");
+  });
+});
+
+describe("ask_user.respond / task.list schemas", () => {
+  test("ask_user.respond params/result + method string", () => {
+    const p = AskUserRespondParams.parse({ sessionId: "s1", callId: "c1", answers: { "Which codename?": "Falcon" } });
+    expect(p.answers["Which codename?"]).toBe("Falcon");
+    expect(AskUserRespondResult.parse({ ok: true, alreadyResolved: false }).alreadyResolved).toBe(false);
+    expect(METHODS.askUserRespond).toBe("ask_user.respond");
+  });
+
+  test("task.list params/result + method string", () => {
+    expect(TaskListParams.parse({ sessionId: "s1" }).sessionId).toBe("s1");
+    const r = TaskListResult.parse({ ok: true, tasks: [{ id: "1", subject: "rename", status: "pending" }] });
+    expect(r.tasks).toHaveLength(1);
+    expect(() => TaskListResult.parse({ ok: true, tasks: [{ id: "1", subject: "rename", status: "bogus" }] })).toThrow();
+    expect(METHODS.taskList).toBe("task.list");
   });
 });

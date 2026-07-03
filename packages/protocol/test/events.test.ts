@@ -79,6 +79,42 @@ describe("SessionEvent discriminated union", () => {
     expect(e.type).toBe("checkpoint" as SessionEvent["type"]);
     if (e.type === "checkpoint") { expect(e.uptoSeq).toBe(2); expect(e.summary).toContain("decided Y"); }
   });
+
+  test("question_asked / question_resolved / task_updated round-trip", () => {
+    const qa = {
+      type: "question_asked" as const, sessionId: "s", threadId: "t", seq: 1, ts: 1, callId: "c1",
+      questions: [
+        { question: "Which codename?", header: "Codename", options: [{ label: "Falcon" }, { label: "Osprey", description: "the bird" }], multiSelect: false },
+        { question: "Which features?", header: "Features", options: [{ label: "A" }, { label: "B" }, { label: "C" }], multiSelect: true },
+      ],
+    };
+    expect(SessionEvent.parse(qa)).toEqual(qa);
+
+    const qr = {
+      type: "question_resolved", sessionId: "s", threadId: "t", seq: 2, ts: 2, callId: "c1",
+      answers: { "Which codename?": "Osprey" }, by: "cli",
+    } as const;
+    expect(SessionEvent.parse(qr)).toEqual(qr);
+
+    const tu = {
+      type: "task_updated", sessionId: "s", threadId: "t", seq: 3, ts: 3,
+      task: { id: "1", subject: "rename", status: "pending" },
+    } as const;
+    expect(SessionEvent.parse(tu)).toEqual(tu);
+  });
+
+  test("bounds: 0/5 questions, 1/5 options, 13-char header rejected", () => {
+    const t = { seq: 1, sessionId: "s", ts: 1, threadId: "t" };
+    const validQuestion = { question: "Q?", header: "Header", options: [{ label: "A" }, { label: "B" }], multiSelect: false };
+
+    expect(SessionEvent.safeParse({ ...t, type: "question_asked", callId: "c", questions: [] }).success).toBe(false); // 0 questions
+    expect(SessionEvent.safeParse({ ...t, type: "question_asked", callId: "c", questions: Array(5).fill(validQuestion) }).success).toBe(false); // 5 questions
+    expect(SessionEvent.safeParse({ ...t, type: "question_asked", callId: "c", questions: [validQuestion] }).success).toBe(true); // 1 question ok
+    expect(SessionEvent.safeParse({ ...t, type: "question_asked", callId: "c", questions: [{ ...validQuestion, options: [{ label: "A" }] }] }).success).toBe(false); // 1 option
+    expect(SessionEvent.safeParse({ ...t, type: "question_asked", callId: "c", questions: [{ ...validQuestion, options: Array(5).fill({ label: "A" }) }] }).success).toBe(false); // 5 options
+    expect(SessionEvent.safeParse({ ...t, type: "question_asked", callId: "c", questions: [{ ...validQuestion, header: "H".repeat(13) }] }).success).toBe(false); // 13-char header
+    expect(SessionEvent.safeParse({ ...t, type: "question_asked", callId: "c", questions: [{ ...validQuestion, header: "H".repeat(12) }] }).success).toBe(true); // 12-char header ok
+  });
 });
 
 describe("hello method schemas", () => {

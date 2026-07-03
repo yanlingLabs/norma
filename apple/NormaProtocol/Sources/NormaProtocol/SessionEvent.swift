@@ -18,6 +18,9 @@ public enum SessionEvent: Codable, Equatable {
     case bgTaskOutput(BgTaskOutput)
     case bgTaskExited(BgTaskExited)
     case checkpoint(Checkpoint)
+    case questionAsked(QuestionAsked)
+    case questionResolved(QuestionResolved)
+    case taskUpdated(TaskUpdated)
 
     public struct SessionCreated: Codable, Equatable {
         public let seq: Int
@@ -168,6 +171,52 @@ public enum SessionEvent: Codable, Equatable {
         public let uptoSeq: Int
     }
 
+    public struct QuestionOption: Codable, Equatable {
+        public let label: String
+        public let description: String?
+    }
+
+    public struct Question: Codable, Equatable {
+        public let question: String
+        public let header: String
+        public let options: [QuestionOption]
+        public let multiSelect: Bool
+    }
+
+    public struct Task: Codable, Equatable {
+        public let id: String
+        public let subject: String
+        public let status: String
+        public let activeForm: String?
+    }
+
+    public struct QuestionAsked: Codable, Equatable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let callId: String
+        public let questions: [Question]
+    }
+
+    public struct QuestionResolved: Codable, Equatable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let callId: String
+        public let answers: [String: String]
+        public let by: String
+    }
+
+    public struct TaskUpdated: Codable, Equatable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let task: Task
+    }
+
     private enum Discriminator: String, Codable {
         case session_created
         case harness_attached
@@ -186,6 +235,9 @@ public enum SessionEvent: Codable, Equatable {
         case bg_task_output
         case bg_task_exited
         case checkpoint
+        case question_asked
+        case question_resolved
+        case task_updated
     }
 
     private enum TypeKey: String, CodingKey { case type }
@@ -210,6 +262,9 @@ public enum SessionEvent: Codable, Equatable {
         case .bg_task_output:       self = .bgTaskOutput(try BgTaskOutput(from: decoder))
         case .bg_task_exited:       self = .bgTaskExited(try BgTaskExited(from: decoder))
         case .checkpoint:           self = .checkpoint(try Checkpoint(from: decoder))
+        case .question_asked:       self = .questionAsked(try QuestionAsked(from: decoder))
+        case .question_resolved:    self = .questionResolved(try QuestionResolved(from: decoder))
+        case .task_updated:         self = .taskUpdated(try TaskUpdated(from: decoder))
         }
     }
 
@@ -283,6 +338,18 @@ public enum SessionEvent: Codable, Equatable {
             try v.encode(to: encoder)
             var c = encoder.container(keyedBy: TypeKey.self)
             try c.encode(Discriminator.checkpoint.rawValue, forKey: .type)
+        case .questionAsked(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.question_asked.rawValue, forKey: .type)
+        case .questionResolved(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.question_resolved.rawValue, forKey: .type)
+        case .taskUpdated(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.task_updated.rawValue, forKey: .type)
         }
     }
 }

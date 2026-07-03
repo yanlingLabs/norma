@@ -1,0 +1,13 @@
+{
+  "type": "task_updated",
+  "sessionId": "s_1",
+  "threadId": "t_1",
+  "seq": 12,
+  "ts": 1700000000002,
+  "task": {
+    "id": "1",
+    "subject": "rename the project",
+    "status": "in_progress",
+    "activeForm": "Renaming the project"
+  }
+}

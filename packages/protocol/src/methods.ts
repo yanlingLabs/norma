@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { SessionEvent } from "./events";
+import { SessionEvent, TaskSchema } from "./events";
 
 export const PROTOCOL_VERSION = 0;
 
@@ -127,6 +127,14 @@ export const PluginInfoSchema = z.object({
 export const PluginsListParams = z.object({});
 export const PluginsListResult = z.object({ ok: z.literal(true), plugins: z.array(PluginInfoSchema) });
 
+export const AskUserRespondParams = z.object({
+  sessionId: z.string().min(1), callId: z.string().min(1), answers: z.record(z.string(), z.string()),
+});
+export const AskUserRespondResult = z.object({ ok: z.literal(true), alreadyResolved: z.boolean() });
+
+export const TaskListParams = z.object({ sessionId: z.string().min(1) });
+export const TaskListResult = z.object({ ok: z.literal(true), tasks: z.array(TaskSchema) });
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -148,4 +156,6 @@ export const METHODS = {
   skillsList: "skills.list",
   mcpList: "mcp.list",
   pluginsList: "plugins.list",
+  askUserRespond: "ask_user.respond",
+  taskList: "task.list",
 } as const;
