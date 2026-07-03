@@ -743,4 +743,94 @@ describe("daemon IPC", () => {
       server.stop();
     }
   });
+
+  // THE CONSENT SEAM: a plugin's skills are always live (SkillStore has no consent gate), but a
+  // plugin's MCP servers only start when the user has opted in via settings.plugins.enabled —
+  // and settings.plugins.disabled always wins over enabled (fully off: no skills, no MCP).
+  function seedDemoPlugin(home: string, fixture: string): void {
+    mkdirSync(join(home, "plugins", "demo", "skills", "greet"), { recursive: true });
+    writeFileSync(join(home, "plugins", "demo", "skills", "greet", "SKILL.md"), "---\nname: greet\ndescription: hi\n---\nbody");
+    writeFileSync(join(home, "plugins", "demo", ".mcp.json"), JSON.stringify({ mcpServers: { fake: { command: "bun", args: ["run", fixture] } } }));
+  }
+
+  test("CONSENT: a not-enabled plugin's skills are live but its MCP servers are NOT started", async () => {
+    if (process.platform !== "darwin") return; // spawns a child process
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const fixture = join(import.meta.dir, "agent", "mcp", "fake-mcp-server.ts");
+    const home = mkdtempSync(join(tmpdir(), "norma-plugin-consent-"));
+    seedDemoPlugin(home, fixture);
+    writeFileSync(join(home, "settings.json"), JSON.stringify({
+      schemaVersion: 2,
+      provider: { type: "codex-oauth", model: "gpt-5.4" },
+    }));
+    const secrets = new FileSecretStore(join(home, "test-secrets"));
+    const fake = new FakeProvider([[{ type: "text_delta", delta: "hi" }, { type: "done", stopReason: "end_turn" }]]);
+    daemon = await startDaemon({ home, secrets, agentProvider: { provider: fake, model: "fake-1" } });
+    harnessToken = daemon.tokens.harness;
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "consent-off");
+    const skills = (await c.request(METHODS.skillsList, {})).result;
+    expect(skills.skills.map((s: any) => s.name)).toContain("demo:greet"); // skills always live
+    const mcp = (await c.request(METHODS.mcpList, {})).result;
+    expect(mcp.servers.find((s: any) => s.name === "demo:fake")).toBeUndefined(); // no consent → no server
+    const plugins = (await c.request(METHODS.pluginsList, {})).result;
+    expect(plugins.plugins[0]).toMatchObject({ name: "demo", hasMcp: true, mcpEnabled: false, disabled: false });
+    c.close();
+  });
+
+  test("enabled in settings → the plugin's MCP server starts at boot (source plugin)", async () => {
+    if (process.platform !== "darwin") return; // spawns a child process
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const fixture = join(import.meta.dir, "agent", "mcp", "fake-mcp-server.ts");
+    const home = mkdtempSync(join(tmpdir(), "norma-plugin-consent-"));
+    seedDemoPlugin(home, fixture);
+    writeFileSync(join(home, "settings.json"), JSON.stringify({
+      schemaVersion: 2,
+      provider: { type: "codex-oauth", model: "gpt-5.4" },
+      plugins: { enabled: ["demo"] },
+    }));
+    const secrets = new FileSecretStore(join(home, "test-secrets"));
+    const fake = new FakeProvider([[{ type: "text_delta", delta: "hi" }, { type: "done", stopReason: "end_turn" }]]);
+    daemon = await startDaemon({ home, secrets, agentProvider: { provider: fake, model: "fake-1" } });
+    harnessToken = daemon.tokens.harness;
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "consent-on");
+    const mcp = (await c.request(METHODS.mcpList, {})).result;
+    const st = mcp.servers.find((s: any) => s.name === "demo:fake");
+    expect(st?.source).toBe("plugin");
+    expect(st?.status).toBe("connected");
+    expect(st?.toolNames).toEqual(["echo"]); // tool registered + reachable through the registry
+    const plugins = (await c.request(METHODS.pluginsList, {})).result;
+    expect(plugins.plugins[0]).toMatchObject({ name: "demo", hasMcp: true, mcpEnabled: true, disabled: false });
+    c.close();
+  });
+
+  test("disabled beats enabled → plugin fully off (skills gone, MCP not started)", async () => {
+    if (process.platform !== "darwin") return; // spawns a child process
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const fixture = join(import.meta.dir, "agent", "mcp", "fake-mcp-server.ts");
+    const home = mkdtempSync(join(tmpdir(), "norma-plugin-consent-"));
+    seedDemoPlugin(home, fixture);
+    writeFileSync(join(home, "settings.json"), JSON.stringify({
+      schemaVersion: 2,
+      provider: { type: "codex-oauth", model: "gpt-5.4" },
+      plugins: { enabled: ["demo"], disabled: ["demo"] },
+    }));
+    const secrets = new FileSecretStore(join(home, "test-secrets"));
+    const fake = new FakeProvider([[{ type: "text_delta", delta: "hi" }, { type: "done", stopReason: "end_turn" }]]);
+    daemon = await startDaemon({ home, secrets, agentProvider: { provider: fake, model: "fake-1" } });
+    harnessToken = daemon.tokens.harness;
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "consent-disabled");
+    const skills = (await c.request(METHODS.skillsList, {})).result;
+    expect(skills.skills.map((s: any) => s.name)).not.toContain("demo:greet");
+    const mcp = (await c.request(METHODS.mcpList, {})).result;
+    expect(mcp.servers.find((s: any) => s.name === "demo:fake")).toBeUndefined();
+    const plugins = (await c.request(METHODS.pluginsList, {})).result;
+    expect(plugins.plugins[0]).toMatchObject({ name: "demo", hasMcp: true, mcpEnabled: false, disabled: true });
+    c.close();
+  });
 });

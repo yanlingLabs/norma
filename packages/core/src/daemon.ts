@@ -28,6 +28,7 @@ import { ContextAssembler } from "./agent/context";
 import { SkillStore } from "./agent/skills";
 import { BackgroundTaskRegistry } from "./agent/bg-registry";
 import { sessionTmpDir } from "./agent/session-tmp";
+import { PluginStore } from "./agent/plugins";
 
 export const CORE_VERSION = "0.0.1";
 
@@ -56,8 +57,21 @@ export async function startDaemon(opts: {
   const hub = new SessionHub(store);
 
   const normaHome = dirs.home;
+
+  // Loaded once, up front, so the settings-derived plugin consent (below) is available before
+  // the SkillStore and PluginStore are built. A malformed settings.json degrades to `null` here
+  // — the agent gets disabled further down rather than crashing daemon startup.
+  let settings: ReturnType<typeof loadSettings> | null;
+  try {
+    settings = loadSettings(dirs.settingsPath);
+  } catch (err) {
+    console.error(`settings unavailable, agent disabled: ${(err as Error).message}`);
+    settings = null;
+  }
+
   const trustStore = new TrustStore(join(normaHome, "trust.json"));
-  const skillStore = new SkillStore({ normaHome, trust: trustStore });
+  const pluginStore = new PluginStore({ normaHome, plugins: settings?.plugins, log: (m) => console.error(m) });
+  const skillStore = new SkillStore({ normaHome, trust: trustStore, plugins: { disabled: settings?.plugins?.disabled ?? [] } });
   const assembler = new ContextAssembler({ normaHome, trust: trustStore, skills: skillStore });
   // Built unconditionally (needs only store, no provider) so the server's session.addDir /
   // setCwd handlers always have live roots to work with, even when the agent is disabled.
@@ -79,12 +93,15 @@ export async function startDaemon(opts: {
 
   let agentProvider = opts.agentProvider;
   if (agentProvider === undefined) {
-    try {
-      const settings = loadSettings(dirs.settingsPath);
-      const active = await createProvider(settings, secrets);
-      agentProvider = { provider: active.provider, model: active.model };
-    } catch (err) {
-      console.error(`agent disabled: ${(err as Error).message}`);
+    if (settings) {
+      try {
+        const active = await createProvider(settings, secrets);
+        agentProvider = { provider: active.provider, model: active.model };
+      } catch (err) {
+        console.error(`agent disabled: ${(err as Error).message}`);
+        agentProvider = null;
+      }
+    } else {
       agentProvider = null;
     }
   }
@@ -99,9 +116,16 @@ export async function startDaemon(opts: {
     registerBashTool(registry, { bgRegistry });
     registerBackgroundTools(registry, { bgRegistry });
     registerSkillTools(registry, { skills: skillStore });
-    const settings = loadSettings(dirs.settingsPath);
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
-    await mcp.startAll(settings.mcpServers ?? {});
+    await mcp.startAll(settings?.mcpServers ?? {});
+    // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled && !disabled);
+    // a plugin's skills are always live (SkillStore above), but its MCP servers are the seam that
+    // needs the user opting in via settings.plugins.enabled.
+    const enabledPlugins = pluginStore
+      .list()
+      .filter((p) => p.mcpEnabled && !p.disabled && p.hasMcp)
+      .map((p) => ({ name: p.name, dir: join(normaHome, "plugins", p.name) }));
+    await mcp.startPlugins(enabledPlugins);
     broker = new ApprovalBroker();
     registerRequestDirTool(registry, {
       broker,
@@ -111,7 +135,7 @@ export async function startDaemon(opts: {
     });
     const compactor = new Compactor({ provider: agentProvider, store, hub });
     // Default ON: the reviewer is built unless settings.reviewer.enabled is explicitly false.
-    const reviewerCfg = settings.reviewer;
+    const reviewerCfg = settings?.reviewer;
     const reviewer =
       reviewerCfg?.enabled === false ? undefined : new BashReviewer({ provider: agentProvider, model: reviewerCfg?.model });
     engine = new AgentEngine({
@@ -140,6 +164,7 @@ export async function startDaemon(opts: {
     trust: trustStore,
     bg: bgRegistry,
     skills: skillStore,
+    plugins: pluginStore,
     mcp: mcp ?? undefined,
     ...opts.server,
   });
