@@ -92,6 +92,13 @@ export const PlanResolvedEvent = ThreadBase.extend({
   feedback: z.string().optional(), autoAccept: z.boolean(), by: z.string().min(1),
 });
 
+export const WorktreeEnteredEvent = ThreadBase.extend({
+  type: z.literal("worktree_entered"), name: z.string().min(1), path: z.string().min(1), branch: z.string().min(1),
+});
+export const WorktreeExitedEvent = ThreadBase.extend({
+  type: z.literal("worktree_exited"), name: z.string().min(1), action: z.enum(["keep", "remove"]), removed: z.boolean(),
+});
+
 export const SessionEvent = z.discriminatedUnion("type", [
   SessionCreatedEvent,
   HarnessAttachedEvent,
@@ -115,6 +122,8 @@ export const SessionEvent = z.discriminatedUnion("type", [
   TaskUpdatedEvent,
   PlanPresentedEvent,
   PlanResolvedEvent,
+  WorktreeEnteredEvent,
+  WorktreeExitedEvent,
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 

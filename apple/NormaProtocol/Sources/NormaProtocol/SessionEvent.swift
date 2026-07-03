@@ -23,6 +23,8 @@ public enum SessionEvent: Codable, Equatable {
     case taskUpdated(TaskUpdated)
     case planPresented(PlanPresented)
     case planResolved(PlanResolved)
+    case worktreeEntered(WorktreeEntered)
+    case worktreeExited(WorktreeExited)
 
     public struct SessionCreated: Codable, Equatable {
         public let seq: Int
@@ -240,6 +242,26 @@ public enum SessionEvent: Codable, Equatable {
         public let by: String
     }
 
+    public struct WorktreeEntered: Codable, Equatable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let name: String
+        public let path: String
+        public let branch: String
+    }
+
+    public struct WorktreeExited: Codable, Equatable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let name: String
+        public let action: String
+        public let removed: Bool
+    }
+
     private enum Discriminator: String, Codable {
         case session_created
         case harness_attached
@@ -263,6 +285,8 @@ public enum SessionEvent: Codable, Equatable {
         case task_updated
         case plan_presented
         case plan_resolved
+        case worktree_entered
+        case worktree_exited
     }
 
     private enum TypeKey: String, CodingKey { case type }
@@ -292,6 +316,8 @@ public enum SessionEvent: Codable, Equatable {
         case .task_updated:         self = .taskUpdated(try TaskUpdated(from: decoder))
         case .plan_presented:       self = .planPresented(try PlanPresented(from: decoder))
         case .plan_resolved:        self = .planResolved(try PlanResolved(from: decoder))
+        case .worktree_entered:     self = .worktreeEntered(try WorktreeEntered(from: decoder))
+        case .worktree_exited:      self = .worktreeExited(try WorktreeExited(from: decoder))
         }
     }
 
@@ -385,6 +411,14 @@ public enum SessionEvent: Codable, Equatable {
             try v.encode(to: encoder)
             var c = encoder.container(keyedBy: TypeKey.self)
             try c.encode(Discriminator.plan_resolved.rawValue, forKey: .type)
+        case .worktreeEntered(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.worktree_entered.rawValue, forKey: .type)
+        case .worktreeExited(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.worktree_exited.rawValue, forKey: .type)
         }
     }
 }

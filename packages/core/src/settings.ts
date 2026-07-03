@@ -34,6 +34,9 @@ export const Settings = z.object({
     enabled: z.boolean().optional(),
     deferThreshold: z.number().int().positive().optional(),
   }).optional(),
+  worktree: z.object({
+    baseRef: z.enum(["fresh", "head"]).optional(),
+  }).optional(),
 });
 export type Settings = z.infer<typeof Settings>;
 

@@ -38,6 +38,8 @@ const fixtures: Record<string, unknown> = {
   task_updated: { type: "task_updated", sessionId: "s_1", threadId: "t_1", seq: 12, ts: 1700000000002, task: { id: "1", subject: "rename the project", status: "in_progress", activeForm: "Renaming the project" } },
   plan_presented: { type: "plan_presented", sessionId: "s_1", threadId: "t_1", seq: 13, ts: 1700000000003, callId: "call_1", plan: "# Plan\n\n1. Add the flag\n2. Wire it up\n3. Test" },
   plan_resolved: { type: "plan_resolved", sessionId: "s_1", threadId: "t_1", seq: 14, ts: 1700000000004, callId: "call_1", approved: true, feedback: "looks good", autoAccept: true, by: "cli" },
+  worktree_entered: { type: "worktree_entered", sessionId: "s_1", threadId: "t_1", seq: 15, ts: 1700000000005, name: "fix-auth", path: "/repo/.norma/worktrees/fix-auth", branch: "norma/fix-auth" },
+  worktree_exited: { type: "worktree_exited", sessionId: "s_1", threadId: "t_1", seq: 16, ts: 1700000000006, name: "fix-auth", action: "keep", removed: false },
 };
 for (const [name, value] of Object.entries(fixtures)) {
   SessionEvent.parse(value); // fixtures must be valid by construction

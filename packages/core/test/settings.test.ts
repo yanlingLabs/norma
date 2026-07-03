@@ -113,6 +113,20 @@ describe("loadSettings", () => {
     expect(s.schemaVersion).toBe(2);
     expect(s.toolSearch).toBeUndefined();
   });
+
+  test("worktree config parses; absent → undefined; bad baseRef rejected", () => {
+    const s = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, worktree: { baseRef: "fresh" } });
+    expect(s.worktree).toEqual({ baseRef: "fresh" });
+    expect(Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" } }).worktree).toBeUndefined();
+    expect(() => Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, worktree: { baseRef: "bogus" } })).toThrow();
+  });
+
+  test("legacy migration keeps working with worktree field absent", () => {
+    const p = tmpSettings({ webSearch: { provider: "disabled" } });
+    const s = loadSettings(p);
+    expect(s.schemaVersion).toBe(2);
+    expect(s.worktree).toBeUndefined();
+  });
 });
 
 describe("saveSettings", () => {

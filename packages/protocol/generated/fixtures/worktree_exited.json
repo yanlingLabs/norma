@@ -1,0 +1,10 @@
+{
+  "type": "worktree_exited",
+  "sessionId": "s_1",
+  "threadId": "t_1",
+  "seq": 16,
+  "ts": 1700000000006,
+  "name": "fix-auth",
+  "action": "keep",
+  "removed": false
+}

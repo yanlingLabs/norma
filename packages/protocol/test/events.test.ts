@@ -126,6 +126,21 @@ describe("SessionEvent discriminated union", () => {
   test("plan_presented requires a non-empty plan", () => {
     expect(SessionEvent.safeParse({ type: "plan_presented", sessionId: "s", threadId: "t", seq: 1, ts: 1, callId: "c", plan: "" }).success).toBe(false);
   });
+
+  test("worktree_entered / worktree_exited round-trip", () => {
+    const we = { type: "worktree_entered", sessionId: "s", threadId: "t", seq: 1, ts: 1, name: "fix-auth", path: "/repo/.norma/worktrees/fix-auth", branch: "norma/fix-auth" } as const;
+    expect(SessionEvent.parse(we)).toEqual(we);
+    const wx = { type: "worktree_exited", sessionId: "s", threadId: "t", seq: 2, ts: 2, name: "fix-auth", action: "keep", removed: false } as const;
+    expect(SessionEvent.parse(wx)).toEqual(wx);
+  });
+
+  test("worktree_entered rejects empty name/path/branch; worktree_exited rejects bad action", () => {
+    const t = { sessionId: "s", threadId: "t", seq: 1, ts: 1 };
+    expect(SessionEvent.safeParse({ ...t, type: "worktree_entered", name: "", path: "/p", branch: "b" }).success).toBe(false);
+    expect(SessionEvent.safeParse({ ...t, type: "worktree_entered", name: "n", path: "", branch: "b" }).success).toBe(false);
+    expect(SessionEvent.safeParse({ ...t, type: "worktree_entered", name: "n", path: "/p", branch: "" }).success).toBe(false);
+    expect(SessionEvent.safeParse({ ...t, type: "worktree_exited", name: "n", action: "delete", removed: false }).success).toBe(false);
+  });
 });
 
 describe("hello method schemas", () => {
