@@ -7,10 +7,15 @@ import {
   SessionCreateResult,
   ApprovalRespondParams,
   ApprovalRespondResult,
+  ApprovalPolicy,
   AskUserRespondParams,
   AskUserRespondResult,
   TaskListParams,
   TaskListResult,
+  PlanRespondParams,
+  PlanRespondResult,
+  SessionSetPolicyParams,
+  SessionSetPolicyResult,
   SessionAddDirParams,
   SessionSetCwdParams,
   TrustDirParams,
@@ -219,5 +224,27 @@ describe("ask_user.respond / task.list schemas", () => {
     expect(r.tasks).toHaveLength(1);
     expect(() => TaskListResult.parse({ ok: true, tasks: [{ id: "1", subject: "rename", status: "bogus" }] })).toThrow();
     expect(METHODS.taskList).toBe("task.list");
+  });
+});
+
+describe("plan.respond / session.setPolicy schemas", () => {
+  test("ApprovalPolicy accepts plan; plan.respond + session.setPolicy params parse", () => {
+    expect(ApprovalPolicy.parse("plan")).toBe("plan");
+    expect(PlanRespondParams.parse({ sessionId: "s", callId: "c", approved: false }).autoAccept).toBe(false); // default
+    expect(SessionSetPolicyParams.parse({ sessionId: "s", policy: "plan" }).policy).toBe("plan");
+  });
+
+  test("plan.respond params/result + method string", () => {
+    const p = PlanRespondParams.parse({ sessionId: "s1", callId: "c1", approved: true, feedback: "looks good", autoAccept: true });
+    expect(p).toEqual({ sessionId: "s1", callId: "c1", approved: true, feedback: "looks good", autoAccept: true });
+    expect(PlanRespondResult.parse({ ok: true, alreadyResolved: false }).alreadyResolved).toBe(false);
+    expect(METHODS.planRespond).toBe("plan.respond");
+  });
+
+  test("session.setPolicy params/result + method string", () => {
+    expect(SessionSetPolicyParams.parse({ sessionId: "s1", policy: "auto" }).policy).toBe("auto");
+    expect(() => SessionSetPolicyParams.parse({ sessionId: "s1", policy: "bogus" })).toThrow();
+    expect(SessionSetPolicyResult.parse({ ok: true }).ok).toBe(true);
+    expect(METHODS.sessionSetPolicy).toBe("session.setPolicy");
   });
 });

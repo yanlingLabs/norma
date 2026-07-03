@@ -1,0 +1,9 @@
+{
+  "type": "plan_presented",
+  "sessionId": "s_1",
+  "threadId": "t_1",
+  "seq": 13,
+  "ts": 1700000000003,
+  "callId": "call_1",
+  "plan": "# Plan\n\n1. Add the flag\n2. Wire it up\n3. Test"
+}

@@ -21,6 +21,8 @@ public enum SessionEvent: Codable, Equatable {
     case questionAsked(QuestionAsked)
     case questionResolved(QuestionResolved)
     case taskUpdated(TaskUpdated)
+    case planPresented(PlanPresented)
+    case planResolved(PlanResolved)
 
     public struct SessionCreated: Codable, Equatable {
         public let seq: Int
@@ -217,6 +219,27 @@ public enum SessionEvent: Codable, Equatable {
         public let task: Task
     }
 
+    public struct PlanPresented: Codable, Equatable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let callId: String
+        public let plan: String
+    }
+
+    public struct PlanResolved: Codable, Equatable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let callId: String
+        public let approved: Bool
+        public let feedback: String?
+        public let autoAccept: Bool
+        public let by: String
+    }
+
     private enum Discriminator: String, Codable {
         case session_created
         case harness_attached
@@ -238,6 +261,8 @@ public enum SessionEvent: Codable, Equatable {
         case question_asked
         case question_resolved
         case task_updated
+        case plan_presented
+        case plan_resolved
     }
 
     private enum TypeKey: String, CodingKey { case type }
@@ -265,6 +290,8 @@ public enum SessionEvent: Codable, Equatable {
         case .question_asked:       self = .questionAsked(try QuestionAsked(from: decoder))
         case .question_resolved:    self = .questionResolved(try QuestionResolved(from: decoder))
         case .task_updated:         self = .taskUpdated(try TaskUpdated(from: decoder))
+        case .plan_presented:       self = .planPresented(try PlanPresented(from: decoder))
+        case .plan_resolved:        self = .planResolved(try PlanResolved(from: decoder))
         }
     }
 
@@ -350,6 +377,14 @@ public enum SessionEvent: Codable, Equatable {
             try v.encode(to: encoder)
             var c = encoder.container(keyedBy: TypeKey.self)
             try c.encode(Discriminator.task_updated.rawValue, forKey: .type)
+        case .planPresented(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.plan_presented.rawValue, forKey: .type)
+        case .planResolved(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.plan_resolved.rawValue, forKey: .type)
         }
     }
 }

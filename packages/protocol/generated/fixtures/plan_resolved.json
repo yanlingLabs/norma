@@ -1,0 +1,12 @@
+{
+  "type": "plan_resolved",
+  "sessionId": "s_1",
+  "threadId": "t_1",
+  "seq": 14,
+  "ts": 1700000000004,
+  "callId": "call_1",
+  "approved": true,
+  "feedback": "looks good",
+  "autoAccept": true,
+  "by": "cli"
+}

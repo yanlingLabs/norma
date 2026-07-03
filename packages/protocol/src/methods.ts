@@ -9,7 +9,7 @@ export const AbsoluteDirPath = z.string().startsWith("/").refine((p) => p !== "/
 export const Role = z.enum(["harness", "plugin", "admin"]);
 export type Role = z.infer<typeof Role>;
 
-export const ApprovalPolicy = z.enum(["ask", "auto"]);
+export const ApprovalPolicy = z.enum(["ask", "auto", "plan"]);
 export type ApprovalPolicy = z.infer<typeof ApprovalPolicy>;
 
 export const HelloParams = z.object({
@@ -135,6 +135,15 @@ export const AskUserRespondResult = z.object({ ok: z.literal(true), alreadyResol
 export const TaskListParams = z.object({ sessionId: z.string().min(1) });
 export const TaskListResult = z.object({ ok: z.literal(true), tasks: z.array(TaskSchema) });
 
+export const PlanRespondParams = z.object({
+  sessionId: z.string().min(1), callId: z.string().min(1), approved: z.boolean(),
+  feedback: z.string().optional(), autoAccept: z.boolean().default(false),
+});
+export const PlanRespondResult = z.object({ ok: z.literal(true), alreadyResolved: z.boolean() });
+
+export const SessionSetPolicyParams = z.object({ sessionId: z.string().min(1), policy: ApprovalPolicy });
+export const SessionSetPolicyResult = z.object({ ok: z.literal(true) });
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -158,4 +167,6 @@ export const METHODS = {
   pluginsList: "plugins.list",
   askUserRespond: "ask_user.respond",
   taskList: "task.list",
+  planRespond: "plan.respond",
+  sessionSetPolicy: "session.setPolicy",
 } as const;

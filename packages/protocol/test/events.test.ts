@@ -115,6 +115,17 @@ describe("SessionEvent discriminated union", () => {
     expect(SessionEvent.safeParse({ ...t, type: "question_asked", callId: "c", questions: [{ ...validQuestion, header: "H".repeat(13) }] }).success).toBe(false); // 13-char header
     expect(SessionEvent.safeParse({ ...t, type: "question_asked", callId: "c", questions: [{ ...validQuestion, header: "H".repeat(12) }] }).success).toBe(true); // 12-char header ok
   });
+
+  test("plan_presented / plan_resolved round-trip", () => {
+    const pp = { type: "plan_presented", sessionId: "s", threadId: "t", seq: 1, ts: 1, callId: "c1", plan: "# Plan\n1. do X" } as const;
+    expect(SessionEvent.parse(pp)).toEqual(pp);
+    const pr = { type: "plan_resolved", sessionId: "s", threadId: "t", seq: 2, ts: 2, callId: "c1", approved: true, feedback: "looks good", autoAccept: true, by: "cli" } as const;
+    expect(SessionEvent.parse(pr)).toEqual(pr);
+  });
+
+  test("plan_presented requires a non-empty plan", () => {
+    expect(SessionEvent.safeParse({ type: "plan_presented", sessionId: "s", threadId: "t", seq: 1, ts: 1, callId: "c", plan: "" }).success).toBe(false);
+  });
 });
 
 describe("hello method schemas", () => {

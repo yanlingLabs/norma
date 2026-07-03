@@ -84,6 +84,14 @@ export const QuestionResolvedEvent = ThreadBase.extend({
 });
 export const TaskUpdatedEvent = ThreadBase.extend({ type: z.literal("task_updated"), task: TaskSchema });
 
+export const PlanPresentedEvent = ThreadBase.extend({
+  type: z.literal("plan_presented"), callId: z.string().min(1), plan: z.string().min(1),
+});
+export const PlanResolvedEvent = ThreadBase.extend({
+  type: z.literal("plan_resolved"), callId: z.string().min(1), approved: z.boolean(),
+  feedback: z.string().optional(), autoAccept: z.boolean(), by: z.string().min(1),
+});
+
 export const SessionEvent = z.discriminatedUnion("type", [
   SessionCreatedEvent,
   HarnessAttachedEvent,
@@ -105,6 +113,8 @@ export const SessionEvent = z.discriminatedUnion("type", [
   QuestionAskedEvent,
   QuestionResolvedEvent,
   TaskUpdatedEvent,
+  PlanPresentedEvent,
+  PlanResolvedEvent,
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 
