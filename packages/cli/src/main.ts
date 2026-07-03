@@ -6,6 +6,7 @@ import { NormaClient } from "./client";
 import { applyEvent, isStalled, type WatchdogState } from "./watchdog";
 import { installPlugin, removePluginDir, removePluginFromSettings, setPluginEnabled } from "./plugin-cli";
 import { isOtherChoice, parseQuestionAnswer } from "./questions";
+import { parsePlanResponse } from "./plan-response";
 
 const AQUA = "\x1b[38;2;53;214;232m";
 const DIM = "\x1b[2m";
@@ -116,10 +117,11 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
   }
   const prompt = promptOverride ?? process.argv[3];
   if (!prompt) {
-    console.error('usage: norma -p "<prompt>" [--auto]');
+    console.error('usage: norma -p "<prompt>" [--auto|--plan]');
     process.exit(1);
   }
   const auto = forceAuto || process.argv.includes("--auto");
+  const plan = process.argv.includes("--plan"); // plan mode: agent must present a plan before editing; ignored if --auto also set
   const pending: string[] = []; // callIds awaiting a y/n on stdin, oldest first
   let sessionId = ""; // set below, before send() — turn_completed can only fire after that
   const wd: WatchdogState = { turnRunning: false, toolsInFlight: 0, approvalsPending: 0, lastEventAt: Date.now() };
@@ -163,6 +165,20 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
           await c.askUserRespond({ sessionId, callId: e.callId, answers });
         })();
       }
+    } else if (e.type === "plan_presented") {
+      // No TTY → skip rendering entirely (do NOT block reading stdin); the server-side timeout
+      // resolves the plan and the engine proceeds, same guard as question_asked above.
+      if (process.stdin.isTTY) {
+        void (async () => {
+          console.log(`\n${AQUA}Plan${RESET}\n${e.plan}\n`);
+          console.log(`  1) approve — I'll approve each edit\n  2) approve + auto-accept edits\n  3) reject (type: 3 <reason>)`);
+          const input = await readLine("choose (number or text): ");
+          const r = parsePlanResponse(input);
+          await c.planRespond({ sessionId, callId: e.callId, ...r });
+        })();
+      }
+    } else if (e.type === "plan_resolved") {
+      console.log(`${DIM}${e.approved ? `plan approved${e.autoAccept ? " (auto-accept edits)" : ""}` : "plan rejected"}${RESET}`);
     } else if (e.type === "task_updated") {
       console.log(`${DIM}${TASK_ICONS[e.task.status]} ${e.task.subject}${RESET}`);
     } else if (e.type === "agent_error") {
@@ -182,7 +198,7 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
     // historical turn_completed event on this session, tripping endHeadlessTurn immediately.
     await c.attach(sessionId, info.lastSeq);
   } else {
-    const created = await c.createSession("global", { cwd, approvalPolicy: auto ? "auto" : "ask" });
+    const created = await c.createSession("global", { cwd, approvalPolicy: auto ? "auto" : plan ? "plan" : "ask" });
     sessionId = created.sessionId;
     if (!created.trusted) {
       const wantTrust = process.argv.includes("--trust")
@@ -580,6 +596,6 @@ if (import.meta.main) {
   bg list <session> | bg peek <session> <taskId> | bg kill <session> <taskId>
   login [--api-key] | logout | provider | provider-smoke [--prompt <text>]
   init                                            generate/update NORMA.md by surveying the project
-  -p "<prompt>" [--auto] [--trust|--no-trust]   headless agent turn (asks for tool approval unless --auto)`);
+  -p "<prompt>" [--auto|--plan] [--trust|--no-trust]   headless agent turn (asks for tool approval unless --auto/--plan)`);
   }
 }

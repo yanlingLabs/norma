@@ -5,6 +5,7 @@ import {
   BgListResult, BgPeekResult, BgKillResult, BgKillAllResult,
   SessionSteerResult, SessionInterruptResult, SessionCompactResult, SkillsListResult,
   PluginsListResult, AskUserRespondResult, TaskListResult,
+  PlanRespondResult, SessionSetPolicyResult, type ApprovalPolicy,
   ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 
@@ -90,7 +91,7 @@ export class NormaClient {
     return r.data;
   }
 
-  async createSession(scope: string, opts?: { cwd?: string; approvalPolicy?: "ask" | "auto" }): Promise<{ sessionId: string; trusted: boolean }> {
+  async createSession(scope: string, opts?: { cwd?: string; approvalPolicy?: ApprovalPolicy }): Promise<{ sessionId: string; trusted: boolean }> {
     const r = this.validated(SessionCreateResult, await this.request(METHODS.sessionCreate, { scope, ...opts }), METHODS.sessionCreate);
     return { sessionId: r.sessionId, trusted: r.trusted };
   }
@@ -151,6 +152,12 @@ export class NormaClient {
   }
   async taskList(params: { sessionId: string }): Promise<{ ok: true; tasks: Array<{ id: string; subject: string; status: "pending" | "in_progress" | "completed"; activeForm?: string }> }> {
     return this.validated(TaskListResult, await this.request(METHODS.taskList, params), METHODS.taskList);
+  }
+  async planRespond(params: { sessionId: string; callId: string; approved: boolean; autoAccept?: boolean; feedback?: string }): Promise<{ ok: true; alreadyResolved: boolean }> {
+    return this.validated(PlanRespondResult, await this.request(METHODS.planRespond, params), METHODS.planRespond);
+  }
+  async sessionSetPolicy(params: { sessionId: string; policy: ApprovalPolicy }): Promise<{ ok: true }> {
+    return this.validated(SessionSetPolicyResult, await this.request(METHODS.sessionSetPolicy, params), METHODS.sessionSetPolicy);
   }
   close(): void { this.socket.end(); }
 }
