@@ -648,7 +648,7 @@ describe("daemon IPC", () => {
     const c = await TestClient.connect(daemon.socketPath);
     await c.hello(harnessToken, "mcp-lister");
     const { result } = await c.request(METHODS.mcpList, {});
-    expect(result).toEqual({ ok: true, servers: [{ name: "fake", status: "connected", toolNames: ["echo"] }] });
+    expect(result).toEqual({ ok: true, servers: [{ name: "fake", status: "connected", toolNames: ["echo"], source: "user" }] });
     c.close();
   });
 });

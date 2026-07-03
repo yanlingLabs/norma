@@ -98,7 +98,7 @@ export async function startDaemon(opts: {
     registerBashTool(registry, { bgRegistry });
     registerBackgroundTools(registry, { bgRegistry });
     registerSkillTools(registry, { skills: skillStore });
-    mcp = new McpManager({ registry, log: (m) => console.error(m) });
+    mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
     await mcp.startAll(loadSettings(dirs.settingsPath).mcpServers ?? {});
     broker = new ApprovalBroker();
     registerRequestDirTool(registry, {
