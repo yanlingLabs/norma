@@ -5,7 +5,7 @@ import { METHODS } from "@norma/protocol";
 import { NormaClient } from "./client";
 import { applyEvent, isStalled, type WatchdogState } from "./watchdog";
 import { installPlugin, removePluginDir, removePluginFromSettings, setPluginEnabled } from "./plugin-cli";
-import { parseQuestionAnswer } from "./questions";
+import { isOtherChoice, parseQuestionAnswer } from "./questions";
 
 const AQUA = "\x1b[38;2;53;214;232m";
 const DIM = "\x1b[2m";
@@ -151,7 +151,14 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
             });
             console.log(`  ${q.options.length + 1}) Other (type your answer)`);
             const input = await readLine(q.multiSelect ? "choose (comma-separated numbers or text): " : "choose (number or text): ");
-            answers[q.question] = parseQuestionAnswer(input, q.options.map((o: { label: string }) => o.label), q.multiSelect);
+            if (isOtherChoice(input, q.options.length)) {
+              // M1: choosing "Other" BY ITS MENU NUMBER isn't itself an answer — that digit is a
+              // selection, not free text. Re-prompt for the real answer so the model never sees
+              // the literal number as if the user had typed it as their response.
+              answers[q.question] = (await readLine("your answer: ")).trim();
+            } else {
+              answers[q.question] = parseQuestionAnswer(input, q.options.map((o: { label: string }) => o.label), q.multiSelect);
+            }
           }
           await c.askUserRespond({ sessionId, callId: e.callId, answers });
         })();

@@ -404,7 +404,14 @@ export class AgentEngine {
           return res;
         }
       : undefined;
-    const taskEvent = (task: Task) => { this.emit(sessionId, { type: "task_updated", sessionId, threadId, task }); };
+    // Gated on cfg.tasks (mirrors `ask` above being gated on cfg.questions) — previously
+    // unconditional, which left cfg.tasks dead and contradicted the "absent means ctx.taskEvent
+    // is undefined" comment on EngineConfig. registerTaskTools is what actually decides whether
+    // task_create/task_update/task_list exist at all, so this only matters if a future caller
+    // registers those tools without also wiring a TaskStore into the engine config (M2 finding).
+    const taskEvent = this.cfg.tasks
+      ? (task: Task) => { this.emit(sessionId, { type: "task_updated", sessionId, threadId, task }); }
+      : undefined;
     return this.cfg.registry.execute(call.name, args, {
       cwd, roots, tmpDir, sessionId, signal, markSkillLoaded,
       markToolLoaded,
