@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { z } from "zod";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdtempSync, writeFileSync, realpathSync } from "node:fs";
@@ -124,5 +125,69 @@ describe.if(isMac)("McpManager.list(cwd) + stopAll", () => {
     expect(withCwd.find((s) => s.name === "proj")).toMatchObject({ status: "connected", source: "project" });
     mgr.stopAll();
     expect(registry.has("mcp__proj__echo")).toBe(false); // stopAll unregistered project tools
+  });
+});
+
+function pluginDir(mcpJson?: string | object): string {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "mcp-plugin-")));
+  if (mcpJson !== undefined) {
+    writeFileSync(join(dir, ".mcp.json"), typeof mcpJson === "string" ? mcpJson : JSON.stringify(mcpJson));
+  }
+  return dir;
+}
+
+describe.if(isMac)("McpManager.startPlugins", () => {
+  test("enabled plugin's .mcp.json servers start; tools mcp__<plugin>_<server>__*; list source plugin; stopAll unregisters", async () => {
+    const dir = pluginDir({ mcpServers: { fake: { command: "bun", args: ["run", FIXTURE] } } });
+    const registry = new ToolRegistry();
+    const trust = new TrustStore(join(realDir(), "trust.json"));
+    const mgr = new McpManager({ registry, trust });
+    await mgr.startPlugins([{ name: "demo", dir }]);
+    expect(registry.has("mcp__demo_fake__echo")).toBe(true);
+    const st = mgr.list().find((s) => s.name === "demo:fake");
+    expect(st?.source).toBe("plugin");
+    expect(st?.status).toBe("connected");
+    mgr.stopAll();
+    expect(registry.has("mcp__demo_fake__echo")).toBe(false); // stopAll unregistered plugin tools
+  });
+
+  test("missing/malformed .mcp.json → skipped, no throw", async () => {
+    const noMcp = pluginDir(); // no .mcp.json at all
+    const badMcp = pluginDir("{ not json");
+    const registry = new ToolRegistry();
+    const trust = new TrustStore(join(realDir(), "trust.json"));
+    const mgr = new McpManager({ registry, trust });
+    await expect(mgr.startPlugins([{ name: "nop", dir: noMcp }, { name: "bad", dir: badMcp }])).resolves.toBeUndefined();
+    expect(mgr.list().length).toBe(0);
+    mgr.stopAll();
+  });
+
+  test("one failing server + one FIXTURE sibling → failed status + connected sibling", async () => {
+    const dir = pluginDir({ mcpServers: { bad: { command: "/nonexistent" }, good: { command: "bun", args: ["run", FIXTURE] } } });
+    const registry = new ToolRegistry();
+    const trust = new TrustStore(join(realDir(), "trust.json"));
+    const mgr = new McpManager({ registry, trust });
+    await mgr.startPlugins([{ name: "demo", dir }]);
+    expect(mgr.list().find((s) => s.name === "demo:bad")?.status).toBe("failed");
+    expect(mgr.list().find((s) => s.name === "demo:good")?.status).toBe("connected");
+    expect(registry.has("mcp__demo_good__echo")).toBe(true);
+    mgr.stopAll();
+  });
+
+  test("tool-name collision with an existing registration → collision-skipped + logged, no crash", async () => {
+    const dir = pluginDir({ mcpServers: { fake: { command: "bun", args: ["run", FIXTURE] } } });
+    const registry = new ToolRegistry();
+    registry.register({ name: "mcp__demo_fake__echo", description: "pre-existing", args: z.object({}).passthrough(), run: () => "pre-existing" });
+    const trust = new TrustStore(join(realDir(), "trust.json"));
+    const logs: string[] = [];
+    const mgr = new McpManager({ registry, trust, log: (m) => logs.push(m) });
+    await expect(mgr.startPlugins([{ name: "demo", dir }])).resolves.toBeUndefined();
+    const st = mgr.list().find((s) => s.name === "demo:fake");
+    expect(st?.status).toBe("connected"); // server still connects; only the colliding tool is skipped
+    expect(st?.toolNames).toEqual([]);
+    expect(logs.some((m) => m.includes("collide"))).toBe(true);
+    // the pre-existing registration is untouched:
+    expect((await registry.execute("mcp__demo_fake__echo", {}, ctx())).output).toBe("pre-existing");
+    mgr.stopAll();
   });
 });

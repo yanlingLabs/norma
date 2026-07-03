@@ -5,7 +5,7 @@ import { McpStdioClient } from "./client";
 import type { ToolRegistry } from "../tools/registry";
 import type { TrustStore } from "../trust";
 
-export interface McpServerStatus { name: string; status: "connected" | "failed"; toolNames: string[]; source: "user" | "project" }
+export interface McpServerStatus { name: string; status: "connected" | "failed"; toolNames: string[]; source: "user" | "project" | "plugin" }
 export interface McpServerConfig { command: string; args?: string[]; env?: Record<string, string> }
 
 const ProjectMcpConfig = z.object({
@@ -16,40 +16,89 @@ const ProjectMcpConfig = z.object({
   })).optional(),
 });
 type ProjectState = { kind: "none" } | { kind: "started"; servers: McpServerStatus[]; clients: McpStdioClient[]; toolNames: string[] };
+type StartOneResult = { status: "connected" | "failed"; toolNames: string[]; client?: McpStdioClient };
 
 export class McpManager {
   private clients = new Map<string, McpStdioClient>();
   private statuses = new Map<string, McpServerStatus>();
   private projects = new Map<string, ProjectState>();
   private inFlight = new Map<string, Promise<void>>();
+  private pluginState: Array<{ display: string; status: McpServerStatus["status"]; toolNames: string[]; client?: McpStdioClient }> = [];
+  private pluginToolNames: string[] = []; // full `mcp__<plugin>_<server>__<tool>` names, for stopAll teardown
   constructor(private readonly deps: { registry: ToolRegistry; trust: TrustStore; log?: (m: string) => void }) {}
 
-  async startAll(servers: Record<string, McpServerConfig>): Promise<void> {
-    await Promise.all(Object.entries(servers).map(async ([name, cfg]) => {
-      const client = new McpStdioClient(cfg);
-      try {
-        await client.start();
-        this.clients.set(name, client);
-        const toolNames: string[] = [];
-        for (const t of client.tools()) {
-          const full = `mcp__${name}__${t.name}`;
+  /**
+   * Shared per-server bring-up used by startAll/doEnsureProject/startPlugins: spawn the client,
+   * handshake under NORMA_MCP_START_TIMEOUT_MS, register its tools as
+   * `mcp__<serverKey>__<tool>`, and report a status. Every failure (start timeout/error, or —
+   * in "throw" collision mode — a registration throw) is caught HERE so one bad server never
+   * rejects the `Promise.all` its caller runs it under.
+   *
+   * `opts.onCollision` controls what happens when a tool name is already registered:
+   *  - "skip" (project/plugin bring-up): pre-check `registry.has(full)` and skip + log just
+   *    that one tool (collisions are expected across namespaces there) — the whole server still
+   *    ends up "connected" as long as it started. A register() throw (e.g. a race) is likewise
+   *    caught per-tool and skipped, never failing the server.
+   *  - "throw" (startAll/user servers): no pre-check — `registry.register` is called directly
+   *    and left free to throw, which the outer catch below turns into a whole-server "failed"
+   *    (this fail-fast semantics is pinned by an existing test: a server whose OWN tool list has
+   *    an internal duplicate name is entirely marked failed, not partially registered).
+   */
+  private async startOne(
+    serverKey: string,
+    cfg: McpServerConfig,
+    opts?: { scope?: string; onCollision?: "skip" | "throw"; label?: string; context?: string },
+  ): Promise<StartOneResult> {
+    const client = new McpStdioClient(cfg);
+    const label = opts?.label ?? "server";
+    try {
+      await client.start();
+      const toolNames: string[] = [];
+      for (const t of client.tools()) {
+        const full = `mcp__${serverKey}__${t.name}`;
+        if (opts?.onCollision === "skip") {
+          if (this.deps.registry.has(full)) {
+            this.deps.log?.(`mcp: ${label} tool '${full}' collides — skipped`);
+            continue;
+          }
+          try {
+            this.deps.registry.register({
+              name: full,
+              description: t.description,
+              args: z.object({}).passthrough(),
+              rawParameters: t.inputSchema,
+              scope: opts?.scope,
+              run: (a, ctx) => client.callTool(t.name, a, ctx.signal),
+            });
+          } catch (e) {
+            this.deps.log?.(`mcp: register '${full}' failed: ${(e as Error).message}`);
+            continue;
+          }
+        } else {
           this.deps.registry.register({
             name: full,
             description: t.description,
             args: z.object({}).passthrough(),
             rawParameters: t.inputSchema,
-            run: (args, ctx) => client.callTool(t.name, args, ctx.signal),
+            scope: opts?.scope,
+            run: (a, ctx) => client.callTool(t.name, a, ctx.signal),
           });
-          toolNames.push(t.name);
         }
-        this.statuses.set(name, { name, status: "connected", toolNames, source: "user" });
-      } catch (e) {
-        this.deps.log?.(`mcp: server '${name}' failed to start: ${(e as Error).message}`);
-        this.statuses.set(name, { name, status: "failed", toolNames: [], source: "user" });
-        this.clients.delete(name);
-        client.stop();
-        return;
+        toolNames.push(t.name);
       }
+      return { status: "connected", toolNames, client };
+    } catch (e) {
+      this.deps.log?.(`mcp: ${label} '${serverKey}'${opts?.context ?? ""} failed to start: ${(e as Error).message}`);
+      client.stop();
+      return { status: "failed", toolNames: [] };
+    }
+  }
+
+  async startAll(servers: Record<string, McpServerConfig>): Promise<void> {
+    await Promise.all(Object.entries(servers).map(async ([name, cfg]) => {
+      const { status, toolNames, client } = await this.startOne(name, cfg, { onCollision: "throw" });
+      if (client) this.clients.set(name, client);
+      this.statuses.set(name, { name, status, toolNames, source: "user" });
     }));
   }
 
@@ -59,7 +108,7 @@ export class McpManager {
    * recording anything — nothing is read/spawned/registered, and a later `trust.trust(dir)` +
    * another `ensureProject` call will retry and start it. Defensive: a missing/malformed
    * `.mcp.json` degrades to a recorded "none" rather than throwing. Every server start is
-   * individually guarded (mirrors `startAll`) so one bad server doesn't block its siblings.
+   * individually guarded (via `startOne`) so one bad server doesn't block its siblings.
    * CONCURRENCY: two calls for the same canonicalized dir join a single in-flight run (via
    * `inFlight`) so a project's servers are never spawned twice / a first run's clients never
    * get orphaned by a second run overwriting `projects`. NOTE: deliberately NOT declared
@@ -96,50 +145,54 @@ export class McpManager {
 
     const state: ProjectState = { kind: "started", servers: [], clients: [], toolNames: [] };
     await Promise.all(Object.entries(servers).map(async ([name, sc]) => {
-      const client = new McpStdioClient(sc);
-      try {
-        await client.start();
-      } catch (e) {
-        this.deps.log?.(`mcp: project server '${name}' (${dir}) failed: ${(e as Error).message}`);
-        state.servers.push({ name, status: "failed", toolNames: [], source: "project" });
-        client.stop();
-        return;
-      }
-      const toolNames: string[] = [];
-      for (const t of client.tools()) {
-        const full = `mcp__${name}__${t.name}`;
-        if (this.deps.registry.has(full)) {
-          this.deps.log?.(`mcp: project tool '${full}' collides — skipped`);
-          continue;
-        }
-        try {
-          this.deps.registry.register({
-            name: full,
-            description: t.description,
-            args: z.object({}).passthrough(),
-            rawParameters: t.inputSchema,
-            scope: dir,
-            run: (a, ctx) => client.callTool(t.name, a, ctx.signal),
-          });
-        } catch (e) {
-          this.deps.log?.(`mcp: register '${full}' failed: ${(e as Error).message}`);
-          continue;
-        }
-        toolNames.push(t.name);
-        state.toolNames.push(full);
-      }
-      state.clients.push(client);
-      state.servers.push({ name, status: "connected", toolNames, source: "project" });
+      const { status, toolNames, client } = await this.startOne(name, sc, {
+        scope: dir,
+        onCollision: "skip",
+        label: "project server",
+        context: ` (${dir})`,
+      });
+      if (client) state.clients.push(client);
+      for (const t of toolNames) state.toolNames.push(`mcp__${name}__${t}`);
+      state.servers.push({ name, status, toolNames, source: "project" });
     }));
     this.projects.set(dir, state);
   }
 
   /**
+   * Start the `.mcp.json` servers of EXPLICITLY ENABLED plugins. Boot-time, like user servers —
+   * the daemon passes only consented plugins (consent is `settings.plugins.enabled`, checked by
+   * the caller); this method does not itself consult any consent/trust store. Tools are
+   * namespaced per-plugin-per-server as `mcp__<plugin>_<server>__<tool>` (GLOBAL scope — no
+   * `scope` field — unlike project servers, which are cwd-scoped). A missing/malformed
+   * `<dir>/.mcp.json` is defensive: logged and skipped, never throws. Each server is started via
+   * the shared `startOne` helper in "skip" collision mode, so one bad/colliding server never
+   * blocks its siblings or the rest of the plugin list.
+   */
+  async startPlugins(plugins: Array<{ name: string; dir: string }>): Promise<void> {
+    for (const { name, dir } of plugins) {
+      let cfg: z.infer<typeof ProjectMcpConfig>;
+      try {
+        cfg = ProjectMcpConfig.parse(JSON.parse(readFileSync(join(dir, ".mcp.json"), "utf8")));
+      } catch {
+        this.deps.log?.(`plugin ${name}: no/invalid .mcp.json — no servers started`);
+        continue;
+      }
+      await Promise.all(Object.entries(cfg.mcpServers ?? {}).map(async ([server, sc]) => {
+        // serverKey namespaces the tools per-plugin: mcp__<plugin>_<server>__<tool>
+        const serverKey = `${name}_${server}`;
+        const entry = await this.startOne(serverKey, sc, { onCollision: "skip", label: "plugin" });
+        this.pluginState.push({ display: `${name}:${server}`, status: entry.status, toolNames: entry.toolNames, client: entry.client });
+        for (const t of entry.toolNames) this.pluginToolNames.push(`mcp__${serverKey}__${t}`);
+      }));
+    }
+  }
+
+  /**
    * SYNC/PURE: returns already-known statuses without spawning/reading anything. User servers
-   * (source "user") are always included; project servers (source "project") for `cwd` are
-   * included only if `ensureProject(cwd)` has already recorded a "started" state for it — this
-   * method does NOT call `ensureProject` itself (callers, e.g. the daemon's request handler,
-   * must `await ensureProject(cwd)` first).
+   * (source "user") and plugin servers (source "plugin") are always included; project servers
+   * (source "project") for `cwd` are included only if `ensureProject(cwd)` has already recorded
+   * a "started" state for it — this method does NOT call `ensureProject` itself (callers, e.g.
+   * the daemon's request handler, must `await ensureProject(cwd)` first).
    */
   list(cwd?: string): McpServerStatus[] {
     const out = [...this.statuses.values()];
@@ -149,6 +202,7 @@ export class McpManager {
       const state = this.projects.get(dir);
       if (state?.kind === "started") out.push(...state.servers);
     }
+    out.push(...this.pluginState.map((p): McpServerStatus => ({ name: p.display, status: p.status, toolNames: p.toolNames, source: "plugin" })));
     return out;
   }
 
@@ -162,5 +216,9 @@ export class McpManager {
       }
     }
     this.projects.clear();
+    for (const p of this.pluginState) p.client?.stop();
+    for (const n of this.pluginToolNames) this.deps.registry.unregister(n);
+    this.pluginState = [];
+    this.pluginToolNames = [];
   }
 }
