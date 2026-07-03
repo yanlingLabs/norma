@@ -16,11 +16,12 @@ import { GatedProvider, deferred } from "../../src/agent/test-providers";
 import type { Provider } from "../../src/providers/types";
 import { ContextAssembler } from "../../src/agent/context";
 import { TrustStore } from "../../src/agent/trust";
+import { Compactor } from "../../src/agent/compactor";
 
 // Mirrors packages/core/test/agent/engine.test.ts's setup(). Exported so other engine test
 // files (e.g. engine-interrupt.test.ts, engine-context.test.ts) can reuse the same harness
 // instead of duplicating it.
-export function setupEngine(provider: Provider, opts?: { cwd?: string; assembler?: ContextAssembler }) {
+export function setupEngine(provider: Provider, opts?: { cwd?: string; assembler?: ContextAssembler; compactor?: Compactor }) {
   const home = mkdtempSync(join(tmpdir(), "norma-engine-steer-"));
   const cwd = opts?.cwd ?? realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-steer-cwd-")));
   const store = new SessionStore(home);
@@ -38,6 +39,10 @@ export function setupEngine(provider: Provider, opts?: { cwd?: string; assembler
     const assemblerHome = mkdtempSync(join(tmpdir(), "norma-engine-steer-actx-"));
     return new ContextAssembler({ normaHome: assemblerHome, trust: new TrustStore(join(assemblerHome, "trust.json")) });
   })();
+  // Default compactor (built from this same provider/store/hub) when a test doesn't care about
+  // compaction of its own — keeps every pre-existing engine test working without threading one
+  // through. Mirrors the assembler default above.
+  const compactor = opts?.compactor ?? new Compactor({ provider: { provider, model: "gated-1" }, store, hub });
   const engine = new AgentEngine({
     store, hub, registry, broker,
     gate: new PermissionGate(),
@@ -45,6 +50,7 @@ export function setupEngine(provider: Provider, opts?: { cwd?: string; assembler
     dirs,
     approvalTimeoutMs: 500,
     assembler,
+    compactor,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: "auto" });
   // Collect every SessionEvent broadcast for this session (live, via a hub subscriber) so

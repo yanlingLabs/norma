@@ -8,6 +8,7 @@ import type { ApprovalBroker } from "./approvals";
 import type { SessionDirectories } from "./dirs";
 import { sessionTmpDir } from "./session-tmp";
 import type { ContextAssembler } from "./context";
+import type { Compactor } from "./compactor";
 
 const MAIN_THREAD = "main";
 const MAX_TOOL_ITERATIONS = 24; // runaway guard until 1b-ii budgets land
@@ -15,6 +16,11 @@ const MAX_TOOL_ITERATIONS = 24; // runaway guard until 1b-ii budgets land
 type Checkpoint = Extract<SessionEvent, { type: "checkpoint" }>;
 function isCheckpoint(e: SessionEvent): e is Checkpoint {
   return e.type === "checkpoint";
+}
+
+type TurnCompleted = Extract<SessionEvent, { type: "turn_completed" }>;
+function isTurnCompleted(e: SessionEvent): e is TurnCompleted {
+  return e.type === "turn_completed";
 }
 
 export const SYSTEM_PROMPT = [
@@ -32,6 +38,7 @@ export interface EngineConfig {
   dirs: SessionDirectories;
   provider: { provider: Provider; model: string };
   assembler: ContextAssembler;
+  compactor: Compactor;
   approvalTimeoutMs?: number; // default 5 min
 }
 
@@ -89,6 +96,33 @@ export class AgentEngine {
     return this.cfg.hub.append(sessionId, event); // hub.append: store.append + broadcast (added below)
   }
 
+  /** Manually trigger compaction (e.g. via an explicit IPC method), scoped to any turn
+   *  currently running for this session so an abort/interrupt also cancels the compaction. */
+  async compact(sessionId: string): Promise<{ compacted: boolean; uptoSeq: number; summaryChars: number }> {
+    return this.cfg.compactor.compact(sessionId, this.aborters.get(sessionId)?.signal);
+  }
+
+  private contextWindow(): number {
+    const m = this.cfg.provider.provider.models().find((mi) => mi.id === this.cfg.provider.model);
+    return m?.contextWindow ?? Infinity;
+  }
+
+  /** Auto-compact off the REAL provider-reported size of the previous turn (its `turn_completed`
+   *  `inputTokens`) — not an estimate. Runs at the start of every turn, before `historyInput` is
+   *  built, so a triggered compaction's checkpoint is what `historyInput` sees for this turn. No
+   *  prior completed turn (first turn of a session) means the context is necessarily small, so
+   *  there's nothing to check. */
+  private async maybeAutoCompact(sessionId: string): Promise<void> {
+    const events = this.cfg.store.read(sessionId);
+    const lastCompleted = [...events].reverse().find(isTurnCompleted);
+    if (!lastCompleted) return;
+    const used = lastCompleted.inputTokens;
+    const frac = Number(process.env.NORMA_COMPACT_THRESHOLD_FRAC ?? 0.75);
+    const absMax = process.env.NORMA_COMPACT_MAX_TOKENS ? Number(process.env.NORMA_COMPACT_MAX_TOKENS) : Infinity;
+    const limit = Math.min(this.contextWindow() * frac, absMax);
+    if (used > limit) await this.cfg.compactor.compact(sessionId, this.aborters.get(sessionId)?.signal);
+  }
+
   /** Builds the turn's starting input from history: if the session has been compacted (a
    *  `checkpoint` event exists), the input opens with the checkpoint's summary in place of the
    *  messages it covers, followed only by messages after its `uptoSeq` — this is what actually
@@ -125,6 +159,10 @@ export class AgentEngine {
     // system instructions in a later round of the SAME turn. A NORMA.md change only takes
     // effect starting the NEXT turn.
     const instructions = this.cfg.assembler.assemble({ cwd });
+    // Auto-compact BEFORE historyInput is built, so a triggered compaction's checkpoint is
+    // reflected in this turn's input. A compaction failure degrades to a normal (uncompacted)
+    // turn rather than breaking it.
+    try { await this.maybeAutoCompact(sessionId); } catch (e) { console.error("auto-compact failed", e); }
     const input = this.historyInput(sessionId);
     const usage = { inputTokens: 0, outputTokens: 0 };
 

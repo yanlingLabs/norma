@@ -18,6 +18,7 @@ import { registerBackgroundTools } from "./agent/tools/background";
 import { PermissionGate } from "./agent/gate";
 import { ApprovalBroker } from "./agent/approvals";
 import { AgentEngine } from "./agent/engine";
+import { Compactor } from "./agent/compactor";
 import { SessionDirectories } from "./agent/dirs";
 import { TrustStore } from "./agent/trust";
 import { ContextAssembler } from "./agent/context";
@@ -98,12 +99,14 @@ export async function startDaemon(opts: {
       emit: (sid, e) => hub.append(sid, e),
       projectDir: (sid) => store.meta(sid).cwd,
     });
+    const compactor = new Compactor({ provider: agentProvider, store, hub });
     engine = new AgentEngine({
       store, hub, registry, broker,
       gate: new PermissionGate(),
       dirs: sessionDirs,
       provider: agentProvider,
       assembler,
+      compactor,
     });
   }
 
