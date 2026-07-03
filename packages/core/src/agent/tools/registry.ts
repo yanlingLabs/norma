@@ -15,6 +15,7 @@ export interface ToolDefinition<S extends z.ZodTypeAny = z.ZodTypeAny> {
   name: string;
   description: string;
   args: S;
+  rawParameters?: Record<string, unknown>;
   /** May throw — the registry converts throws into isError outcomes. */
   run(args: z.infer<S>, ctx: ToolContext): Promise<string> | string;
 }
@@ -33,7 +34,7 @@ export class ToolRegistry {
     return [...this.defs.values()].map((d) => ({
       name: d.name,
       description: d.description,
-      parameters: z.toJSONSchema(d.args),
+      parameters: d.rawParameters ?? z.toJSONSchema(d.args),
     }));
   }
 
