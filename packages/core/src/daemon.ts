@@ -17,9 +17,13 @@ import { registerRequestDirTool } from "./agent/tools/request-dir";
 import { registerBackgroundTools } from "./agent/tools/background";
 import { registerSkillTools } from "./agent/tools/skill";
 import { registerToolSearchTool } from "./agent/tools/toolsearch";
+import { registerAskUserTool } from "./agent/tools/ask-user";
+import { registerTaskTools } from "./agent/tools/tasks";
 import { McpManager } from "./agent/mcp/manager";
 import { PermissionGate } from "./agent/gate";
 import { ApprovalBroker } from "./agent/approvals";
+import { QuestionBroker } from "./agent/questions";
+import { TaskStore } from "./agent/task-store";
 import { AgentEngine } from "./agent/engine";
 import { BashReviewer } from "./agent/reviewer";
 import { Compactor } from "./agent/compactor";
@@ -110,6 +114,8 @@ export async function startDaemon(opts: {
   let engine: AgentEngine | null = null;
   let broker: ApprovalBroker | null = null;
   let mcp: McpManager | null = null;
+  let questions: QuestionBroker | null = null;
+  let taskStore: TaskStore | null = null;
   if (agentProvider) {
     const registry = new ToolRegistry();
     registerReadTools(registry);
@@ -118,6 +124,10 @@ export async function startDaemon(opts: {
     registerBackgroundTools(registry, { bgRegistry });
     registerSkillTools(registry, { skills: skillStore });
     registerToolSearchTool(registry);
+    questions = new QuestionBroker();
+    taskStore = new TaskStore();
+    registerAskUserTool(registry);
+    registerTaskTools(registry, { tasks: taskStore });
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
     await mcp.startAll(settings?.mcpServers ?? {});
     // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled && !disabled);
@@ -148,6 +158,8 @@ export async function startDaemon(opts: {
       assembler,
       compactor,
       mcp: mcp ?? undefined,
+      questions: questions ?? undefined,
+      tasks: taskStore ?? undefined,
       reviewer,
       reviewerEnabled: reviewerCfg?.enabled,
       reviewerAllow: reviewerCfg?.allow ?? [],
@@ -172,6 +184,8 @@ export async function startDaemon(opts: {
     skills: skillStore,
     plugins: pluginStore,
     mcp: mcp ?? undefined,
+    questions: questions ?? undefined,
+    tasks: taskStore ?? undefined,
     ...opts.server,
   });
 

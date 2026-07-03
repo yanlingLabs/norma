@@ -1,10 +1,12 @@
-import type { NewSessionEvent, SessionEvent } from "@norma/protocol";
+import type { NewSessionEvent, Question, SessionEvent, Task } from "@norma/protocol";
 import type { SessionStore } from "../sessions/store";
 import type { SessionHub } from "../sessions/hub";
 import type { Provider, ProviderEvent, TurnInputItem } from "../providers/types";
 import type { ToolRegistry } from "./tools/registry";
 import type { PermissionGate } from "./gate";
 import type { ApprovalBroker } from "./approvals";
+import type { QuestionBroker } from "./questions";
+import type { TaskStore } from "./task-store";
 import type { SessionDirectories } from "./dirs";
 import { sessionTmpDir } from "./session-tmp";
 import type { ContextAssembler } from "./context";
@@ -42,6 +44,11 @@ export interface EngineConfig {
   assembler: ContextAssembler;
   compactor: Compactor;
   mcp?: McpManager;
+  // Both optional — absent means the corresponding tool bridge (ctx.ask / ctx.taskEvent) is
+  // undefined, and the ask_user/task_* tools degrade (ask_user: immediate "proceed" message;
+  // task tools: registered only when a TaskStore is passed to registerTaskTools by the caller).
+  questions?: QuestionBroker;
+  tasks?: TaskStore;
   approvalTimeoutMs?: number; // default 5 min
   reviewer?: BashReviewer; // safety review for auto-policy bash calls (undefined → no review, unchanged behavior)
   reviewerEnabled?: boolean; // default true when reviewer is set; false disables the review path entirely
@@ -285,7 +292,7 @@ export class AgentEngine {
             justification = typeof a.justification === "string" ? a.justification : undefined;
           } catch { /* fall through to review of "" → likely unsafe */ }
           if (command && bashLooksSafe(command, this.cfg.reviewerAllow ?? [])) {
-            outcome = await this.executeCall(call, cwd, sessionId, signal);
+            outcome = await this.executeCall(call, cwd, sessionId, threadId, signal);
           } else {
             let v: { verdict: "safe" | "unsafe"; reason: string };
             try {
@@ -300,11 +307,11 @@ export class AgentEngine {
                 denialMessage: `blocked by the safety reviewer: ${v.reason}. No approval within 60s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.`,
               });
             } else {
-              outcome = await this.executeCall(call, cwd, sessionId, signal);
+              outcome = await this.executeCall(call, cwd, sessionId, threadId, signal);
             }
           }
         } else {
-          outcome = await this.executeCall(call, cwd, sessionId, signal);
+          outcome = await this.executeCall(call, cwd, sessionId, threadId, signal);
         }
 
         this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
@@ -345,11 +352,17 @@ export class AgentEngine {
     const res = await waiting;
     this.emit(sessionId, { type: "approval_resolved", sessionId, threadId, callId: call.callId, approved: res.approved, by: res.by });
     return res.approved
-      ? await this.executeCall(call, cwd, sessionId, signal)
+      ? await this.executeCall(call, cwd, sessionId, threadId, signal)
       : { output: opts.denialMessage ?? `denied by ${res.by}`, isError: true };
   }
 
-  private executeCall(call: { name: string; argsJson: string }, cwd: string, sessionId: string, signal: AbortSignal): Promise<{ output: string; isError: boolean }> {
+  private executeCall(
+    call: { callId: string; name: string; argsJson: string },
+    cwd: string,
+    sessionId: string,
+    threadId: string,
+    signal: AbortSignal,
+  ): Promise<{ output: string; isError: boolean }> {
     let args: unknown;
     try { args = call.argsJson.length ? JSON.parse(call.argsJson) : {}; }
     catch { return Promise.resolve({ output: `tool arguments were not valid JSON`, isError: true }); }
@@ -368,11 +381,37 @@ export class AgentEngine {
       if (!set) { set = new Set(); this.loadedTools.set(sessionId, set); }
       set.add(n);
     };
+    const askTimeoutMs = Number(process.env.NORMA_ASK_TIMEOUT_MS ?? 300_000);
+    const ask = this.cfg.questions
+      ? async (questions: Question[]) => {
+          // Register the wait BEFORE emitting: broadcast is synchronous, so a watcher that
+          // responds as soon as it observes question_asked would otherwise race the broker
+          // (see requestApproval's identical wait-before-emit comment above).
+          const waiting = this.cfg.questions!.wait(sessionId, call.callId, askTimeoutMs);
+          try {
+            this.emit(sessionId, { type: "question_asked", sessionId, threadId, callId: call.callId, questions });
+          } catch (err) {
+            this.cfg.questions!.respond(sessionId, call.callId, {}, "emit-failure");
+            await waiting;
+            return { timedOut: true } as const;
+          }
+          const res = await waiting;
+          this.emit(sessionId, {
+            type: "question_resolved", sessionId, threadId, callId: call.callId,
+            answers: "answers" in res ? res.answers : {},
+            by: "by" in res ? res.by : "timeout",
+          });
+          return res;
+        }
+      : undefined;
+    const taskEvent = (task: Task) => { this.emit(sessionId, { type: "task_updated", sessionId, threadId, task }); };
     return this.cfg.registry.execute(call.name, args, {
       cwd, roots, tmpDir, sessionId, signal, markSkillLoaded,
       markToolLoaded,
       loadedTools: this.loadedTools.get(sessionId) ?? new Set(),
       deferThreshold: this.toolSearchThreshold(),
+      ask,
+      taskEvent,
     });
   }
 }

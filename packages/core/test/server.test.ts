@@ -327,6 +327,35 @@ describe("daemon IPC", () => {
     c.close();
   });
 
+  test("ask_user.respond round-trip + alreadyResolved; task.list snapshot", async () => {
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const fake = new FakeProvider([
+      [{ type: "tool_call", callId: "q1", name: "ask_user", argsJson: JSON.stringify({
+        questions: [{ question: "Pick one", header: "Pick", options: [{ label: "A" }, { label: "B" }], multiSelect: false }],
+      }) }, { type: "done", stopReason: "tool_calls" }],
+      [{ type: "tool_call", callId: "t1", name: "task_create", argsJson: JSON.stringify({ subject: "Ship it" }) }, { type: "done", stopReason: "tool_calls" }],
+      [{ type: "text_delta", delta: "done" }, { type: "done", stopReason: "end_turn" }],
+    ]);
+    await boot({}, fake);
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "ask-tasker");
+    const cwd = mkdtempSync(join(tmpdir(), "norma-askuser-"));
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", cwd, approvalPolicy: "auto" });
+    await c.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
+    await c.request(METHODS.sessionSend, { sessionId: created.sessionId, text: "ask, then track a task" });
+
+    const asked = await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "question_asked");
+    const res1 = await c.request(METHODS.askUserRespond, { sessionId: created.sessionId, callId: asked.params.callId, answers: { "Pick one": "B" } });
+    expect(res1.result).toEqual({ ok: true, alreadyResolved: false });
+    const res2 = await c.request(METHODS.askUserRespond, { sessionId: created.sessionId, callId: asked.params.callId, answers: { "Pick one": "B" } });
+    expect(res2.result).toEqual({ ok: true, alreadyResolved: true });
+
+    await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "turn_completed");
+    const list = await c.request(METHODS.taskList, { sessionId: created.sessionId });
+    expect(list.result).toEqual({ ok: true, tasks: [{ id: "1", subject: "Ship it", status: "pending" }] });
+    c.close();
+  });
+
   test("without a provider, sessions behave as Phase 0 (echo only, no agent events)", async () => {
     await boot(); // no provider injected
     const c = await TestClient.connect(daemon.socketPath);

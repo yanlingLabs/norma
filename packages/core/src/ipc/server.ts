@@ -6,7 +6,7 @@ import {
   SessionAddDirParams, SessionSetCwdParams, TrustDirParams,
   BgListParams, BgPeekParams, BgKillParams, BgKillAllParams,
   SessionSteerParams, SessionInterruptParams, SessionCompactParams, SkillsListParams, McpListParams,
-  PluginsListParams,
+  PluginsListParams, AskUserRespondParams, TaskListParams,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
@@ -14,6 +14,8 @@ import type { SessionStore } from "../sessions/store";
 import { SessionHub, type HubClient } from "../sessions/hub";
 import type { AgentEngine } from "../agent/engine";
 import type { ApprovalBroker } from "../agent/approvals";
+import type { QuestionBroker } from "../agent/questions";
+import type { TaskStore } from "../agent/task-store";
 import type { SessionDirectories } from "../agent/dirs";
 import type { TrustStore } from "../agent/trust";
 import type { BackgroundTaskRegistry } from "../agent/bg-registry";
@@ -45,6 +47,8 @@ export interface IpcServerOptions {
   skills?: SkillStore;       // discovered SKILL.md skills; skills.list
   mcp?: McpManager;          // MCP servers started at boot; mcp.list
   plugins?: PluginStore;     // discovered ~/.norma/plugins/*; plugins.list
+  questions?: QuestionBroker; // in-flight ask_user questions; ask_user.respond
+  tasks?: TaskStore;         // session task lists; task.list
   helloTimeoutMs?: number;   // default 5000
   maxConnections?: number;   // default 64
   preAuthMaxLine?: number;   // default 64 KiB
@@ -228,6 +232,14 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       case METHODS.approvalRespond: {
         const p = parseParams(ApprovalRespondParams, params);
         return opts.broker?.resolve(p.sessionId, p.callId, p.approved, socket.data.clientName) ?? { ok: true, alreadyResolved: true };
+      }
+      case METHODS.askUserRespond: {
+        const p = parseParams(AskUserRespondParams, params);
+        return opts.questions?.respond(p.sessionId, p.callId, p.answers, socket.data.clientName) ?? { ok: true, alreadyResolved: true };
+      }
+      case METHODS.taskList: {
+        const p = parseParams(TaskListParams, params);
+        return { ok: true, tasks: opts.tasks?.list(p.sessionId) ?? [] };
       }
       case METHODS.sessionAddDir: {
         const p = parseParams(SessionAddDirParams, params);
