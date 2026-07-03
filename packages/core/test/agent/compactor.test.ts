@@ -89,4 +89,14 @@ describe("Compactor", () => {
     expect(res.compacted).toBe(true); // waited past the limit, then produced the checkpoint
     expect(store.read(sid).find((e) => e.type === "checkpoint")).toBeTruthy();
   });
+
+  test("empty model summary → not compacted (no blank checkpoint)", async () => {
+    const { store, hub, sid } = seedSession(10); // 20 messages
+    // a provider that yields NO text_delta — just done(end_turn) → summary === ""
+    const emptySummarizer = new FakeProvider([[{ type: "done", stopReason: "end_turn" }]]);
+    const c = new Compactor({ provider: { provider: emptySummarizer, model: "fake" }, store, hub, keepTail: 6 });
+    const res = await c.compact(sid);
+    expect(res.compacted).toBe(false);
+    expect(store.read(sid).some((e) => e.type === "checkpoint")).toBe(false);
+  });
 });
