@@ -15,6 +15,7 @@ import { registerWriteTools } from "./agent/tools/fs-write";
 import { registerBashTool } from "./agent/tools/bash";
 import { registerRequestDirTool } from "./agent/tools/request-dir";
 import { registerBackgroundTools } from "./agent/tools/background";
+import { registerSkillTools } from "./agent/tools/skill";
 import { PermissionGate } from "./agent/gate";
 import { ApprovalBroker } from "./agent/approvals";
 import { AgentEngine } from "./agent/engine";
@@ -94,6 +95,7 @@ export async function startDaemon(opts: {
     registerWriteTools(registry);
     registerBashTool(registry, { bgRegistry });
     registerBackgroundTools(registry, { bgRegistry });
+    registerSkillTools(registry, { skills: skillStore });
     broker = new ApprovalBroker();
     registerRequestDirTool(registry, {
       broker,

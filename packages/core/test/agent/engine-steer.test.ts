@@ -8,6 +8,7 @@ import { SessionHub } from "../../src/sessions/hub";
 import { ToolRegistry } from "../../src/agent/tools/registry";
 import { registerReadTools } from "../../src/agent/tools/fs-read";
 import { registerWriteTools } from "../../src/agent/tools/fs-write";
+import { registerSkillTools } from "../../src/agent/tools/skill";
 import { PermissionGate } from "../../src/agent/gate";
 import { ApprovalBroker } from "../../src/agent/approvals";
 import { AgentEngine } from "../../src/agent/engine";
@@ -22,7 +23,7 @@ import { Compactor } from "../../src/agent/compactor";
 // Mirrors packages/core/test/agent/engine.test.ts's setup(). Exported so other engine test
 // files (e.g. engine-interrupt.test.ts, engine-context.test.ts) can reuse the same harness
 // instead of duplicating it.
-export function setupEngine(provider: Provider, opts?: { cwd?: string; assembler?: ContextAssembler; compactor?: Compactor }) {
+export function setupEngine(provider: Provider, opts?: { cwd?: string; assembler?: ContextAssembler; compactor?: Compactor; skills?: SkillStore }) {
   const home = mkdtempSync(join(tmpdir(), "norma-engine-steer-"));
   const cwd = opts?.cwd ?? realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-steer-cwd-")));
   const store = new SessionStore(home);
@@ -32,6 +33,13 @@ export function setupEngine(provider: Provider, opts?: { cwd?: string; assembler
   registerWriteTools(registry);
   const broker = new ApprovalBroker();
   const dirs = new SessionDirectories(() => [cwd]);
+  // Shared SkillStore for the default assembler AND the Skill tool below, so a skill loaded via
+  // the tool is visible to assemble()'s injection. opts.skills lets a test supply its own store
+  // (e.g. one seeded with a skill) that both consumers then see.
+  const skills = opts?.skills ?? (() => {
+    const skillsHome = mkdtempSync(join(tmpdir(), "norma-engine-steer-skills-"));
+    return new SkillStore({ normaHome: skillsHome, trust: new TrustStore(join(skillsHome, "trust.json")) });
+  })();
   // Default assembler (no NORMA.md/memory of its own) when a test doesn't care about context
   // assembly — keeps every pre-existing engine test working without threading one through.
   // Only create the temp home (mkdtempSync) when actually needed, i.e. the caller didn't
@@ -39,8 +47,12 @@ export function setupEngine(provider: Provider, opts?: { cwd?: string; assembler
   const assembler = opts?.assembler ?? (() => {
     const assemblerHome = mkdtempSync(join(tmpdir(), "norma-engine-steer-actx-"));
     const assemblerTrust = new TrustStore(join(assemblerHome, "trust.json"));
-    return new ContextAssembler({ normaHome: assemblerHome, trust: assemblerTrust, skills: new SkillStore({ normaHome: assemblerHome, trust: assemblerTrust }) });
+    return new ContextAssembler({ normaHome: assemblerHome, trust: assemblerTrust, skills });
   })();
+  // Registered with the SAME store as the default assembler (or the caller's opts.skills) so a
+  // test driving a real Skill tool call sees it reflected in assemble()'s `## Available
+  // capabilities` / sticky `### Loaded skills` sections.
+  registerSkillTools(registry, { skills });
   // Default compactor (built from this same provider/store/hub) when a test doesn't care about
   // compaction of its own — keeps every pre-existing engine test working without threading one
   // through. Mirrors the assembler default above.

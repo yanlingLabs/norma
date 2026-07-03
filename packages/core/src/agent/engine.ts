@@ -46,6 +46,11 @@ export class AgentEngine {
   private runningTurns = new Set<string>();
   private steerQueue = new Map<string, string[]>();
   private aborters = new Map<string, AbortController>();
+  // loadedSkills is SESSION-scoped (sticky across turns) — NOT cleared per turn, unlike
+  // steerQueue/aborters below (which ARE deleted in runTurn's finally, being per-turn). A skill
+  // loaded via the Skill tool in one turn must still be injected into the NEXT turn's assembled
+  // instructions, so this map lives for the lifetime of the engine (per session), not the turn.
+  private loadedSkills = new Map<string, Set<string>>();
   constructor(private readonly cfg: EngineConfig) {}
 
   /** True while a turn is executing for the session. */
@@ -158,7 +163,7 @@ export class AgentEngine {
     // same-turn tool write to <cwd>/NORMA.md (under `auto` policy) get injected as trusted
     // system instructions in a later round of the SAME turn. A NORMA.md change only takes
     // effect starting the NEXT turn.
-    const instructions = this.cfg.assembler.assemble({ cwd });
+    const instructions = this.cfg.assembler.assemble({ cwd, loadedSkills: [...(this.loadedSkills.get(sessionId) ?? [])] });
     // Auto-compact BEFORE historyInput is built, so a triggered compaction's checkpoint is
     // reflected in this turn's input. A compaction failure degrades to a normal (uncompacted)
     // turn rather than breaking it.
@@ -254,6 +259,11 @@ export class AgentEngine {
     catch { return Promise.resolve({ output: `tool arguments were not valid JSON`, isError: true }); }
     const roots = this.cfg.dirs.roots(sessionId);
     const tmpDir = sessionTmpDir(sessionId);
-    return this.cfg.registry.execute(call.name, args, { cwd, roots, tmpDir, sessionId, signal });
+    const markSkillLoaded = (n: string) => {
+      let set = this.loadedSkills.get(sessionId);
+      if (!set) { set = new Set(); this.loadedSkills.set(sessionId, set); }
+      set.add(n);
+    };
+    return this.cfg.registry.execute(call.name, args, { cwd, roots, tmpDir, sessionId, signal, markSkillLoaded });
   }
 }

@@ -1,7 +1,12 @@
 export type GateDecision = "allow" | "ask";
 export type SessionApprovalPolicy = "ask" | "auto";
 
-const READ_ONLY = new Set(["read", "glob", "grep", "bash_output"]);
+// Skill is read-only: it reads a SKILL.md body and marks it loaded in-memory (no filesystem
+// mutation) — same class as read/glob/grep. Without this it would fall through to the
+// unclassified "always ask" branch below, which would block session-sticky skill loading even
+// under `auto` policy (that branch ignores policy entirely, by design — fail-closed for
+// genuinely unknown tools).
+const READ_ONLY = new Set(["read", "glob", "grep", "bash_output", "Skill"]);
 const MUTATING = new Set(["write", "edit", "bash", "bash_kill"]);
 const SELF_GATING = new Set(["request_directory"]);
 

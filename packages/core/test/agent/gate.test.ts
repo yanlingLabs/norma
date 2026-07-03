@@ -43,4 +43,9 @@ describe("PermissionGate v1", () => {
     expect(gate.evaluate("bash_kill", "ask")).toBe("ask");
     expect(gate.evaluate("bash_kill", "auto")).toBe("allow");
   });
+
+  test("Skill is read-only: always allowed (loading a skill body must not require approval)", () => {
+    expect(gate.evaluate("Skill", "ask")).toBe("allow");
+    expect(gate.evaluate("Skill", "auto")).toBe("allow");
+  });
 });
