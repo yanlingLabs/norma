@@ -71,7 +71,7 @@ export class Compactor {
     } catch {
       return NOT_COMPACTED;
     }
-    if (signal?.aborted || summary.length === 0) return NOT_COMPACTED;
+    if (signal?.aborted || summary.trim().length === 0) return NOT_COMPACTED;
 
     this.hub.append(sessionId, { type: "checkpoint", sessionId, threadId: MAIN_THREAD, summary, uptoSeq });
     return { compacted: true, uptoSeq, summaryChars: summary.length };

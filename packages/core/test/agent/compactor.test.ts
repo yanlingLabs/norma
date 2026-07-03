@@ -99,4 +99,14 @@ describe("Compactor", () => {
     expect(res.compacted).toBe(false);
     expect(store.read(sid).some((e) => e.type === "checkpoint")).toBe(false);
   });
+
+  test("whitespace-only model summary → not compacted (no blank checkpoint)", async () => {
+    const { store, hub, sid } = seedSession(10); // 20 messages
+    // a provider that yields only whitespace → summary.trim() === ""
+    const whitespaceSummarizer = new FakeProvider([[{ type: "text_delta", delta: "   \n  " }, { type: "done", stopReason: "end_turn" }]]);
+    const c = new Compactor({ provider: { provider: whitespaceSummarizer, model: "fake" }, store, hub, keepTail: 6 });
+    const res = await c.compact(sid);
+    expect(res.compacted).toBe(false);
+    expect(store.read(sid).some((e) => e.type === "checkpoint")).toBe(false);
+  });
 });
