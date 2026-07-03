@@ -70,8 +70,9 @@ export const INIT_PROMPT =
 // Headless agent mode: `norma -p "<prompt>" [--auto]`. Streams the turn to stdout and,
 // under the default "ask" approval policy, prompts on stdin for each tool approval.
 // promptOverride/forceAuto let other commands (e.g. `init`) reuse the same headless flow
-// with a canned prompt instead of reading argv.
-async function runHeadlessAgent(promptOverride?: string, forceAuto = false): Promise<void> {
+// with a canned prompt instead of reading argv. existingSessionId (set by `norma resume`)
+// attaches to a previously-created session instead of creating a new one.
+async function runHeadlessAgent(promptOverride?: string, forceAuto = false, existingSessionId?: string): Promise<void> {
   // -p teardown: mirrors Claude Code's headless grace-kill. Any bg tasks still running when the
   // turn completes get a grace period (NORMA_BG_PRINT_WAIT_MS, default 5000ms; 0 = poll until none
   // are running rather than racing a fixed timer) before we force-kill whatever remains.
@@ -126,14 +127,24 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false): Pro
   });
 
   const cwd = process.cwd();
-  const created = await c.createSession("global", { cwd, approvalPolicy: auto ? "auto" : "ask" });
-  sessionId = created.sessionId;
-  if (!created.trusted) {
-    const wantTrust = process.argv.includes("--trust")
-      || (process.stdout.isTTY && !process.argv.includes("--no-trust") && (await askYesNo(`Do you trust the files in ${cwd}? Norma may grant directory access declared there. [y/N] `)));
-    if (wantTrust) { await c.trustDir(cwd); console.log(`${DIM}trusted ${cwd}${RESET}`); }
+  if (existingSessionId) {
+    sessionId = existingSessionId;
+    const info = (await c.listSessions()).sessions.find((r: any) => r.sessionId === existingSessionId);
+    if (!info) { console.error(`no such session: ${existingSessionId}`); c.close(); process.exit(1); }
+    console.log(`${DIM}↻ resuming ${existingSessionId} — ${info.scope}, ${info.lastSeq} events${RESET}`);
+    // Attach from the tip (info.lastSeq), not seq 0: attaching from 0 would replay every
+    // historical turn_completed event on this session, tripping endHeadlessTurn immediately.
+    await c.attach(sessionId, info.lastSeq);
+  } else {
+    const created = await c.createSession("global", { cwd, approvalPolicy: auto ? "auto" : "ask" });
+    sessionId = created.sessionId;
+    if (!created.trusted) {
+      const wantTrust = process.argv.includes("--trust")
+        || (process.stdout.isTTY && !process.argv.includes("--no-trust") && (await askYesNo(`Do you trust the files in ${cwd}? Norma may grant directory access declared there. [y/N] `)));
+      if (wantTrust) { await c.trustDir(cwd); console.log(`${DIM}trusted ${cwd}${RESET}`); }
+    }
+    await c.attach(sessionId);
   }
-  await c.attach(sessionId);
 
   if (!auto) {
     process.stdin.on("data", async (d) => {
@@ -378,6 +389,25 @@ if (import.meta.main) {
     await runHeadlessAgent(INIT_PROMPT, true); // force auto: writes NORMA.md without approval prompts
     break;
   }
+  case "resume": {
+    const sid = process.argv[3];
+    if (!sid) { // picker: list resumable sessions
+      const c = await connect("cli-resume");
+      const rows = (await c.listSessions()).sessions;
+      if (!rows.length) console.log("no sessions yet");
+      for (const r of rows) console.log(`${r.sessionId}  ${DIM}${r.scope}  ${r.lastSeq} events${RESET}`);
+      c.close(); process.exit(0);
+    }
+    const text = process.argv.slice(4).join(" ");
+    if (!text) { // recap only: show the session line, tell them how to continue
+      const c = await connect("cli-resume");
+      const info = (await c.listSessions()).sessions.find((r: any) => r.sessionId === sid);
+      console.log(info ? `${sid}  ${DIM}${info.scope}  ${info.lastSeq} events${RESET}\nresume with: norma resume ${sid} "<message>"` : `no such session: ${sid}`);
+      c.close(); process.exit(info ? 0 : 1);
+    }
+    await runHeadlessAgent(text, true, sid); // continue the existing session headless (auto)
+    break;
+  }
   case "provider-smoke": {
     const { loadSettings, resolveNormaHome, createProvider, KeychainSecretStore } = await import("@norma/core");
     const s = loadSettings(join(resolveNormaHome(), "settings.json"));
@@ -401,6 +431,7 @@ if (import.meta.main) {
   daemon run | daemon install | daemon uninstall | daemon status
   ping | sessions | send <sessionId|new> <text> | watch <sessionId> | add-dir <sessionId> <path> [--persist] | cd <sessionId> <path>
   steer <sessionId> <text> | interrupt <sessionId>
+  resume [id] [msg]   list sessions, or continue an existing one
   trust <dir> [--list]
   bg list <session> | bg peek <session> <taskId> | bg kill <session> <taskId>
   login [--api-key] | logout | provider | provider-smoke [--prompt <text>]

@@ -101,6 +101,20 @@ describe("NormaClient", () => {
     expect(events.some((e) => e.type === "user_message" && e.text === INIT_PROMPT)).toBe(true);
     client.close();
   });
+
+  test("resume continues an existing session (no new session)", async () => {
+    await boot();
+    const c1 = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "a", onEvent: () => {} });
+    const { sessionId } = await c1.createSession("global", { cwd: mkdtempSync(join(tmpdir(), "r-")), approvalPolicy: "auto" });
+    await c1.attach(sessionId); await c1.send(sessionId, "first"); c1.close();
+    const seen: any[] = [];
+    const c2 = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "b", onEvent: (e) => seen.push(e) });
+    const tip = (await c2.listSessions()).sessions.find((r: any) => r.sessionId === sessionId)!.lastSeq;
+    await c2.attach(sessionId, tip); await c2.send(sessionId, "second");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(seen.some((e) => e.type === "user_message" && e.text === "second")).toBe(true);
+    c2.close();
+  });
 });
 
 describe("NormaClient against a hostile/fake server", () => {
