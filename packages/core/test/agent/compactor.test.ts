@@ -46,9 +46,9 @@ describe("Compactor", () => {
     expect(store.read(sid).some((e) => e.type === "checkpoint")).toBe(false);
   });
 
-  test("an already-checkpointed session folds the prior summary into the next", async () => {
+  test("an already-checkpointed session carries the prior summary forward verbatim (never re-fed to the model)", async () => {
     const { store, hub, sid } = seedSession(10);
-    const c1 = new Compactor({ provider: { provider: summarizer("FIRST"), model: "fake" }, store, hub, keepTail: 6 });
+    const c1 = new Compactor({ provider: { provider: summarizer("FIRST lucky number 4242"), model: "fake" }, store, hub, keepTail: 6 });
     await c1.compact(sid);
     for (let i = 0; i < 6; i++) {
       store.append(sid, { type: "user_message", sessionId: sid, threadId: "main", text: `nu${i}`, clientName: "test" });
@@ -61,7 +61,19 @@ describe("Compactor", () => {
     rec.streamTurn = (req: any) => { inputs.push(req.input); return orig(req); };
     const c2 = new Compactor({ provider: { provider: rec, model: "fake" }, store, hub, keepTail: 6 });
     await c2.compact(sid);
-    expect(JSON.stringify(inputs[0])).toContain("FIRST"); // the prior summary was folded into the older set
+    // Regression guard: the model input on re-compaction contains ONLY the new older messages —
+    // the prior summary is never re-fed, so a real model can no longer drop it under repeated
+    // re-compression.
+    expect(JSON.stringify(inputs[0])).not.toContain("FIRST");
+    expect(JSON.stringify(inputs[0])).not.toContain("4242");
+    // The new checkpoint's cumulative summary carries the prior summary forward verbatim AND
+    // appends the freshly summarized section — this is the regression the live gate caught: a
+    // fact from checkpoint 1 must still be present verbatim in checkpoint 2's summary.
+    const checkpoints = store.read(sid).filter((e) => e.type === "checkpoint");
+    expect(checkpoints.length).toBe(2);
+    const newCheckpoint: any = checkpoints[1];
+    expect(newCheckpoint.summary).toContain("FIRST lucky number 4242");
+    expect(newCheckpoint.summary).toContain("SECOND");
   });
 
   test("honors the abort signal (interrupt cancels a running compaction)", async () => {

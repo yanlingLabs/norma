@@ -5,8 +5,7 @@ import type { SessionHub } from "../sessions/hub";
 
 export const SUMMARIZE_INSTRUCTION =
   "You are compacting a conversation so it can continue with less context. " +
-  "The messages below may begin with a '[Prior summary]' block — that block is earlier context that was already compacted. You MUST carry EVERY fact, name, number, identifier, decision, file path, preference, and open task from the [Prior summary] forward into your new summary. Never drop something just because it appears in the prior summary rather than a recent message. " +
-  "Then integrate the newer messages. " +
+  "Summarize the messages below. " +
   "Write the summary as clear DECLARATIVE statements of what is true and what was decided — e.g. 'The user's lucky number is 4242.' — NOT as a paraphrase of the most recent message or an echo of an acknowledgement. " +
   "Preserve all specifics (numbers, names, paths, identifiers, exact values) verbatim. Be concise but complete; do not sacrifice a fact for brevity. Output only the summary text.";
 
@@ -26,8 +25,11 @@ function isCheckpoint(e: SessionEvent): e is Checkpoint {
 const NOT_COMPACTED = { compacted: false, uptoSeq: 0, summaryChars: 0 } as const;
 
 /** Folds older turns into a checkpoint summary, keeping only the most recent `keepTail`
- *  messages verbatim. Re-compacting an already-checkpointed session folds the prior summary
- *  in as the first input item, so compaction stays lossless across repeated runs. */
+ *  messages verbatim. Re-compacting an already-checkpointed session NEVER re-feeds the prior
+ *  checkpoint's summary to the model — under repeated re-compression the model reliably drops
+ *  facts from a folded-in summary. Instead the prior summary is carried forward VERBATIM and
+ *  concatenated with a fresh summary of only the newest "older" messages, so every fact
+ *  survives every re-compaction. */
 export class Compactor {
   private readonly provider: { provider: Provider; model: string };
   private readonly store: SessionStore;
@@ -43,7 +45,6 @@ export class Compactor {
 
   async compact(sessionId: string, signal?: AbortSignal): Promise<{ compacted: boolean; uptoSeq: number; summaryChars: number }> {
     const events = this.store.read(sessionId);
-    // Fold a prior checkpoint's summary into the "older" set so re-compaction stays lossless.
     const lastCp = [...events].reverse().find(isCheckpoint);
     const msgs = events.filter(isMessage);
     const afterCp = lastCp ? msgs.filter((m) => m.seq > lastCp.uptoSeq) : msgs;
@@ -52,13 +53,15 @@ export class Compactor {
     const older = afterCp.slice(0, afterCp.length - this.keepTail);
     const uptoSeq = older[older.length - 1]!.seq;
 
-    const input: TurnInputItem[] = [];
-    if (lastCp) input.push({ type: "message", role: "user", content: "[Prior summary]\n" + lastCp.summary });
-    for (const m of older) {
-      input.push({ type: "message", role: m.type === "user_message" ? "user" : "assistant", content: m.text });
-    }
+    // Only the new "older" messages go to the model — the prior summary is never re-fed, so it
+    // can never be eroded by re-summarization.
+    const input: TurnInputItem[] = older.map((m) => ({
+      type: "message",
+      role: m.type === "user_message" ? "user" : "assistant",
+      content: m.text,
+    }));
 
-    let summary = "";
+    let newPartial = "";
     try {
       for await (const ev of this.provider.provider.streamTurn({
         model: this.provider.model,
@@ -67,13 +70,17 @@ export class Compactor {
         tools: [],
         signal,
       })) {
-        if (ev.type === "text_delta") summary += ev.delta;
+        if (ev.type === "text_delta") newPartial += ev.delta;
         else if (ev.type === "done" && ev.stopReason === "aborted") return NOT_COMPACTED;
       }
     } catch {
       return NOT_COMPACTED;
     }
-    if (signal?.aborted || summary.trim().length === 0) return NOT_COMPACTED;
+    if (signal?.aborted || newPartial.trim().length === 0) return NOT_COMPACTED;
+
+    // Carry the prior summary forward VERBATIM and append the freshly summarized section, so the
+    // cumulative summary only ever grows and never re-erodes earlier facts.
+    const summary = lastCp ? lastCp.summary + "\n\n" + newPartial : newPartial;
 
     this.hub.append(sessionId, { type: "checkpoint", sessionId, threadId: MAIN_THREAD, summary, uptoSeq });
     return { compacted: true, uptoSeq, summaryChars: summary.length };
