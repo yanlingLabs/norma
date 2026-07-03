@@ -16,6 +16,7 @@ import { registerBashTool } from "./agent/tools/bash";
 import { registerRequestDirTool } from "./agent/tools/request-dir";
 import { registerBackgroundTools } from "./agent/tools/background";
 import { registerSkillTools } from "./agent/tools/skill";
+import { registerToolSearchTool } from "./agent/tools/toolsearch";
 import { McpManager } from "./agent/mcp/manager";
 import { PermissionGate } from "./agent/gate";
 import { ApprovalBroker } from "./agent/approvals";
@@ -116,6 +117,7 @@ export async function startDaemon(opts: {
     registerBashTool(registry, { bgRegistry });
     registerBackgroundTools(registry, { bgRegistry });
     registerSkillTools(registry, { skills: skillStore });
+    registerToolSearchTool(registry);
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
     await mcp.startAll(settings?.mcpServers ?? {});
     // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled && !disabled);
@@ -149,6 +151,10 @@ export async function startDaemon(opts: {
       reviewer,
       reviewerEnabled: reviewerCfg?.enabled,
       reviewerAllow: reviewerCfg?.allow ?? [],
+      toolSearch: {
+        enabled: settings?.toolSearch?.enabled,
+        deferThreshold: settings?.toolSearch?.deferThreshold ?? Number(process.env.NORMA_TOOLSEARCH_THRESHOLD ?? 12),
+      },
     });
   }
 

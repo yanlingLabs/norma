@@ -30,6 +30,10 @@ export const Settings = z.object({
     enabled: z.array(z.string()).optional(),
     disabled: z.array(z.string()).optional(),
   }).optional(),
+  toolSearch: z.object({
+    enabled: z.boolean().optional(),
+    deferThreshold: z.number().int().positive().optional(),
+  }).optional(),
 });
 export type Settings = z.infer<typeof Settings>;
 

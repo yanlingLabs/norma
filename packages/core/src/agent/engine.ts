@@ -46,6 +46,9 @@ export interface EngineConfig {
   reviewer?: BashReviewer; // safety review for auto-policy bash calls (undefined → no review, unchanged behavior)
   reviewerEnabled?: boolean; // default true when reviewer is set; false disables the review path entirely
   reviewerAllow?: string[]; // extra commands/argv0s bashLooksSafe treats as obviously-safe (bypass review)
+  // deferral wired ONLY when this is set AND enabled !== false — undefined (the setupEngine/
+  // daemon default before this config existed) leaves specs()/instructions/execute untouched.
+  toolSearch?: { enabled?: boolean; deferThreshold?: number };
 }
 
 export class AgentEngine {
@@ -57,6 +60,13 @@ export class AgentEngine {
   // loaded via the Skill tool in one turn must still be injected into the NEXT turn's assembled
   // instructions, so this map lives for the lifetime of the engine (per session), not the turn.
   private loadedSkills = new Map<string, Set<string>>();
+  // loadedTools mirrors loadedSkills above: SESSION-scoped (sticky across turns), NOT cleared in
+  // runTurn's finally. A deferred mcp__ tool's schema, once loaded via the ToolSearch tool, must
+  // stay loaded for every later round of the SAME turn (defense-in-depth's execute check runs
+  // per-round) AND for every subsequent turn of the session — so this Set is shared, mutated
+  // in-place (never copied/snapshotted), across specs()/deferredIndex()/executeCall's ctx. See
+  // the NOTE in turn() below.
+  private loadedTools = new Map<string, Set<string>>();
   constructor(private readonly cfg: EngineConfig) {}
 
   /** True while a turn is executing for the session. */
@@ -111,6 +121,15 @@ export class AgentEngine {
    *  currently running for this session so an abort/interrupt also cancels the compaction. */
   async compact(sessionId: string): Promise<{ compacted: boolean; uptoSeq: number; summaryChars: number }> {
     return this.cfg.compactor.compact(sessionId, this.aborters.get(sessionId)?.signal);
+  }
+
+  /** ToolSearch deferral is wired ONLY when cfg.toolSearch is set AND enabled !== false. */
+  private toolSearchEnabled(): boolean {
+    return this.cfg.toolSearch !== undefined && this.cfg.toolSearch.enabled !== false;
+  }
+
+  private toolSearchThreshold(): number | undefined {
+    return this.toolSearchEnabled() ? this.cfg.toolSearch!.deferThreshold : undefined;
   }
 
   private contextWindow(): number {
@@ -176,6 +195,22 @@ export class AgentEngine {
     // system instructions in a later round of the SAME turn. A NORMA.md change only takes
     // effect starting the NEXT turn.
     const instructions = this.cfg.assembler.assemble({ cwd, loadedSkills: [...(this.loadedSkills.get(sessionId) ?? [])] });
+    // NOTE (correctness-critical): `loaded` MUST be THE ONE LIVE SET for this session — never a
+    // snapshot/copy. It's read here to build specs()/deferredIndex() for round 0, and the SAME
+    // object is handed to executeCall's ctx below; markToolLoaded (called by the ToolSearch tool)
+    // mutates it in place. That's what makes a load in round 1 visible to round 2's specs() AND
+    // to execute's defense-in-depth check, all within this one turn, without re-reading anything.
+    if (!this.loadedTools.has(sessionId)) this.loadedTools.set(sessionId, new Set());
+    const loaded = this.loadedTools.get(sessionId)!;
+    const tsEnabled = this.toolSearchEnabled();
+    const deferThreshold = this.toolSearchThreshold();
+    const deferred = tsEnabled ? this.cfg.registry.deferredIndex(cwd, loaded, deferThreshold) : [];
+    // Appended ONCE per turn, right after assemble (same one-per-turn rule as `instructions`
+    // above) — a same-turn ToolSearch load changes `loaded` but must not re-trigger this section
+    // mid-turn; deferred/instructionsFull are computed once here and reused for every round.
+    const instructionsFull = deferred.length
+      ? instructions + "\n\n# Deferred tools\nThe following tools exist but their schemas are NOT loaded — calling them directly fails. Load schemas first with the ToolSearch tool (query \"select:<name>\" or keywords), then call them normally.\n" + deferred.map((d) => `- ${d.name} — ${d.description}`).join("\n")
+      : instructions;
     // Auto-compact BEFORE historyInput is built, so a triggered compaction's checkpoint is
     // reflected in this turn's input. A compaction failure degrades to a normal (uncompacted)
     // turn rather than breaking it.
@@ -195,9 +230,9 @@ export class AgentEngine {
 
       for await (const ev of this.cfg.provider.provider.streamTurn({
         model: this.cfg.provider.model,
-        instructions,
+        instructions: instructionsFull,
         input,
-        tools: this.cfg.registry.specs(cwd),
+        tools: this.cfg.registry.specs(cwd, tsEnabled ? { loaded, deferThreshold } : undefined),
         signal,
       })) {
         if (ev.type === "text_delta") textBuf += ev.delta;
@@ -325,6 +360,19 @@ export class AgentEngine {
       if (!set) { set = new Set(); this.loadedSkills.set(sessionId, set); }
       set.add(n);
     };
-    return this.cfg.registry.execute(call.name, args, { cwd, roots, tmpDir, sessionId, signal, markSkillLoaded });
+    // Pass the LIVE loadedTools set (mutated in place by markToolLoaded) — see the NOTE in
+    // turn() above. By the time executeCall runs, turn() has already ensured this session's
+    // entry exists, so `?? new Set()` here is a defensive fallback, never the live path.
+    const markToolLoaded = (n: string) => {
+      let set = this.loadedTools.get(sessionId);
+      if (!set) { set = new Set(); this.loadedTools.set(sessionId, set); }
+      set.add(n);
+    };
+    return this.cfg.registry.execute(call.name, args, {
+      cwd, roots, tmpDir, sessionId, signal, markSkillLoaded,
+      markToolLoaded,
+      loadedTools: this.loadedTools.get(sessionId) ?? new Set(),
+      deferThreshold: this.toolSearchThreshold(),
+    });
   }
 }

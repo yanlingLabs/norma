@@ -28,6 +28,8 @@ import type { BashReviewer } from "../../src/agent/reviewer";
 export function setupEngine(provider: Provider, opts?: {
   cwd?: string; assembler?: ContextAssembler; compactor?: Compactor; skills?: SkillStore; registry?: ToolRegistry; mcp?: McpManager;
   reviewer?: BashReviewer; reviewerEnabled?: boolean; reviewerAllow?: string[]; policy?: "ask" | "auto";
+  // undefined (default) → no deferral anywhere; every pre-existing engine test omits this and is unaffected.
+  toolSearch?: { enabled?: boolean; deferThreshold?: number };
 }) {
   const home = mkdtempSync(join(tmpdir(), "norma-engine-steer-"));
   const cwd = opts?.cwd ?? realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-steer-cwd-")));
@@ -77,6 +79,7 @@ export function setupEngine(provider: Provider, opts?: {
     reviewer: opts?.reviewer,
     reviewerEnabled: opts?.reviewerEnabled,
     reviewerAllow: opts?.reviewerAllow,
+    toolSearch: opts?.toolSearch,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: opts?.policy ?? "auto" });
   // Collect every SessionEvent broadcast for this session (live, via a hub subscriber) so

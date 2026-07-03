@@ -100,6 +100,19 @@ describe("loadSettings", () => {
     expect(s.schemaVersion).toBe(2);
     expect(s.plugins).toBeUndefined();
   });
+
+  test("toolSearch config parses; absent → undefined", () => {
+    const s = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, toolSearch: { enabled: true, deferThreshold: 20 } });
+    expect(s.toolSearch).toEqual({ enabled: true, deferThreshold: 20 });
+    expect(Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" } }).toolSearch).toBeUndefined();
+  });
+
+  test("legacy migration keeps working with toolSearch field absent", () => {
+    const p = tmpSettings({ webSearch: { provider: "disabled" } });
+    const s = loadSettings(p);
+    expect(s.schemaVersion).toBe(2);
+    expect(s.toolSearch).toBeUndefined();
+  });
 });
 
 describe("saveSettings", () => {
