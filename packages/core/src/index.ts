@@ -22,5 +22,6 @@ export { SessionDirectories } from "./agent/dirs";
 export { sessionTmpDir } from "./agent/session-tmp";
 export { TrustStore } from "./agent/trust";
 export { ContextAssembler, BASE_PROMPT } from "./agent/context";
+export { SkillStore, type SkillMeta } from "./agent/skills";
 export { BackgroundTaskRegistry, type BgDeps } from "./agent/bg-registry";
 export { Compactor, SUMMARIZE_INSTRUCTION } from "./agent/compactor";
