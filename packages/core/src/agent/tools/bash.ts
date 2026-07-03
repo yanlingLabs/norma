@@ -13,11 +13,12 @@ const MAX_CAPTURE = 256 * 1024; // hard bound before the registry's own 64KB cap
 export function registerBashTool(r: ToolRegistry, deps: { bgRegistry?: BackgroundTaskRegistry } = {}): void {
   r.register({
     name: "bash",
-    description: "Run a shell command in the session directory. Confined by a macOS sandbox: writes are limited to the session directory and network is disabled. Combined stdout+stderr is returned with the exit code. Note: bare mktemp may fail under the sandbox (macOS ignores $TMPDIR); use $TMPDIR explicitly, e.g. mktemp \"$TMPDIR/XXXXXX\". Set runInBackground: true to launch long-running commands without blocking; poll output with bash_output and stop them with bash_kill.",
+    description: "Run a shell command in the session directory. Confined by a macOS sandbox: writes are limited to the session directory and network is disabled. Combined stdout+stderr is returned with the exit code. Note: bare mktemp may fail under the sandbox (macOS ignores $TMPDIR); use $TMPDIR explicitly, e.g. mktemp \"$TMPDIR/XXXXXX\". Set runInBackground: true to launch long-running commands without blocking; poll output with bash_output and stop them with bash_kill. If a prior bash call was blocked by the safety reviewer, pass justification: a short explanation of why this command is necessary and safe; the reviewer will reconsider. It does not affect execution.",
     args: z.object({
       command: z.string().min(1),
       timeoutMs: z.number().int().positive().max(MAX_TIMEOUT_MS).optional(),
       runInBackground: z.boolean().optional(),
+      justification: z.string().optional(),
     }),
     async run({ command, timeoutMs, runInBackground }, { cwd, roots, tmpDir, sessionId, signal }) {
       if (runInBackground) {

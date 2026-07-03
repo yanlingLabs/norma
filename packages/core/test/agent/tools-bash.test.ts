@@ -116,4 +116,11 @@ d("bash tool (sandboxed)", () => {
     const orphans = (() => { try { return execSync("pgrep -f 'sleep 30'").toString().trim(); } catch { return ""; } })();
     expect(orphans).toBe("");
   });
+
+  test("bash accepts an optional justification and ignores it for execution", async () => {
+    const cwd = proj();
+    const res = await reg().execute("bash", { command: "echo hi", justification: "because the reviewer asked" }, { cwd, roots: [cwd], sessionId: "s1" });
+    expect(res.isError).toBe(false);
+    expect(res.output).toContain("hi"); // command ran; justification did not affect execution
+  });
 });
