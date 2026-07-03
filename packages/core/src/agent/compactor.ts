@@ -4,9 +4,11 @@ import type { SessionStore } from "../sessions/store";
 import type { SessionHub } from "../sessions/hub";
 
 export const SUMMARIZE_INSTRUCTION =
-  "You are compacting a conversation so it can continue seamlessly with less context. " +
-  "Summarize everything below, preserving key facts, decisions, identifiers, file paths, and open threads / next steps. " +
-  "Be concise but lossless on specifics. Output only the summary.";
+  "You are compacting a conversation so it can continue with less context. " +
+  "The messages below may begin with a '[Prior summary]' block — that block is earlier context that was already compacted. You MUST carry EVERY fact, name, number, identifier, decision, file path, preference, and open task from the [Prior summary] forward into your new summary. Never drop something just because it appears in the prior summary rather than a recent message. " +
+  "Then integrate the newer messages. " +
+  "Write the summary as clear DECLARATIVE statements of what is true and what was decided — e.g. 'The user's lucky number is 4242.' — NOT as a paraphrase of the most recent message or an echo of an acknowledgement. " +
+  "Preserve all specifics (numbers, names, paths, identifiers, exact values) verbatim. Be concise but complete; do not sacrifice a fact for brevity. Output only the summary text.";
 
 const DEFAULT_KEEP_TAIL = 6;
 const MAIN_THREAD = "main";
