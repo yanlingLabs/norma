@@ -25,4 +25,5 @@ export { ContextAssembler, BASE_PROMPT } from "./agent/context";
 export { SkillStore, type SkillMeta } from "./agent/skills";
 export { BackgroundTaskRegistry, type BgDeps } from "./agent/bg-registry";
 export { Compactor, SUMMARIZE_INSTRUCTION } from "./agent/compactor";
+export { bashLooksSafe, BashReviewer, REVIEW_INSTRUCTION, type ReviewVerdict } from "./agent/reviewer";
 export { McpManager, type McpServerStatus, type McpServerConfig } from "./agent/mcp/manager";
