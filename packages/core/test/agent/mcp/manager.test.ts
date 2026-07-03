@@ -96,3 +96,19 @@ describe.if(isMac)("McpManager.ensureProject", () => {
     mgr.stopAll();
   });
 });
+
+describe.if(isMac)("McpManager.list(cwd) + stopAll", () => {
+  test("list(trusted cwd) includes the project server (source project); list() only user", async () => {
+    const dir = projDir();
+    const registry = new ToolRegistry();
+    const trust = new TrustStore(join(realDir(), "trust.json")); trust.trust(dir);
+    const mgr = new McpManager({ registry, trust });
+    await mgr.startAll({}); // no user servers
+    await mgr.ensureProject(dir);
+    expect(mgr.list().some((s) => s.source === "project")).toBe(false); // no cwd → no project
+    const withCwd = mgr.list(dir);
+    expect(withCwd.find((s) => s.name === "proj")).toMatchObject({ status: "connected", source: "project" });
+    mgr.stopAll();
+    expect(registry.has("mcp__proj__echo")).toBe(false); // stopAll unregistered project tools
+  });
+});

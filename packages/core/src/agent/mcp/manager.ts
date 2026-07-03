@@ -119,13 +119,33 @@ export class McpManager {
     this.projects.set(dir, state);
   }
 
-  list(): McpServerStatus[] { return [...this.statuses.values()]; }
+  /**
+   * SYNC/PURE: returns already-known statuses without spawning/reading anything. User servers
+   * (source "user") are always included; project servers (source "project") for `cwd` are
+   * included only if `ensureProject(cwd)` has already recorded a "started" state for it — this
+   * method does NOT call `ensureProject` itself (callers, e.g. the daemon's request handler,
+   * must `await ensureProject(cwd)` first).
+   */
+  list(cwd?: string): McpServerStatus[] {
+    const out = [...this.statuses.values()];
+    if (cwd) {
+      let dir: string;
+      try { dir = realpathSync(cwd); } catch { dir = cwd; }
+      const state = this.projects.get(dir);
+      if (state?.kind === "started") out.push(...state.servers);
+    }
+    return out;
+  }
 
   stopAll(): void {
     for (const c of this.clients.values()) c.stop();
     this.clients.clear();
     for (const state of this.projects.values()) {
-      if (state.kind === "started") for (const c of state.clients) c.stop();
+      if (state.kind === "started") {
+        for (const c of state.clients) c.stop();
+        for (const n of state.toolNames) this.deps.registry.unregister(n);
+      }
     }
+    this.projects.clear();
   }
 }
