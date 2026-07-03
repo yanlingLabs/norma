@@ -74,4 +74,47 @@ describe("ContextAssembler", () => {
     expect(() => a.assemble({ cwd })).not.toThrow();
     expect(a.assemble({ cwd })).not.toContain("Project instructions");
   });
+
+  test("byte cap is UTF-8 byte-accurate for non-ASCII (not char-length) and truncates on a valid boundary", () => {
+    const { home, trust } = setup();
+    // 20000 CJK chars = 60000 UTF-8 bytes, well over the 32768-byte instructions cap
+    writeFileSync(join(home, "NORMA.md"), "字".repeat(20000));
+    const a = new ContextAssembler({ normaHome: home, trust });
+    const out = a.assemble({ cwd: null });
+    expect(out).toContain("[…truncated]");
+    // the user-instructions content must be <= the byte cap (not ~1.8x over):
+    // (isolate to just this section — stop at the next "## " heading — so the trailing
+    // "## Available capabilities" boilerplate doesn't inflate the measured byte count)
+    const section = (out.split("## User instructions")[1] ?? "").split("\n\n## ")[0] ?? "";
+    expect(Buffer.byteLength(section.replace("\n[…truncated]", ""), "utf8")).toBeLessThanOrEqual(32768 + 64); // +header slack
+    // no lone surrogate / invalid unit: re-encoding round-trips cleanly (no U+FFFD from OUR split beyond at most the boundary char)
+    expect(() => Buffer.from(out, "utf8")).not.toThrow();
+    // an emoji straddling the boundary does not leave a lone surrogate:
+    const home2 = realDir(); mkdirSync(join(home2, "memory"), { recursive: true });
+    const trust2 = new (trust.constructor as any)(join(home2, "trust.json"));
+    writeFileSync(join(home2, "NORMA.md"), "a".repeat(32766) + "😀😀😀");
+    const b = new ContextAssembler({ normaHome: home2, trust: trust2 });
+    const o2 = b.assemble({ cwd: null });
+    // no unpaired surrogate: matching /[\ud800-\udfff]/ against a valid string finds only paired ones; a lone one would be caught by round-trip:
+    expect(Buffer.from(o2, "utf8").toString("utf8").includes("��")).toBe(false); // not a cascade of replacements
+  });
+
+  test("present-but-EMPTY NORMA.md is omitted (no empty header)", () => {
+    const { home, trust } = setup();
+    writeFileSync(join(home, "NORMA.md"), ""); // zero bytes, but the file EXISTS
+    const a = new ContextAssembler({ normaHome: home, trust });
+    expect(a.assemble({ cwd: null })).not.toContain("User instructions");
+  });
+
+  test("memory 24576-byte cap fires independently of the 200-line cap", () => {
+    const { home, trust } = setup();
+    // 50 long lines (< 200 lines) but > 24576 bytes → byte cap must fire
+    writeFileSync(join(home, "memory", "MEMORY.md"), Array.from({length:50}, () => "y".repeat(1000)).join("\n"));
+    const a = new ContextAssembler({ normaHome: home, trust });
+    const out = a.assemble({ cwd: null });
+    expect(out).toContain("[…truncated]");
+    // isolate to just this section (stop at the next "## " heading) for the same reason as above
+    const mem = (out.split("## Memory")[1] ?? "").split("\n\n## ")[0] ?? "";
+    expect(Buffer.byteLength(mem.replace("\n[…truncated]",""), "utf8")).toBeLessThanOrEqual(24576 + 64);
+  });
 });

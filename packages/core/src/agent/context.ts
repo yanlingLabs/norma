@@ -10,13 +10,21 @@ export const BASE_PROMPT = [
 
 const TRUNC = "\n[…truncated]";
 
+/** Cap a string to `maxBytes` UTF-8 bytes, truncating on a valid boundary (a split multibyte char degrades to U+FFFD, never a lone surrogate). */
+function capBytes(s: string, maxBytes: number): { text: string; truncated: boolean } {
+  const buf = Buffer.from(s, "utf8");
+  if (buf.byteLength <= maxBytes) return { text: s, truncated: false };
+  return { text: buf.subarray(0, maxBytes).toString("utf8"), truncated: true };
+}
+
 /** Read a UTF-8 file, capping at `maxBytes`; returns null if missing/unreadable/not a regular file. */
 function readCapped(path: string, maxBytes: number): string | null {
   try {
     if (!statSync(path).isFile()) return null;
     const s = readFileSync(path, "utf8");
     if (s.length === 0) return null;
-    return s.length > maxBytes ? s.slice(0, maxBytes) + TRUNC : s;
+    const { text, truncated } = capBytes(s, maxBytes);
+    return truncated ? text + TRUNC : text;
   } catch { return null; }
 }
 
@@ -29,7 +37,9 @@ function readMemory(path: string, maxLines: number, maxBytes: number): string | 
     let truncated = false;
     const lines = s.split("\n");
     if (lines.length > maxLines) { s = lines.slice(0, maxLines).join("\n"); truncated = true; }
-    if (s.length > maxBytes) { s = s.slice(0, maxBytes); truncated = true; }
+    const capped = capBytes(s, maxBytes);
+    s = capped.text;
+    truncated = truncated || capped.truncated;
     return truncated ? s + TRUNC : s;
   } catch { return null; }
 }
