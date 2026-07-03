@@ -17,6 +17,8 @@ export { registerBackgroundTools } from "./agent/tools/background";
 export { registerRequestDirTool, type RequestDirDeps } from "./agent/tools/request-dir";
 export { registerToolSearchTool } from "./agent/tools/toolsearch";
 export { registerAskUserTool } from "./agent/tools/ask-user";
+export { TaskStore } from "./agent/task-store";
+export { registerTaskTools } from "./agent/tools/tasks";
 export { buildSeatbeltProfile, sandboxAvailable } from "./agent/sandbox";
 export { PermissionGate, type GateDecision, type SessionApprovalPolicy } from "./agent/gate";
 export { ApprovalBroker, type ApprovalOutcome } from "./agent/approvals";
