@@ -3,7 +3,7 @@ import {
   SessionCreateResult, SessionAttachResult, SessionSendResult, SessionListResult,
   SessionAddDirResult, SessionSetCwdResult, TrustDirResult,
   BgListResult, BgPeekResult, BgKillResult, BgKillAllResult,
-  SessionSteerResult, SessionInterruptResult,
+  SessionSteerResult, SessionInterruptResult, SessionCompactResult,
   ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 
@@ -130,6 +130,10 @@ export class NormaClient {
   async interrupt(sessionId: string): Promise<{ wasRunning: boolean }> {
     const r = this.validated(SessionInterruptResult, await this.request(METHODS.sessionInterrupt, { sessionId }), METHODS.sessionInterrupt);
     return { wasRunning: r.wasRunning };
+  }
+  async compact(sessionId: string): Promise<{ compacted: boolean; uptoSeq: number; summaryChars: number }> {
+    const r = this.validated(SessionCompactResult, await this.request(METHODS.sessionCompact, { sessionId }), METHODS.sessionCompact);
+    return { compacted: r.compacted, uptoSeq: r.uptoSeq, summaryChars: r.summaryChars };
   }
   close(): void { this.socket.end(); }
 }

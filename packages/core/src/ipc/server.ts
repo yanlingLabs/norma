@@ -5,7 +5,7 @@ import {
   HelloParams, SessionCreateParams, SessionAttachParams, SessionSendParams, ApprovalRespondParams,
   SessionAddDirParams, SessionSetCwdParams, TrustDirParams,
   BgListParams, BgPeekParams, BgKillParams, BgKillAllParams,
-  SessionSteerParams, SessionInterruptParams,
+  SessionSteerParams, SessionInterruptParams, SessionCompactParams,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
@@ -198,6 +198,11 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         const p = parseParams(SessionInterruptParams, params);
         if (!opts.engine) return { ok: true, wasRunning: false };
         return { ok: true, ...opts.engine.interrupt(p.sessionId) };
+      }
+      case METHODS.sessionCompact: {
+        const p = parseParams(SessionCompactParams, params);
+        if (!opts.engine) return { ok: true, compacted: false, uptoSeq: 0, summaryChars: 0 };
+        return { ok: true, ...(await opts.engine.compact(p.sessionId)) };
       }
       case METHODS.approvalRespond: {
         const p = parseParams(ApprovalRespondParams, params);

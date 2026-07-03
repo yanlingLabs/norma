@@ -20,6 +20,8 @@ import {
   SessionInterruptParams,
   SessionSteerResult,
   SessionInterruptResult,
+  SessionCompactParams,
+  SessionCompactResult,
   METHODS,
 } from "../src/methods";
 
@@ -144,5 +146,17 @@ describe("session.steer / session.interrupt schemas", () => {
     expect(SessionInterruptParams.parse({ sessionId: "s1" }).sessionId).toBe("s1");
     expect(SessionInterruptResult.parse({ ok: true, wasRunning: false }).wasRunning).toBe(false);
     expect([METHODS.sessionSteer, METHODS.sessionInterrupt]).toEqual(["session.steer", "session.interrupt"]);
+  });
+});
+
+describe("session.compact schema", () => {
+  test("session.compact params/result + method string", () => {
+    expect(SessionCompactParams.parse({ sessionId: "s1" }).sessionId).toBe("s1");
+    expect(() => SessionCompactParams.parse({ sessionId: "" })).toThrow();
+    const r = SessionCompactResult.parse({ ok: true, compacted: true, uptoSeq: 12, summaryChars: 340 });
+    expect(r).toEqual({ ok: true, compacted: true, uptoSeq: 12, summaryChars: 340 });
+    expect(() => SessionCompactResult.parse({ ok: true, compacted: true, uptoSeq: -1, summaryChars: 0 })).toThrow();
+    expect(() => SessionCompactResult.parse({ ok: true, compacted: true, uptoSeq: 0, summaryChars: -1 })).toThrow();
+    expect(METHODS.sessionCompact).toBe("session.compact");
   });
 });

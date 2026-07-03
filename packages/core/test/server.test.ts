@@ -559,4 +559,48 @@ describe("daemon IPC", () => {
     expect(interrupt).toEqual({ ok: true, wasRunning: false });
     c.close();
   });
+
+  test("session.compact without an engine degrades gracefully", async () => {
+    await boot(); // no provider → no engine
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "no-engine-compact");
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global" });
+    const r = (await c.request(METHODS.sessionCompact, { sessionId: created.sessionId })).result;
+    expect(r).toEqual({ ok: true, compacted: false, uptoSeq: 0, summaryChars: 0 });
+    c.close();
+  });
+
+  test("session.compact folds older turns into a checkpoint (over the socket)", async () => {
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const fake = new FakeProvider([
+      [{ type: "text_delta", delta: "ok" }, { type: "done", stopReason: "end_turn" }],
+    ]);
+    await boot({}, fake);
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "compactor");
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-compact-")));
+    const s = (await c.request(METHODS.sessionCreate, { scope: "global", cwd, approvalPolicy: "auto" })).result.sessionId;
+    await c.request(METHODS.sessionAttach, { sessionId: s, fromSeq: 0 });
+
+    // 4 turns → 8 messages, past the Compactor's default keepTail(6) → compactable.
+    // Sends must be serialized: a turn already running just queues history instead of starting a new one.
+    for (let i = 0; i < 4; i++) {
+      await c.request(METHODS.sessionSend, { sessionId: s, text: `turn ${i}` });
+      const deadline = Date.now() + 2000;
+      while (c.notifications.filter((n) => n.method === METHODS.event && n.params.type === "turn_completed").length <= i) {
+        if (Date.now() > deadline) throw new Error("timed out waiting for turn_completed");
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    }
+
+    const r = (await c.request(METHODS.sessionCompact, { sessionId: s })).result;
+    expect(r.ok).toBe(true);
+    expect(r.compacted).toBe(true);
+    expect(r.uptoSeq).toBeGreaterThan(0);
+    expect(r.summaryChars).toBeGreaterThan(0);
+    const checkpoint = await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "checkpoint");
+    expect(checkpoint.params.uptoSeq).toBe(r.uptoSeq);
+    expect(checkpoint.params.summary.length).toBe(r.summaryChars);
+    c.close();
+  });
 });

@@ -88,6 +88,14 @@ describe("NormaClient", () => {
     client.close();
   });
 
+  test("compact client method round-trip (no engine → nothing to compact)", async () => {
+    await boot();
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "cc", onEvent: () => {} });
+    const { sessionId } = await client.createSession("global", { cwd: mkdtempSync(join(tmpdir(), "norma-cc-")), approvalPolicy: "auto" });
+    expect(await client.compact(sessionId)).toEqual({ compacted: false, uptoSeq: 0, summaryChars: 0 });
+    client.close();
+  });
+
   test("init prompt reaches the session (canned NORMA.md-generation prompt)", async () => {
     const { INIT_PROMPT } = await import("../src/main");
     expect(INIT_PROMPT).toMatch(/NORMA\.md/i);

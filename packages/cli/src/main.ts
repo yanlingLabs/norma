@@ -284,6 +284,15 @@ if (import.meta.main) {
     c.close();
     break;
   }
+  case "compact": {
+    const sid = process.argv[3];
+    if (!sid) { console.error("usage: norma compact <sessionId>"); process.exit(1); }
+    const c = await connect("cli-compact");
+    const r = await c.compact(sid);
+    console.log(r.compacted ? `${AQUA}compacted${RESET} (through seq ${r.uptoSeq}, ${r.summaryChars} char summary)` : "nothing to compact yet");
+    c.close();
+    process.exit(0);
+  }
   case "bg": {
     const bgSub = process.argv[3];
     const bgSessionId = process.argv[4];
@@ -434,7 +443,7 @@ if (import.meta.main) {
     console.log(`norma (Phase 1b-ii-d) — commands:
   daemon run | daemon install | daemon uninstall | daemon status
   ping | sessions | send <sessionId|new> <text> | watch <sessionId> | add-dir <sessionId> <path> [--persist] | cd <sessionId> <path>
-  steer <sessionId> <text> | interrupt <sessionId>
+  steer <sessionId> <text> | interrupt <sessionId> | compact <sessionId>
   resume [id] [msg]   list sessions, or continue an existing one
   trust <dir> [--list]
   bg list <session> | bg peek <session> <taskId> | bg kill <session> <taskId>

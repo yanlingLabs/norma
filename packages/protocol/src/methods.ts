@@ -89,6 +89,14 @@ export const SessionSteerResult = z.object({ ok: z.literal(true), injected: z.bo
 export const SessionInterruptParams = z.object({ sessionId: z.string() });
 export const SessionInterruptResult = z.object({ ok: z.literal(true), wasRunning: z.boolean() });
 
+export const SessionCompactParams = z.object({ sessionId: z.string().min(1) });
+export const SessionCompactResult = z.object({
+  ok: z.literal(true),
+  compacted: z.boolean(),
+  uptoSeq: z.number().int().nonnegative(),
+  summaryChars: z.number().int().nonnegative(),
+});
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -106,4 +114,5 @@ export const METHODS = {
   bgKillAll: "bg.killAll",
   sessionSteer: "session.steer",
   sessionInterrupt: "session.interrupt",
+  sessionCompact: "session.compact",
 } as const;
