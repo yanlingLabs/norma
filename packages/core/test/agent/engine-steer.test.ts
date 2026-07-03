@@ -32,8 +32,12 @@ export function setupEngine(provider: Provider, opts?: { cwd?: string; assembler
   const dirs = new SessionDirectories(() => [cwd]);
   // Default assembler (no NORMA.md/memory of its own) when a test doesn't care about context
   // assembly — keeps every pre-existing engine test working without threading one through.
-  const assemblerHome = mkdtempSync(join(tmpdir(), "norma-engine-steer-actx-"));
-  const assembler = opts?.assembler ?? new ContextAssembler({ normaHome: assemblerHome, trust: new TrustStore(join(assemblerHome, "trust.json")) });
+  // Only create the temp home (mkdtempSync) when actually needed, i.e. the caller didn't
+  // supply their own assembler.
+  const assembler = opts?.assembler ?? (() => {
+    const assemblerHome = mkdtempSync(join(tmpdir(), "norma-engine-steer-actx-"));
+    return new ContextAssembler({ normaHome: assemblerHome, trust: new TrustStore(join(assemblerHome, "trust.json")) });
+  })();
   const engine = new AgentEngine({
     store, hub, registry, broker,
     gate: new PermissionGate(),

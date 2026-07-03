@@ -105,6 +105,11 @@ export class AgentEngine {
       return;
     }
     const cwd = meta.cwd;
+    // Assembled ONCE per turn — not re-read per tool-round. Re-reading here would let a
+    // same-turn tool write to <cwd>/NORMA.md (under `auto` policy) get injected as trusted
+    // system instructions in a later round of the SAME turn. A NORMA.md change only takes
+    // effect starting the NEXT turn.
+    const instructions = this.cfg.assembler.assemble({ cwd });
     const input = this.historyInput(sessionId);
     const usage = { inputTokens: 0, outputTokens: 0 };
 
@@ -120,7 +125,7 @@ export class AgentEngine {
 
       for await (const ev of this.cfg.provider.provider.streamTurn({
         model: this.cfg.provider.model,
-        instructions: this.cfg.assembler.assemble({ cwd: meta.cwd }),
+        instructions,
         input,
         tools: this.cfg.registry.specs(),
         signal,
