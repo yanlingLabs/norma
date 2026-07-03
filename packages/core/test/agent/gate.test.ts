@@ -55,4 +55,9 @@ describe("PermissionGate v1", () => {
     expect(g.evaluate("mcp__srv__tool", "ask")).toBe("ask");
     expect(g.evaluate("read", "ask")).toBe("allow"); // READ_ONLY unchanged
   });
+
+  test("ToolSearch is read-only: always allowed (loading a deferred tool's schema must not require approval)", () => {
+    expect(gate.evaluate("ToolSearch", "ask")).toBe("allow");
+    expect(gate.evaluate("ToolSearch", "auto")).toBe("allow");
+  });
 });

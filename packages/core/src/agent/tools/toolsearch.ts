@@ -1,0 +1,48 @@
+import { z } from "zod";
+import type { ToolRegistry } from "./registry";
+
+export function registerToolSearchTool(r: ToolRegistry): void {
+  r.register({
+    name: "ToolSearch",
+    description:
+      "Load deferred tools' schemas so they can be called. Deferred tools are listed by name in the instructions — until loaded, they cannot be invoked. " +
+      'Query forms: "select:name1,name2" loads those exact tools; otherwise keywords match name+description ("+term" requires the term). ' +
+      "Loaded schemas are returned and the tools become callable from the next step on.",
+    args: z.object({
+      query: z.string().min(1),
+      maxResults: z.number().int().positive().max(20).optional(),
+    }),
+    run({ query, maxResults }, ctx) {
+      const index = r.deferredIndex(ctx.cwd, ctx.loadedTools, ctx.deferThreshold);
+      let matches: Array<{ name: string; description: string }>;
+      if (query.startsWith("select:")) {
+        const wanted = query.slice("select:".length).split(",").map((s: string) => s.trim()).filter(Boolean);
+        matches = index.filter((e) => wanted.includes(e.name));
+      } else {
+        const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+        const required = tokens.filter((t: string) => t.startsWith("+")).map((t: string) => t.slice(1)).filter(Boolean);
+        const rest = tokens.filter((t: string) => !t.startsWith("+"));
+        matches = index
+          .map((e) => {
+            const hay = `${e.name} ${e.description}`.toLowerCase();
+            if (!required.every((t: string) => hay.includes(t))) return null;
+            const hits = rest.filter((t: string) => hay.includes(t)).length + required.length;
+            return hits > 0 ? { e, hits } : null;
+          })
+          .filter((m): m is { e: { name: string; description: string }; hits: number } => m !== null)
+          .sort((a, b) => b.hits - a.hits)
+          .slice(0, maxResults ?? 5)
+          .map((m) => m.e);
+      }
+      if (matches.length === 0) {
+        const near = index.slice(0, 3).map((e) => e.name).join(", ");
+        return `no deferred tools matched "${query}".${near ? ` Deferred tools include: ${near}. Try select:<name> or different keywords.` : " Nothing is currently deferred."}`;
+      }
+      const lines = matches.map((e) => {
+        ctx.markToolLoaded?.(e.name);
+        return JSON.stringify(r.specFor(e.name, ctx.cwd));
+      });
+      return `Loaded ${matches.length} tool(s) — now callable from your next step:\n${lines.join("\n")}`;
+    },
+  });
+}

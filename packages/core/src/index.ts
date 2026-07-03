@@ -15,6 +15,7 @@ export { registerWriteTools } from "./agent/tools/fs-write";
 export { registerBashTool } from "./agent/tools/bash";
 export { registerBackgroundTools } from "./agent/tools/background";
 export { registerRequestDirTool, type RequestDirDeps } from "./agent/tools/request-dir";
+export { registerToolSearchTool } from "./agent/tools/toolsearch";
 export { buildSeatbeltProfile, sandboxAvailable } from "./agent/sandbox";
 export { PermissionGate, type GateDecision, type SessionApprovalPolicy } from "./agent/gate";
 export { ApprovalBroker, type ApprovalOutcome } from "./agent/approvals";

@@ -6,7 +6,11 @@ export type SessionApprovalPolicy = "ask" | "auto";
 // unclassified "always ask" branch below, which would block session-sticky skill loading even
 // under `auto` policy (that branch ignores policy entirely, by design — fail-closed for
 // genuinely unknown tools).
-const READ_ONLY = new Set(["read", "glob", "grep", "bash_output", "Skill"]);
+// ToolSearch is the same class: it reads the (in-memory) deferred tool index and marks matched
+// tools loaded for the session — no filesystem/network mutation. It must be classified here (not
+// left to fall through, and NOT matched by the `mcp__` prefix check below — its own name never
+// starts with `mcp__`) so schema-loading itself never requires approval, even under `ask` policy.
+const READ_ONLY = new Set(["read", "glob", "grep", "bash_output", "Skill", "ToolSearch"]);
 const MUTATING = new Set(["write", "edit", "bash", "bash_kill"]);
 const SELF_GATING = new Set(["request_directory"]);
 
