@@ -151,7 +151,34 @@ describe("AgentEngine: plan mode (deny + exit_plan_mode bridge)", () => {
     expect(existsSync(join(cwd, "f.txt"))).toBe(false);
   });
 
-  test("timeout → treated as reject (isError false, 'no response')", async () => {
+  test("reject without feedback → 'without specific feedback' message (isError false), policy unchanged", async () => {
+    const { engine, store, hub, sessionId, setPolicyCalls, plans } = setup([
+      [{ type: "tool_call", callId: "e1", name: "exit_plan_mode", argsJson: JSON.stringify({ plan: "Step 1: do the thing" }) }, done("tool_calls")],
+      text("ok"),
+    ]);
+    const watcher: HubClient = {
+      clientName: "test-client",
+      deliver(e) {
+        if (e.type === "plan_presented") plans!.respond(sessionId, e.callId, { approved: false, autoAccept: false }, "test-client");
+        return true;
+      },
+    };
+    hub.attach(watcher, sessionId, 0);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const resolved = events.find((e) => e.type === "plan_resolved");
+    expect(resolved).toMatchObject({ callId: "e1", approved: false, autoAccept: false, by: "test-client" });
+
+    const exitResult = events.find((e) => e.type === "tool_result" && e.callId === "e1");
+    expect(exitResult).toMatchObject({ isError: false });
+    expect((exitResult as any).output).toContain("Plan rejected: the user rejected the plan without specific feedback");
+    expect((exitResult as any).output).toContain("revise your plan");
+
+    expect(setPolicyCalls).toEqual([]); // policy unchanged
+  });
+
+  test("timeout → 'did not respond within the time limit' message (isError false)", async () => {
     const prev = process.env.NORMA_PLAN_TIMEOUT_MS;
     process.env.NORMA_PLAN_TIMEOUT_MS = "50";
     try {
@@ -166,8 +193,8 @@ describe("AgentEngine: plan mode (deny + exit_plan_mode bridge)", () => {
       expect(resolved).toMatchObject({ callId: "e1", approved: false, autoAccept: false, by: "timeout" });
       const exitResult = events.find((e) => e.type === "tool_result" && e.callId === "e1");
       expect(exitResult).toMatchObject({ isError: false });
-      expect((exitResult as any).output).toContain("Plan rejected:");
-      expect((exitResult as any).output).toContain("no response");
+      expect((exitResult as any).output).toContain("Plan rejected: no response — the user did not respond within the time limit");
+      expect((exitResult as any).output).toContain("revise your plan");
       expect(setPolicyCalls).toEqual([]);
     } finally {
       if (prev === undefined) delete process.env.NORMA_PLAN_TIMEOUT_MS;

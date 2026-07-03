@@ -426,8 +426,13 @@ export class AgentEngine {
         isError: false,
       };
     }
+    const reason = feedback && feedback.trim().length > 0
+      ? feedback
+      : (by === "timeout"
+          ? "no response — the user did not respond within the time limit"
+          : "the user rejected the plan without specific feedback");
     return {
-      output: `Plan rejected: ${feedback || "no response — the user did not respond"}. Stay in plan mode and revise your plan, then call exit_plan_mode again.`,
+      output: `Plan rejected: ${reason}. Stay in plan mode and revise your plan, then call exit_plan_mode again.`,
       isError: false,
     };
   }
