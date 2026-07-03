@@ -302,7 +302,7 @@ export class AgentEngine {
             summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
             // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
           });
-        } else if (call.name === "exit_plan_mode" && this.cfg.plans) {
+        } else if (call.name === "exit_plan_mode" && this.cfg.plans && meta.approvalPolicy === "plan") {
           outcome = await this.runPlanBridge(call, sessionId, threadId, meta);
         } else if (
           decision === "allow" && call.name === "bash" && this.cfg.reviewer &&

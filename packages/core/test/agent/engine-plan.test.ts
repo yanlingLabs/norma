@@ -201,4 +201,32 @@ describe("AgentEngine: plan mode (deny + exit_plan_mode bridge)", () => {
     expect(exitResult).toMatchObject({ isError: false });
     expect((exitResult as any).output).toContain("exit_plan_mode is only meaningful in plan mode");
   });
+
+  test("exit_plan_mode in ask mode → policy guard prevents bridge, falls to placeholder", async () => {
+    const prev = process.env.NORMA_PLAN_TIMEOUT_MS;
+    process.env.NORMA_PLAN_TIMEOUT_MS = "50"; // short timeout so test doesn't hang if bridge fires
+    try {
+      const { engine, store, sessionId } = setup(
+        [
+          [{ type: "tool_call", callId: "e1", name: "exit_plan_mode", argsJson: JSON.stringify({ plan: "Step 1: do the thing" }) }, done("tool_calls")],
+          text("ok"),
+        ],
+        { approvalPolicy: "ask" }, // not in plan mode
+      );
+      await engine.runTurn(sessionId);
+      const events = store.read(sessionId);
+
+      // Bridge must NOT fire — no plan_presented event emitted
+      expect(events.some((e) => e.type === "plan_presented")).toBe(false);
+      expect(events.some((e) => e.type === "plan_resolved")).toBe(false);
+
+      // Tool must return placeholder text (executeCall path, not bridge)
+      const exitResult = events.find((e) => e.type === "tool_result" && e.callId === "e1");
+      expect(exitResult).toMatchObject({ isError: false });
+      expect((exitResult as any).output).toContain("exit_plan_mode is only meaningful in plan mode");
+    } finally {
+      if (prev === undefined) delete process.env.NORMA_PLAN_TIMEOUT_MS;
+      else process.env.NORMA_PLAN_TIMEOUT_MS = prev;
+    }
+  });
 });
