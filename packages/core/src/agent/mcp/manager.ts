@@ -21,6 +21,7 @@ export class McpManager {
   private clients = new Map<string, McpStdioClient>();
   private statuses = new Map<string, McpServerStatus>();
   private projects = new Map<string, ProjectState>();
+  private inFlight = new Map<string, Promise<void>>();
   constructor(private readonly deps: { registry: ToolRegistry; trust: TrustStore; log?: (m: string) => void }) {}
 
   async startAll(servers: Record<string, McpServerConfig>): Promise<void> {
@@ -59,11 +60,25 @@ export class McpManager {
    * another `ensureProject` call will retry and start it. Defensive: a missing/malformed
    * `.mcp.json` degrades to a recorded "none" rather than throwing. Every server start is
    * individually guarded (mirrors `startAll`) so one bad server doesn't block its siblings.
+   * CONCURRENCY: two calls for the same canonicalized dir join a single in-flight run (via
+   * `inFlight`) so a project's servers are never spawned twice / a first run's clients never
+   * get orphaned by a second run overwriting `projects`. NOTE: deliberately NOT declared
+   * `async` — an `async` method always wraps its return value in a brand-new promise, which
+   * would defeat the guard (concurrent callers must get back the literal same promise object,
+   * not two different promises that merely resolve at the same time).
    */
-  async ensureProject(cwd: string): Promise<void> {
+  ensureProject(cwd: string): Promise<void> {
     let dir: string;
     try { dir = realpathSync(cwd); } catch { dir = cwd; }
-    if (this.projects.has(dir)) return; // already started or recorded "none"
+    if (this.projects.has(dir)) return Promise.resolve(); // already started or recorded "none"
+    const pending = this.inFlight.get(dir);
+    if (pending) return pending; // an ensureProject is already running for this dir — join it
+    const p = this.doEnsureProject(dir).finally(() => this.inFlight.delete(dir));
+    this.inFlight.set(dir, p);
+    return p;
+  }
+
+  private async doEnsureProject(dir: string): Promise<void> {
     if (!this.deps.trust.isTrusted(dir)) return; // untrusted → not recorded (retry after trust)
 
     let cfg: z.infer<typeof ProjectMcpConfig>;

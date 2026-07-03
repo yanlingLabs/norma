@@ -95,6 +95,20 @@ describe.if(isMac)("McpManager.ensureProject", () => {
     await mgr.ensureProject(dir); // idempotent
     mgr.stopAll();
   });
+
+  test("concurrent ensureProject for the same dir shares one in-flight run (no double-spawn)", async () => {
+    const dir = projDir();
+    const registry = new ToolRegistry();
+    const trust = new TrustStore(join(realDir(), "trust.json")); trust.trust(dir);
+    const mgr = new McpManager({ registry, trust });
+    const p1 = mgr.ensureProject(dir);
+    const p2 = mgr.ensureProject(dir);
+    expect(p2).toBe(p1); // second call JOINS the first (in-flight guard) — RED without the fix
+    await Promise.all([p1, p2]);
+    expect(registry.has("mcp__proj__echo")).toBe(true);
+    expect(mgr.list(dir).filter((s) => s.name === "proj").length).toBe(1); // exactly one project server, not duplicated
+    mgr.stopAll();
+  });
 });
 
 describe.if(isMac)("McpManager.list(cwd) + stopAll", () => {
