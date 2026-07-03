@@ -22,6 +22,7 @@ import { Compactor } from "./agent/compactor";
 import { SessionDirectories } from "./agent/dirs";
 import { TrustStore } from "./agent/trust";
 import { ContextAssembler } from "./agent/context";
+import { SkillStore } from "./agent/skills";
 import { BackgroundTaskRegistry } from "./agent/bg-registry";
 import { sessionTmpDir } from "./agent/session-tmp";
 
@@ -53,7 +54,8 @@ export async function startDaemon(opts: {
 
   const normaHome = dirs.home;
   const trustStore = new TrustStore(join(normaHome, "trust.json"));
-  const assembler = new ContextAssembler({ normaHome, trust: trustStore });
+  const skillStore = new SkillStore({ normaHome, trust: trustStore });
+  const assembler = new ContextAssembler({ normaHome, trust: trustStore, skills: skillStore });
   // Built unconditionally (needs only store, no provider) so the server's session.addDir /
   // setCwd handlers always have live roots to work with, even when the agent is disabled.
   const sessionDirs = new SessionDirectories((sid) => {

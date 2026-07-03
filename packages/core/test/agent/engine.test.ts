@@ -16,6 +16,7 @@ import { FakeProvider } from "../../src/agent/fake-provider";
 import { SessionDirectories } from "../../src/agent/dirs";
 import { ContextAssembler } from "../../src/agent/context";
 import { TrustStore } from "../../src/agent/trust";
+import { SkillStore } from "../../src/agent/skills";
 import { Compactor } from "../../src/agent/compactor";
 import type { ProviderEvent } from "../../src/providers/types";
 
@@ -39,7 +40,8 @@ function setup(script: ProviderEvent[][], policy: "ask" | "auto" = "auto", extra
   });
   // Default assembler — these tests don't exercise context assembly (see engine-context.test.ts).
   const assemblerHome = mkdtempSync(join(tmpdir(), "norma-engine-actx-"));
-  const assembler = new ContextAssembler({ normaHome: assemblerHome, trust: new TrustStore(join(assemblerHome, "trust.json")) });
+  const assemblerTrust = new TrustStore(join(assemblerHome, "trust.json"));
+  const assembler = new ContextAssembler({ normaHome: assemblerHome, trust: assemblerTrust, skills: new SkillStore({ normaHome: assemblerHome, trust: assemblerTrust }) });
   // Default compactor — these tests don't exercise compaction (see engine-compaction.test.ts).
   const compactor = new Compactor({ provider: { provider, model: "fake-1" }, store, hub });
   const engine = new AgentEngine({

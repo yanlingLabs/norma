@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ContextAssembler } from "../../src/agent/context";
 import { TrustStore } from "../../src/agent/trust";
+import { SkillStore } from "../../src/agent/skills";
 
 function realDir(): string { return realpathSync(mkdtempSync(join(tmpdir(), "norma-ctx-"))); }
 function setup() {
@@ -19,7 +20,7 @@ describe("ContextAssembler", () => {
     writeFileSync(join(home, "NORMA.md"), "USER_RULE_SENTINEL");
     const cwd = realDir();
     writeFileSync(join(cwd, "NORMA.md"), "PROJECT_RULE_SENTINEL");
-    const a = new ContextAssembler({ normaHome: home, trust });
+    const a = new ContextAssembler({ normaHome: home, trust, skills: new SkillStore({ normaHome: home, trust }) });
 
     const untrusted = a.assemble({ cwd });
     expect(untrusted).toContain("USER_RULE_SENTINEL");
@@ -33,7 +34,7 @@ describe("ContextAssembler", () => {
 
   test("base prompt present; capability stub present; empty sources omit their headers", () => {
     const { home, trust } = setup();
-    const a = new ContextAssembler({ normaHome: home, trust });
+    const a = new ContextAssembler({ normaHome: home, trust, skills: new SkillStore({ normaHome: home, trust }) });
     const out = a.assemble({ cwd: null });
     expect(out).toContain("Norma"); // base prompt
     expect(out).toMatch(/Available capabilities/);
@@ -47,7 +48,7 @@ describe("ContextAssembler", () => {
     const cwd = realDir();
     mkdirSync(join(cwd, ".norma", "memory"), { recursive: true });
     writeFileSync(join(cwd, ".norma", "memory", "MEMORY.md"), "PROJECT_MEMORY_FACT");
-    const a = new ContextAssembler({ normaHome: home, trust });
+    const a = new ContextAssembler({ normaHome: home, trust, skills: new SkillStore({ normaHome: home, trust }) });
     const untrusted = a.assemble({ cwd });
     expect(untrusted).toContain("USER_MEMORY_FACT");
     expect(untrusted).not.toContain("PROJECT_MEMORY_FACT");
@@ -59,7 +60,7 @@ describe("ContextAssembler", () => {
     const { home, trust } = setup();
     writeFileSync(join(home, "NORMA.md"), "x".repeat(40000));
     writeFileSync(join(home, "memory", "MEMORY.md"), Array.from({ length: 500 }, (_, i) => `line${i}`).join("\n"));
-    const a = new ContextAssembler({ normaHome: home, trust });
+    const a = new ContextAssembler({ normaHome: home, trust, skills: new SkillStore({ normaHome: home, trust }) });
     const out = a.assemble({ cwd: null });
     expect(out).toContain("[…truncated]");
     expect(out).not.toContain("line300"); // beyond the 200-line memory cap
@@ -68,7 +69,7 @@ describe("ContextAssembler", () => {
 
   test("missing/broken files never throw (section omitted)", () => {
     const { home, trust } = setup();
-    const a = new ContextAssembler({ normaHome: home, trust });
+    const a = new ContextAssembler({ normaHome: home, trust, skills: new SkillStore({ normaHome: home, trust }) });
     // point cwd at a dir with a NORMA.md that is actually a directory (unreadable as a file)
     const cwd = realDir(); mkdirSync(join(cwd, "NORMA.md")); trust.trust(cwd);
     expect(() => a.assemble({ cwd })).not.toThrow();
@@ -79,7 +80,7 @@ describe("ContextAssembler", () => {
     const { home, trust } = setup();
     // 20000 CJK chars = 60000 UTF-8 bytes, well over the 32768-byte instructions cap
     writeFileSync(join(home, "NORMA.md"), "字".repeat(20000));
-    const a = new ContextAssembler({ normaHome: home, trust });
+    const a = new ContextAssembler({ normaHome: home, trust, skills: new SkillStore({ normaHome: home, trust }) });
     const out = a.assemble({ cwd: null });
     expect(out).toContain("[…truncated]");
     // the user-instructions content must be <= the byte cap (not ~1.8x over):
@@ -93,7 +94,7 @@ describe("ContextAssembler", () => {
     const home2 = realDir(); mkdirSync(join(home2, "memory"), { recursive: true });
     const trust2 = new (trust.constructor as any)(join(home2, "trust.json"));
     writeFileSync(join(home2, "NORMA.md"), "a".repeat(32766) + "😀😀😀");
-    const b = new ContextAssembler({ normaHome: home2, trust: trust2 });
+    const b = new ContextAssembler({ normaHome: home2, trust: trust2, skills: new SkillStore({ normaHome: home2, trust: trust2 }) });
     const o2 = b.assemble({ cwd: null });
     // no unpaired surrogate: matching /[\ud800-\udfff]/ against a valid string finds only paired ones; a lone one would be caught by round-trip:
     expect(Buffer.from(o2, "utf8").toString("utf8").includes("��")).toBe(false); // not a cascade of replacements
@@ -102,7 +103,7 @@ describe("ContextAssembler", () => {
   test("present-but-EMPTY NORMA.md is omitted (no empty header)", () => {
     const { home, trust } = setup();
     writeFileSync(join(home, "NORMA.md"), ""); // zero bytes, but the file EXISTS
-    const a = new ContextAssembler({ normaHome: home, trust });
+    const a = new ContextAssembler({ normaHome: home, trust, skills: new SkillStore({ normaHome: home, trust }) });
     expect(a.assemble({ cwd: null })).not.toContain("User instructions");
   });
 
@@ -110,11 +111,37 @@ describe("ContextAssembler", () => {
     const { home, trust } = setup();
     // 50 long lines (< 200 lines) but > 24576 bytes → byte cap must fire
     writeFileSync(join(home, "memory", "MEMORY.md"), Array.from({length:50}, () => "y".repeat(1000)).join("\n"));
-    const a = new ContextAssembler({ normaHome: home, trust });
+    const a = new ContextAssembler({ normaHome: home, trust, skills: new SkillStore({ normaHome: home, trust }) });
     const out = a.assemble({ cwd: null });
     expect(out).toContain("[…truncated]");
     // isolate to just this section (stop at the next "## " heading) for the same reason as above
     const mem = (out.split("## Memory")[1] ?? "").split("\n\n## ")[0] ?? "";
     expect(Buffer.byteLength(mem.replace("\n[…truncated]",""), "utf8")).toBeLessThanOrEqual(24576 + 64);
+  });
+
+  test("capability index lists discovered skills; loadedSkills injects the body", () => {
+    const { home, trust } = setup(); // existing helper: temp normaHome + TrustStore
+    // write a user skill
+    mkdirSync(join(home, "skills", "haiku"), { recursive: true });
+    writeFileSync(join(home, "skills", "haiku", "SKILL.md"), "---\nname: haiku\ndescription: Respond in haiku\n---\nHAIKU_BODY_ONLY_HERE\n");
+    const skills = new SkillStore({ normaHome: home, trust });
+    const a = new ContextAssembler({ normaHome: home, trust, skills });
+    const idx = a.assemble({ cwd: null });
+    expect(idx).toContain("Available capabilities");
+    expect(idx).toContain("haiku"); expect(idx).toContain("Respond in haiku");
+    expect(idx).not.toContain("HAIKU_BODY_ONLY_HERE");    // body NOT in the index (progressive disclosure)
+    expect(idx).not.toMatch(/Loaded skills/);             // none loaded
+
+    const loaded = a.assemble({ cwd: null, loadedSkills: ["haiku"] });
+    expect(loaded).toMatch(/Loaded skills/);
+    expect(loaded).toContain("HAIKU_BODY_ONLY_HERE");     // full body injected when loaded
+  });
+
+  test("no skills → 'No skills are installed.'; unresolved loadedSkills silently dropped", () => {
+    const { home, trust } = setup();
+    const a = new ContextAssembler({ normaHome: home, trust, skills: new SkillStore({ normaHome: home, trust }) });
+    expect(a.assemble({ cwd: null })).toContain("No skills are installed.");
+    expect(() => a.assemble({ cwd: null, loadedSkills: ["ghost"] })).not.toThrow();
+    expect(a.assemble({ cwd: null, loadedSkills: ["ghost"] })).not.toMatch(/Loaded skills/); // nothing resolved
   });
 });

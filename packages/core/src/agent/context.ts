@@ -1,6 +1,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { TrustStore } from "./trust";
+import type { SkillStore } from "./skills";
 
 export const BASE_PROMPT = [
   "You are Norma, an agentic assistant running on the user's Mac.",
@@ -44,25 +45,28 @@ function readMemory(path: string, maxLines: number, maxBytes: number): string | 
   } catch { return null; }
 }
 
-export interface AssemblerCaps { instructionsBytes?: number; memoryLines?: number; memoryBytes?: number }
+export interface AssemblerCaps { instructionsBytes?: number; memoryLines?: number; memoryBytes?: number; bodyBytes?: number }
 
 export class ContextAssembler {
   private readonly normaHome: string;
   private readonly trust: TrustStore;
+  private readonly skills: SkillStore;
   private readonly basePrompt: string;
   private readonly caps: Required<AssemblerCaps>;
-  constructor(deps: { normaHome: string; trust: TrustStore; basePrompt?: string; caps?: AssemblerCaps }) {
+  constructor(deps: { normaHome: string; trust: TrustStore; skills: SkillStore; basePrompt?: string; caps?: AssemblerCaps }) {
     this.normaHome = deps.normaHome;
     this.trust = deps.trust;
+    this.skills = deps.skills;
     this.basePrompt = deps.basePrompt ?? BASE_PROMPT;
     this.caps = {
       instructionsBytes: deps.caps?.instructionsBytes ?? 32768,
       memoryLines: deps.caps?.memoryLines ?? 200,
       memoryBytes: deps.caps?.memoryBytes ?? 24576,
+      bodyBytes: deps.caps?.bodyBytes ?? 32768,
     };
   }
 
-  assemble(input: { cwd: string | null }): string {
+  assemble(input: { cwd: string | null; loadedSkills?: string[] }): string {
     const cwd = input.cwd;
     const trusted = cwd ? this.trust.isTrusted(cwd) : false;
     const sections: string[] = [this.basePrompt];
@@ -84,8 +88,22 @@ export class ContextAssembler {
     }
     if (mem.length) sections.push(`## Memory\n${mem.join("\n\n")}`);
 
-    // Capability seam — 1c-iii (skills) / 1c-iv (MCP) populate this. Stub for now.
-    sections.push("## Available capabilities\nNo additional skills or MCP tools are loaded.");
+    const metas = this.skills.list({ cwd });
+    const capLines: string[] = ["## Available capabilities"];
+    if (metas.length) {
+      capLines.push("### Skills — call the `Skill` tool with a skill name to load its full instructions before using it");
+      for (const m of metas) capLines.push(`- **${m.name}** — ${m.description}`);
+    } else {
+      capLines.push("No skills are installed.");
+    }
+    const loaded = (input.loadedSkills ?? [])
+      .map((n) => this.skills.load(n, { cwd }))
+      .filter((x): x is { name: string; body: string } => x !== null);
+    if (loaded.length) {
+      capLines.push("### Loaded skills");
+      for (const s of loaded) capLines.push(`#### ${s.name}\n${s.body}`);
+    }
+    sections.push(capLines.join("\n"));
 
     return sections.join("\n\n");
   }

@@ -16,6 +16,7 @@ import { GatedProvider, deferred } from "../../src/agent/test-providers";
 import type { Provider } from "../../src/providers/types";
 import { ContextAssembler } from "../../src/agent/context";
 import { TrustStore } from "../../src/agent/trust";
+import { SkillStore } from "../../src/agent/skills";
 import { Compactor } from "../../src/agent/compactor";
 
 // Mirrors packages/core/test/agent/engine.test.ts's setup(). Exported so other engine test
@@ -37,7 +38,8 @@ export function setupEngine(provider: Provider, opts?: { cwd?: string; assembler
   // supply their own assembler.
   const assembler = opts?.assembler ?? (() => {
     const assemblerHome = mkdtempSync(join(tmpdir(), "norma-engine-steer-actx-"));
-    return new ContextAssembler({ normaHome: assemblerHome, trust: new TrustStore(join(assemblerHome, "trust.json")) });
+    const assemblerTrust = new TrustStore(join(assemblerHome, "trust.json"));
+    return new ContextAssembler({ normaHome: assemblerHome, trust: assemblerTrust, skills: new SkillStore({ normaHome: assemblerHome, trust: assemblerTrust }) });
   })();
   // Default compactor (built from this same provider/store/hub) when a test doesn't care about
   // compaction of its own — keeps every pre-existing engine test working without threading one
