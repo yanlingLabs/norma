@@ -9,6 +9,7 @@ import type { SessionDirectories } from "./dirs";
 import { sessionTmpDir } from "./session-tmp";
 import type { ContextAssembler } from "./context";
 import type { Compactor } from "./compactor";
+import type { McpManager } from "./mcp/manager";
 
 const MAIN_THREAD = "main";
 const MAX_TOOL_ITERATIONS = 24; // runaway guard until 1b-ii budgets land
@@ -39,6 +40,7 @@ export interface EngineConfig {
   provider: { provider: Provider; model: string };
   assembler: ContextAssembler;
   compactor: Compactor;
+  mcp?: McpManager;
   approvalTimeoutMs?: number; // default 5 min
 }
 
@@ -159,6 +161,12 @@ export class AgentEngine {
       return;
     }
     const cwd = meta.cwd;
+    // Trust-gated project .mcp.json bring-up, BEFORE the turn_started emit: this can spawn
+    // subprocesses (slow), and a project server that's already started/recorded is a no-op, so
+    // doing it here (rather than after turn_started) keeps the -p watchdog from tripping on a
+    // slow first-turn project-server start. A failure here degrades to a turn with no project
+    // tools rather than breaking the turn.
+    try { await this.cfg.mcp?.ensureProject(cwd); } catch (e) { console.error("mcp ensureProject failed", e); }
     // Assembled ONCE per turn — not re-read per tool-round. Re-reading here would let a
     // same-turn tool write to <cwd>/NORMA.md (under `auto` policy) get injected as trusted
     // system instructions in a later round of the SAME turn. A NORMA.md change only takes
@@ -185,7 +193,7 @@ export class AgentEngine {
         model: this.cfg.provider.model,
         instructions,
         input,
-        tools: this.cfg.registry.specs(),
+        tools: this.cfg.registry.specs(cwd),
         signal,
       })) {
         if (ev.type === "text_delta") textBuf += ev.delta;

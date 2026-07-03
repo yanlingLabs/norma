@@ -115,6 +115,7 @@ export async function startDaemon(opts: {
       provider: agentProvider,
       assembler,
       compactor,
+      mcp: mcp ?? undefined,
     });
   }
 

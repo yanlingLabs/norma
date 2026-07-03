@@ -19,16 +19,20 @@ import { ContextAssembler } from "../../src/agent/context";
 import { TrustStore } from "../../src/agent/trust";
 import { SkillStore } from "../../src/agent/skills";
 import { Compactor } from "../../src/agent/compactor";
+import type { McpManager } from "../../src/agent/mcp/manager";
 
 // Mirrors packages/core/test/agent/engine.test.ts's setup(). Exported so other engine test
 // files (e.g. engine-interrupt.test.ts, engine-context.test.ts) can reuse the same harness
 // instead of duplicating it.
-export function setupEngine(provider: Provider, opts?: { cwd?: string; assembler?: ContextAssembler; compactor?: Compactor; skills?: SkillStore }) {
+export function setupEngine(provider: Provider, opts?: { cwd?: string; assembler?: ContextAssembler; compactor?: Compactor; skills?: SkillStore; registry?: ToolRegistry; mcp?: McpManager }) {
   const home = mkdtempSync(join(tmpdir(), "norma-engine-steer-"));
   const cwd = opts?.cwd ?? realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-steer-cwd-")));
   const store = new SessionStore(home);
   const hub = new SessionHub(store);
-  const registry = new ToolRegistry();
+  // opts.registry lets a caller supply a registry it also hands to an McpManager it built
+  // itself, so the engine's tools (specs/execute) and the McpManager's registrations are the
+  // SAME registry (e.g. engine-mcp.test.ts). Default: a fresh registry, as before.
+  const registry = opts?.registry ?? new ToolRegistry();
   registerReadTools(registry);
   registerWriteTools(registry);
   const broker = new ApprovalBroker();
@@ -65,6 +69,7 @@ export function setupEngine(provider: Provider, opts?: { cwd?: string; assembler
     approvalTimeoutMs: 500,
     assembler,
     compactor,
+    mcp: opts?.mcp,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: "auto" });
   // Collect every SessionEvent broadcast for this session (live, via a hub subscriber) so
@@ -72,7 +77,7 @@ export function setupEngine(provider: Provider, opts?: { cwd?: string; assembler
   // the store themselves.
   const events: SessionEvent[] = [];
   hub.attach({ clientName: "test-observer", deliver: (e) => { events.push(e); return true; } }, sessionId, 0);
-  return { engine, store, hub, broker, sessionId, cwd, dirs, events };
+  return { engine, store, hub, broker, sessionId, cwd, dirs, events, registry };
 }
 
 describe("engine steering", () => {
