@@ -181,6 +181,10 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
       console.log(`${DIM}${e.approved ? `plan approved${e.autoAccept ? " (auto-accept edits)" : ""}` : "plan rejected"}${RESET}`);
     } else if (e.type === "task_updated") {
       console.log(`${DIM}${TASK_ICONS[e.task.status]} ${e.task.subject}${RESET}`);
+    } else if (e.type === "worktree_entered") {
+      console.log(`${DIM}⛿ entered worktree ${e.name} (branch ${e.branch})${RESET}`);
+    } else if (e.type === "worktree_exited") {
+      console.log(`${DIM}⟲ left worktree ${e.name}${e.removed ? " (removed)" : ""}${RESET}`);
     } else if (e.type === "agent_error") {
       console.error(`agent error: ${e.message}`);
     } else if (e.type === "turn_completed") {
