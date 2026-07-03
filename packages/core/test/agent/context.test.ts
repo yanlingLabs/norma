@@ -144,4 +144,19 @@ describe("ContextAssembler", () => {
     expect(() => a.assemble({ cwd: null, loadedSkills: ["ghost"] })).not.toThrow();
     expect(a.assemble({ cwd: null, loadedSkills: ["ghost"] })).not.toMatch(/Loaded skills/); // nothing resolved
   });
+
+  test("mixed resolution: resolved skills injected, unresolved dropped (no empty header)", () => {
+    const { home, trust } = setup();
+    // set up the haiku skill
+    mkdirSync(join(home, "skills", "haiku"), { recursive: true });
+    writeFileSync(join(home, "skills", "haiku", "SKILL.md"), "---\nname: haiku\ndescription: Respond in haiku\n---\nHAIKU_BODY_ONLY_HERE\n");
+    const skills = new SkillStore({ normaHome: home, trust });
+    const a = new ContextAssembler({ normaHome: home, trust, skills });
+
+    // assemble with both a resolved skill (haiku) and an unresolved one (ghost)
+    const out = a.assemble({ cwd: null, loadedSkills: ["haiku", "ghost"] });
+    expect(out).toContain("HAIKU_BODY_ONLY_HERE"); // haiku body is present
+    expect(out).not.toContain("#### ghost");      // unresolved skill name not as empty header
+    expect(out).toMatch(/### Loaded skills/);     // section header present (at least one resolved)
+  });
 });

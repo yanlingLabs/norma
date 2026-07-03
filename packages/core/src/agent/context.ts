@@ -45,7 +45,7 @@ function readMemory(path: string, maxLines: number, maxBytes: number): string | 
   } catch { return null; }
 }
 
-export interface AssemblerCaps { instructionsBytes?: number; memoryLines?: number; memoryBytes?: number; bodyBytes?: number }
+export interface AssemblerCaps { instructionsBytes?: number; memoryLines?: number; memoryBytes?: number }
 
 export class ContextAssembler {
   private readonly normaHome: string;
@@ -62,7 +62,6 @@ export class ContextAssembler {
       instructionsBytes: deps.caps?.instructionsBytes ?? 32768,
       memoryLines: deps.caps?.memoryLines ?? 200,
       memoryBytes: deps.caps?.memoryBytes ?? 24576,
-      bodyBytes: deps.caps?.bodyBytes ?? 32768,
     };
   }
 
