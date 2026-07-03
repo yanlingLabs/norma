@@ -10,7 +10,11 @@ export type SessionApprovalPolicy = "ask" | "auto";
 // tools loaded for the session — no filesystem/network mutation. It must be classified here (not
 // left to fall through, and NOT matched by the `mcp__` prefix check below — its own name never
 // starts with `mcp__`) so schema-loading itself never requires approval, even under `ask` policy.
-const READ_ONLY = new Set(["read", "glob", "grep", "bash_output", "Skill", "ToolSearch"]);
+// ask_user/task_create/task_update/task_list are read-only too: ask_user only emits a
+// question_asked event and blocks on the QuestionBroker (no fs/process mutation — the human is
+// the approval, so a gate prompt on top would double-ask); the task tools (registered in a later
+// task) only maintain in-memory/session task state and emit task_updated.
+const READ_ONLY = new Set(["read", "glob", "grep", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list"]);
 const MUTATING = new Set(["write", "edit", "bash", "bash_kill"]);
 const SELF_GATING = new Set(["request_directory"]);
 

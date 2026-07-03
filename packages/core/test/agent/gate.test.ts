@@ -60,4 +60,8 @@ describe("PermissionGate v1", () => {
     expect(gate.evaluate("ToolSearch", "ask")).toBe("allow");
     expect(gate.evaluate("ToolSearch", "auto")).toBe("allow");
   });
+
+  test("ask_user + task tools are allow under ask policy", () => {
+    for (const t of ["ask_user", "task_create", "task_update", "task_list"]) expect(gate.evaluate(t, "ask")).toBe("allow");
+  });
 });

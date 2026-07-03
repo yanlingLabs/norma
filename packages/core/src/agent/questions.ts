@@ -1,0 +1,25 @@
+export type AskOutcome = { answers: Record<string, string>; by: string } | { timedOut: true };
+
+/** In-flight ask_user questions, keyed by sessionId+callId. First response wins (mirrors ApprovalBroker). */
+export class QuestionBroker {
+  private pending = new Map<string, { resolve: (o: AskOutcome) => void; timer: ReturnType<typeof setTimeout> }>();
+  private key(sessionId: string, callId: string): string { return `${sessionId}:${callId}`; }
+
+  wait(sessionId: string, callId: string, timeoutMs: number): Promise<AskOutcome> {
+    return new Promise((resolve) => {
+      const k = this.key(sessionId, callId);
+      const timer = setTimeout(() => { this.pending.delete(k); resolve({ timedOut: true }); }, timeoutMs);
+      this.pending.set(k, { resolve, timer });
+    });
+  }
+
+  respond(sessionId: string, callId: string, answers: Record<string, string>, by: string): { ok: true; alreadyResolved: boolean } {
+    const k = this.key(sessionId, callId);
+    const entry = this.pending.get(k);
+    if (!entry) return { ok: true, alreadyResolved: true };
+    this.pending.delete(k);
+    clearTimeout(entry.timer);
+    entry.resolve({ answers, by });
+    return { ok: true, alreadyResolved: false };
+  }
+}

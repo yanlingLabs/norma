@@ -1,6 +1,8 @@
 import { z } from "zod";
+import type { Question, Task } from "@norma/protocol";
 import type { ToolSpec } from "../../providers/types";
 import { isWithin } from "../paths";
+import type { AskOutcome } from "../questions";
 
 export interface ToolContext {
   cwd: string;
@@ -12,6 +14,8 @@ export interface ToolContext {
   markToolLoaded?: (name: string) => void; // set by the engine; the ToolSearch tool calls it to pin a deferred tool's schema as loaded for the session
   loadedTools?: Set<string>; // mcp__ tools whose schema has been loaded via ToolSearch this session; consulted by execute's deferral reject
   deferThreshold?: number; // when set and cwd-visible mcp__ tool count exceeds it, deferral is active for this session
+  ask?: (questions: Question[]) => Promise<AskOutcome>; // engine bridge: emits question_asked/question_resolved events and blocks on the QuestionBroker; the ask_user tool calls it
+  taskEvent?: (task: Task) => void; // engine bridge: emits task_updated; called by the task tools (task_create/task_update/task_list)
 }
 export interface ToolOutcome { output: string; isError: boolean }
 
