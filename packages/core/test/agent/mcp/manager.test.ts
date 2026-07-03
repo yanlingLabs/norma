@@ -29,4 +29,18 @@ describe.if(isMac)("McpManager", () => {
     expect(mgr.list().find((s) => s.name === "good")!.status).toBe("connected");
     mgr.stopAll();
   });
+
+  test("a server with duplicate tool names (register throws) is skipped; a sibling good server still registers (one bad ≠ dead)", async () => {
+    const registry = new ToolRegistry();
+    const mgr = new McpManager({ registry });
+    await mgr.startAll({
+      good: { command: "bun", args: ["run", FIXTURE] },
+      dup: { command: "bun", args: ["run", FIXTURE], env: { NORMA_FAKE_DUP: "1" } },
+    });
+    // startAll must never throw regardless of one server's registration failure.
+    expect(registry.has("mcp__good__echo")).toBe(true);
+    expect(mgr.list().find((s) => s.name === "good")!.status).toBe("connected");
+    expect(mgr.list().find((s) => s.name === "dup")!.status).toBe("failed");
+    mgr.stopAll();
+  });
 });

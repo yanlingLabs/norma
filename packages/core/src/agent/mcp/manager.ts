@@ -15,26 +15,27 @@ export class McpManager {
       const client = new McpStdioClient(cfg);
       try {
         await client.start();
+        this.clients.set(name, client);
+        const toolNames: string[] = [];
+        for (const t of client.tools()) {
+          const full = `mcp__${name}__${t.name}`;
+          this.deps.registry.register({
+            name: full,
+            description: t.description,
+            args: z.object({}).passthrough(),
+            rawParameters: t.inputSchema,
+            run: (args, ctx) => client.callTool(t.name, args, ctx.signal),
+          });
+          toolNames.push(t.name);
+        }
+        this.statuses.set(name, { name, status: "connected", toolNames });
       } catch (e) {
         this.deps.log?.(`mcp: server '${name}' failed to start: ${(e as Error).message}`);
         this.statuses.set(name, { name, status: "failed", toolNames: [] });
+        this.clients.delete(name);
         client.stop();
         return;
       }
-      this.clients.set(name, client);
-      const toolNames: string[] = [];
-      for (const t of client.tools()) {
-        const full = `mcp__${name}__${t.name}`;
-        toolNames.push(t.name);
-        this.deps.registry.register({
-          name: full,
-          description: t.description,
-          args: z.object({}).passthrough(),
-          rawParameters: t.inputSchema,
-          run: (args, ctx) => client.callTool(t.name, args, ctx.signal),
-        });
-      }
-      this.statuses.set(name, { name, status: "connected", toolNames });
     }));
   }
 
