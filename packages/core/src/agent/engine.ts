@@ -7,6 +7,7 @@ import type { PermissionGate } from "./gate";
 import type { ApprovalBroker } from "./approvals";
 import type { SessionDirectories } from "./dirs";
 import { sessionTmpDir } from "./session-tmp";
+import type { ContextAssembler } from "./context";
 
 const MAIN_THREAD = "main";
 const MAX_TOOL_ITERATIONS = 24; // runaway guard until 1b-ii budgets land
@@ -25,6 +26,7 @@ export interface EngineConfig {
   broker: ApprovalBroker;
   dirs: SessionDirectories;
   provider: { provider: Provider; model: string };
+  assembler: ContextAssembler;
   approvalTimeoutMs?: number; // default 5 min
 }
 
@@ -118,7 +120,7 @@ export class AgentEngine {
 
       for await (const ev of this.cfg.provider.provider.streamTurn({
         model: this.cfg.provider.model,
-        instructions: SYSTEM_PROMPT,
+        instructions: this.cfg.assembler.assemble({ cwd: meta.cwd }),
         input,
         tools: this.cfg.registry.specs(),
         signal,

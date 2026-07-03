@@ -14,6 +14,8 @@ import { ApprovalBroker } from "../../src/agent/approvals";
 import { AgentEngine } from "../../src/agent/engine";
 import { FakeProvider } from "../../src/agent/fake-provider";
 import { SessionDirectories } from "../../src/agent/dirs";
+import { ContextAssembler } from "../../src/agent/context";
+import { TrustStore } from "../../src/agent/trust";
 import type { ProviderEvent } from "../../src/providers/types";
 
 function setup(script: ProviderEvent[][], policy: "ask" | "auto" = "auto", extraRoots: string[] = []) {
@@ -34,12 +36,16 @@ function setup(script: ProviderEvent[][], policy: "ask" | "auto" = "auto", extra
     projectDir: () => null,
     approvalTimeoutMs: 500,
   });
+  // Default assembler — these tests don't exercise context assembly (see engine-context.test.ts).
+  const assemblerHome = mkdtempSync(join(tmpdir(), "norma-engine-actx-"));
+  const assembler = new ContextAssembler({ normaHome: assemblerHome, trust: new TrustStore(join(assemblerHome, "trust.json")) });
   const engine = new AgentEngine({
     store, hub, registry, broker,
     gate: new PermissionGate(),
     provider: { provider, model: "fake-1" },
     dirs,
     approvalTimeoutMs: 500,
+    assembler,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: policy });
   return { engine, store, hub, broker, sessionId, cwd, provider, dirs };

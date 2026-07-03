@@ -20,6 +20,7 @@ import { ApprovalBroker } from "./agent/approvals";
 import { AgentEngine } from "./agent/engine";
 import { SessionDirectories } from "./agent/dirs";
 import { TrustStore } from "./agent/trust";
+import { ContextAssembler } from "./agent/context";
 import { BackgroundTaskRegistry } from "./agent/bg-registry";
 import { sessionTmpDir } from "./agent/session-tmp";
 
@@ -51,6 +52,7 @@ export async function startDaemon(opts: {
 
   const normaHome = dirs.home;
   const trustStore = new TrustStore(join(normaHome, "trust.json"));
+  const assembler = new ContextAssembler({ normaHome, trust: trustStore });
   // Built unconditionally (needs only store, no provider) so the server's session.addDir /
   // setCwd handlers always have live roots to work with, even when the agent is disabled.
   const sessionDirs = new SessionDirectories((sid) => {
@@ -101,6 +103,7 @@ export async function startDaemon(opts: {
       gate: new PermissionGate(),
       dirs: sessionDirs,
       provider: agentProvider,
+      assembler,
     });
   }
 
