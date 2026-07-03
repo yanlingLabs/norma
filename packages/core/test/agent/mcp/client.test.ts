@@ -28,4 +28,11 @@ describe.if(isMac)("McpStdioClient", () => {
     expect(c.dead).toBe(true);
     await expect(c.callTool("echo", { msg: "x" })).rejects.toThrow();
   });
+
+  test("a bare `null` JSON-RPC line from the server is ignored, not a crash", async () => {
+    const c = new McpStdioClient({ command: "bun", args: ["run", FIXTURE], env: { NORMA_FAKE_NULL: "1" } });
+    await c.start();
+    expect(c.tools().map((t) => t.name)).toEqual(["echo"]);
+    c.stop();
+  });
 });

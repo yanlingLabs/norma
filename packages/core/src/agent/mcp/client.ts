@@ -73,7 +73,7 @@ export class McpStdioClient {
       if (!line) continue;
       let msg: any;
       try { msg = JSON.parse(line); } catch { continue; }
-      if (typeof msg.id === "number" && this.pending.has(msg.id)) {
+      if (msg && typeof msg.id === "number" && this.pending.has(msg.id)) {
         const p = this.pending.get(msg.id)!; this.pending.delete(msg.id);
         if (msg.error) p.reject(new Error(msg.error?.message ?? "mcp error"));
         else p.resolve(msg.result);

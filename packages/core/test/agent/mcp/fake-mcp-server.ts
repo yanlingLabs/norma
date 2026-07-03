@@ -11,7 +11,10 @@ process.stdin.on("data", (chunk: string) => {
 });
 function send(o: unknown) { process.stdout.write(JSON.stringify(o) + "\n"); }
 function handle(msg: any) {
-  if (msg.method === "initialize") send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "fake", version: "1" } } });
+  if (msg.method === "initialize") {
+    if (process.env.NORMA_FAKE_NULL === "1") process.stdout.write("null\n");
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "fake", version: "1" } } });
+  }
   else if (msg.method === "notifications/initialized") { /* notification, no reply */ }
   else if (msg.method === "tools/list") {
     const echoTool = { name: "echo", description: "Echo the msg back", inputSchema: { type: "object", properties: { msg: { type: "string" } }, required: ["msg"] } };
