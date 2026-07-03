@@ -106,6 +106,14 @@ export const SkillMetaSchema = z.object({
 export const SkillsListParams = z.object({ cwd: z.string().optional() });
 export const SkillsListResult = z.object({ ok: z.literal(true), skills: z.array(SkillMetaSchema) });
 
+export const McpServerStatusSchema = z.object({
+  name: z.string(),
+  status: z.enum(["connected", "failed"]),
+  toolNames: z.array(z.string()),
+});
+export const McpListParams = z.object({});
+export const McpListResult = z.object({ ok: z.literal(true), servers: z.array(McpServerStatusSchema) });
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -125,4 +133,5 @@ export const METHODS = {
   sessionInterrupt: "session.interrupt",
   sessionCompact: "session.compact",
   skillsList: "skills.list",
+  mcpList: "mcp.list",
 } as const;

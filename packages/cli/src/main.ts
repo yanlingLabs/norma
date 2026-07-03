@@ -301,6 +301,16 @@ if (import.meta.main) {
     c.close();
     process.exit(0);
   }
+  case "mcp": {
+    const c = await connect("cli-mcp");
+    const servers = await c.listMcp();
+    if (!servers.length) console.log("no MCP servers configured");
+    for (const s of servers) {
+      console.log(`${AQUA}${s.name}${RESET}  ${DIM}(${s.status})${RESET}  ${s.toolNames.map((t) => `mcp__${s.name}__${t}`).join(", ")}`);
+    }
+    c.close();
+    process.exit(0);
+  }
   case "bg": {
     const bgSub = process.argv[3];
     const bgSessionId = process.argv[4];
@@ -455,6 +465,7 @@ if (import.meta.main) {
   resume [id] [msg]   list sessions, or continue an existing one
   trust <dir> [--list]
   skills                                          list discovered skills for this directory
+  mcp                                              list configured MCP servers and their tools
   bg list <session> | bg peek <session> <taskId> | bg kill <session> <taskId>
   login [--api-key] | logout | provider | provider-smoke [--prompt <text>]
   init                                            generate/update NORMA.md by surveying the project

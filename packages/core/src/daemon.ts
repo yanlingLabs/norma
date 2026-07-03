@@ -16,6 +16,7 @@ import { registerBashTool } from "./agent/tools/bash";
 import { registerRequestDirTool } from "./agent/tools/request-dir";
 import { registerBackgroundTools } from "./agent/tools/background";
 import { registerSkillTools } from "./agent/tools/skill";
+import { McpManager } from "./agent/mcp/manager";
 import { PermissionGate } from "./agent/gate";
 import { ApprovalBroker } from "./agent/approvals";
 import { AgentEngine } from "./agent/engine";
@@ -89,6 +90,7 @@ export async function startDaemon(opts: {
 
   let engine: AgentEngine | null = null;
   let broker: ApprovalBroker | null = null;
+  let mcp: McpManager | null = null;
   if (agentProvider) {
     const registry = new ToolRegistry();
     registerReadTools(registry);
@@ -96,6 +98,8 @@ export async function startDaemon(opts: {
     registerBashTool(registry, { bgRegistry });
     registerBackgroundTools(registry, { bgRegistry });
     registerSkillTools(registry, { skills: skillStore });
+    mcp = new McpManager({ registry, log: (m) => console.error(m) });
+    await mcp.startAll(loadSettings(dirs.settingsPath).mcpServers ?? {});
     broker = new ApprovalBroker();
     registerRequestDirTool(registry, {
       broker,
@@ -126,6 +130,7 @@ export async function startDaemon(opts: {
     trust: trustStore,
     bg: bgRegistry,
     skills: skillStore,
+    mcp: mcp ?? undefined,
     ...opts.server,
   });
 
@@ -133,7 +138,7 @@ export async function startDaemon(opts: {
   return {
     socketPath: dirs.socketPath,
     tokens,
-    stop() { server.stop(); bgRegistry.killAll(); store.close(); lock.release(); },
+    stop() { server.stop(); mcp?.stopAll(); bgRegistry.killAll(); store.close(); lock.release(); },
   };
 }
 

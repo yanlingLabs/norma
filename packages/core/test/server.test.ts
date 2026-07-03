@@ -629,4 +629,26 @@ describe("daemon IPC", () => {
     expect(result.skills[0]).toMatchObject({ name: "greet", description: "Say hi", source: "user" });
     c.close();
   });
+
+  test("mcp.list reports a connected MCP server started by the daemon at boot (spawns a real child process)", async () => {
+    if (process.platform !== "darwin") return; // spawns a child process
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const fixture = join(import.meta.dir, "agent", "mcp", "fake-mcp-server.ts");
+    const home = mkdtempSync(join(tmpdir(), "norma-daemon-"));
+    writeFileSync(join(home, "settings.json"), JSON.stringify({
+      schemaVersion: 2,
+      provider: { type: "codex-oauth", model: "gpt-5.4" },
+      mcpServers: { fake: { command: "bun", args: ["run", fixture] } },
+    }, null, 2));
+    const secrets = new FileSecretStore(join(home, "test-secrets"));
+    const fake = new FakeProvider([[{ type: "text_delta", delta: "hi" }, { type: "done", stopReason: "end_turn" }]]);
+    daemon = await startDaemon({ home, secrets, agentProvider: { provider: fake, model: "fake-1" } });
+    harnessToken = daemon.tokens.harness;
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "mcp-lister");
+    const { result } = await c.request(METHODS.mcpList, {});
+    expect(result).toEqual({ ok: true, servers: [{ name: "fake", status: "connected", toolNames: ["echo"] }] });
+    c.close();
+  });
 });
