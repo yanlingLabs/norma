@@ -402,7 +402,11 @@ if (import.meta.main) {
     if (!text) { // recap only: show the session line, tell them how to continue
       const c = await connect("cli-resume");
       const info = (await c.listSessions()).sessions.find((r: any) => r.sessionId === sid);
-      console.log(info ? `${sid}  ${DIM}${info.scope}  ${info.lastSeq} events${RESET}\nresume with: norma resume ${sid} "<message>"` : `no such session: ${sid}`);
+      if (info) {
+        console.log(`${sid}  ${DIM}${info.scope}  ${info.lastSeq} events${RESET}\nresume with: norma resume ${sid} "<message>"`);
+      } else {
+        console.error(`no such session: ${sid}`);
+      }
       c.close(); process.exit(info ? 0 : 1);
     }
     await runHeadlessAgent(text, true, sid); // continue the existing session headless (auto)

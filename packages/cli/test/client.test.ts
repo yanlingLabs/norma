@@ -113,6 +113,8 @@ describe("NormaClient", () => {
     await c2.attach(sessionId, tip); await c2.send(sessionId, "second");
     await new Promise((r) => setTimeout(r, 50));
     expect(seen.some((e) => e.type === "user_message" && e.text === "second")).toBe(true);
+    // attach-from-tip (not 0): the historical "first" message must NOT be replayed to the resuming client
+    expect(seen.some((e) => e.type === "user_message" && e.text === "first")).toBe(false);
     c2.close();
   });
 });
