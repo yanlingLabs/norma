@@ -4,6 +4,7 @@ import { resolveNormaHome, KeychainSecretStore, startDaemon, TOKEN_NAMES } from 
 import { METHODS } from "@norma/protocol";
 import { NormaClient } from "./client";
 import { applyEvent, isStalled, type WatchdogState } from "./watchdog";
+import { installPlugin, removePluginDir, removePluginFromSettings, setPluginEnabled } from "./plugin-cli";
 
 const AQUA = "\x1b[38;2;53;214;232m";
 const DIM = "\x1b[2m";
@@ -311,6 +312,70 @@ if (import.meta.main) {
     c.close();
     process.exit(0);
   }
+  case "plugin": {
+    const sub = process.argv[3];
+    const home = resolveNormaHome();
+    const settingsPath = join(home, "settings.json");
+    const pluginsRoot = join(home, "plugins");
+
+    if (sub === "list") {
+      const c = await connect("cli-plugin-list");
+      const res = await c.pluginsList();
+      for (const p of res.plugins) {
+        const mcp = !p.hasMcp ? "no mcp" : p.mcpEnabled ? "mcp: enabled" : `mcp: DISABLED (norma plugin enable ${p.name} to allow — code execution)`;
+        const flags = p.disabled ? " [disabled]" : "";
+        console.log(`${AQUA}${p.name}${RESET}${p.version ? ` ${DIM}v${p.version}${RESET}` : ""}${flags}  skills: ${p.skills.join(", ") || "(none)"}  ${DIM}${mcp}${RESET}`);
+      }
+      if (res.plugins.length === 0) console.log("no plugins installed");
+      c.close();
+      process.exit(0);
+    }
+
+    if (sub === "install") {
+      const url = process.argv[4];
+      if (!url) { console.error("usage: norma plugin install <git-url> [name]"); process.exit(1); }
+      let installed: { name: string; target: string };
+      try {
+        installed = installPlugin({ url, name: process.argv[5], pluginsRoot });
+      } catch (err) {
+        console.error((err as Error).message);
+        process.exit(1);
+      }
+      const { PluginStore } = await import("@norma/core");
+      const info = new PluginStore({ normaHome: home }).list().find((p) => p.name === installed.name);
+      console.log(`${AQUA}installed ${installed.name}${RESET}  skills: ${info?.skills.join(", ") || "(none)"}`);
+      if (info?.hasMcp) console.log(`this plugin bundles MCP servers (code execution) — run ${AQUA}norma plugin enable ${installed.name}${RESET} to allow them`);
+      break; // NEVER touches settings
+    }
+
+    if (sub === "enable" || sub === "disable") {
+      const name = process.argv[4];
+      if (!name) { console.error(`usage: norma plugin ${sub} <name>`); process.exit(1); }
+      if (!existsSync(join(pluginsRoot, name))) { console.error(`no such plugin: ${name}`); process.exit(1); }
+      const { loadSettings, saveSettings } = await import("@norma/core");
+      saveSettings(settingsPath, setPluginEnabled(loadSettings(settingsPath), name, sub === "enable"));
+      console.log(`${AQUA}${name} ${sub}d${RESET} — restart the daemon to apply`);
+      break;
+    }
+
+    if (sub === "remove") {
+      const name = process.argv[4];
+      if (!name) { console.error("usage: norma plugin remove <name>"); process.exit(1); }
+      try {
+        removePluginDir(pluginsRoot, name);
+      } catch (err) {
+        console.error((err as Error).message);
+        process.exit(1);
+      }
+      const { loadSettings, saveSettings } = await import("@norma/core");
+      saveSettings(settingsPath, removePluginFromSettings(loadSettings(settingsPath), name));
+      console.log(`${AQUA}removed ${name}${RESET}`);
+      break;
+    }
+
+    console.error("usage: norma plugin list | install <git-url> [name] | enable <name> | disable <name> | remove <name>");
+    process.exit(1);
+  }
   case "bg": {
     const bgSub = process.argv[3];
     const bgSessionId = process.argv[4];
@@ -466,6 +531,7 @@ if (import.meta.main) {
   trust <dir> [--list]
   skills                                          list discovered skills for this directory
   mcp                                              list configured MCP servers and their tools
+  plugin list | install <git-url> [name] | enable <name> | disable <name> | remove <name>
   bg list <session> | bg peek <session> <taskId> | bg kill <session> <taskId>
   login [--api-key] | logout | provider | provider-smoke [--prompt <text>]
   init                                            generate/update NORMA.md by surveying the project

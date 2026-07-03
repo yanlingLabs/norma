@@ -110,10 +110,22 @@ export const McpServerStatusSchema = z.object({
   name: z.string(),
   status: z.enum(["connected", "failed"]),
   toolNames: z.array(z.string()),
-  source: z.enum(["user", "project"]),
+  source: z.enum(["user", "project", "plugin"]),
 });
 export const McpListParams = z.object({ cwd: z.string().optional() });
 export const McpListResult = z.object({ ok: z.literal(true), servers: z.array(McpServerStatusSchema) });
+
+export const PluginInfoSchema = z.object({
+  name: z.string(),
+  description: z.string().optional(),
+  version: z.string().optional(),
+  skills: z.array(z.string()),
+  hasMcp: z.boolean(),
+  mcpEnabled: z.boolean(),
+  disabled: z.boolean(),
+});
+export const PluginsListParams = z.object({});
+export const PluginsListResult = z.object({ ok: z.literal(true), plugins: z.array(PluginInfoSchema) });
 
 export const METHODS = {
   hello: "protocol.hello",
@@ -135,4 +147,5 @@ export const METHODS = {
   sessionCompact: "session.compact",
   skillsList: "skills.list",
   mcpList: "mcp.list",
+  pluginsList: "plugins.list",
 } as const;

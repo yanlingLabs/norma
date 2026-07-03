@@ -6,6 +6,7 @@ import {
   SessionAddDirParams, SessionSetCwdParams, TrustDirParams,
   BgListParams, BgPeekParams, BgKillParams, BgKillAllParams,
   SessionSteerParams, SessionInterruptParams, SessionCompactParams, SkillsListParams, McpListParams,
+  PluginsListParams,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
@@ -18,6 +19,7 @@ import type { TrustStore } from "../agent/trust";
 import type { BackgroundTaskRegistry } from "../agent/bg-registry";
 import type { SkillStore } from "../agent/skills";
 import type { McpManager } from "../agent/mcp/manager";
+import type { PluginStore } from "../agent/plugins";
 import { addLocalDir } from "../settings";
 
 interface ConnState {
@@ -42,6 +44,7 @@ export interface IpcServerOptions {
   bg?: BackgroundTaskRegistry; // background bash tasks; bg.list/peek/kill/killAll
   skills?: SkillStore;       // discovered SKILL.md skills; skills.list
   mcp?: McpManager;          // MCP servers started at boot; mcp.list
+  plugins?: PluginStore;     // discovered ~/.norma/plugins/*; plugins.list
   helloTimeoutMs?: number;   // default 5000
   maxConnections?: number;   // default 64
   preAuthMaxLine?: number;   // default 64 KiB
@@ -217,6 +220,10 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         const p = parseParams(McpListParams, params);
         if (p.cwd) await opts.mcp?.ensureProject(p.cwd);
         return { ok: true, servers: opts.mcp?.list(p.cwd) ?? [] };
+      }
+      case METHODS.pluginsList: {
+        parseParams(PluginsListParams, params);
+        return { ok: true, plugins: opts.plugins?.list() ?? [] };
       }
       case METHODS.approvalRespond: {
         const p = parseParams(ApprovalRespondParams, params);

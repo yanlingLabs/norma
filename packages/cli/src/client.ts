@@ -4,6 +4,7 @@ import {
   SessionAddDirResult, SessionSetCwdResult, TrustDirResult,
   BgListResult, BgPeekResult, BgKillResult, BgKillAllResult,
   SessionSteerResult, SessionInterruptResult, SessionCompactResult, SkillsListResult,
+  PluginsListResult,
   ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 
@@ -141,6 +142,9 @@ export class NormaClient {
   async listMcp(cwd?: string): Promise<Array<{ name: string; status: string; toolNames: string[]; source: string }>> {
     const r = await this.request(METHODS.mcpList, { cwd });
     return r.servers;
+  }
+  async pluginsList(): Promise<{ ok: true; plugins: Array<{ name: string; description?: string; version?: string; skills: string[]; hasMcp: boolean; mcpEnabled: boolean; disabled: boolean }> }> {
+    return this.validated(PluginsListResult, await this.request(METHODS.pluginsList, {}), METHODS.pluginsList);
   }
   close(): void { this.socket.end(); }
 }

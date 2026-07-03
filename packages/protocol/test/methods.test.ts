@@ -25,6 +25,10 @@ import {
   SkillMetaSchema,
   SkillsListParams,
   SkillsListResult,
+  McpServerStatusSchema,
+  PluginInfoSchema,
+  PluginsListParams,
+  PluginsListResult,
   METHODS,
 } from "../src/methods";
 
@@ -174,5 +178,25 @@ describe("skills.list schema", () => {
     const r = SkillsListResult.parse({ ok: true, skills: [meta] });
     expect(r.skills).toHaveLength(1);
     expect(METHODS.skillsList).toBe("skills.list");
+  });
+});
+
+describe("plugins.list schema", () => {
+  test("plugins.list params/result + method string", () => {
+    expect(PluginsListParams.parse({})).toEqual({});
+    const info = PluginInfoSchema.parse({
+      name: "demo", description: "d", version: "0.1.0",
+      skills: ["greet"], hasMcp: true, mcpEnabled: false, disabled: false,
+    });
+    expect(info.name).toBe("demo");
+    // description/version are optional
+    expect(PluginInfoSchema.parse({ name: "bare", skills: [], hasMcp: false, mcpEnabled: false, disabled: false }).description).toBeUndefined();
+    const r = PluginsListResult.parse({ ok: true, plugins: [info] });
+    expect(r.plugins).toHaveLength(1);
+    expect(METHODS.pluginsList).toBe("plugins.list");
+  });
+
+  test("McpServerStatusSchema.source is widened to include \"plugin\"", () => {
+    expect(McpServerStatusSchema.parse({ name: "x", status: "connected", toolNames: [], source: "plugin" }).source).toBe("plugin");
   });
 });

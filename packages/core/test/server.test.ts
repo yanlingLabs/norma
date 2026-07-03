@@ -7,6 +7,8 @@ import { startDaemon, type RunningDaemon } from "../src/daemon";
 import { startIpcServer } from "../src/ipc/server";
 import { SessionStore } from "../src/sessions/store";
 import { FileSecretStore } from "../src/auth/secret-store";
+import { TokenAuthority } from "../src/auth/tokens";
+import { PluginStore } from "../src/agent/plugins";
 import type { Provider } from "../src/providers/types";
 
 /** Minimal raw test client speaking NDJSON JSON-RPC. */
@@ -703,5 +705,42 @@ describe("daemon IPC", () => {
     expect(result.servers).toContainEqual({ name: "fake", status: "connected", toolNames: ["echo"], source: "user" });
 
     c.close();
+  });
+
+  test("plugins.list returns [] when no PluginStore is wired into the server", async () => {
+    await boot(); // no `plugins` opt passed by the daemon in this test's boot() helper
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "no-plugins");
+    const { result } = await c.request(METHODS.pluginsList, {});
+    expect(result).toEqual({ ok: true, plugins: [] });
+    c.close();
+  });
+
+  test("plugins.list returns a PluginStore's plugins over the socket", async () => {
+    const home = mkdtempSync(join(tmpdir(), "norma-plugins-ipc-"));
+    mkdirSync(join(home, "plugins", "demo", "skills", "greet"), { recursive: true });
+    writeFileSync(join(home, "plugins", "demo", "skills", "greet", "SKILL.md"), "---\nname: greet\ndescription: hi\n---\nbody");
+    writeFileSync(join(home, "plugins", "demo", ".mcp.json"), JSON.stringify({ mcpServers: { fake: { command: "true" } } }));
+    const plugins = new PluginStore({ normaHome: home, plugins: { enabled: ["demo"] } });
+
+    const secrets = new FileSecretStore(join(home, "test-secrets"));
+    const authority = new TokenAuthority(secrets);
+    const tokens = await authority.ensureTokens();
+    const store = new SessionStore(home);
+    const socketPath = join(home, "core.sock");
+    const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, plugins });
+    try {
+      const c = await TestClient.connect(socketPath);
+      await c.hello(tokens.harness, "plugin-lister");
+      const { result } = await c.request(METHODS.pluginsList, {});
+      expect(result.ok).toBe(true);
+      expect(result.plugins).toHaveLength(1);
+      expect(result.plugins[0]).toMatchObject({
+        name: "demo", skills: ["greet"], hasMcp: true, mcpEnabled: true, disabled: false,
+      });
+      c.close();
+    } finally {
+      server.stop();
+    }
   });
 });

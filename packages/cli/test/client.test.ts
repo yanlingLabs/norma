@@ -103,6 +103,13 @@ describe("NormaClient", () => {
     client.close();
   });
 
+  test("pluginsList client method round-trip (no plugins installed)", async () => {
+    await boot();
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "pl", onEvent: () => {} });
+    expect(await client.pluginsList()).toEqual({ ok: true, plugins: [] });
+    client.close();
+  });
+
   test("init prompt reaches the session (canned NORMA.md-generation prompt)", async () => {
     const { INIT_PROMPT } = await import("../src/main");
     expect(INIT_PROMPT).toMatch(/NORMA\.md/i);
