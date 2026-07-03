@@ -29,3 +29,10 @@ export function resolveWithinAny(roots: string[], p: string): string {
 export function resolveWithin(root: string, p: string): string {
   return resolveWithinAny([root], p);
 }
+
+/** True if `child` is `parent` or a descendant of it (both realpath-canonicalized; falls back to raw on error). */
+export function isWithin(child: string, parent: string): boolean {
+  const canon = (p: string) => { try { return realpathSync(p); } catch { return p; } };
+  const c = canon(child), t = canon(parent);
+  return c === t || c.startsWith(t + sep);
+}

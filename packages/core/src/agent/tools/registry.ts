@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { ToolSpec } from "../../providers/types";
+import { isWithin } from "../paths";
 
 export interface ToolContext {
   cwd: string;
@@ -16,6 +17,8 @@ export interface ToolDefinition<S extends z.ZodTypeAny = z.ZodTypeAny> {
   description: string;
   args: S;
   rawParameters?: Record<string, unknown>;
+  /** If set, the tool is only visible/callable from sessions whose cwd is within this directory (or a descendant of it). */
+  scope?: string;
   /** May throw — the registry converts throws into isError outcomes. */
   run(args: z.infer<S>, ctx: ToolContext): Promise<string> | string;
 }
@@ -30,15 +33,19 @@ export class ToolRegistry {
     this.defs.set(def.name, def);
   }
 
-  specs(): ToolSpec[] {
-    return [...this.defs.values()].map((d) => ({
-      name: d.name,
-      description: d.description,
-      parameters: d.rawParameters ?? z.toJSONSchema(d.args),
-    }));
+  specs(cwd?: string | null): ToolSpec[] {
+    return [...this.defs.values()]
+      .filter((d) => !d.scope || (!!cwd && isWithin(cwd, d.scope)))
+      .map((d) => ({
+        name: d.name,
+        description: d.description,
+        parameters: d.rawParameters ?? z.toJSONSchema(d.args),
+      }));
   }
 
   has(name: string): boolean { return this.defs.has(name); }
+
+  unregister(name: string): void { this.defs.delete(name); }
 
   async execute(name: string, rawArgs: unknown, ctx: ToolContext): Promise<ToolOutcome> {
     const def = this.defs.get(name);
@@ -46,6 +53,9 @@ export class ToolRegistry {
     const parsed = def.args.safeParse(rawArgs);
     if (!parsed.success) {
       return { output: `invalid arguments for ${name}: ${parsed.error.issues.map((i) => i.path.join(".") || "(root)").join(", ")}`, isError: true };
+    }
+    if (def.scope && !(ctx.cwd && isWithin(ctx.cwd, def.scope))) {
+      return { output: `tool ${name} is not available in this directory`, isError: true };
     }
     try {
       let out = String(await def.run(parsed.data, ctx));
