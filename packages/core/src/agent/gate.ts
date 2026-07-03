@@ -21,6 +21,10 @@ export class PermissionGate {
     if (MUTATING.has(toolName)) return policy === "auto" ? "allow" : "ask";
     // request_directory self-gates via ApprovalBroker (path+persist-aware) — a generic gate prompt here would double-prompt
     if (SELF_GATING.has(toolName)) return "allow";
+    // MCP tools are external code (network/fs/arbitrary) → approval-per-policy like bash: allowed under
+    // `auto`, prompt under `ask`. Must NOT be READ_ONLY, and must NOT fall to the unclassified always-ask
+    // branch below (that would block MCP tool use even under `auto`).
+    if (toolName.startsWith("mcp__")) return policy === "auto" ? "allow" : "ask";
     return "ask";
   }
 }

@@ -48,4 +48,11 @@ describe("PermissionGate v1", () => {
     expect(gate.evaluate("Skill", "ask")).toBe("allow");
     expect(gate.evaluate("Skill", "auto")).toBe("allow");
   });
+
+  test("mcp__ tools are approval-per-policy (like bash): allow under auto, ask under ask", () => {
+    const g = new PermissionGate();
+    expect(g.evaluate("mcp__srv__tool", "auto")).toBe("allow");
+    expect(g.evaluate("mcp__srv__tool", "ask")).toBe("ask");
+    expect(g.evaluate("read", "ask")).toBe("allow"); // READ_ONLY unchanged
+  });
 });
