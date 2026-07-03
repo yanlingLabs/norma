@@ -356,6 +356,45 @@ describe("daemon IPC", () => {
     c.close();
   });
 
+  test("plan.respond round-trip + alreadyResolved", async () => {
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const fake = new FakeProvider([
+      [{ type: "tool_call", callId: "e1", name: "exit_plan_mode", argsJson: JSON.stringify({ plan: "Step 1: ship it" }) }, { type: "done", stopReason: "tool_calls" }],
+      [{ type: "text_delta", delta: "done" }, { type: "done", stopReason: "end_turn" }],
+    ]);
+    await boot({}, fake);
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "planner");
+    const cwd = mkdtempSync(join(tmpdir(), "norma-plan-"));
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", cwd, approvalPolicy: "plan" });
+    await c.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
+    await c.request(METHODS.sessionSend, { sessionId: created.sessionId, text: "make a plan" });
+
+    const presented = await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "plan_presented");
+    const res1 = await c.request(METHODS.planRespond, { sessionId: created.sessionId, callId: presented.params.callId, approved: true, autoAccept: true });
+    expect(res1.result).toEqual({ ok: true, alreadyResolved: false });
+    const res2 = await c.request(METHODS.planRespond, { sessionId: created.sessionId, callId: presented.params.callId, approved: true, autoAccept: true });
+    expect(res2.result).toEqual({ ok: true, alreadyResolved: true });
+
+    await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "turn_completed");
+    c.close();
+  });
+
+  test("session.setPolicy round-trip; NOT_FOUND on an unknown session", async () => {
+    await boot();
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "policy-setter");
+    const cwd = mkdtempSync(join(tmpdir(), "norma-setpolicy-"));
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", cwd, approvalPolicy: "plan" });
+    const setPolicy = await c.request(METHODS.sessionSetPolicy, { sessionId: created.sessionId, policy: "auto" });
+    expect(setPolicy.result).toEqual({ ok: true });
+
+    const bad = await c.request(METHODS.sessionSetPolicy, { sessionId: "s_does_not_exist", policy: "auto" });
+    expect(bad.error).toBeTruthy();
+    expect(bad.error.code).toBe(ERR.NOT_FOUND);
+    c.close();
+  });
+
   test("without a provider, sessions behave as Phase 0 (echo only, no agent events)", async () => {
     await boot(); // no provider injected
     const c = await TestClient.connect(daemon.socketPath);

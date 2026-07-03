@@ -7,6 +7,7 @@ import type { PermissionGate } from "./gate";
 import type { ApprovalBroker } from "./approvals";
 import type { QuestionBroker } from "./questions";
 import type { TaskStore } from "./task-store";
+import type { PlanBroker } from "./plans";
 import type { SessionDirectories } from "./dirs";
 import { sessionTmpDir } from "./session-tmp";
 import type { ContextAssembler } from "./context";
@@ -56,6 +57,14 @@ export interface EngineConfig {
   // deferral wired ONLY when this is set AND enabled !== false — undefined (the setupEngine/
   // daemon default before this config existed) leaves specs()/instructions/execute untouched.
   toolSearch?: { enabled?: boolean; deferThreshold?: number };
+  // Plan mode (1d-ii): both optional, and both absent leaves existing behavior untouched. Without
+  // `plans`, exit_plan_mode falls to the else executeCall branch → the tool's own placeholder
+  // run() (tools/plan.ts) rather than the approval bridge below. `setPolicy` persists an approved
+  // plan's mode switch to the SessionStore (so it survives into the NEXT turn); the bridge also
+  // mutates the in-memory `meta` object for the CURRENT turn regardless of whether setPolicy is
+  // set, since that's what lets a same-turn follow-up call see the new mode immediately.
+  plans?: PlanBroker;
+  setPolicy?: (sessionId: string, policy: "ask" | "auto" | "plan") => Promise<void> | void;
 }
 
 export class AgentEngine {
@@ -215,9 +224,15 @@ export class AgentEngine {
     // Appended ONCE per turn, right after assemble (same one-per-turn rule as `instructions`
     // above) — a same-turn ToolSearch load changes `loaded` but must not re-trigger this section
     // mid-turn; deferred/instructionsFull are computed once here and reused for every round.
-    const instructionsFull = deferred.length
+    let instructionsFull = deferred.length
       ? instructions + "\n\n# Deferred tools\nThe following tools exist but their schemas are NOT loaded — calling them directly fails. Load schemas first with the ToolSearch tool (query \"select:<name>\" or keywords), then call them normally.\n" + deferred.map((d) => `- ${d.name} — ${d.description}`).join("\n")
       : instructions;
+    // Same one-per-turn rule as above: computed off the policy at turn start, not re-checked per
+    // round — an in-turn exit_plan_mode approval (which mutates `meta.approvalPolicy` for the
+    // REST of this turn) does not retroactively add/remove this reminder mid-turn.
+    if (meta.approvalPolicy === "plan") {
+      instructionsFull += "\n\n# Plan mode\nYou are in plan mode: research and form a plan, but make NO changes — file edits, writes, and commands are disabled and will be blocked. When your plan is ready, call exit_plan_mode with the plan (markdown) to present it for approval. Only after approval will editing be enabled.";
+    }
     // Auto-compact BEFORE historyInput is built, so a triggered compaction's checkpoint is
     // reflected in this turn's input. A compaction failure degrades to a normal (uncompacted)
     // turn rather than breaking it.
@@ -274,12 +289,21 @@ export class AgentEngine {
 
         let outcome: { output: string; isError: boolean };
         const decision = this.cfg.gate.evaluate(call.name, meta.approvalPolicy);
-        if (decision === "ask") {
+        if (decision === "deny") {
+          // Plan mode's blanket deny (gate.ts): tool NOT run. No approval flow here — the point
+          // of plan mode is that nothing mutates until exit_plan_mode is approved.
+          outcome = {
+            output: "Blocked in plan mode — you are researching and planning, so file changes and commands are disabled. Make no changes; when your plan is ready, call exit_plan_mode to present it for approval.",
+            isError: true,
+          };
+        } else if (decision === "ask") {
           outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
             timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
             summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
             // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
           });
+        } else if (call.name === "exit_plan_mode" && this.cfg.plans) {
+          outcome = await this.runPlanBridge(call, sessionId, threadId, meta);
         } else if (
           decision === "allow" && call.name === "bash" && this.cfg.reviewer &&
           this.cfg.reviewerEnabled !== false && meta.approvalPolicy === "auto"
@@ -354,6 +378,58 @@ export class AgentEngine {
     return res.approved
       ? await this.executeCall(call, cwd, sessionId, threadId, signal)
       : { output: opts.denialMessage ?? `denied by ${res.by}`, isError: true };
+  }
+
+  /** exit_plan_mode's approval bridge — wired ONLY when cfg.plans is set (see the else-if guard
+   *  at the call site); otherwise exit_plan_mode falls through to executeCall's placeholder run.
+   *  Mirrors requestApproval's wait-before-emit + emit-failure pattern above: the PlanBroker wait
+   *  is registered BEFORE `plan_presented` is emitted, since the broadcast is synchronous and a
+   *  watcher that responds as soon as it observes the event would otherwise race an unregistered
+   *  wait into a lost response (see engine-plan.test.ts). On approval, `meta.approvalPolicy` is
+   *  mutated IN PLACE on the SAME object the dispatch loop's gate check reads every iteration —
+   *  that's what makes a follow-up tool call LATER IN THIS SAME TURN see the new mode immediately,
+   *  without waiting for the next turn's `store.meta()` re-read. `cfg.setPolicy` persists the
+   *  change to the SessionStore so it also survives into the next turn. */
+  private async runPlanBridge(
+    call: { callId: string; name: string; argsJson: string },
+    sessionId: string,
+    threadId: string,
+    meta: { approvalPolicy: "ask" | "auto" | "plan" },
+  ): Promise<{ output: string; isError: boolean }> {
+    const plans = this.cfg.plans!;
+    let plan = "";
+    try {
+      const a = JSON.parse(call.argsJson || "{}");
+      plan = typeof a.plan === "string" ? a.plan : "";
+    } catch { /* empty */ }
+    const planTimeoutMs = Number(process.env.NORMA_PLAN_TIMEOUT_MS ?? 300_000);
+    const waiting = plans.wait(sessionId, call.callId, planTimeoutMs); // BEFORE emit (race lesson)
+    try {
+      this.emit(sessionId, { type: "plan_presented", sessionId, threadId, callId: call.callId, plan });
+    } catch (err) {
+      plans.respond(sessionId, call.callId, { approved: false, autoAccept: false }, "emit-failure");
+      await waiting;
+      throw err;
+    }
+    const res = await waiting;
+    const approved = "approved" in res ? res.approved : false;
+    const autoAccept = "approved" in res ? res.autoAccept : false;
+    const feedback = "approved" in res ? res.feedback : undefined;
+    const by = "approved" in res ? res.by : "timeout";
+    this.emit(sessionId, { type: "plan_resolved", sessionId, threadId, callId: call.callId, approved, feedback, autoAccept, by });
+    if (approved) {
+      const next = autoAccept ? "auto" : "ask";
+      await this.cfg.setPolicy?.(sessionId, next);
+      meta.approvalPolicy = next; // SAME-TURN: follow-up calls in this turn use the new mode
+      return {
+        output: `Plan approved (auto-accept edits: ${autoAccept ? "on" : "off"}). Proceed with the plan. Create a task for each step with task_create as you work.`,
+        isError: false,
+      };
+    }
+    return {
+      output: `Plan rejected: ${feedback || "no response — the user did not respond"}. Stay in plan mode and revise your plan, then call exit_plan_mode again.`,
+      isError: false,
+    };
   }
 
   private executeCall(

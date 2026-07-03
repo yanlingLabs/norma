@@ -6,7 +6,7 @@ import {
   SessionAddDirParams, SessionSetCwdParams, TrustDirParams,
   BgListParams, BgPeekParams, BgKillParams, BgKillAllParams,
   SessionSteerParams, SessionInterruptParams, SessionCompactParams, SkillsListParams, McpListParams,
-  PluginsListParams, AskUserRespondParams, TaskListParams,
+  PluginsListParams, AskUserRespondParams, TaskListParams, PlanRespondParams, SessionSetPolicyParams,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
@@ -16,6 +16,7 @@ import type { AgentEngine } from "../agent/engine";
 import type { ApprovalBroker } from "../agent/approvals";
 import type { QuestionBroker } from "../agent/questions";
 import type { TaskStore } from "../agent/task-store";
+import type { PlanBroker } from "../agent/plans";
 import type { SessionDirectories } from "../agent/dirs";
 import type { TrustStore } from "../agent/trust";
 import type { BackgroundTaskRegistry } from "../agent/bg-registry";
@@ -49,6 +50,7 @@ export interface IpcServerOptions {
   plugins?: PluginStore;     // discovered ~/.norma/plugins/*; plugins.list
   questions?: QuestionBroker; // in-flight ask_user questions; ask_user.respond
   tasks?: TaskStore;         // session task lists; task.list
+  plans?: PlanBroker;        // in-flight exit_plan_mode plans; plan.respond
   helloTimeoutMs?: number;   // default 5000
   maxConnections?: number;   // default 64
   preAuthMaxLine?: number;   // default 64 KiB
@@ -240,6 +242,25 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       case METHODS.taskList: {
         const p = parseParams(TaskListParams, params);
         return { ok: true, tasks: opts.tasks?.list(p.sessionId) ?? [] };
+      }
+      case METHODS.planRespond: {
+        const p = parseParams(PlanRespondParams, params);
+        return (
+          opts.plans?.respond(
+            p.sessionId, p.callId,
+            { approved: p.approved, feedback: p.feedback, autoAccept: p.autoAccept },
+            socket.data.clientName,
+          ) ?? { ok: true, alreadyResolved: true }
+        );
+      }
+      case METHODS.sessionSetPolicy: {
+        const p = parseParams(SessionSetPolicyParams, params);
+        try {
+          opts.store.setApprovalPolicy(p.sessionId, p.policy);
+        } catch (e) {
+          throw new RpcFailure(ERR.NOT_FOUND, (e as Error).message);
+        }
+        return { ok: true };
       }
       case METHODS.sessionAddDir: {
         const p = parseParams(SessionAddDirParams, params);

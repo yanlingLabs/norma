@@ -19,11 +19,13 @@ import { registerSkillTools } from "./agent/tools/skill";
 import { registerToolSearchTool } from "./agent/tools/toolsearch";
 import { registerAskUserTool } from "./agent/tools/ask-user";
 import { registerTaskTools } from "./agent/tools/tasks";
+import { registerPlanTool } from "./agent/tools/plan";
 import { McpManager } from "./agent/mcp/manager";
 import { PermissionGate } from "./agent/gate";
 import { ApprovalBroker } from "./agent/approvals";
 import { QuestionBroker } from "./agent/questions";
 import { TaskStore } from "./agent/task-store";
+import { PlanBroker } from "./agent/plans";
 import { AgentEngine } from "./agent/engine";
 import { BashReviewer } from "./agent/reviewer";
 import { Compactor } from "./agent/compactor";
@@ -116,6 +118,7 @@ export async function startDaemon(opts: {
   let mcp: McpManager | null = null;
   let questions: QuestionBroker | null = null;
   let taskStore: TaskStore | null = null;
+  let plans: PlanBroker | null = null;
   if (agentProvider) {
     const registry = new ToolRegistry();
     registerReadTools(registry);
@@ -128,6 +131,8 @@ export async function startDaemon(opts: {
     taskStore = new TaskStore();
     registerAskUserTool(registry);
     registerTaskTools(registry, { tasks: taskStore });
+    plans = new PlanBroker();
+    registerPlanTool(registry);
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
     await mcp.startAll(settings?.mcpServers ?? {});
     // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled && !disabled);
@@ -160,6 +165,8 @@ export async function startDaemon(opts: {
       mcp: mcp ?? undefined,
       questions: questions ?? undefined,
       tasks: taskStore ?? undefined,
+      plans: plans ?? undefined,
+      setPolicy: (sid, pol) => store.setApprovalPolicy(sid, pol),
       reviewer,
       reviewerEnabled: reviewerCfg?.enabled,
       reviewerAllow: reviewerCfg?.allow ?? [],
@@ -186,6 +193,7 @@ export async function startDaemon(opts: {
     mcp: mcp ?? undefined,
     questions: questions ?? undefined,
     tasks: taskStore ?? undefined,
+    plans: plans ?? undefined,
     ...opts.server,
   });
 
