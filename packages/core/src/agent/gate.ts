@@ -1,5 +1,5 @@
-export type GateDecision = "allow" | "ask";
-export type SessionApprovalPolicy = "ask" | "auto";
+export type GateDecision = "allow" | "ask" | "deny";
+export type SessionApprovalPolicy = "ask" | "auto" | "plan";
 
 // Skill is read-only: it reads a SKILL.md body and marks it loaded in-memory (no filesystem
 // mutation) — same class as read/glob/grep. Without this it would fall through to the
@@ -14,7 +14,9 @@ export type SessionApprovalPolicy = "ask" | "auto";
 // question_asked event and blocks on the QuestionBroker (no fs/process mutation — the human is
 // the approval, so a gate prompt on top would double-ask); the task tools (registered in a later
 // task) only maintain in-memory/session task state and emit task_updated.
-const READ_ONLY = new Set(["read", "glob", "grep", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list"]);
+// exit_plan_mode is read-only too: it only presents a plan for approval (no fs/process mutation)
+// — it must stay allowed under "plan" policy or the model could never exit plan mode.
+const READ_ONLY = new Set(["read", "glob", "grep", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "exit_plan_mode"]);
 const MUTATING = new Set(["write", "edit", "bash", "bash_kill"]);
 const SELF_GATING = new Set(["request_directory"]);
 
@@ -25,6 +27,14 @@ const SELF_GATING = new Set(["request_directory"]);
  */
 export class PermissionGate {
   evaluate(toolName: string, policy: SessionApprovalPolicy): GateDecision {
+    // Plan mode: only reads/self-gating tools (incl. exit_plan_mode, ask_user, task_*) are allowed;
+    // everything else (writes/edit/bash/mcp__/unclassified) is denied outright — no prompt, since the
+    // whole point of plan mode is that nothing mutates until the plan is approved.
+    if (policy === "plan") {
+      if (READ_ONLY.has(toolName)) return "allow"; // incl. exit_plan_mode, ask_user, task_*
+      if (SELF_GATING.has(toolName)) return "allow"; // request_directory only asks for a dir
+      return "deny"; // write/edit/bash/mcp__/unclassified — all blocked while planning
+    }
     if (READ_ONLY.has(toolName)) return "allow";
     if (MUTATING.has(toolName)) return policy === "auto" ? "allow" : "ask";
     // request_directory self-gates via ApprovalBroker (path+persist-aware) — a generic gate prompt here would double-prompt
