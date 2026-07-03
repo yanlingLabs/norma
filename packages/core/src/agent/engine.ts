@@ -299,6 +299,13 @@ export class AgentEngine {
 
         let outcome: { output: string; isError: boolean };
         const decision = this.cfg.gate.evaluate(call.name, meta.approvalPolicy);
+        // Worktree tools are MUTATING (gate.ts), so under `ask` policy (the DEFAULT) `decision` is
+        // "ask", not "allow" — checked here, BEFORE the generic `decision === "ask"` branch below,
+        // so that branch never gets first crack at a worktree call. Without this dedicated branch,
+        // the generic one would run executeCall on approval (the tool's own placeholder run()),
+        // and the bridge (setCwd + git + same-turn cwd + worktree_* events) would NEVER run outside
+        // `auto` policy — see task-4-report.md for the bug writeup.
+        const isWorktree = (call.name === "enter_worktree" || call.name === "exit_worktree") && !!this.cfg.worktrees;
         if (decision === "deny") {
           // Plan mode's blanket deny (gate.ts): tool NOT run. No approval flow here — the point
           // of plan mode is that nothing mutates until exit_plan_mode is approved.
@@ -306,6 +313,28 @@ export class AgentEngine {
             output: "Blocked in plan mode — you are researching and planning, so file changes and commands are disabled. Make no changes; when your plan is ready, call exit_plan_mode to present it for approval.",
             isError: true,
           };
+        } else if (isWorktree) {
+          // "allow" (auto policy) runs the bridge directly, synchronously. "ask" (default policy)
+          // still waits on the ApprovalBroker via requestApproval, but passes the bridge itself as
+          // the onApprove action, so an APPROVED enter/exit runs the bridge — not executeCall.
+          // `newCwd` is captured through the `onCwd` callback in both branches; because
+          // runWorktreeBridge is synchronous, the callback (if any) has already run by the time
+          // each branch's `await`/direct call returns, so reading `newCwd` right after is safe —
+          // and it's reassigned to the loop's local `cwd` so a same-turn follow-up call resolves
+          // into (or back out of) the worktree either way (mirrors the plan bridge's same-turn
+          // `meta.approvalPolicy` mutation above).
+          let newCwd: string | undefined;
+          const onCwd = (next: string) => { newCwd = next; };
+          if (decision === "ask") {
+            outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
+              timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
+              summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
+              // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
+            }, async () => this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd));
+          } else {
+            outcome = this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd);
+          }
+          if (newCwd !== undefined) cwd = newCwd;
         } else if (decision === "ask") {
           outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
             timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
@@ -314,8 +343,6 @@ export class AgentEngine {
           });
         } else if (call.name === "exit_plan_mode" && this.cfg.plans && meta.approvalPolicy === "plan") {
           outcome = await this.runPlanBridge(call, sessionId, threadId, meta);
-        } else if ((call.name === "enter_worktree" || call.name === "exit_worktree") && this.cfg.worktrees) {
-          outcome = this.runWorktreeBridge(call, sessionId, threadId, cwd, (next) => { cwd = next; });
         } else if (
           decision === "allow" && call.name === "bash" && this.cfg.reviewer &&
           this.cfg.reviewerEnabled !== false && meta.approvalPolicy === "auto"
@@ -359,13 +386,16 @@ export class AgentEngine {
     this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "error", ...usage });
   }
 
-  /** Shared approval-request flow for both the `ask`-policy path and the reviewer's escalation
-   *  path. Registers the broker wait BEFORE emitting `approval_requested` — the broadcast is
-   *  synchronous, so a watcher that resolves the approval as soon as it observes the event (see
-   *  engine.test.ts) would otherwise race `broker.wait()` and resolve into an empty pending-map
-   *  slot, timing out. On denial, `opts.denialMessage` lets a caller (the reviewer path) override
-   *  the default `denied by ${res.by}` string with a retry-hint message; the `ask` path passes no
-   *  override, preserving that exact string byte-for-byte. */
+  /** Shared approval-request flow for the `ask`-policy path, the reviewer's escalation path, and
+   *  (1d-iii) the worktree bridge's ask-policy path. Registers the broker wait BEFORE emitting
+   *  `approval_requested` — the broadcast is synchronous, so a watcher that resolves the approval
+   *  as soon as it observes the event (see engine.test.ts) would otherwise race `broker.wait()`
+   *  and resolve into an empty pending-map slot, timing out. On denial, `opts.denialMessage` lets
+   *  a caller (the reviewer path) override the default `denied by ${res.by}` string with a
+   *  retry-hint message; the `ask` path passes no override, preserving that exact string
+   *  byte-for-byte. `onApprove` lets a caller run something OTHER than executeCall when approved
+   *  (the worktree dispatch branch passes the worktree bridge here); omitted (the `ask`/reviewer
+   *  callers above), it defaults to `executeCall` — behavior-preserving for every existing caller. */
   private async requestApproval(
     call: { callId: string; name: string; argsJson: string },
     cwd: string,
@@ -373,6 +403,7 @@ export class AgentEngine {
     threadId: string,
     signal: AbortSignal,
     opts: { timeoutMs: number; summary: string; denialMessage?: string },
+    onApprove?: () => Promise<{ output: string; isError: boolean }>,
   ): Promise<{ output: string; isError: boolean }> {
     const waiting = this.cfg.broker.wait(sessionId, call.callId, opts.timeoutMs);
     try {
@@ -388,7 +419,7 @@ export class AgentEngine {
     const res = await waiting;
     this.emit(sessionId, { type: "approval_resolved", sessionId, threadId, callId: call.callId, approved: res.approved, by: res.by });
     return res.approved
-      ? await this.executeCall(call, cwd, sessionId, threadId, signal)
+      ? await (onApprove ? onApprove() : this.executeCall(call, cwd, sessionId, threadId, signal))
       : { output: opts.denialMessage ?? `denied by ${res.by}`, isError: true };
   }
 
@@ -450,12 +481,16 @@ export class AgentEngine {
   }
 
   /** enter_worktree/exit_worktree's bridge — wired ONLY when cfg.worktrees is set (see the
-   *  else-if guard at the call site); otherwise both tools fall through to executeCall's
-   *  placeholder run (tools/worktree.ts). Synchronous (WorktreeManager's git calls are
-   *  Bun.spawnSync), unlike the approval/plan bridges above which wait on a broker.
-   *  `setCwd` persists the switch to the SessionStore so it also survives into the next turn;
-   *  `onCwd` mutates the dispatch loop's local `cwd` (now `let`) so a follow-up call LATER IN
-   *  THIS SAME TURN resolves into (or back out of) the worktree immediately. A thrown manager
+   *  `isWorktree` guard at the call site); otherwise both tools fall through to executeCall's
+   *  placeholder run (tools/worktree.ts). Called from BOTH decisions the gate can produce for a
+   *  MUTATING tool: directly when `decision === "allow"` (auto policy), and as `requestApproval`'s
+   *  `onApprove` action when `decision === "ask"` (the DEFAULT policy) — see the dispatch loop
+   *  above. Synchronous (WorktreeManager's git calls are Bun.spawnSync), unlike the approval/plan
+   *  bridges above which wait on a broker. `setCwd` persists the switch to the SessionStore so it
+   *  also survives into the next turn; `onCwd` reports the new cwd to the caller, which mutates the
+   *  dispatch loop's local `cwd` (now `let`) so a follow-up call LATER IN THIS SAME TURN resolves
+   *  into (or back out of) the worktree immediately — this works identically whether the caller is
+   *  the direct "allow" branch or the "ask"-approved `onApprove` closure. A thrown manager
    *  error (e.g. dirty worktree on remove, not a git repo, already in a worktree) becomes an
    *  isError outcome rather than propagating and failing the whole turn. */
   private runWorktreeBridge(

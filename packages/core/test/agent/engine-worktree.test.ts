@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionStore } from "../../src/sessions/store";
-import { SessionHub } from "../../src/sessions/hub";
+import { SessionHub, type HubClient } from "../../src/sessions/hub";
 import { ToolRegistry } from "../../src/agent/tools/registry";
 import { registerWriteTools } from "../../src/agent/tools/fs-write";
 import { registerWorktreeTools } from "../../src/agent/tools/worktree";
@@ -175,6 +175,81 @@ describe.if(isMac)("AgentEngine: worktree bridge (enter/exit_worktree)", () => {
     expect(result).toMatchObject({ isError: true });
     expect((result as any).output).toContain("Blocked in plan mode");
     expect(events.some((e) => e.type === "worktree_entered")).toBe(false);
+    expect(store.meta(sessionId).cwd).toBe(cwd);
+  });
+
+  // `ask` is the DEFAULT session policy, and enter_worktree/exit_worktree are MUTATING (gate.ts)
+  // → under `ask`, gate.evaluate returns "ask", not "allow". Before the fix, the dispatch loop's
+  // generic `decision === "ask"` branch ran FIRST and, on approval, called executeCall — which
+  // resolves to the worktree tool's own PLACEHOLDER run() ("worktree support is not available"),
+  // never the bridge (setCwd + git + same-turn cwd + worktree_entered). These two tests pin the
+  // approved and denied halves of that path under `ask`.
+  test("ask policy: enter_worktree APPROVED → the bridge runs (not the placeholder): worktree_entered emitted, same-turn write lands in the worktree", async () => {
+    const { engine, store, hub, broker, sessionId, cwd } = setup(
+      [
+        [{ type: "tool_call", callId: "e1", name: "enter_worktree", argsJson: JSON.stringify({ name: "feat3" }) }, done("tool_calls")],
+        [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "scratch.txt", content: "x" }) }, done("tool_calls")],
+        text("done"),
+      ],
+      { approvalPolicy: "ask" },
+    );
+    // watcher approves the approval as soon as it sees it (sync — must be registered BEFORE the
+    // emit; requestApproval's wait-before-emit ordering is what makes this not race/hang):
+    const watcher: HubClient = {
+      clientName: "auto-approver",
+      deliver(e) { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, true, "auto-approver"); return true; },
+    };
+    hub.attach(watcher, sessionId, 0);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    // approval flow happened (this IS the `ask` path — not silently downgraded to auto)
+    expect(events.find((e) => e.type === "approval_resolved")).toMatchObject({ approved: true, by: "auto-approver" });
+
+    // the BRIDGE ran, not the placeholder: worktree_entered was emitted
+    const entered = events.find((e) => e.type === "worktree_entered");
+    expect(entered).toMatchObject({ name: "feat3", branch: "norma/feat3" });
+    const wtDir = (entered as any).path as string;
+    expect(existsSync(wtDir)).toBe(true);
+
+    const enterResult = events.find((e) => e.type === "tool_result" && e.callId === "e1");
+    expect(enterResult).toMatchObject({ isError: false });
+    expect((enterResult as any).output).toContain("Entered worktree feat3"); // NOT "worktree support is not available"
+
+    // store.setCwd was called with the worktree dir
+    expect(store.meta(sessionId).cwd).toBe(wtDir);
+
+    // SAME-TURN follow-up write lands in the worktree, not the original repo
+    const writeResult = events.find((e) => e.type === "tool_result" && e.callId === "w1");
+    expect(writeResult).toMatchObject({ isError: false });
+    expect(existsSync(join(wtDir, "scratch.txt"))).toBe(true);
+    expect(existsSync(join(cwd, "scratch.txt"))).toBe(false);
+  });
+
+  test("ask policy: enter_worktree DENIED → denied outcome, no git op, no worktree_entered", async () => {
+    const { engine, store, hub, broker, sessionId, cwd } = setup(
+      [
+        [{ type: "tool_call", callId: "e1", name: "enter_worktree", argsJson: JSON.stringify({ name: "feat4" }) }, done("tool_calls")],
+        text("ok, not entering"),
+      ],
+      { approvalPolicy: "ask" },
+    );
+    const watcher: HubClient = {
+      clientName: "auto-denier",
+      deliver(e) { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, false, "auto-denier"); return true; },
+    };
+    hub.attach(watcher, sessionId, 0);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(events.find((e) => e.type === "approval_resolved")).toMatchObject({ approved: false, by: "auto-denier" });
+    expect(events.some((e) => e.type === "worktree_entered")).toBe(false);
+
+    const enterResult = events.find((e) => e.type === "tool_result" && e.callId === "e1");
+    expect(enterResult).toMatchObject({ isError: true });
+    expect((enterResult as any).output).toMatch(/denied/);
+
+    // no git op: cwd unchanged, no worktree dir created under cwd's parent side-effects
     expect(store.meta(sessionId).cwd).toBe(cwd);
   });
 });
