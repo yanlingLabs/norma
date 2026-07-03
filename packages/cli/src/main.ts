@@ -63,9 +63,15 @@ async function connect(name: string, onEvent: (e: any) => void = () => {}): Prom
   return NormaClient.connect({ socketPath: socketPath(), token: await getToken(), clientName: name, onEvent });
 }
 
+// Canned prompt for `norma init`: surveys the project and writes/updates a NORMA.md at its root.
+export const INIT_PROMPT =
+  "Survey this project to understand it: read the README, the package manifest (package.json/pyproject/Cargo.toml/etc.), and skim the directory structure and a few key source files. Then write a concise NORMA.md at the project root capturing: what this project is, how to build/test/run it, and the key conventions a new contributor should follow. If a NORMA.md already exists, read it and UPDATE it rather than clobbering. Keep it tight and factual.";
+
 // Headless agent mode: `norma -p "<prompt>" [--auto]`. Streams the turn to stdout and,
 // under the default "ask" approval policy, prompts on stdin for each tool approval.
-async function runHeadlessAgent(): Promise<void> {
+// promptOverride/forceAuto let other commands (e.g. `init`) reuse the same headless flow
+// with a canned prompt instead of reading argv.
+async function runHeadlessAgent(promptOverride?: string, forceAuto = false): Promise<void> {
   // -p teardown: mirrors Claude Code's headless grace-kill. Any bg tasks still running when the
   // turn completes get a grace period (NORMA_BG_PRINT_WAIT_MS, default 5000ms; 0 = poll until none
   // are running rather than racing a fixed timer) before we force-kill whatever remains.
@@ -88,12 +94,12 @@ async function runHeadlessAgent(): Promise<void> {
     c.close();
     process.exit(exitCode);
   }
-  const prompt = process.argv[3];
+  const prompt = promptOverride ?? process.argv[3];
   if (!prompt) {
     console.error('usage: norma -p "<prompt>" [--auto]');
     process.exit(1);
   }
-  const auto = process.argv.includes("--auto");
+  const auto = forceAuto || process.argv.includes("--auto");
   const pending: string[] = []; // callIds awaiting a y/n on stdin, oldest first
   let sessionId = ""; // set below, before send() — turn_completed can only fire after that
   const wd: WatchdogState = { turnRunning: false, toolsInFlight: 0, approvalsPending: 0, lastEventAt: Date.now() };
@@ -158,17 +164,20 @@ async function runHeadlessAgent(): Promise<void> {
   await new Promise(() => {}); // exits via the turn_completed branch of onEvent above
 }
 
-if (process.argv[2] === "-p") {
-  await runHeadlessAgent(); // never resolves normally — exits via process.exit()
-}
+// Guarded so `main.ts` can be imported (e.g. by tests, for INIT_PROMPT/runHeadlessAgent) without
+// executing the CLI — import.meta.main is true only when this file is the entry point.
+if (import.meta.main) {
+  if (process.argv[2] === "-p") {
+    await runHeadlessAgent(); // never resolves normally — exits via process.exit()
+  }
 
-const argv = process.argv.slice(2);
-const [cmd, sub] = argv;
+  const argv = process.argv.slice(2);
+  const [cmd, sub] = argv;
 
-// Two-word subcommands use "cmd sub"; single-word commands match on cmd alone.
-const cmdKey = cmd === "daemon" ? `daemon ${sub ?? ""}`.trim() : (cmd ?? "");
+  // Two-word subcommands use "cmd sub"; single-word commands match on cmd alone.
+  const cmdKey = cmd === "daemon" ? `daemon ${sub ?? ""}`.trim() : (cmd ?? "");
 
-switch (cmdKey) {
+  switch (cmdKey) {
   case "daemon run": {
     await startDaemon();
     break; // keeps running; SIGINT/SIGTERM handled in daemon.ts
@@ -365,6 +374,10 @@ switch (cmdKey) {
     console.log(`${AQUA}${s.provider.type}${RESET} ${DIM}model ${s.provider.model}${RESET}`);
     break;
   }
+  case "init": {
+    await runHeadlessAgent(INIT_PROMPT, true); // force auto: writes NORMA.md without approval prompts
+    break;
+  }
   case "provider-smoke": {
     const { loadSettings, resolveNormaHome, createProvider, KeychainSecretStore } = await import("@norma/core");
     const s = loadSettings(join(resolveNormaHome(), "settings.json"));
@@ -391,5 +404,7 @@ switch (cmdKey) {
   trust <dir> [--list]
   bg list <session> | bg peek <session> <taskId> | bg kill <session> <taskId>
   login [--api-key] | logout | provider | provider-smoke [--prompt <text>]
+  init                                            generate/update NORMA.md by surveying the project
   -p "<prompt>" [--auto] [--trust|--no-trust]   headless agent turn (asks for tool approval unless --auto)`);
+  }
 }

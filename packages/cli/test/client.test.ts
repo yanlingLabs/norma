@@ -87,6 +87,20 @@ describe("NormaClient", () => {
     expect((await client.steer(sessionId, "hi")).injected).toBe(false);
     client.close();
   });
+
+  test("init prompt reaches the session (canned NORMA.md-generation prompt)", async () => {
+    const { INIT_PROMPT } = await import("../src/main");
+    expect(INIT_PROMPT).toMatch(/NORMA\.md/i);
+    await boot();
+    const events: any[] = [];
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "init", onEvent: (e) => events.push(e) });
+    const { sessionId } = await client.createSession("global", { cwd: mkdtempSync(join(tmpdir(), "norma-init-")), approvalPolicy: "auto" });
+    await client.attach(sessionId);
+    await client.send(sessionId, INIT_PROMPT);
+    await new Promise((r) => setTimeout(r, 40));
+    expect(events.some((e) => e.type === "user_message" && e.text === INIT_PROMPT)).toBe(true);
+    client.close();
+  });
 });
 
 describe("NormaClient against a hostile/fake server", () => {
