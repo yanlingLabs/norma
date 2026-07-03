@@ -20,11 +20,15 @@ import { TrustStore } from "../../src/agent/trust";
 import { SkillStore } from "../../src/agent/skills";
 import { Compactor } from "../../src/agent/compactor";
 import type { McpManager } from "../../src/agent/mcp/manager";
+import type { BashReviewer } from "../../src/agent/reviewer";
 
 // Mirrors packages/core/test/agent/engine.test.ts's setup(). Exported so other engine test
 // files (e.g. engine-interrupt.test.ts, engine-context.test.ts) can reuse the same harness
 // instead of duplicating it.
-export function setupEngine(provider: Provider, opts?: { cwd?: string; assembler?: ContextAssembler; compactor?: Compactor; skills?: SkillStore; registry?: ToolRegistry; mcp?: McpManager }) {
+export function setupEngine(provider: Provider, opts?: {
+  cwd?: string; assembler?: ContextAssembler; compactor?: Compactor; skills?: SkillStore; registry?: ToolRegistry; mcp?: McpManager;
+  reviewer?: BashReviewer; reviewerEnabled?: boolean; reviewerAllow?: string[]; policy?: "ask" | "auto";
+}) {
   const home = mkdtempSync(join(tmpdir(), "norma-engine-steer-"));
   const cwd = opts?.cwd ?? realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-steer-cwd-")));
   const store = new SessionStore(home);
@@ -70,8 +74,11 @@ export function setupEngine(provider: Provider, opts?: { cwd?: string; assembler
     assembler,
     compactor,
     mcp: opts?.mcp,
+    reviewer: opts?.reviewer,
+    reviewerEnabled: opts?.reviewerEnabled,
+    reviewerAllow: opts?.reviewerAllow,
   });
-  const sessionId = store.createSession("global", { cwd, approvalPolicy: "auto" });
+  const sessionId = store.createSession("global", { cwd, approvalPolicy: opts?.policy ?? "auto" });
   // Collect every SessionEvent broadcast for this session (live, via a hub subscriber) so
   // tests can assert on emitted events (e.g. turn_completed's stopReason) without re-reading
   // the store themselves.

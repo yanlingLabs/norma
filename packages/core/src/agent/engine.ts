@@ -10,6 +10,7 @@ import { sessionTmpDir } from "./session-tmp";
 import type { ContextAssembler } from "./context";
 import type { Compactor } from "./compactor";
 import type { McpManager } from "./mcp/manager";
+import { bashLooksSafe, type BashReviewer } from "./reviewer";
 
 const MAIN_THREAD = "main";
 const MAX_TOOL_ITERATIONS = 24; // runaway guard until 1b-ii budgets land
@@ -42,6 +43,9 @@ export interface EngineConfig {
   compactor: Compactor;
   mcp?: McpManager;
   approvalTimeoutMs?: number; // default 5 min
+  reviewer?: BashReviewer; // safety review for auto-policy bash calls (undefined → no review, unchanged behavior)
+  reviewerEnabled?: boolean; // default true when reviewer is set; false disables the review path entirely
+  reviewerAllow?: string[]; // extra commands/argv0s bashLooksSafe treats as obviously-safe (bypass review)
 }
 
 export class AgentEngine {
@@ -229,25 +233,41 @@ export class AgentEngine {
         let outcome: { output: string; isError: boolean };
         const decision = this.cfg.gate.evaluate(call.name, meta.approvalPolicy);
         if (decision === "ask") {
-          // Register the wait BEFORE emitting: broadcast is synchronous, so a watcher that
-          // resolves the approval as soon as it observes the event (see engine.test.ts) would
-          // otherwise race broker.wait() and resolve into an empty pending-map slot, timing out.
-          const waiting = this.cfg.broker.wait(sessionId, call.callId, this.cfg.approvalTimeoutMs ?? 5 * 60_000);
+          outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
+            timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
+            summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
+            // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
+          });
+        } else if (
+          decision === "allow" && call.name === "bash" && this.cfg.reviewer &&
+          this.cfg.reviewerEnabled !== false && meta.approvalPolicy === "auto"
+        ) {
+          let command = "";
+          let justification: string | undefined;
           try {
-            this.emit(sessionId, {
-              type: "approval_requested", sessionId, threadId, callId: call.callId, toolName: call.name,
-              summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
-            });
-          } catch (err) {
-            // emit failed (e.g. disk): resolve the registered waiter now so it doesn't linger until timeout
-            this.cfg.broker.resolve(sessionId, call.callId, false, "emit-failure");
-            throw err;
+            const a = JSON.parse(call.argsJson || "{}");
+            command = typeof a.command === "string" ? a.command : "";
+            justification = typeof a.justification === "string" ? a.justification : undefined;
+          } catch { /* fall through to review of "" → likely unsafe */ }
+          if (command && bashLooksSafe(command, this.cfg.reviewerAllow ?? [])) {
+            outcome = await this.executeCall(call, cwd, sessionId, signal);
+          } else {
+            let v: { verdict: "safe" | "unsafe"; reason: string };
+            try {
+              v = await this.cfg.reviewer.review({ command, justification }, signal);
+            } catch {
+              v = { verdict: "unsafe", reason: "reviewer unavailable — manual approval required" };
+            }
+            if (v.verdict === "unsafe") {
+              outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
+                timeoutMs: Number(process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS ?? 60_000),
+                summary: `⚠ safety reviewer: ${v.reason} — ${call.name} ${command.slice(0, 120)}`,
+                denialMessage: `blocked by the safety reviewer: ${v.reason}. No approval within 60s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.`,
+              });
+            } else {
+              outcome = await this.executeCall(call, cwd, sessionId, signal);
+            }
           }
-          const res = await waiting;
-          this.emit(sessionId, { type: "approval_resolved", sessionId, threadId, callId: call.callId, approved: res.approved, by: res.by });
-          outcome = res.approved
-            ? await this.executeCall(call, cwd, sessionId, signal)
-            : { output: `denied by ${res.by}`, isError: true };
         } else {
           outcome = await this.executeCall(call, cwd, sessionId, signal);
         }
@@ -259,6 +279,39 @@ export class AgentEngine {
 
     this.emit(sessionId, { type: "agent_error", sessionId, threadId, message: `tool-iteration cap (${MAX_TOOL_ITERATIONS}) reached` });
     this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "error", ...usage });
+  }
+
+  /** Shared approval-request flow for both the `ask`-policy path and the reviewer's escalation
+   *  path. Registers the broker wait BEFORE emitting `approval_requested` — the broadcast is
+   *  synchronous, so a watcher that resolves the approval as soon as it observes the event (see
+   *  engine.test.ts) would otherwise race `broker.wait()` and resolve into an empty pending-map
+   *  slot, timing out. On denial, `opts.denialMessage` lets a caller (the reviewer path) override
+   *  the default `denied by ${res.by}` string with a retry-hint message; the `ask` path passes no
+   *  override, preserving that exact string byte-for-byte. */
+  private async requestApproval(
+    call: { callId: string; name: string; argsJson: string },
+    cwd: string,
+    sessionId: string,
+    threadId: string,
+    signal: AbortSignal,
+    opts: { timeoutMs: number; summary: string; denialMessage?: string },
+  ): Promise<{ output: string; isError: boolean }> {
+    const waiting = this.cfg.broker.wait(sessionId, call.callId, opts.timeoutMs);
+    try {
+      this.emit(sessionId, {
+        type: "approval_requested", sessionId, threadId, callId: call.callId, toolName: call.name,
+        summary: opts.summary,
+      });
+    } catch (err) {
+      // emit failed (e.g. disk): resolve the registered waiter now so it doesn't linger until timeout
+      this.cfg.broker.resolve(sessionId, call.callId, false, "emit-failure");
+      throw err;
+    }
+    const res = await waiting;
+    this.emit(sessionId, { type: "approval_resolved", sessionId, threadId, callId: call.callId, approved: res.approved, by: res.by });
+    return res.approved
+      ? await this.executeCall(call, cwd, sessionId, signal)
+      : { output: opts.denialMessage ?? `denied by ${res.by}`, isError: true };
   }
 
   private executeCall(call: { name: string; argsJson: string }, cwd: string, sessionId: string, signal: AbortSignal): Promise<{ output: string; isError: boolean }> {
