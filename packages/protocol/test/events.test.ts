@@ -73,6 +73,12 @@ describe("SessionEvent discriminated union", () => {
     const e = { ...base, threadId: "main", type: "tool_result", callId: "c", output: "x".repeat(100), isError: true };
     expect(SessionEvent.parse(e)).toMatchObject({ isError: true });
   });
+
+  test("checkpoint event parses", () => {
+    const e = SessionEvent.parse({ seq: 3, ts: 1781270000000, sessionId: "s_x", type: "checkpoint", threadId: "main", summary: "did X, decided Y", uptoSeq: 2 });
+    expect(e.type).toBe("checkpoint" as SessionEvent["type"]);
+    if (e.type === "checkpoint") { expect(e.uptoSeq).toBe(2); expect(e.summary).toContain("decided Y"); }
+  });
 });
 
 describe("hello method schemas", () => {

@@ -17,6 +17,7 @@ public enum SessionEvent: Codable, Equatable {
     case bgTaskStarted(BgTaskStarted)
     case bgTaskOutput(BgTaskOutput)
     case bgTaskExited(BgTaskExited)
+    case checkpoint(Checkpoint)
 
     public struct SessionCreated: Codable, Equatable {
         public let seq: Int
@@ -158,6 +159,15 @@ public enum SessionEvent: Codable, Equatable {
         public let killed: Bool
     }
 
+    public struct Checkpoint: Codable, Equatable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let summary: String
+        public let uptoSeq: Int
+    }
+
     private enum Discriminator: String, Codable {
         case session_created
         case harness_attached
@@ -175,6 +185,7 @@ public enum SessionEvent: Codable, Equatable {
         case bg_task_started
         case bg_task_output
         case bg_task_exited
+        case checkpoint
     }
 
     private enum TypeKey: String, CodingKey { case type }
@@ -198,6 +209,7 @@ public enum SessionEvent: Codable, Equatable {
         case .bg_task_started:      self = .bgTaskStarted(try BgTaskStarted(from: decoder))
         case .bg_task_output:       self = .bgTaskOutput(try BgTaskOutput(from: decoder))
         case .bg_task_exited:       self = .bgTaskExited(try BgTaskExited(from: decoder))
+        case .checkpoint:           self = .checkpoint(try Checkpoint(from: decoder))
         }
     }
 
@@ -267,6 +279,10 @@ public enum SessionEvent: Codable, Equatable {
             try v.encode(to: encoder)
             var c = encoder.container(keyedBy: TypeKey.self)
             try c.encode(Discriminator.bg_task_exited.rawValue, forKey: .type)
+        case .checkpoint(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.checkpoint.rawValue, forKey: .type)
         }
     }
 }

@@ -1,0 +1,9 @@
+{
+  "seq": 7,
+  "sessionId": "s_fixture",
+  "ts": 1781270000000,
+  "type": "checkpoint",
+  "threadId": "main",
+  "summary": "Earlier: set up the repo; decided to use Bun.",
+  "uptoSeq": 5
+}

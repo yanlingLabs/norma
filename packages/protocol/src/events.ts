@@ -59,6 +59,10 @@ export const BgTaskStartedEvent = ThreadBase.extend({ type: z.literal("bg_task_s
 export const BgTaskOutputEvent = ThreadBase.extend({ type: z.literal("bg_task_output"), taskId: z.string().min(1), chunk: z.string() });
 export const BgTaskExitedEvent = ThreadBase.extend({ type: z.literal("bg_task_exited"), taskId: z.string().min(1), exitCode: z.number().int().nullable(), killed: z.boolean() });
 
+export const CheckpointEvent = ThreadBase.extend({
+  type: z.literal("checkpoint"), summary: z.string(), uptoSeq: z.number().int().nonnegative(),
+});
+
 export const SessionEvent = z.discriminatedUnion("type", [
   SessionCreatedEvent,
   HarnessAttachedEvent,
@@ -76,6 +80,7 @@ export const SessionEvent = z.discriminatedUnion("type", [
   BgTaskStartedEvent,
   BgTaskOutputEvent,
   BgTaskExitedEvent,
+  CheckpointEvent,
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 
