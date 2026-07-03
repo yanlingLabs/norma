@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadSettings, loadPermissionDirs, addLocalDir } from "../src/settings";
+import { loadSettings, loadPermissionDirs, addLocalDir, Settings } from "../src/settings";
 import { mkdirSync, writeFileSync as wf } from "node:fs";
 
 function tmpSettings(content: unknown): string {
@@ -65,6 +65,14 @@ describe("loadSettings", () => {
     const s = loadSettings(p);
     expect(s.schemaVersion).toBe(2);
     expect(s.permissions?.additionalDirectories).toEqual(["/opt/x"]);
+  });
+
+  test("mcpServers parses; absent → undefined; legacy migration keeps working", () => {
+    const s = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, mcpServers: { everything: { command: "npx", args: ["-y", "@modelcontextprotocol/server-everything"], env: { X: "1" } } } });
+    if (!s.mcpServers) throw new Error("mcpServers must be defined");
+    expect(s.mcpServers["everything"]?.command).toBe("npx");
+    const none = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" } });
+    expect(none.mcpServers).toBeUndefined();
   });
 });
 

@@ -16,6 +16,11 @@ export const Settings = z.object({
   schemaVersion: z.literal(2),
   provider: ProviderSettings,
   permissions: PermissionsSettings.optional(),
+  mcpServers: z.record(z.string(), z.object({
+    command: z.string().min(1),
+    args: z.array(z.string()).optional(),
+    env: z.record(z.string(), z.string()).optional(),
+  })).optional(),
 });
 export type Settings = z.infer<typeof Settings>;
 
