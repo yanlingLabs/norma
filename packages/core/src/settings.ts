@@ -37,6 +37,9 @@ export const Settings = z.object({
   worktree: z.object({
     baseRef: z.enum(["fresh", "head"]).optional(),
   }).optional(),
+  subagents: z.object({
+    maxConcurrent: z.number().int().positive().optional(),
+  }).optional(),
 });
 export type Settings = z.infer<typeof Settings>;
 

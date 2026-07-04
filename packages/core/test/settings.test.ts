@@ -127,6 +127,21 @@ describe("loadSettings", () => {
     expect(s.schemaVersion).toBe(2);
     expect(s.worktree).toBeUndefined();
   });
+
+  test("subagents config parses; absent → undefined; non-positive maxConcurrent rejected", () => {
+    const s = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, subagents: { maxConcurrent: 2 } });
+    expect(s.subagents).toEqual({ maxConcurrent: 2 });
+    expect(Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" } }).subagents).toBeUndefined();
+    expect(() => Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, subagents: { maxConcurrent: 0 } })).toThrow();
+    expect(() => Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, subagents: { maxConcurrent: -1 } })).toThrow();
+  });
+
+  test("legacy migration keeps working with subagents field absent", () => {
+    const p = tmpSettings({ webSearch: { provider: "disabled" } });
+    const s = loadSettings(p);
+    expect(s.schemaVersion).toBe(2);
+    expect(s.subagents).toBeUndefined();
+  });
 });
 
 describe("saveSettings", () => {

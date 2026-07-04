@@ -38,6 +38,9 @@ import {
   PluginInfoSchema,
   PluginsListParams,
   PluginsListResult,
+  ThreadInfoSchema,
+  ThreadListParams,
+  ThreadListResult,
   METHODS,
 } from "../src/methods";
 
@@ -246,5 +249,20 @@ describe("plan.respond / session.setPolicy schemas", () => {
     expect(() => SessionSetPolicyParams.parse({ sessionId: "s1", policy: "bogus" })).toThrow();
     expect(SessionSetPolicyResult.parse({ ok: true }).ok).toBe(true);
     expect(METHODS.sessionSetPolicy).toBe("session.setPolicy");
+  });
+});
+
+describe("thread.list schema", () => {
+  test("thread.list params/result + method string", () => {
+    expect(ThreadListParams.parse({ sessionId: "s1" }).sessionId).toBe("s1");
+    expect(() => ThreadListParams.parse({ sessionId: "" })).toThrow();
+    const info = ThreadInfoSchema.parse({ threadId: "th_child1", parentThreadId: "main", agentType: "researcher", status: "running" });
+    expect(info.status).toBe("running");
+    // parentThreadId/agentType/stopReason are optional
+    expect(ThreadInfoSchema.parse({ threadId: "main", status: "completed" }).parentThreadId).toBeUndefined();
+    expect(() => ThreadInfoSchema.parse({ threadId: "t", status: "bogus" })).toThrow();
+    const r = ThreadListResult.parse({ ok: true, threads: [info] });
+    expect(r.threads).toHaveLength(1);
+    expect(METHODS.threadList).toBe("thread.list");
   });
 });

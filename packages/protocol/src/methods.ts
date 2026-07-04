@@ -144,6 +144,13 @@ export const PlanRespondResult = z.object({ ok: z.literal(true), alreadyResolved
 export const SessionSetPolicyParams = z.object({ sessionId: z.string().min(1), policy: ApprovalPolicy });
 export const SessionSetPolicyResult = z.object({ ok: z.literal(true) });
 
+export const ThreadInfoSchema = z.object({
+  threadId: z.string(), parentThreadId: z.string().optional(), agentType: z.string().optional(),
+  status: z.enum(["running", "completed"]), stopReason: z.string().optional(),
+});
+export const ThreadListParams = z.object({ sessionId: z.string().min(1) });
+export const ThreadListResult = z.object({ ok: z.literal(true), threads: z.array(ThreadInfoSchema) });
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -169,4 +176,5 @@ export const METHODS = {
   taskList: "task.list",
   planRespond: "plan.respond",
   sessionSetPolicy: "session.setPolicy",
+  threadList: "thread.list",
 } as const;

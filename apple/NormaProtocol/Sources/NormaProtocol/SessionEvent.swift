@@ -25,6 +25,8 @@ public enum SessionEvent: Codable, Equatable {
     case planResolved(PlanResolved)
     case worktreeEntered(WorktreeEntered)
     case worktreeExited(WorktreeExited)
+    case threadStarted(ThreadStarted)
+    case threadCompleted(ThreadCompleted)
 
     public struct SessionCreated: Codable, Equatable {
         public let seq: Int
@@ -262,6 +264,24 @@ public enum SessionEvent: Codable, Equatable {
         public let removed: Bool
     }
 
+    public struct ThreadStarted: Codable, Equatable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let parentThreadId: String
+        public let agentType: String
+        public let prompt: String
+    }
+
+    public struct ThreadCompleted: Codable, Equatable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let stopReason: String
+    }
+
     private enum Discriminator: String, Codable {
         case session_created
         case harness_attached
@@ -287,6 +307,8 @@ public enum SessionEvent: Codable, Equatable {
         case plan_resolved
         case worktree_entered
         case worktree_exited
+        case thread_started
+        case thread_completed
     }
 
     private enum TypeKey: String, CodingKey { case type }
@@ -318,6 +340,8 @@ public enum SessionEvent: Codable, Equatable {
         case .plan_resolved:        self = .planResolved(try PlanResolved(from: decoder))
         case .worktree_entered:     self = .worktreeEntered(try WorktreeEntered(from: decoder))
         case .worktree_exited:      self = .worktreeExited(try WorktreeExited(from: decoder))
+        case .thread_started:       self = .threadStarted(try ThreadStarted(from: decoder))
+        case .thread_completed:     self = .threadCompleted(try ThreadCompleted(from: decoder))
         }
     }
 
@@ -419,6 +443,14 @@ public enum SessionEvent: Codable, Equatable {
             try v.encode(to: encoder)
             var c = encoder.container(keyedBy: TypeKey.self)
             try c.encode(Discriminator.worktree_exited.rawValue, forKey: .type)
+        case .threadStarted(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.thread_started.rawValue, forKey: .type)
+        case .threadCompleted(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.thread_completed.rawValue, forKey: .type)
         }
     }
 }

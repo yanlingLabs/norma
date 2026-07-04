@@ -1,0 +1,8 @@
+{
+  "type": "thread_completed",
+  "sessionId": "s_1",
+  "threadId": "th_child1",
+  "seq": 18,
+  "ts": 1700000000008,
+  "stopReason": "end_turn"
+}

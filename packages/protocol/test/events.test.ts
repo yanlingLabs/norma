@@ -141,6 +141,19 @@ describe("SessionEvent discriminated union", () => {
     expect(SessionEvent.safeParse({ ...t, type: "worktree_entered", name: "n", path: "/p", branch: "" }).success).toBe(false);
     expect(SessionEvent.safeParse({ ...t, type: "worktree_exited", name: "n", action: "delete", removed: false }).success).toBe(false);
   });
+
+  test("thread_started / thread_completed round-trip", () => {
+    const ts = { type: "thread_started", sessionId: "s", threadId: "th_child1", seq: 1, ts: 1, parentThreadId: "main", agentType: "researcher", prompt: "Summarize the auth module" } as const;
+    expect(SessionEvent.parse(ts)).toEqual(ts);
+    const tc = { type: "thread_completed", sessionId: "s", threadId: "th_child1", seq: 2, ts: 2, stopReason: "end_turn" } as const;
+    expect(SessionEvent.parse(tc)).toEqual(tc);
+  });
+
+  test("thread_started rejects empty parentThreadId; thread_completed rejects bad stopReason", () => {
+    const t = { sessionId: "s", threadId: "th_child1", seq: 1, ts: 1 };
+    expect(SessionEvent.safeParse({ ...t, type: "thread_started", parentThreadId: "", agentType: "researcher", prompt: "x" }).success).toBe(false);
+    expect(SessionEvent.safeParse({ ...t, type: "thread_completed", stopReason: "bogus" }).success).toBe(false);
+  });
 });
 
 describe("hello method schemas", () => {

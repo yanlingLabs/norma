@@ -1,0 +1,10 @@
+{
+  "type": "thread_started",
+  "sessionId": "s_1",
+  "threadId": "th_child1",
+  "seq": 17,
+  "ts": 1700000000007,
+  "parentThreadId": "main",
+  "agentType": "researcher",
+  "prompt": "Summarize the auth module"
+}

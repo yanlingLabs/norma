@@ -99,6 +99,13 @@ export const WorktreeExitedEvent = ThreadBase.extend({
   type: z.literal("worktree_exited"), name: z.string().min(1), action: z.enum(["keep", "remove"]), removed: z.boolean(),
 });
 
+export const ThreadStartedEvent = ThreadBase.extend({
+  type: z.literal("thread_started"), parentThreadId: z.string().min(1), agentType: z.string(), prompt: z.string(),
+});
+export const ThreadCompletedEvent = ThreadBase.extend({
+  type: z.literal("thread_completed"), stopReason: z.enum(["end_turn", "aborted", "error"]),
+});
+
 export const SessionEvent = z.discriminatedUnion("type", [
   SessionCreatedEvent,
   HarnessAttachedEvent,
@@ -124,6 +131,8 @@ export const SessionEvent = z.discriminatedUnion("type", [
   PlanResolvedEvent,
   WorktreeEnteredEvent,
   WorktreeExitedEvent,
+  ThreadStartedEvent,
+  ThreadCompletedEvent,
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 
