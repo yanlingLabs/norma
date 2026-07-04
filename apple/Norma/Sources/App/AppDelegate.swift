@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Combine
 import NormaKit
 
 @MainActor
@@ -9,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var orbController: OrbWindowController?
     private var stickiness: StickinessEngine?
     private var startTask: Task<Void, Never>?
+    private var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -47,6 +49,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let orb = OrbWindowController(session: model.session)
         orbController = orb
 
+        orb.onSubmit = { [weak self] text in
+            Task { @MainActor in
+                guard let self, let model = self.appModel else { return }
+                if await model.sendOrSteer(text) { Haptics.messageSent() }
+            }
+        }
+        orb.onEsc = { [weak self] in
+            guard let self, self.appModel?.session.state.turnRunning == true else { return false }
+            Task { await self.appModel?.interruptTurn() }
+            return true
+        }
+
         let sticky = StickinessEngine(onTarget: { [weak orb] target in
             orb?.follower.setMagneticTarget(target)
         })
@@ -57,6 +71,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sticky?.updateCursorLocation(location)
         }
 
+        // Trigger sources + Combine wiring: never armed under unit tests. MultitouchTrigger
+        // dlopens a private framework the xctest host shouldn't touch, and these sinks have
+        // nothing to observe in the degraded test boot path anyway.
+        if !Self.isRunningUnitTests {
+            MultitouchTrigger.shared.start()
+            HotkeyTrigger.shared.start()
+
+            TriggerHub.shared.didTrigger
+                .sink { [weak orb] in
+                    Haptics.gestureRecognized()
+                    orb?.toggleField()
+                }
+                .store(in: &cancellables)
+
+            var lastPendingApprovalCount = model.session.state.pendingApprovalIds.count
+            model.session.$state
+                .sink { state in
+                    let count = state.pendingApprovalIds.count
+                    if count > lastPendingApprovalCount {
+                        Haptics.approvalRequested()
+                    }
+                    lastPendingApprovalCount = count
+                }
+                .store(in: &cancellables)
+        }
+
         let mb = MenuBarController(
             statusLine: { [weak model] in
                 tokenMissing ? "no daemon token — run `norma daemon run`, then relaunch"
@@ -65,6 +105,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             toggleOrb: { [weak self] in
                 self?.orbController?.toggle()
                 self?.menuBar?.setOrbVisible(self?.orbController?.isVisible ?? false)
+            },
+            summonField: {
+                TriggerHub.shared.fire(from: "menu")
             },
             quit: { NSApp.terminate(nil) }
         )

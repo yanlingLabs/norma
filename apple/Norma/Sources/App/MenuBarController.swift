@@ -4,14 +4,22 @@ import AppKit
 final class MenuBarController {
     private let statusLine: () -> String
     private let toggleOrb: () -> Void
+    private let summonField: () -> Void
     private let quitApplication: () -> Void
     private var statusItem: NSStatusItem?
     private let stateItem = NSMenuItem(title: "starting…", action: nil, keyEquivalent: "")
     private let orbItem = NSMenuItem(title: "Hide Orb", action: #selector(didToggleOrb), keyEquivalent: "o")
+    private let summonFieldItem = NSMenuItem(title: "Summon Field", action: #selector(didSummonField), keyEquivalent: "")
 
-    init(statusLine: @escaping () -> String, toggleOrb: @escaping () -> Void, quit: @escaping () -> Void) {
+    init(
+        statusLine: @escaping () -> String,
+        toggleOrb: @escaping () -> Void,
+        summonField: @escaping () -> Void,
+        quit: @escaping () -> Void
+    ) {
         self.statusLine = statusLine
         self.toggleOrb = toggleOrb
+        self.summonField = summonField
         self.quitApplication = quit
     }
 
@@ -26,6 +34,8 @@ final class MenuBarController {
         menu.addItem(.separator())
         orbItem.target = self
         menu.addItem(orbItem)
+        summonFieldItem.target = self
+        menu.addItem(summonFieldItem)
         menu.addItem(.separator())
         let quitItem = NSMenuItem(title: "Quit Norma", action: #selector(didQuit), keyEquivalent: "q")
         quitItem.target = self
@@ -45,5 +55,6 @@ final class MenuBarController {
     }
 
     @objc private func didToggleOrb() { toggleOrb() }
+    @objc private func didSummonField() { summonField() }
     @objc private func didQuit() { quitApplication() }
 }
