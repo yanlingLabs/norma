@@ -33,6 +33,7 @@ let socketPath = args.socket ?? NormaPaths.socketPath()
 let token: String
 if let t = args.token { token = t }
 else {
+    out("reading harness token from Keychain — a permission prompt may appear; pass --token to skip")
     do { token = try KeychainToken.readHarnessToken() }
     catch {
         out("cannot read harness token from Keychain (\(error)) — is the daemon installed? Or pass --token.")
@@ -64,7 +65,7 @@ Task {
             // session.send requires an attached connection (hub membership check). Attach from
             // the session's CURRENT lastSeq so the replay is empty — fire-and-forget send.
             guard let session = try await client.listSessions().first(where: { $0.sessionId == sid }) else {
-                out("unknown session: \(sid)"); exit(2)
+                out("unknown session: \(sid)"); exit(1)
             }
             _ = try await client.attach(sessionId: sid, fromSeq: session.lastSeq)
             let text = args.positional.dropFirst().joined(separator: " ")
@@ -76,12 +77,14 @@ Task {
             out("attached to \(sid) (server lastSeq \(last)) — streaming, Ctrl-C to quit")
             var midStream = false
             for await ev in client.events {
-                switch ev {
-                case .session(.assistantDelta(let d)):
+                if case .session(.assistantDelta(let d)) = ev {
                     out(d.delta, newline: false) // token streaming, no newline
                     midStream = true
+                    continue
+                }
+                if midStream { out(""); midStream = false } // terminate the streamed line first
+                switch ev {
                 case .session(let e):
-                    if midStream { out(""); midStream = false } // terminate the streamed line
                     let line = summarize(e)
                     if !line.isEmpty { out(line) }
                 case .unknown(let raw):
