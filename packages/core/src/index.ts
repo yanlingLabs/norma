@@ -38,3 +38,4 @@ export { Compactor, SUMMARIZE_INSTRUCTION } from "./agent/compactor";
 export { bashLooksSafe, BashReviewer, REVIEW_INSTRUCTION, type ReviewVerdict } from "./agent/reviewer";
 export { McpManager, type McpServerStatus, type McpServerConfig } from "./agent/mcp/manager";
 export { WorktreeManager, type ActiveWorktree } from "./agent/worktree";
+export { SubagentManager, type SubagentResult } from "./agent/subagents";
