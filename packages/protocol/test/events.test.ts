@@ -53,6 +53,12 @@ describe("SessionEvent discriminated union", () => {
     for (const e of events) expect(SessionEvent.parse(e).type).toBe(e.type);
   });
 
+  test("assistant_delta parses; empty delta rejected", () => {
+    const e = { ...base, threadId: "main", type: "assistant_delta", delta: "wor" } as const;
+    expect(SessionEvent.parse(e)).toEqual(e);
+    expect(() => SessionEvent.parse({ ...base, threadId: "main", type: "assistant_delta", delta: "" })).toThrow();
+  });
+
   test("directory_added variant parses", () => {
     const e = { ...base, threadId: "main", type: "directory_added", path: "/opt/data", persisted: true };
     expect(SessionEvent.parse(e)).toMatchObject({ type: "directory_added", path: "/opt/data", persisted: true });

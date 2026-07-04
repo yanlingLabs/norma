@@ -1,12 +1,13 @@
 import Foundation
 
-public enum SessionEvent: Codable, Equatable {
+public enum SessionEvent: Codable, Equatable, Sendable {
     case sessionCreated(SessionCreated)
     case harnessAttached(HarnessAttached)
     case harnessDetached(HarnessDetached)
     case userMessage(UserMessage)
     case turnStarted(TurnStarted)
     case assistantMessage(AssistantMessage)
+    case assistantDelta(AssistantDelta)
     case toolCall(ToolCall)
     case toolResult(ToolResult)
     case approvalRequested(ApprovalRequested)
@@ -28,28 +29,28 @@ public enum SessionEvent: Codable, Equatable {
     case threadStarted(ThreadStarted)
     case threadCompleted(ThreadCompleted)
 
-    public struct SessionCreated: Codable, Equatable {
+    public struct SessionCreated: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
         public let scope: String
     }
 
-    public struct HarnessAttached: Codable, Equatable {
+    public struct HarnessAttached: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
         public let clientName: String
     }
 
-    public struct HarnessDetached: Codable, Equatable {
+    public struct HarnessDetached: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
         public let clientName: String
     }
 
-    public struct UserMessage: Codable, Equatable {
+    public struct UserMessage: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -58,14 +59,14 @@ public enum SessionEvent: Codable, Equatable {
         public let clientName: String
     }
 
-    public struct TurnStarted: Codable, Equatable {
+    public struct TurnStarted: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
         public let threadId: String
     }
 
-    public struct AssistantMessage: Codable, Equatable {
+    public struct AssistantMessage: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -73,7 +74,17 @@ public enum SessionEvent: Codable, Equatable {
         public let text: String
     }
 
-    public struct ToolCall: Codable, Equatable {
+    /// TRANSIENT streaming chunk — broadcast-only, never persisted/replayed; seq is the store's
+    /// lastSeq at broadcast time. Exempt from seq-based dedupe and lastSeq tracking (see NormaKit).
+    public struct AssistantDelta: Codable, Equatable, Sendable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let delta: String
+    }
+
+    public struct ToolCall: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -83,7 +94,7 @@ public enum SessionEvent: Codable, Equatable {
         public let argsJson: String
     }
 
-    public struct ToolResult: Codable, Equatable {
+    public struct ToolResult: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -93,7 +104,7 @@ public enum SessionEvent: Codable, Equatable {
         public let isError: Bool
     }
 
-    public struct ApprovalRequested: Codable, Equatable {
+    public struct ApprovalRequested: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -103,7 +114,7 @@ public enum SessionEvent: Codable, Equatable {
         public let summary: String
     }
 
-    public struct ApprovalResolved: Codable, Equatable {
+    public struct ApprovalResolved: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -113,7 +124,7 @@ public enum SessionEvent: Codable, Equatable {
         public let by: String
     }
 
-    public struct TurnCompleted: Codable, Equatable {
+    public struct TurnCompleted: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -123,7 +134,7 @@ public enum SessionEvent: Codable, Equatable {
         public let outputTokens: Int
     }
 
-    public struct AgentError: Codable, Equatable {
+    public struct AgentError: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -131,7 +142,7 @@ public enum SessionEvent: Codable, Equatable {
         public let message: String
     }
 
-    public struct DirectoryAdded: Codable, Equatable {
+    public struct DirectoryAdded: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -140,7 +151,7 @@ public enum SessionEvent: Codable, Equatable {
         public let persisted: Bool
     }
 
-    public struct BgTaskStarted: Codable, Equatable {
+    public struct BgTaskStarted: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -149,7 +160,7 @@ public enum SessionEvent: Codable, Equatable {
         public let command: String
     }
 
-    public struct BgTaskOutput: Codable, Equatable {
+    public struct BgTaskOutput: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -158,7 +169,7 @@ public enum SessionEvent: Codable, Equatable {
         public let chunk: String
     }
 
-    public struct BgTaskExited: Codable, Equatable {
+    public struct BgTaskExited: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -168,7 +179,7 @@ public enum SessionEvent: Codable, Equatable {
         public let killed: Bool
     }
 
-    public struct Checkpoint: Codable, Equatable {
+    public struct Checkpoint: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -177,26 +188,26 @@ public enum SessionEvent: Codable, Equatable {
         public let uptoSeq: Int
     }
 
-    public struct QuestionOption: Codable, Equatable {
+    public struct QuestionOption: Codable, Equatable, Sendable {
         public let label: String
         public let description: String?
     }
 
-    public struct Question: Codable, Equatable {
+    public struct Question: Codable, Equatable, Sendable {
         public let question: String
         public let header: String
         public let options: [QuestionOption]
         public let multiSelect: Bool
     }
 
-    public struct Task: Codable, Equatable {
+    public struct Task: Codable, Equatable, Sendable {
         public let id: String
         public let subject: String
         public let status: String
         public let activeForm: String?
     }
 
-    public struct QuestionAsked: Codable, Equatable {
+    public struct QuestionAsked: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -205,7 +216,7 @@ public enum SessionEvent: Codable, Equatable {
         public let questions: [Question]
     }
 
-    public struct QuestionResolved: Codable, Equatable {
+    public struct QuestionResolved: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -215,7 +226,7 @@ public enum SessionEvent: Codable, Equatable {
         public let by: String
     }
 
-    public struct TaskUpdated: Codable, Equatable {
+    public struct TaskUpdated: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -223,7 +234,7 @@ public enum SessionEvent: Codable, Equatable {
         public let task: Task
     }
 
-    public struct PlanPresented: Codable, Equatable {
+    public struct PlanPresented: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -232,7 +243,7 @@ public enum SessionEvent: Codable, Equatable {
         public let plan: String
     }
 
-    public struct PlanResolved: Codable, Equatable {
+    public struct PlanResolved: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -244,7 +255,7 @@ public enum SessionEvent: Codable, Equatable {
         public let by: String
     }
 
-    public struct WorktreeEntered: Codable, Equatable {
+    public struct WorktreeEntered: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -254,7 +265,7 @@ public enum SessionEvent: Codable, Equatable {
         public let branch: String
     }
 
-    public struct WorktreeExited: Codable, Equatable {
+    public struct WorktreeExited: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -264,7 +275,7 @@ public enum SessionEvent: Codable, Equatable {
         public let removed: Bool
     }
 
-    public struct ThreadStarted: Codable, Equatable {
+    public struct ThreadStarted: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -274,7 +285,7 @@ public enum SessionEvent: Codable, Equatable {
         public let prompt: String
     }
 
-    public struct ThreadCompleted: Codable, Equatable {
+    public struct ThreadCompleted: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
         public let ts: Int
@@ -289,6 +300,7 @@ public enum SessionEvent: Codable, Equatable {
         case user_message
         case turn_started
         case assistant_message
+        case assistant_delta
         case tool_call
         case tool_result
         case approval_requested
@@ -322,6 +334,7 @@ public enum SessionEvent: Codable, Equatable {
         case .user_message:         self = .userMessage(try UserMessage(from: decoder))
         case .turn_started:         self = .turnStarted(try TurnStarted(from: decoder))
         case .assistant_message:    self = .assistantMessage(try AssistantMessage(from: decoder))
+        case .assistant_delta:      self = .assistantDelta(try AssistantDelta(from: decoder))
         case .tool_call:            self = .toolCall(try ToolCall(from: decoder))
         case .tool_result:          self = .toolResult(try ToolResult(from: decoder))
         case .approval_requested:   self = .approvalRequested(try ApprovalRequested(from: decoder))
@@ -371,6 +384,10 @@ public enum SessionEvent: Codable, Equatable {
             try v.encode(to: encoder)
             var c = encoder.container(keyedBy: TypeKey.self)
             try c.encode(Discriminator.assistant_message.rawValue, forKey: .type)
+        case .assistantDelta(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.assistant_delta.rawValue, forKey: .type)
         case .toolCall(let v):
             try v.encode(to: encoder)
             var c = encoder.container(keyedBy: TypeKey.self)
