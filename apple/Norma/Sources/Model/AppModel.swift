@@ -62,7 +62,10 @@ final class AppModel: ObservableObject {
     func ensureFocusedSession() async -> String? {
         if let sid = focusedSessionId { return sid }
         guard let created = try? await client.createSession(scope: "global", cwd: NSHomeDirectory()) else { return nil }
-        selfCreatedSessionId = created.sessionId // the broadcast for our own create must not re-refocus
+        // The daemon broadcasts session_created BEFORE the RPC response returns; the pump may
+        // have already refocused us onto the new session. Idempotent skip — never double-attach.
+        if focusedSessionId == created.sessionId { return focusedSessionId }
+        selfCreatedSessionId = created.sessionId // belt: suppress the broadcast if it arrives AFTER us
         await refocus(onto: created.sessionId)
         return focusedSessionId
     }
@@ -109,6 +112,8 @@ final class AppModel: ObservableObject {
     }
 
     private func refocus(onto sessionId: String) async {
+        // Idempotent: already focused AND attached to this session — nothing to do.
+        if sessionId == focusedSessionId, await client.attachedSession == sessionId { return }
         session.reset()
         focusedSessionId = sessionId
         // Full replay from 0 rebuilds tasks/pending state through the reducer.

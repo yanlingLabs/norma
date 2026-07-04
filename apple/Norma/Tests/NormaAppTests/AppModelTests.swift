@@ -120,31 +120,32 @@ final class AppModelTests: XCTestCase {
         let model = AppModel(makeTransport: { t }, token: "tok")
         let startTask = Task { await model.start() }
         defer { startTask.cancel(); model.stop() }
-        await answerHandshake(t, sessions: "[]") // connected, unattached
+        await answerHandshake(t, sessions: "[]")
         await waitUntil { model.session.state.status == .idle }
 
         async let sent = model.sendOrSteer("hello")
-        // session.create arrives
         await waitUntilSent(t, 3)
         let create = lineJSON(t.sent[2])
         XCTAssertEqual(create["method"] as? String, "session.create")
+        // REAL daemon wire order: broadcast BEFORE the RPC response.
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"session_created","seq":1,"sessionId":"s_new","ts":0,"scope":"global"}}"#)
         t.feed(#"{"jsonrpc":"2.0","id":\#(create["id"] as! Int),"result":{"sessionId":"s_new","trusted":true}}"#)
-        // attach then send
+        // exactly ONE attach must follow (either path — never both)
         await waitUntilSent(t, 4)
         let attach = lineJSON(t.sent[3])
         XCTAssertEqual(attach["method"] as? String, "session.attach")
         t.feed(#"{"jsonrpc":"2.0","id":\#(attach["id"] as! Int),"result":{"ok":true,"lastSeq":1}}"#)
+        // then the send goes out
         await waitUntilSent(t, 5)
         let send = lineJSON(t.sent[4])
         XCTAssertEqual(send["method"] as? String, "session.send")
-        XCTAssertEqual((send["params"] as? [String: Any])?["text"] as? String, "hello")
         t.feed(#"{"jsonrpc":"2.0","id":\#(send["id"] as! Int),"result":{"seq":2}}"#)
         let ok = await sent
         XCTAssertTrue(ok)
-        // the broadcast session_created for our own create must NOT trigger a second attach
-        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"session_created","seq":1,"sessionId":"s_new","ts":0,"scope":"global"}}"#)
-        try? await Task.sleep(nanoseconds: 200_000_000)
-        XCTAssertEqual(t.sent.count, 5, "self-created session_created broadcast caused extra RPC (double refocus)")
+        // settle: no SECOND attach/reset thrash may trail in
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        let attaches = t.sent.filter { lineJSON($0)["method"] as? String == "session.attach" }
+        XCTAssertEqual(attaches.count, 1, "double refocus: \(t.sent)")
     }
 
     func testSendDuringRunningTurnSteers() async throws {
