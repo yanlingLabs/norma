@@ -29,12 +29,7 @@ final class AXScanner: @unchecked Sendable {
 
         let systemWide = AXUIElementCreateSystemWide()
         var elementRef: AXUIElement?
-        let hitError = withUnsafeMutablePointer(to: &elementRef) { ptr -> AXError in
-            var cfEl: AXUIElement?
-            let err = AXUIElementCopyElementAtPosition(systemWide, Float(axPoint.x), Float(axPoint.y), &cfEl)
-            ptr.pointee = cfEl
-            return err
-        }
+        let hitError = AXUIElementCopyElementAtPosition(systemWide, Float(axPoint.x), Float(axPoint.y), &elementRef)
         guard hitError == .success, let hit = elementRef else { return .emptyTree }
 
         var pid: pid_t = 0

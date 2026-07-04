@@ -39,4 +39,13 @@ final class StickinessPolicyTests: XCTestCase {
         let t = stickyTarget(cursor: CGPoint(x: 100, y: 185), current: a.center, candidates: [a, c])
         XCTAssertEqual(t, a.center)
     }
+
+    func testHeldAbsentFromCandidatesDoesNotSwitchToFartherCandidate() {
+        // held at 30pt (inside release), NOT in the candidates array (AX re-layout blip);
+        // another candidate at 38pt is inside switchRadius but FARTHER than held → keep held
+        let held = CGPoint(x: 100, y: 130) // 30pt above cursor
+        let far = ClickableCandidate(center: CGPoint(x: 100, y: 62), frame: .zero) // 38pt below cursor
+        let t = stickyTarget(cursor: CGPoint(x: 100, y: 100), current: held, candidates: [far])
+        XCTAssertEqual(t, held)
+    }
 }

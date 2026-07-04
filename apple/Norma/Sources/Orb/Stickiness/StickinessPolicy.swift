@@ -13,6 +13,7 @@ enum StickinessConstants {
     static let scanDeadline: TimeInterval = 0.025
     static let maxConsecutiveFailures = 3
     static let rescanInterval: TimeInterval = 0.05 // v1 20 Hz cadence, now event-driven
+    static let degradedProbeInterval: TimeInterval = 1.0 // slow recovery probe while degraded
 }
 
 /// PURE sticky-target policy (D1: policy on main, scanning elsewhere).
@@ -22,7 +23,8 @@ func stickyTarget(cursor: CGPoint, current: CGPoint?, candidates: [ClickableCand
 
     if let held = current, dist(held) <= StickinessConstants.releaseRadius {
         // Hysteresis hold — but a candidate RIGHT under the cursor wins deliberately.
-        if let n = nearest, dist(n.center) <= StickinessConstants.switchRadius, n.center != held {
+        if let n = nearest, dist(n.center) <= StickinessConstants.switchRadius,
+           n.center != held, dist(n.center) < dist(held) {
             return n.center
         }
         return held

@@ -19,6 +19,7 @@ final class StickinessEngine {
     private var degradedPid: pid_t = 0
     private var lastPid: pid_t = 0 // main-actor copy fed by finishScan — never read scanner state from main
     private var retriedAfterPoke = false
+    private var retryPending = false
     private var activationObserver: NSObjectProtocol?
 
     init(onTarget: @escaping (CGPoint?) -> Void) {
@@ -67,17 +68,19 @@ final class StickinessEngine {
         onTarget(t)
     }
 
-    private func maybeScan() {
+    private func maybeScan(force: Bool = false) {
         guard !scanInFlight, let cursor = pendingCursor else { return }
         let now = CFAbsoluteTimeGetCurrent()
-        guard now - lastScanAt >= StickinessConstants.rescanInterval else { return }
-        guard degradedPid == 0 || lastPid != degradedPid else { return }
+        // While degraded, don't block scanning outright — probe at a slow cadence so
+        // recovery (cursor moves off the dead app, or the app heals) is reachable.
+        let interval = degradedPid != 0 ? StickinessConstants.degradedProbeInterval : StickinessConstants.rescanInterval
+        guard force || now - lastScanAt >= interval else { return }
 
         scanInFlight = true
         lastScanAt = now
         pendingCursor = nil
 
-        queue.async { [weak self, scanner] in
+        queue.async { [scanner] in
             let result = scanner.scan(around: cursor, deadline: StickinessConstants.scanDeadline)
             let pid = scanner.lastHitPid
             Task { @MainActor [weak self] in
@@ -89,10 +92,18 @@ final class StickinessEngine {
     private func finishScan(_ result: ScanResult, pid: pid_t, cursor: CGPoint) {
         scanInFlight = false
         lastPid = pid
+        if degradedPid != 0, pid != 0, pid != degradedPid {
+            // Cursor landed on a different, healthy app — recover immediately.
+            // Pokes stay recorded; they're still valid for that other app.
+            degradedPid = 0
+            consecutiveFailures = 0
+            retriedAfterPoke = false
+        }
         switch result {
         case .candidates(let found):
             consecutiveFailures = 0
             retriedAfterPoke = false
+            degradedPid = 0 // a successful scan (even a probe on the same app) heals it
             candidates = found
             applyPolicy(cursor: cursor)
         case .emptyTree:
@@ -101,8 +112,12 @@ final class StickinessEngine {
                 // delayed retry before it counts as a failure.
                 retriedAfterPoke = true
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-                    self?.pendingCursor = cursor
-                    self?.maybeScan()
+                    guard let self else { return }
+                    self.pendingCursor = cursor
+                    // A cadence-driven scan may have just run and updated lastScanAt,
+                    // which would otherwise swallow this retry with a stationary cursor.
+                    if self.scanInFlight { self.retryPending = true }
+                    self.maybeScan(force: true)
                 }
                 return
             }
@@ -111,7 +126,12 @@ final class StickinessEngine {
             registerFailure(pid: pid)
         }
         // A pending cursor that arrived mid-scan gets its scan now.
-        maybeScan()
+        if retryPending {
+            retryPending = false
+            maybeScan(force: true)
+        } else {
+            maybeScan()
+        }
     }
 
     private func registerFailure(pid: pid_t) {
