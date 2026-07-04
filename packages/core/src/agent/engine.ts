@@ -197,6 +197,24 @@ export class AgentEngine {
     return input;
   }
 
+  // Computed ONCE per turn by turn() (same one-per-turn rule as `instructions` itself) — a
+  // same-turn ToolSearch load changes `loaded` but must not re-trigger this mid-turn; and the
+  // plan-mode reminder is appended off the policy at turn start, not re-checked per round, so an
+  // in-turn exit_plan_mode approval (which mutates `meta.approvalPolicy` for the REST of this
+  // turn) does not retroactively add/remove this reminder mid-turn.
+  private buildInstructionsFull(base: string, cwd: string, loaded: Set<string>, policy: "ask" | "auto" | "plan"): string {
+    const tsEnabled = this.toolSearchEnabled();
+    const deferThreshold = this.toolSearchThreshold();
+    const deferred = tsEnabled ? this.cfg.registry.deferredIndex(cwd, loaded, deferThreshold) : [];
+    let instructionsFull = deferred.length
+      ? base + "\n\n# Deferred tools\nThe following tools exist but their schemas are NOT loaded — calling them directly fails. Load schemas first with the ToolSearch tool (query \"select:<name>\" or keywords), then call them normally.\n" + deferred.map((d) => `- ${d.name} — ${d.description}`).join("\n")
+      : base;
+    if (policy === "plan") {
+      instructionsFull += "\n\n# Plan mode\nYou are in plan mode: research and form a plan, but make NO changes — file edits, writes, and commands are disabled and will be blocked. When your plan is ready, call exit_plan_mode with the plan (markdown) to present it for approval. Only after approval will editing be enabled.";
+    }
+    return instructionsFull;
+  }
+
   private async turn(sessionId: string, signal: AbortSignal): Promise<void> {
     const meta = this.cfg.store.meta(sessionId);
     const threadId = MAIN_THREAD;
@@ -228,43 +246,72 @@ export class AgentEngine {
     // to execute's defense-in-depth check, all within this one turn, without re-reading anything.
     if (!this.loadedTools.has(sessionId)) this.loadedTools.set(sessionId, new Set());
     const loaded = this.loadedTools.get(sessionId)!;
-    const tsEnabled = this.toolSearchEnabled();
-    const deferThreshold = this.toolSearchThreshold();
-    const deferred = tsEnabled ? this.cfg.registry.deferredIndex(cwd, loaded, deferThreshold) : [];
-    // Appended ONCE per turn, right after assemble (same one-per-turn rule as `instructions`
-    // above) — a same-turn ToolSearch load changes `loaded` but must not re-trigger this section
-    // mid-turn; deferred/instructionsFull are computed once here and reused for every round.
-    let instructionsFull = deferred.length
-      ? instructions + "\n\n# Deferred tools\nThe following tools exist but their schemas are NOT loaded — calling them directly fails. Load schemas first with the ToolSearch tool (query \"select:<name>\" or keywords), then call them normally.\n" + deferred.map((d) => `- ${d.name} — ${d.description}`).join("\n")
-      : instructions;
-    // Same one-per-turn rule as above: computed off the policy at turn start, not re-checked per
-    // round — an in-turn exit_plan_mode approval (which mutates `meta.approvalPolicy` for the
-    // REST of this turn) does not retroactively add/remove this reminder mid-turn.
-    if (meta.approvalPolicy === "plan") {
-      instructionsFull += "\n\n# Plan mode\nYou are in plan mode: research and form a plan, but make NO changes — file edits, writes, and commands are disabled and will be blocked. When your plan is ready, call exit_plan_mode with the plan (markdown) to present it for approval. Only after approval will editing be enabled.";
-    }
+    const instructionsFull = this.buildInstructionsFull(instructions, cwd, loaded, meta.approvalPolicy);
     // Auto-compact BEFORE historyInput is built, so a triggered compaction's checkpoint is
     // reflected in this turn's input. A compaction failure degrades to a normal (uncompacted)
     // turn rather than breaking it.
     try { await this.maybeAutoCompact(sessionId); } catch (e) { console.error("auto-compact failed", e); }
     const input = this.historyInput(sessionId);
+
+    await this.runThread({
+      sessionId,
+      threadId: MAIN_THREAD,
+      instructionsFull,
+      input,
+      cwd,
+      model: this.cfg.provider.model,
+      meta,
+      depth: 0,
+      signal,
+      loaded,
+    });
+  }
+
+  /**
+   * The tool-calling loop shared by the main turn (`turn()`, depth 0, threadId MAIN_THREAD) and
+   * (later) sub-agent threads. Steer-queue draining only applies to the main thread — a child
+   * thread has no steer queue of its own.
+   */
+  private async runThread(opts: {
+    sessionId: string;
+    threadId: string;
+    instructionsFull: string;
+    input: TurnInputItem[];
+    cwd: string;
+    model: string;
+    meta: ReturnType<SessionStore["meta"]>;
+    depth: number;
+    signal: AbortSignal;
+    loaded: Set<string>;
+    excludeTools?: Set<string>;
+    allowTools?: Set<string>;
+  }): Promise<{ finalText: string; stopReason: "end_turn" | "aborted" | "error" }> {
+    const { sessionId, threadId, instructionsFull, input, meta, signal, loaded, excludeTools, allowTools } = opts;
+    let cwd = opts.cwd;
+    const tsEnabled = this.toolSearchEnabled();
+    const deferThreshold = this.toolSearchThreshold();
     const usage = { inputTokens: 0, outputTokens: 0 };
+    let lastText = "";
 
     this.emit(sessionId, { type: "turn_started", sessionId, threadId });
 
     for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
-      const steers = this.steerQueue.get(sessionId);
-      if (steers && steers.length) { for (const t of steers) input.push({ type: "message", role: "user", content: t }); steers.length = 0; }
+      if (threadId === MAIN_THREAD) {
+        const steers = this.steerQueue.get(sessionId);
+        if (steers && steers.length) { for (const t of steers) input.push({ type: "message", role: "user", content: t }); steers.length = 0; }
+      }
 
       let textBuf = "";
       const calls: Extract<ProviderEvent, { type: "tool_call" }>[] = [];
       let stop: "end_turn" | "tool_calls" | "aborted" | null = null;
 
       for await (const ev of this.cfg.provider.provider.streamTurn({
-        model: this.cfg.provider.model,
+        model: opts.model,
         instructions: instructionsFull,
         input,
-        tools: this.cfg.registry.specs(cwd, tsEnabled ? { loaded, deferThreshold } : undefined),
+        tools: this.cfg.registry.specs(cwd, tsEnabled ? { loaded, deferThreshold } : undefined)
+          .filter((s) => !excludeTools?.has(s.name))
+          .filter((s) => !allowTools || allowTools.has(s.name)),
         signal,
       })) {
         if (ev.type === "text_delta") textBuf += ev.delta;
@@ -274,23 +321,26 @@ export class AgentEngine {
         else if (ev.type === "error") {
           this.emit(sessionId, { type: "agent_error", sessionId, threadId, message: ev.message });
           this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "error", ...usage });
-          return;
+          return { finalText: lastText, stopReason: "error" };
         }
       }
 
       if (textBuf.length > 0) {
         this.emit(sessionId, { type: "assistant_message", sessionId, threadId, text: textBuf });
         input.push({ type: "message", role: "assistant", content: textBuf });
+        lastText = textBuf;
       }
 
       if (stop !== "tool_calls" || calls.length === 0) {
-        const pending = this.steerQueue.get(sessionId);
-        // A steer landed as we finished → drain at next iteration top, keep going. But an
-        // interrupt must win: an aborted turn ends now with turn_completed(aborted) even if a
-        // steer is queued (it stays queued for the next runTurn, e.g. via steer()'s own restart).
-        if (stop !== "aborted" && pending && pending.length) { continue; }
+        if (threadId === MAIN_THREAD) {
+          const pending = this.steerQueue.get(sessionId);
+          // A steer landed as we finished → drain at next iteration top, keep going. But an
+          // interrupt must win: an aborted turn ends now with turn_completed(aborted) even if a
+          // steer is queued (it stays queued for the next runTurn, e.g. via steer()'s own restart).
+          if (stop !== "aborted" && pending && pending.length) { continue; }
+        }
         this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: stop === "aborted" ? "aborted" : "end_turn", ...usage });
-        return;
+        return { finalText: lastText, stopReason: stop === "aborted" ? "aborted" : "end_turn" };
       }
 
       for (const call of calls) {
@@ -384,6 +434,7 @@ export class AgentEngine {
 
     this.emit(sessionId, { type: "agent_error", sessionId, threadId, message: `tool-iteration cap (${MAX_TOOL_ITERATIONS}) reached` });
     this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "error", ...usage });
+    return { finalText: lastText, stopReason: "error" };
   }
 
   /** Shared approval-request flow for the `ask`-policy path, the reviewer's escalation path, and
