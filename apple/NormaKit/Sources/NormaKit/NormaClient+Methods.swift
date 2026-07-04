@@ -29,14 +29,26 @@ extension NormaClient {
 
     /// Attaches (server replays events with seq > fromSeq). Seeds the client-side dedupe
     /// watermark BEFORE the request so replayed events pass `seq > lastSeq`.
+    ///
+    /// AMENDMENT 5 (carried from Task 8 review): seeding before the await is deliberate (replay
+    /// race safety), but that left attachedSessionId/lastSeq corrupted if the request threw.
+    /// Snapshot the previous values and restore them on any failure before rethrowing.
     public func attach(sessionId: String, fromSeq: Int = 0) async throws -> Int {
+        let previousSessionId = attachedSessionId
+        let previousLastSeq = lastSeq
         attachedSessionId = sessionId
         lastSeq = fromSeq
-        let r = try await request("session.attach", params: obj([
-            "sessionId": .string(sessionId), "fromSeq": .number(Double(fromSeq)),
-        ]))
-        guard let last = r["lastSeq"]?.intValue else { throw RpcError(code: -3, message: "invalid result from server for session.attach") }
-        return last
+        do {
+            let r = try await request("session.attach", params: obj([
+                "sessionId": .string(sessionId), "fromSeq": .number(Double(fromSeq)),
+            ]))
+            guard let last = r["lastSeq"]?.intValue else { throw RpcError(code: -3, message: "invalid result from server for session.attach") }
+            return last
+        } catch {
+            attachedSessionId = previousSessionId
+            lastSeq = previousLastSeq
+            throw error
+        }
     }
 
     public func send(sessionId: String, text: String) async throws -> Int {

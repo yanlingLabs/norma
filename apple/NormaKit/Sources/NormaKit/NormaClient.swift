@@ -15,6 +15,12 @@ public actor NormaClient {
     private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
     private var pumpTask: Task<Void, Never>?
 
+    // Task 9 reconnect flags: `everConnected` gates startReconnect() (never reconnect before the
+    // first successful connect); `deliberatelyClosed` distinguishes a user-initiated close() from
+    // an unexpected transport drop (the latter triggers reconnectLoop, the former must not).
+    var everConnected = false
+    var deliberatelyClosed = false
+
     public nonisolated let events: AsyncStream<NormaEvent>
     nonisolated let eventsCont: AsyncStream<NormaEvent>.Continuation // internal: Task 9's reconnect extension yields states
 
@@ -51,9 +57,16 @@ public actor NormaClient {
             "token": .string(token),
             "clientName": .string(clientName),
         ]))
+        everConnected = true
     }
 
     public func close() {
+        deliberatelyClosed = true
+        // AMENDMENT 3 (carried from Task 7 review): fail pending requests immediately rather than
+        // leaving them to linger until their per-request timeout. ScriptedTransport.close()/most
+        // real transports don't synchronously re-deliver .closed through the pump, so without this
+        // a caller awaiting a request across close() would otherwise wait out the full timeout.
+        failAllPending(RpcError(code: -1, message: "connection closed"))
         transport?.close()
         transport = nil
     }
@@ -84,9 +97,9 @@ public actor NormaClient {
         }
     }
 
-    /// Task 9 replaces this with backoff + reconnect + re-attach. Kept separate so the pump
-    /// logic never changes when reconnection lands.
-    func onDisconnected() {}
+    /// Task 9: backoff + reconnect + re-attach (NormaClient+Reconnect.swift). Kept separate so
+    /// the pump logic never changes when reconnection lands.
+    func onDisconnected() { startReconnect() }
 
     private func route(_ msg: ServerMessage) {
         switch msg {
@@ -135,7 +148,7 @@ public actor NormaClient {
             pending[id] = cont
             Task {
                 do { try await t.send(data + Data([0x0a])) }
-                catch { self.timeOut(id: id, method: method) }
+                catch { self.sendFailed(id: id, method: method) }
             }
         }
     }
@@ -143,6 +156,14 @@ public actor NormaClient {
     private func timeOut(id: Int, method: String) {
         guard let cont = pending.removeValue(forKey: id) else { return }
         cont.resume(throwing: RpcError(code: -2, message: "request timed out: \(method)"))
+    }
+
+    // AMENDMENT 4 (carried from Task 7 review): send failures get their own error/message instead
+    // of reusing the timeout path's "timed out" wording. Mirrors timeOut's exactly-once guard
+    // (remove from `pending` before resuming, so a late timeout/response can't double-resume).
+    private func sendFailed(id: Int, method: String) {
+        guard let cont = pending.removeValue(forKey: id) else { return }
+        cont.resume(throwing: RpcError(code: -5, message: "transport send failed: \(method)"))
     }
 }
 
