@@ -52,6 +52,9 @@ public actor NormaClient {
     }
 
     /// Open the transport, start the read pump, authenticate. Throws on transport or hello failure.
+    /// CONTRACT: a successful return IS the "connected" signal — no `.connection(.connected)`
+    /// event is yielded for the INITIAL connect (AsyncStream pre-iterator buffering would make
+    /// it the first value every consumer sees). Reconnects DO yield `.connection` states.
     public func connect() async throws {
         let t = makeTransport()
         transport = t

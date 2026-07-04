@@ -28,7 +28,17 @@ extension NormaClient {
             do {
                 try await connect() // fresh transport from the factory + hello
                 if let sid = attachedSessionId {
-                    _ = try await attach(sessionId: sid, fromSeq: lastSeq) // resync: replay > lastSeq
+                    do {
+                        _ = try await attach(sessionId: sid, fromSeq: lastSeq) // resync: replay > lastSeq
+                    } catch let e as RpcError where e.code <= -32000 {
+                        // SERVER answered: the connection is healthy but the session is gone
+                        // (e.g. daemon state wiped). Stay connected, detached — the app layer
+                        // decides what to attach next. attach() already restored the previous
+                        // attachedSessionId on throw; clear it: that session is not coming back.
+                        attachedSessionId = nil
+                    }
+                    // transport-layer RpcError (-1/-2/-4/-5) or any other error falls to the
+                    // outer catch below and is retried — after closing the fresh transport.
                 }
                 // Re-check once more: close() may have landed during connect()/attach() (both
                 // await network round-trips). If so, don't surface .connected — close the
@@ -43,6 +53,9 @@ extension NormaClient {
                 eventsCont.yield(.connection(.connected))
                 return
             } catch {
+                // M1: the attempt's fresh transport must not leak while we retry on another.
+                transport?.close()
+                transport = nil
                 attempt += 1
             }
         }
