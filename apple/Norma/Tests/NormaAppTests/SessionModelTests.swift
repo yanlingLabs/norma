@@ -96,6 +96,16 @@ final class SessionModelTests: XCTestCase {
         XCTAssertEqual(s.status, .thinking) // turnRunning was true
     }
 
+    func testReconnectPreservesPendingApprovalStatus() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, turnStarted())
+        s = SessionReducer.reduce(s, approvalRequested(callId: "c1"))
+        s = SessionReducer.reduceConnection(s, .disconnected)
+        XCTAssertEqual(s.status, .disconnected)
+        s = SessionReducer.reduceConnection(s, .connected)
+        XCTAssertEqual(s.status, .approvalNeeded(count: 1)) // pending survives the reconnect
+    }
+
     @MainActor
     func testSessionModelStorePublishesAndMarksConnected() {
         let m = SessionModel()

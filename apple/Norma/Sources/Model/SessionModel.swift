@@ -75,7 +75,9 @@ enum SessionReducer {
         case .disconnected, .reconnecting:
             s.status = .disconnected
         case .connected:
-            s.status = s.turnRunning ? .thinking : .idle
+            s.status = s.pendingApprovalIds.isEmpty
+                ? (s.turnRunning ? .thinking : .idle)
+                : .approvalNeeded(count: s.pendingApprovalIds.count)
         }
         return s
     }
