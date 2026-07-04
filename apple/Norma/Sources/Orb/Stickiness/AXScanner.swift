@@ -49,10 +49,25 @@ final class AXScanner: @unchecked Sendable {
 
         var found: [ClickableCandidate] = []
         var visited = 0
-        var stack: [AXUIElement] = roots
+        var prunedSubtrees = 0
+        // FIFO queue (index-based head, no Deque dep) — BFS instead of DFS so shallow
+        // toolbar/tab elements near the cursor are reached before a large content
+        // subtree (browser web area, terminal scrollback) can burn the whole deadline.
+        var queue: [AXUIElement] = roots
+        var head = 0
         var sawAnyChild = false
 
-        while let el = stack.popLast() {
+        // Box approximation of the scan circle — over-inclusive at the corners,
+        // never under, so pruning never drops a real candidate.
+        let scanCircleBounds = CGRect(
+            x: axPoint.x - StickinessConstants.scanRadius,
+            y: axPoint.y - StickinessConstants.scanRadius,
+            width: StickinessConstants.scanRadius * 2,
+            height: StickinessConstants.scanRadius * 2)
+
+        while head < queue.count {
+            let el = queue[head]
+            head += 1
             visited += 1
             // A fruitless over-deadline walk is a real timeout; but if we've already found
             // candidates near the cursor, partial results are useful — return them instead
@@ -60,40 +75,50 @@ final class AXScanner: @unchecked Sendable {
             if visited % 32 == 0, CFAbsoluteTimeGetCurrent() - start > deadline {
                 let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
                 if !found.isEmpty {
-                    OrbDebug.log("ax scan: candidates(\(found.count)) (deadline, partial) pid=\(pid) roots=\(roots.count) visited=\(visited) elapsedMs=\(elapsedMs)")
+                    OrbDebug.log("ax scan: candidates(\(found.count)) (deadline, partial) pid=\(pid) roots=\(roots.count) visited=\(visited) prunedSubtrees=\(prunedSubtrees) elapsedMs=\(elapsedMs)")
                     return .candidates(found)
                 }
-                OrbDebug.log("ax scan: timedOut (deadline) pid=\(pid) roots=\(roots.count) visited=\(visited) elapsedMs=\(elapsedMs)")
+                OrbDebug.log("ax scan: timedOut (deadline) pid=\(pid) roots=\(roots.count) visited=\(visited) prunedSubtrees=\(prunedSubtrees) elapsedMs=\(elapsedMs)")
                 return .timedOut
             }
             if visited >= StickinessConstants.maxVisitedNodes {
                 let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
                 if !found.isEmpty {
-                    OrbDebug.log("ax scan: candidates(\(found.count)) (nodeCap, partial) pid=\(pid) roots=\(roots.count) visited=\(visited) elapsedMs=\(elapsedMs)")
+                    OrbDebug.log("ax scan: candidates(\(found.count)) (nodeCap, partial) pid=\(pid) roots=\(roots.count) visited=\(visited) prunedSubtrees=\(prunedSubtrees) elapsedMs=\(elapsedMs)")
                     return .candidates(found)
                 }
-                OrbDebug.log("ax scan: timedOut (nodeCap) pid=\(pid) roots=\(roots.count) visited=\(visited) elapsedMs=\(elapsedMs)")
+                OrbDebug.log("ax scan: timedOut (nodeCap) pid=\(pid) roots=\(roots.count) visited=\(visited) prunedSubtrees=\(prunedSubtrees) elapsedMs=\(elapsedMs)")
                 return .timedOut
             }
 
-            if let role = copyString(el, kAXRoleAttribute), clickableRoles.contains(role),
-               let frame = copyFrame(el) {
+            // Read the frame ONCE per element, then reuse it for both the prune
+            // check and (if not pruned) the collection check below.
+            let frame = copyFrame(el)
+            if let frame, !frame.intersects(scanCircleBounds) {
+                // Outside the scan circle: skip entirely — no collection, no
+                // children enqueued. This is the subtree prune.
+                prunedSubtrees += 1
+                continue
+            }
+
+            if let frame, let role = copyString(el, kAXRoleAttribute), clickableRoles.contains(role) {
                 let center = CGPoint(x: frame.midX, y: frame.midY)
                 if hypot(center.x - axPoint.x, center.y - axPoint.y) <= StickinessConstants.scanRadius {
                     let appKitFrame = toAppKitRect(frame)
                     found.append(ClickableCandidate(center: CGPoint(x: appKitFrame.midX, y: appKitFrame.midY), frame: appKitFrame))
                 }
             }
+            // Frame unreadable (some containers) or readable-and-intersecting: descend.
             if let kids = copyChildren(el) {
                 if !kids.isEmpty { sawAnyChild = true }
-                stack.append(contentsOf: kids)
+                queue.append(contentsOf: kids)
             }
         }
         if found.isEmpty && !sawAnyChild {
-            OrbDebug.log("ax scan: emptyTree (childless) pid=\(pid) roots=\(roots.count) visited=\(visited) elapsedMs=\(Int((CFAbsoluteTimeGetCurrent() - start) * 1000))")
+            OrbDebug.log("ax scan: emptyTree (childless) pid=\(pid) roots=\(roots.count) visited=\(visited) prunedSubtrees=\(prunedSubtrees) elapsedMs=\(Int((CFAbsoluteTimeGetCurrent() - start) * 1000))")
             return .emptyTree
         }
-        OrbDebug.log("ax scan: pid=\(pid) roots=\(roots.count) visited=\(visited) found=\(found.count) elapsedMs=\(Int((CFAbsoluteTimeGetCurrent() - start) * 1000))")
+        OrbDebug.log("ax scan: pid=\(pid) roots=\(roots.count) visited=\(visited) found=\(found.count) prunedSubtrees=\(prunedSubtrees) elapsedMs=\(Int((CFAbsoluteTimeGetCurrent() - start) * 1000))")
         return .candidates(found)
     }
 
