@@ -30,7 +30,10 @@ final class AXScanner: @unchecked Sendable {
         let systemWide = AXUIElementCreateSystemWide()
         var elementRef: AXUIElement?
         let hitError = AXUIElementCopyElementAtPosition(systemWide, Float(axPoint.x), Float(axPoint.y), &elementRef)
-        guard hitError == .success, let hit = elementRef else { return .emptyTree }
+        guard hitError == .success, let hit = elementRef else {
+            OrbDebug.log("ax scan: emptyTree (hitTestFailed) elapsedMs=\(Int((CFAbsoluteTimeGetCurrent() - start) * 1000))")
+            return .emptyTree
+        }
 
         var pid: pid_t = 0
         if AXUIElementGetPid(hit, &pid) == .success, pid != 0 {
@@ -45,7 +48,10 @@ final class AXScanner: @unchecked Sendable {
             }
         }
 
-        guard let window = walkUpToWindow(from: hit) else { return .emptyTree }
+        guard let window = walkUpToWindow(from: hit) else {
+            OrbDebug.log("ax scan: emptyTree (noWindow) elapsedMs=\(Int((CFAbsoluteTimeGetCurrent() - start) * 1000))")
+            return .emptyTree
+        }
         var found: [ClickableCandidate] = []
         var visited = 0
         var stack: [AXUIElement] = [window]
@@ -53,7 +59,27 @@ final class AXScanner: @unchecked Sendable {
 
         while let el = stack.popLast() {
             visited += 1
-            if visited % 32 == 0, CFAbsoluteTimeGetCurrent() - start > deadline { return .timedOut }
+            // A fruitless over-deadline walk is a real timeout; but if we've already found
+            // candidates near the cursor, partial results are useful — return them instead
+            // of discarding everything (live gate: stickiness was dying on slow AX trees).
+            if visited % 32 == 0, CFAbsoluteTimeGetCurrent() - start > deadline {
+                let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+                if !found.isEmpty {
+                    OrbDebug.log("ax scan: candidates(\(found.count)) (deadline, partial) visited=\(visited) elapsedMs=\(elapsedMs)")
+                    return .candidates(found)
+                }
+                OrbDebug.log("ax scan: timedOut (deadline) visited=\(visited) elapsedMs=\(elapsedMs)")
+                return .timedOut
+            }
+            if visited >= StickinessConstants.maxVisitedNodes {
+                let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+                if !found.isEmpty {
+                    OrbDebug.log("ax scan: candidates(\(found.count)) (nodeCap, partial) visited=\(visited) elapsedMs=\(elapsedMs)")
+                    return .candidates(found)
+                }
+                OrbDebug.log("ax scan: timedOut (nodeCap) visited=\(visited) elapsedMs=\(elapsedMs)")
+                return .timedOut
+            }
 
             if let role = copyString(el, kAXRoleAttribute), clickableRoles.contains(role),
                let frame = copyFrame(el) {
@@ -68,7 +94,11 @@ final class AXScanner: @unchecked Sendable {
                 stack.append(contentsOf: kids)
             }
         }
-        if found.isEmpty && !sawAnyChild { return .emptyTree }
+        if found.isEmpty && !sawAnyChild {
+            OrbDebug.log("ax scan: emptyTree (childless) visited=\(visited) elapsedMs=\(Int((CFAbsoluteTimeGetCurrent() - start) * 1000))")
+            return .emptyTree
+        }
+        OrbDebug.log("ax scan: visited=\(visited) found=\(found.count) elapsedMs=\(Int((CFAbsoluteTimeGetCurrent() - start) * 1000))")
         return .candidates(found)
     }
 

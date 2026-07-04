@@ -42,6 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         let tokenMissing = production == nil
         appModel = model
+        OrbDebug.log("boot: axTrusted=\(axTrusted) tokenMissing=\(tokenMissing)")
 
         let orb = OrbWindowController(session: model.session)
         orbController = orb
@@ -51,6 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         })
         stickiness = sticky
         if axTrusted { sticky.start() }
+        OrbDebug.log("boot: stickiness \(axTrusted ? "STARTED" : "NOT started (no AX)")")
         orb.follower.onCursorLocationChange = { [weak sticky] location in
             sticky?.updateCursorLocation(location)
         }

@@ -19,3 +19,10 @@ enum OrbStatus: Equatable {
         }
     }
 }
+
+/// PURE composition for the "n/m working…" pill (spec change: while a turn is running AND
+/// tasks exist, the pill names the task being worked instead of a bare "thinking…").
+/// n = index of the task being worked (completed + 1, clamped to total); m = total.
+func workingPillText(done: Int, total: Int) -> String {
+    "\(min(done + 1, total))/\(total) working…"
+}

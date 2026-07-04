@@ -106,6 +106,12 @@ final class SessionModelTests: XCTestCase {
         XCTAssertEqual(s.status, .approvalNeeded(count: 1)) // pending survives the reconnect
     }
 
+    func testWorkingPillText() {
+        XCTAssertEqual(workingPillText(done: 0, total: 4), "1/4 working…")
+        XCTAssertEqual(workingPillText(done: 3, total: 4), "4/4 working…")
+        XCTAssertEqual(workingPillText(done: 4, total: 4), "4/4 working…")
+    }
+
     @MainActor
     func testSessionModelStorePublishesAndMarksConnected() {
         let m = SessionModel()

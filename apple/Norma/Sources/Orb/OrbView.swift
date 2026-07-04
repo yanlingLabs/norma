@@ -7,7 +7,13 @@ struct OrbView: View {
     @ObservedObject var session: SessionModel
     @State private var shimmer = 0.0
 
-    private var pillText: String? { session.state.status.pillText }
+    private var pillText: String? {
+        let state = session.state
+        if state.status == .thinking, state.taskCounts.total > 0 {
+            return workingPillText(done: state.taskCounts.done, total: state.taskCounts.total)
+        }
+        return state.status.pillText
+    }
     private var taskText: String? {
         let c = session.state.taskCounts
         return c.total > 0 ? "☑ \(c.done)/\(c.total)" : nil

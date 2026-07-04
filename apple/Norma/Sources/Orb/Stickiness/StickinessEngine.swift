@@ -65,6 +65,7 @@ final class StickinessEngine {
     private func publish(_ t: CGPoint?) {
         guard t != currentTarget else { return }
         currentTarget = t
+        OrbDebug.log("target -> \(String(describing: t))")
         onTarget(t)
     }
 
@@ -79,6 +80,7 @@ final class StickinessEngine {
         scanInFlight = true
         lastScanAt = now
         pendingCursor = nil
+        OrbDebug.log("scan dispatch @\(cursor)")
 
         queue.async { [scanner] in
             let result = scanner.scan(around: cursor, deadline: StickinessConstants.scanDeadline)
@@ -90,6 +92,13 @@ final class StickinessEngine {
     }
 
     private func finishScan(_ result: ScanResult, pid: pid_t, cursor: CGPoint) {
+        let resultSummary: String
+        switch result {
+        case .candidates(let found): resultSummary = "candidates(\(found.count))"
+        case .emptyTree: resultSummary = "emptyTree"
+        case .timedOut: resultSummary = "timedOut(partial 0)"
+        }
+        OrbDebug.log("scan result: \(resultSummary) pid=\(pid) candidates=\(candidates.count) failures=\(consecutiveFailures) degraded=\(degradedPid)")
         scanInFlight = false
         lastPid = pid
         if degradedPid != 0, pid != 0, pid != degradedPid {
