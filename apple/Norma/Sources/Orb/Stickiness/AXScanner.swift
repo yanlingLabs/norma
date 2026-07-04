@@ -18,43 +18,38 @@ final class AXScanner: @unchecked Sendable {
         "AXRadioButton", "AXTextField", "AXTextArea", "AXComboBox", "AXMenuItem",
     ]
     private var pokedPids = Set<pid_t>()
-    private(set) var lastHitPid: pid_t = 0
 
     /// Called when the frontmost app changes — pokes may need re-applying after relaunch.
     func resetPokes() { pokedPids.removeAll() }
 
-    func scan(around point: CGPoint, deadline: TimeInterval) -> ScanResult {
+    /// Scans `pid`'s (the frontmost application's) own windows — v1's root model.
+    /// NEVER a positional hit-test: overlay apps (e.g. BlueStacks on this machine)
+    /// keep invisible, screen-wide, AX-visible windows, so
+    /// `AXUIElementCopyElementAtPosition` lands on their childless tree for every
+    /// on-screen point (visited=2, found=0). Anchoring on the frontmost app's own
+    /// windows instead sidesteps that entirely (live-gate root cause).
+    func scan(around point: CGPoint, pid: pid_t, deadline: TimeInterval) -> ScanResult {
         let start = CFAbsoluteTimeGetCurrent()
         let axPoint = toAXCoordinates(point)
 
-        let systemWide = AXUIElementCreateSystemWide()
-        var elementRef: AXUIElement?
-        let hitError = AXUIElementCopyElementAtPosition(systemWide, Float(axPoint.x), Float(axPoint.y), &elementRef)
-        guard hitError == .success, let hit = elementRef else {
-            OrbDebug.log("ax scan: emptyTree (hitTestFailed) elapsedMs=\(Int((CFAbsoluteTimeGetCurrent() - start) * 1000))")
+        if !pokedPids.contains(pid) {
+            // D2: Chromium/Electron ship a disabled AX tree until an assistive client
+            // announces itself (v1 ClickableStickiness.swift:591-616). No-op for native apps.
+            let appEl = AXUIElementCreateApplication(pid)
+            AXUIElementSetAttributeValue(appEl, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+            AXUIElementSetAttributeValue(appEl, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+            pokedPids.insert(pid)
+        }
+
+        let roots = scanRoots(for: pid)
+        guard !roots.isEmpty else {
+            OrbDebug.log("ax scan: emptyTree (noWindows) pid=\(pid) elapsedMs=\(Int((CFAbsoluteTimeGetCurrent() - start) * 1000))")
             return .emptyTree
         }
 
-        var pid: pid_t = 0
-        if AXUIElementGetPid(hit, &pid) == .success, pid != 0 {
-            lastHitPid = pid
-            if !pokedPids.contains(pid) {
-                // D2: Chromium/Electron ship a disabled AX tree until an assistive client
-                // announces itself (v1 ClickableStickiness.swift:591-616). No-op for native apps.
-                let appEl = AXUIElementCreateApplication(pid)
-                AXUIElementSetAttributeValue(appEl, "AXManualAccessibility" as CFString, kCFBooleanTrue)
-                AXUIElementSetAttributeValue(appEl, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
-                pokedPids.insert(pid)
-            }
-        }
-
-        guard let window = walkUpToWindow(from: hit) else {
-            OrbDebug.log("ax scan: emptyTree (noWindow) elapsedMs=\(Int((CFAbsoluteTimeGetCurrent() - start) * 1000))")
-            return .emptyTree
-        }
         var found: [ClickableCandidate] = []
         var visited = 0
-        var stack: [AXUIElement] = [window]
+        var stack: [AXUIElement] = roots
         var sawAnyChild = false
 
         while let el = stack.popLast() {
@@ -65,19 +60,19 @@ final class AXScanner: @unchecked Sendable {
             if visited % 32 == 0, CFAbsoluteTimeGetCurrent() - start > deadline {
                 let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
                 if !found.isEmpty {
-                    OrbDebug.log("ax scan: candidates(\(found.count)) (deadline, partial) visited=\(visited) elapsedMs=\(elapsedMs)")
+                    OrbDebug.log("ax scan: candidates(\(found.count)) (deadline, partial) pid=\(pid) roots=\(roots.count) visited=\(visited) elapsedMs=\(elapsedMs)")
                     return .candidates(found)
                 }
-                OrbDebug.log("ax scan: timedOut (deadline) visited=\(visited) elapsedMs=\(elapsedMs)")
+                OrbDebug.log("ax scan: timedOut (deadline) pid=\(pid) roots=\(roots.count) visited=\(visited) elapsedMs=\(elapsedMs)")
                 return .timedOut
             }
             if visited >= StickinessConstants.maxVisitedNodes {
                 let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
                 if !found.isEmpty {
-                    OrbDebug.log("ax scan: candidates(\(found.count)) (nodeCap, partial) visited=\(visited) elapsedMs=\(elapsedMs)")
+                    OrbDebug.log("ax scan: candidates(\(found.count)) (nodeCap, partial) pid=\(pid) roots=\(roots.count) visited=\(visited) elapsedMs=\(elapsedMs)")
                     return .candidates(found)
                 }
-                OrbDebug.log("ax scan: timedOut (nodeCap) visited=\(visited) elapsedMs=\(elapsedMs)")
+                OrbDebug.log("ax scan: timedOut (nodeCap) pid=\(pid) roots=\(roots.count) visited=\(visited) elapsedMs=\(elapsedMs)")
                 return .timedOut
             }
 
@@ -95,11 +90,36 @@ final class AXScanner: @unchecked Sendable {
             }
         }
         if found.isEmpty && !sawAnyChild {
-            OrbDebug.log("ax scan: emptyTree (childless) visited=\(visited) elapsedMs=\(Int((CFAbsoluteTimeGetCurrent() - start) * 1000))")
+            OrbDebug.log("ax scan: emptyTree (childless) pid=\(pid) roots=\(roots.count) visited=\(visited) elapsedMs=\(Int((CFAbsoluteTimeGetCurrent() - start) * 1000))")
             return .emptyTree
         }
-        OrbDebug.log("ax scan: visited=\(visited) found=\(found.count) elapsedMs=\(Int((CFAbsoluteTimeGetCurrent() - start) * 1000))")
+        OrbDebug.log("ax scan: pid=\(pid) roots=\(roots.count) visited=\(visited) found=\(found.count) elapsedMs=\(Int((CFAbsoluteTimeGetCurrent() - start) * 1000))")
         return .candidates(found)
+    }
+
+    // MARK: root discovery (v1 root model)
+
+    /// Scan roots for `pid`'s application: the focused window first — that's where
+    /// the user's attention lives, and it's a one-hop lookup — falling back to the
+    /// full window list only if no focused window is reported (menu-bar-only /
+    /// background-agent apps). Mirrors v1's `frontmostFocusedWindows()`
+    /// (ClickableStickiness.swift:401-427); v1's order (focused-first) is kept
+    /// here rather than windows-first since it's the proven-working behavior.
+    private func scanRoots(for pid: pid_t) -> [AXUIElement] {
+        let appEl = AXUIElementCreateApplication(pid)
+
+        var focused: CFTypeRef?
+        if AXUIElementCopyAttributeValue(appEl, kAXFocusedWindowAttribute as CFString, &focused) == .success,
+           let win = focused {
+            return [unsafeDowncast(win, to: AXUIElement.self)]
+        }
+
+        var list: CFTypeRef?
+        if AXUIElementCopyAttributeValue(appEl, kAXWindowsAttribute as CFString, &list) == .success,
+           let windows = list as? [AXUIElement], !windows.isEmpty {
+            return windows
+        }
+        return []
     }
 
     // MARK: AX helpers
@@ -127,18 +147,6 @@ final class AXScanner: @unchecked Sendable {
         guard AXValueGetValue(posRef as! AXValue, .cgPoint, &pos),
               AXValueGetValue(sizeRef as! AXValue, .cgSize, &size) else { return nil }
         return CGRect(origin: pos, size: size)
-    }
-
-    private func walkUpToWindow(from element: AXUIElement) -> AXUIElement? {
-        var current = element
-        for _ in 0..<25 {
-            if copyString(current, kAXRoleAttribute) == kAXWindowRole as String { return current }
-            var parentRef: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(current, kAXParentAttribute as CFString, &parentRef) == .success,
-                  let parent = parentRef else { return nil }
-            current = unsafeDowncast(parent, to: AXUIElement.self)
-        }
-        return nil
     }
 
     // MARK: coordinate conversion (AX top-left ↔ AppKit bottom-left)

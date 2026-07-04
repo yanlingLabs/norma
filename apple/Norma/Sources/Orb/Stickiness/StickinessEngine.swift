@@ -17,7 +17,6 @@ final class StickinessEngine {
     private var currentTarget: CGPoint?
     private var consecutiveFailures = 0
     private var degradedPid: pid_t = 0
-    private var lastPid: pid_t = 0 // main-actor copy fed by finishScan — never read scanner state from main
     private var retriedAfterPoke = false
     private var retryPending = false
     private var activationObserver: NSObjectProtocol?
@@ -71,6 +70,28 @@ final class StickinessEngine {
 
     private func maybeScan(force: Bool = false) {
         guard !scanInFlight, let cursor = pendingCursor else { return }
+
+        // v1 root model: scan the FRONTMOST APPLICATION's own windows, never a
+        // positional hit-test (overlay apps like BlueStacks keep invisible,
+        // screen-wide, childless AX windows that swallow every hit-test — that
+        // was the root cause of dead stickiness). No frontmost app, or our own
+        // app is frontmost, means there is no stickiness target at all.
+        let frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+        guard frontPid != 0, frontPid != getpid() else {
+            OrbDebug.log("scan skip: frontPid=\(frontPid) (none or own app frontmost) — no stickiness target")
+            return
+        }
+
+        // A frontmost app different from the one we're degraded on recovers
+        // immediately; the SAME degraded app still gets probed, just at the
+        // slow cadence below (pid is now known before scanning, so this can
+        // happen here instead of after the fact in finishScan).
+        if degradedPid != 0, frontPid != degradedPid {
+            degradedPid = 0
+            consecutiveFailures = 0
+            retriedAfterPoke = false
+        }
+
         let now = CFAbsoluteTimeGetCurrent()
         // While degraded, don't block scanning outright — probe at a slow cadence so
         // recovery (cursor moves off the dead app, or the app heals) is reachable.
@@ -80,13 +101,12 @@ final class StickinessEngine {
         scanInFlight = true
         lastScanAt = now
         pendingCursor = nil
-        OrbDebug.log("scan dispatch @\(cursor)")
+        OrbDebug.log("scan dispatch @\(cursor) pid=\(frontPid)")
 
         queue.async { [scanner] in
-            let result = scanner.scan(around: cursor, deadline: StickinessConstants.scanDeadline)
-            let pid = scanner.lastHitPid
+            let result = scanner.scan(around: cursor, pid: frontPid, deadline: StickinessConstants.scanDeadline)
             Task { @MainActor [weak self] in
-                self?.finishScan(result, pid: pid, cursor: cursor)
+                self?.finishScan(result, pid: frontPid, cursor: cursor)
             }
         }
     }
@@ -100,14 +120,9 @@ final class StickinessEngine {
         }
         OrbDebug.log("scan result: \(resultSummary) pid=\(pid) candidates=\(candidates.count) failures=\(consecutiveFailures) degraded=\(degradedPid)")
         scanInFlight = false
-        lastPid = pid
-        if degradedPid != 0, pid != 0, pid != degradedPid {
-            // Cursor landed on a different, healthy app — recover immediately.
-            // Pokes stay recorded; they're still valid for that other app.
-            degradedPid = 0
-            consecutiveFailures = 0
-            retriedAfterPoke = false
-        }
+        // Different-frontmost-app recovery now happens in maybeScan, before dispatch —
+        // pid is known up front, so there's no need to reconcile it against degradedPid
+        // after the fact here.
         switch result {
         case .candidates(let found):
             consecutiveFailures = 0
