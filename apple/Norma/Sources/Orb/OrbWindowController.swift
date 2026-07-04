@@ -1,6 +1,13 @@
 import AppKit
 import SwiftUI
 
+/// v1 PointerOverlayWindow's key/main refusal: a borderless NSPanel defaults BOTH to true,
+/// and AppKit auto-promotes orderable key-capable windows on close/deactivate/Space changes.
+private final class NonActivatingPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
 /// Owns the orb panel. ARCHITECTURE NOTE (v1's converged lesson): this panel IS the future
 /// field window's collapsed state — 2c expands it in place so the glassEffectID morph stays
 /// inside one GlassEffectContainer. Do not add a second window for the field.
@@ -12,7 +19,7 @@ final class OrbWindowController {
 
     init(session: SessionModel) {
         // v1 PointerOverlayWindow configuration, verbatim.
-        panel = NSPanel(
+        panel = NonActivatingPanel(
             contentRect: NSRect(origin: .zero, size: OrbMetrics.windowSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
