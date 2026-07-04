@@ -277,4 +277,17 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     expect(asText).toContain("parent turn1 final report");
     expect(asText).toContain("second question");
   });
+
+  test("child-thread deltas carry the child threadId, not main", async () => {
+    const { engine, sessionId, events } = setup([
+      [spawnCall("c1", "do a thing"), done("tool_calls")],
+      text("child-out"),
+      text("parent-final"),
+    ]);
+    await engine.runTurn(sessionId);
+    const childDelta = events.find((e) => e.type === "assistant_delta" && e.threadId !== "main");
+    expect(childDelta).toMatchObject({ delta: "child-out" });
+    const mainDeltas = events.filter((e) => e.type === "assistant_delta" && e.threadId === "main");
+    expect(mainDeltas.map((d) => (d as { delta: string }).delta)).toEqual(["parent-final"]);
+  });
 });

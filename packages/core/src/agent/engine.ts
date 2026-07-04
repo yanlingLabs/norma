@@ -364,7 +364,11 @@ export class AgentEngine {
           .filter((s) => !allowTools || allowTools.has(s.name)),
         signal,
       })) {
-        if (ev.type === "text_delta") textBuf += ev.delta;
+        if (ev.type === "text_delta") {
+          textBuf += ev.delta;
+          // TRANSIENT streaming event: broadcast to attached harnesses, never persisted (spec 2a).
+          if (ev.delta.length > 0) this.cfg.hub.broadcastTransient(sessionId, { type: "assistant_delta", sessionId, threadId, delta: ev.delta });
+        }
         else if (ev.type === "tool_call") calls.push(ev);
         else if (ev.type === "usage") { usage.inputTokens += ev.inputTokens; usage.outputTokens += ev.outputTokens; }
         else if (ev.type === "done") stop = ev.stopReason;
