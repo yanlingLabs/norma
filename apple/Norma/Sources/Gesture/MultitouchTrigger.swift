@@ -54,7 +54,10 @@ final class MultitouchTrigger {
             self.handle = nil
         }
 
-        Self.recognizer = TapRecognizer()
+        // NOTE: no recognizer reset here — the MT callback thread is the recognizer's ONLY
+        // toucher (a main-thread reset would race the in-flight frame callback). The recognizer
+        // self-resets on every all-lift frame; after a detach mid-gesture the next lift clears
+        // any stale armed state (worst case: one deliberately-missed tap after wake).
     }
 
     /// Open the private MultitouchSupport framework and register the frame

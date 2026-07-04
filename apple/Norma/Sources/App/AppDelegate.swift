@@ -50,10 +50,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         orbController = orb
 
         orb.onSubmit = { [weak self] text in
-            Task { @MainActor in
-                guard let self, let model = self.appModel else { return }
-                if await model.sendOrSteer(text) { Haptics.messageSent() }
-            }
+            guard let model = self?.appModel else { return false }
+            let ok = await model.sendOrSteer(text)
+            if ok { Haptics.messageSent() }
+            return ok
         }
         orb.onEsc = { [weak self] in
             guard let self, self.appModel?.session.state.turnRunning == true else { return false }

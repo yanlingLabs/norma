@@ -44,8 +44,13 @@ struct GlassRootView: View {
 
     private func submit() {
         let text = draft
-        controller.onSubmit?(text)
-        draft = ""
-        draftCache.clear()
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        Task { @MainActor in
+            if await controller.onSubmit?(text) == true {
+                draft = ""
+                draftCache.clear()
+            }
+            // failure: text stays in the composer — the draft is never lost (spec §6)
+        }
     }
 }

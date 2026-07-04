@@ -24,7 +24,9 @@ final class OrbWindowController: ObservableObject {
     @Published private(set) var surface: Surface = .orb
 
     /// Wired in Task 6: the controller exposes callbacks, it does NOT import AppModel.
-    var onSubmit: ((String) -> Void)?
+    /// Returns send success — GlassRootView's submit() gates the draft clear on this so a
+    /// failed/disconnected send never loses the composed text (spec §6).
+    var onSubmit: ((String) async -> Bool)?
     var onInterrupt: (() -> Void)?
     /// Returns true when the key was consumed as an interrupt (turn running); false → collapse.
     var onEsc: (() -> Bool)?
