@@ -5,6 +5,10 @@ import SwiftUI
 /// replaced here with a plain `.glassEffect` capsule for the pills.
 struct OrbView: View {
     @ObservedObject var session: SessionModel
+    /// Shared with `GlassRootView`'s single `GlassEffectContainer` (D8): the orb circle and
+    /// the field's composer shell both tag `glassEffectID("norma-shell", in: glassNamespace)`
+    /// so they morph into each other instead of cross-fading as separate views.
+    var glassNamespace: Namespace.ID
     @State private var shimmer = 0.0
 
     private var pillText: String? {
@@ -44,7 +48,7 @@ struct OrbView: View {
 
     private var orbView: some View {
         ZStack {
-            LiquidGlassOrbSurface()
+            LiquidGlassOrbSurface(glassNamespace: glassNamespace)
                 .frame(width: 20, height: 20)
         }
         .frame(width: OrbMetrics.orbDiameter, height: OrbMetrics.orbDiameter)
@@ -81,11 +85,14 @@ struct OrbView: View {
 /// v1 orb glass (PointerRenderer.swift:125-140) — blue-neutral system glass, NO tint.
 struct LiquidGlassOrbSurface: View {
     var drawsBorder: Bool = true
+    var glassNamespace: Namespace.ID
 
     var body: some View {
         Circle()
             .fill(.clear)
             .glassEffect(.regular, in: Circle())
+            .glassEffectID("norma-shell", in: glassNamespace)
+            .glassEffectTransition(.matchedGeometry)
             .overlay(
                 Circle()
                     .strokeBorder(Color.white.opacity(drawsBorder ? 0.5 : 0), lineWidth: drawsBorder ? 1 : 0)

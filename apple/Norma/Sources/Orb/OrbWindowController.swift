@@ -48,12 +48,15 @@ final class OrbWindowController: ObservableObject {
         panel.ignoresMouseEvents = true
         panel.isMovableByWindowBackground = false
         panel.hidesOnDeactivate = false
-        panel.contentView = NSHostingView(rootView: OrbView(session: session))
 
         follower.onOrbCenterChange = { [weak self] center in
             guard let self, isVisible else { return }
             panel.setFrameOrigin(orbWindowOrigin(forOrbCenter: center, windowSize: OrbMetrics.windowSize))
         }
+
+        // ARCHITECTURE NOTE above: GlassRootView (not OrbView) is the panel's content — it owns
+        // the single GlassEffectContainer and switches orb/field in place per `surface`.
+        panel.contentView = NSHostingView(rootView: GlassRootView(session: session, controller: self))
     }
 
     func show() {
