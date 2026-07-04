@@ -173,4 +173,36 @@ describe("SessionHub", () => {
     expect(good.received.length).toBe(before + 1); // only the new message
     expect(good.received.some((e) => e.type === "harness_detached" && (e as any).clientName === "flaky")).toBe(false);
   });
+
+  test("broadcastTransient delivers to attached clients but never persists or replays", () => {
+    const { store, hub } = setup();
+    const id = store.createSession("global");
+    const a = fakeClient("a");
+    hub.attach(a, id, 0); // replay: session_created, then live harness_attached
+    const before = store.lastSeq(id);
+
+    const e = hub.broadcastTransient(id, { type: "assistant_delta", sessionId: id, threadId: "main", delta: "tok" });
+    expect(e).toMatchObject({ type: "assistant_delta", delta: "tok", seq: before }); // seq = lastSeq, unchanged
+    expect(store.lastSeq(id)).toBe(before);                                          // nothing persisted
+    expect(a.received[a.received.length - 1]).toMatchObject({ type: "assistant_delta", delta: "tok" });
+
+    // replay for a NEW client contains no transient events
+    const b = fakeClient("b");
+    hub.attach(b, id, 0);
+    expect(b.received.some((ev) => ev.type === "assistant_delta")).toBe(false);
+  });
+
+  test("broadcastTransient evicts a dead client like a normal broadcast", () => {
+    const { store, hub } = setup();
+    const id = store.createSession("global");
+    const alive = fakeClient("alive");
+    let alive_dead = true;
+    const dead: HubClient = { clientName: "dead", deliver() { return alive_dead; } };
+    hub.attach(alive, id, 0);
+    hub.attach(dead, id, 0);
+    alive_dead = false; // mark dead client as dead
+    hub.broadcastTransient(id, { type: "assistant_delta", sessionId: id, threadId: "main", delta: "x" });
+    // the dead client's eviction appended+broadcast a harness_detached that alive saw
+    expect(alive.received[alive.received.length - 1]).toMatchObject({ type: "harness_detached", clientName: "dead" });
+  });
 });

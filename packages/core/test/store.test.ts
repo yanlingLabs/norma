@@ -200,4 +200,13 @@ describe("SessionStore", () => {
     expect(tail.every((e) => e.seq > all[0]!.seq)).toBe(true);
     expect(tail).toHaveLength(2);
   });
+
+  test("lastSeq returns the current last persisted seq; throws on unknown session", () => {
+    const store = new SessionStore(mkdtempSync(join(tmpdir(), "norma-store-")));
+    const id = store.createSession("global");
+    expect(store.lastSeq(id)).toBe(1); // session_created
+    store.append(id, { type: "user_message", sessionId: id, threadId: "main", text: "hi", clientName: "t" });
+    expect(store.lastSeq(id)).toBe(2);
+    expect(() => store.lastSeq("s_nope")).toThrow("unknown session");
+  });
 });
