@@ -238,6 +238,7 @@ export class AgentEngine {
     const uptoSeq = lastCp ? lastCp.uptoSeq : 0;
     for (const e of events) {
       if (e.seq <= uptoSeq) continue;
+      if ("threadId" in e && e.threadId !== MAIN_THREAD) continue;
       if (e.type === "user_message") input.push({ type: "message", role: "user", content: e.text });
       else if (e.type === "assistant_message") input.push({ type: "message", role: "assistant", content: e.text });
       // Prior turns' tool calls are summarized by their assistant_message; current-turn

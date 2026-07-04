@@ -254,4 +254,27 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     expect(threads[1]).toMatchObject({ parentThreadId: "main", status: "completed", stopReason: "end_turn" });
     expect(threads[1]!.threadId).toMatch(/^th_/);
   });
+
+  test("multi-turn: a child's internal chatter does NOT leak into the 2nd turn's history input (Seam #1 regression)", async () => {
+    const { engine, hub, sessionId, provider } = setup([
+      [spawnCall("s1", "do X"), done("tool_calls")], // turn 1, parent round 0: spawn
+      text("SECRET-CHILD-CHATTER"), // the child's only round — its assistant_message is tagged with the CHILD's threadId, not main
+      text("parent turn1 final report"), // turn 1, parent's own continuation round after the child returns
+      text("parent turn2 final report"), // turn 2's only round (no spawn this time)
+    ]);
+    const client = { clientName: "u", deliver: () => true };
+    hub.attach(client, sessionId, 0);
+    await engine.runTurn(sessionId);
+    hub.send(client, sessionId, "second question");
+    await engine.runTurn(sessionId);
+
+    const fp = provider as FakeProvider;
+    // turn 2's only provider request is the last one recorded
+    const req = fp.requests[fp.requests.length - 1]!;
+    const asText = JSON.stringify(req.input);
+    expect(asText).not.toContain("SECRET-CHILD-CHATTER");
+    // sanity: the parent's own turn-1 assistant_message and the new user message ARE present
+    expect(asText).toContain("parent turn1 final report");
+    expect(asText).toContain("second question");
+  });
 });

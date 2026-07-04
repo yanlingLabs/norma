@@ -34,6 +34,14 @@ describe("SubagentManager", () => {
     expect(r).toEqual({ ok: false, error: expect.stringContaining("boom") });
   });
 
+  test("thrown non-Error (e.g. a bare string) → {ok:false} with the stringified value, not \"undefined\"", async () => {
+    const m = new SubagentManager({});
+    const r = await m.run(async () => {
+      throw "boom-string";
+    });
+    expect(r).toEqual({ ok: false, error: "boom-string" });
+  });
+
   test("slot released on throw (a queued task still runs)", async () => {
     const m = new SubagentManager({ maxConcurrent: 1, timeoutMs: 5000 });
     const first = m.run(async () => {
