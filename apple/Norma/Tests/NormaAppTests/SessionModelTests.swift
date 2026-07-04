@@ -139,7 +139,7 @@ final class SessionModelTests: XCTestCase {
         XCTAssertEqual(s.streamingText, "")
     }
 
-    func testNewTurnClearsStreamingKeepsLastReply()  {
+    func testNewTurnClearsStreamingKeepsLastReply() {
         var s = OrbSessionState()
         s = SessionReducer.reduce(s, turnStarted())
         s = SessionReducer.reduce(s, delta("old"))
@@ -154,6 +154,20 @@ final class SessionModelTests: XCTestCase {
         var s = OrbSessionState()
         s = SessionReducer.reduce(s, turnStarted())
         s = SessionReducer.reduce(s, delta("child", thread: "th_1"))
+        XCTAssertEqual(s.streamingText, "")
+    }
+
+    func testAbortedTurnClearsStreamingText() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, turnStarted())
+        s = SessionReducer.reduce(s, delta("partial"))
+        s = SessionReducer.reduce(s, turnCompleted()) // abort/end without assistant_message
+        XCTAssertEqual(s.streamingText, "")
+        XCTAssertFalse(s.turnRunning)
+
+        s = SessionReducer.reduce(s, turnStarted(seq: 10))
+        s = SessionReducer.reduce(s, delta("more", seq: 11))
+        s = SessionReducer.reduce(s, ev(#"{"type":"agent_error","seq":12,"sessionId":"s","ts":0,"threadId":"main","message":"boom"}"#))
         XCTAssertEqual(s.streamingText, "")
     }
 }

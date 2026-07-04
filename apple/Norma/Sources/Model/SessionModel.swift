@@ -59,10 +59,12 @@ enum SessionReducer {
         case .turnCompleted(let v) where v.threadId == mainThread:
             s.turnRunning = false
             s.pendingApprovalIds = []
+            s.streamingText = ""
             s.status = .idle
         case .agentError(let v) where v.threadId == mainThread:
             s.turnRunning = false
             s.pendingApprovalIds = []
+            s.streamingText = ""
             s.status = .idle
         case .taskUpdated(let v): // any thread — tasks are session-wide
             if let i = s.tasks.firstIndex(where: { $0.id == v.task.id }) {
