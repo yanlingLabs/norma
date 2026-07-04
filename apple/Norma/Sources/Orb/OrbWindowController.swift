@@ -31,7 +31,6 @@ final class OrbWindowController: ObservableObject {
 
     private var keyMonitor: Any?
     private var externalFocus: ExternalFocusSnapshot?
-    private var preExpansionOrbCenter: CGPoint?
 
     init(session: SessionModel) {
         // v1 PointerOverlayWindow configuration, verbatim.
@@ -82,7 +81,6 @@ final class OrbWindowController: ObservableObject {
 
         externalFocus = ExternalFocusSnapshot.captureCurrent()
         let orbCenter = follower.currentOrbCenter
-        preExpansionOrbCenter = orbCenter
         follower.stop()
 
         let visibleFrame = panel.screen?.visibleFrame ?? NSScreen.screens[0].visibleFrame
@@ -106,8 +104,10 @@ final class OrbWindowController: ObservableObject {
         OrbDebug.log("expandToField: frame=\(frame)")
     }
 
-    /// Reverses `expandToField()`: removes the Esc monitor, un-keys the panel, restores the
-    /// captured external focus, snaps the panel back to the orb frame, and resumes the follower.
+    /// Collapses the panel to orb size; removes the Esc monitor, un-keys the panel, and
+    /// restores the captured external focus. The follower re-seeds from the CURRENT cursor
+    /// position and positions the panel (the orb returns to wherever the cursor is now,
+    /// not the pre-expansion point — deliberate UX).
     func collapseToOrb() {
         guard surface == .field else { return }
 
@@ -120,14 +120,11 @@ final class OrbWindowController: ObservableObject {
         externalFocus?.restore()
         externalFocus = nil
 
-        let center = preExpansionOrbCenter ?? follower.currentOrbCenter
-        let origin = orbWindowOrigin(forOrbCenter: center, windowSize: OrbMetrics.windowSize)
-        panel.setFrame(NSRect(origin: origin, size: OrbMetrics.windowSize), display: true)
-        preExpansionOrbCenter = nil
+        panel.setContentSize(OrbMetrics.windowSize)
         follower.start()
         surface = .orb
 
-        OrbDebug.log("collapseToOrb: origin=\(origin)")
+        OrbDebug.log("collapseToOrb")
     }
 
     func toggleField() {
