@@ -1,4 +1,4 @@
-import type { SessionEvent } from "@norma/protocol";
+import { SessionEvent } from "@norma/protocol";
 import type { SessionStore, EventInput } from "./store";
 
 export interface HubClient {
@@ -60,6 +60,21 @@ export class SessionHub {
 
   private appendAndBroadcast(sessionId: string, input: EventInput): SessionEvent {
     const event = this.store.append(sessionId, input);
+    this.fanOut(sessionId, event);
+    return event;
+  }
+
+  /** Broadcast-only TRANSIENT event: fanned out to attached clients, NEVER persisted — absent
+   *  from the JSONL log and from attach replay. Stamped with seq = the store's CURRENT lastSeq
+   *  (it is not itself sequenced): monotonic-safe for naive lastSeq tracking, but clients must
+   *  exempt transient events from seq-based dedupe. Used for assistant_delta streaming. */
+  broadcastTransient(sessionId: string, input: EventInput): SessionEvent {
+    const event = SessionEvent.parse({ ...input, seq: this.store.lastSeq(sessionId), ts: Date.now() });
+    this.fanOut(sessionId, event);
+    return event;
+  }
+
+  private fanOut(sessionId: string, event: SessionEvent): void {
     const dead: HubClient[] = [];
     for (const c of this.attachments.get(sessionId) ?? []) {
       let alive = false;
@@ -80,6 +95,5 @@ export class SessionHub {
         type: "harness_detached", sessionId, clientName: c.clientName,
       }); // bounded recursion: each level evicts at least one client
     }
-    return event;
   }
 }

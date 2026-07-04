@@ -32,6 +32,11 @@ const ThreadBase = Base.extend({ threadId: z.string().min(1) });
 
 export const TurnStartedEvent = ThreadBase.extend({ type: z.literal("turn_started") });
 export const AssistantMessageEvent = ThreadBase.extend({ type: z.literal("assistant_message"), text: z.string() });
+/** TRANSIENT streaming chunk: broadcast-only, never persisted to the session log and never
+ *  replayed on attach. Carries seq = the store's lastSeq at broadcast time (NOT its own seq) —
+ *  monotonic-safe for naive lastSeq tracking, but clients MUST exempt assistant_delta from
+ *  seq-based dedupe and lastSeq updates. The final assistant_message is the persisted record. */
+export const AssistantDeltaEvent = ThreadBase.extend({ type: z.literal("assistant_delta"), delta: z.string().min(1) });
 export const ToolCallEvent = ThreadBase.extend({
   type: z.literal("tool_call"), callId: z.string().min(1), name: z.string().min(1), argsJson: z.string(),
 });
@@ -113,6 +118,7 @@ export const SessionEvent = z.discriminatedUnion("type", [
   UserMessageEvent,
   TurnStartedEvent,
   AssistantMessageEvent,
+  AssistantDeltaEvent,
   ToolCallEvent,
   ToolResultEvent,
   ApprovalRequestedEvent,

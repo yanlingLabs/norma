@@ -20,6 +20,7 @@ const fixtures: Record<string, unknown> = {
   "user_message": { ...base, type: "user_message", threadId: "main", text: "héllo \"world\" — done ✓", clientName: "cli-1" },
   "turn_started": { ...base, threadId: "main", type: "turn_started" },
   "assistant_message": { ...base, threadId: "main", type: "assistant_message", text: "done ✓" },
+  "assistant_delta": { ...base, threadId: "main", type: "assistant_delta", delta: "wor" },
   "tool_call": { ...base, threadId: "main", type: "tool_call", callId: "call_1", name: "read", argsJson: '{"path":"a.txt"}' },
   "tool_result": { ...base, threadId: "main", type: "tool_result", callId: "call_1", output: "line1\nline2", isError: false },
   "approval_requested": { ...base, threadId: "main", type: "approval_requested", callId: "call_2", toolName: "write", summary: "write a.txt" },

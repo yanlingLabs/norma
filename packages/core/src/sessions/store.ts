@@ -144,6 +144,14 @@ export class SessionStore {
     return event;
   }
 
+  /** Current last persisted seq for the session (used to stamp transient broadcast-only events). */
+  lastSeq(sessionId: string): number {
+    const row = this.db.query("SELECT last_seq FROM sessions WHERE session_id = ?").get(sessionId) as
+      | { last_seq: number } | null;
+    if (!row) throw new Error(`unknown session: ${sessionId}`);
+    return row.last_seq;
+  }
+
   read(sessionId: string, fromSeq = 0): SessionEvent[] {
     const row = this.db.query("SELECT scope FROM sessions WHERE session_id = ?").get(sessionId) as
       | { scope: string } | null;

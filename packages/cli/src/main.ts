@@ -4,6 +4,7 @@ import { resolveNormaHome, KeychainSecretStore, startDaemon, TOKEN_NAMES } from 
 import { METHODS } from "@norma/protocol";
 import { NormaClient } from "./client";
 import { applyEvent, isStalled, type WatchdogState } from "./watchdog";
+import { streamAction } from "./stream-state";
 import { installPlugin, removePluginDir, removePluginFromSettings, setPluginEnabled } from "./plugin-cli";
 import { isOtherChoice, parseQuestionAnswer } from "./questions";
 import { parsePlanResponse } from "./plan-response";
@@ -127,10 +128,19 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
   const wd: WatchdogState = { turnRunning: false, toolsInFlight: 0, approvalsPending: 0, lastEventAt: Date.now() };
   let wdTimer: ReturnType<typeof setInterval> | undefined; // started once the turn is sent; cleared on completion/stall
   let exiting = false; // guard to ensure a single exit path wins, not a race between stall watchdog and endHeadlessTurn
+  let streaming = false; // an assistant line is mid-stream on stdout (deltas printed, no newline yet)
 
   const c = await connect("cli-p", (e) => {
+    const sa = streamAction(streaming, e as { type: string; threadId?: string });
+    streaming = sa.streaming;
+    if (sa.action === "write_delta") { process.stdout.write(`${AQUA}${(e as { delta: string }).delta}${RESET}`); }
+    else if (sa.action === "close_line") process.stdout.write("\n");
     applyEvent(wd, e, Date.now());
-    if (e.type === "assistant_message") console.log(`${AQUA}${e.text}${RESET}`);
+    if (e.type === "assistant_message") {
+      if (sa.action === "close_then_print_full") { process.stdout.write("\n"); console.log(`${AQUA}${e.text}${RESET}`); }
+      else if (sa.action === "print_full") console.log(`${AQUA}${e.text}${RESET}`);
+      else process.stdout.write("\n");
+    }
     else if (e.type === "tool_call") console.log(`${DIM}⚙ ${e.name} ${e.argsJson.slice(0, 120)}${RESET}`);
     else if (e.type === "tool_result") console.log(`${DIM}  ↳ ${e.isError ? "ERROR: " : ""}${e.output.split("\n")[0]?.slice(0, 120) ?? ""}${RESET}`);
     else if (e.type === "approval_requested") {
