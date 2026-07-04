@@ -16,7 +16,11 @@ export type SessionApprovalPolicy = "ask" | "auto" | "plan";
 // task) only maintain in-memory/session task state and emit task_updated.
 // exit_plan_mode is read-only too: it only presents a plan for approval (no fs/process mutation)
 // — it must stay allowed under "plan" policy or the model could never exit plan mode.
-const READ_ONLY = new Set(["read", "glob", "grep", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "exit_plan_mode"]);
+// spawn_agent is read-only too: allowed in ALL modes, including plan — it's orchestration (launching
+// a child agent), not a mutation itself. The child inherits the parent's approval policy (engine.ts's
+// bridge passes the SAME `meta` object down), so the child's own mutating tool calls still get gated
+// by that policy — spawning doesn't bypass anything, it just delegates.
+const READ_ONLY = new Set(["read", "glob", "grep", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "exit_plan_mode", "spawn_agent"]);
 const MUTATING = new Set(["write", "edit", "bash", "bash_kill", "notebook_edit", "enter_worktree", "exit_worktree"]);
 const SELF_GATING = new Set(["request_directory"]);
 

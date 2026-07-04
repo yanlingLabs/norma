@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { NewSessionEvent, Question, SessionEvent, Task } from "@norma/protocol";
 import type { SessionStore } from "../sessions/store";
 import type { SessionHub } from "../sessions/hub";
@@ -15,9 +16,21 @@ import type { Compactor } from "./compactor";
 import type { McpManager } from "./mcp/manager";
 import { bashLooksSafe, type BashReviewer } from "./reviewer";
 import type { WorktreeManager } from "./worktree";
+import type { SubagentManager } from "./subagents";
+import type { AgentStore } from "./agents";
 
 const MAIN_THREAD = "main";
 const MAX_TOOL_ITERATIONS = 24; // runaway guard until 1b-ii budgets land
+
+/** Mirrors protocol's ThreadInfoSchema (methods.ts) — kept as a plain local type rather than a
+ *  zod import here since engine.ts only needs the shape, not a schema/validator of its own. */
+export interface ThreadInfo {
+  threadId: string;
+  parentThreadId?: string;
+  agentType?: string;
+  status: "running" | "completed";
+  stopReason?: string;
+}
 
 type Checkpoint = Extract<SessionEvent, { type: "checkpoint" }>;
 function isCheckpoint(e: SessionEvent): e is Checkpoint {
@@ -72,6 +85,11 @@ export interface EngineConfig {
   // call later in this same turn resolves into (or back out of) the worktree immediately — it
   // also persists via store.setCwd/dirs.add so the NEXT turn sees it too.
   worktrees?: WorktreeManager;
+  // Subagents (1d-iv): both optional, and both absent leaves spawn_agent at its own placeholder
+  // run() (tools/spawn.ts) rather than the parallel bridge below. Both must be set together for
+  // the bridge to activate — see the `spawnCalls` filter in runThread's dispatch loop.
+  subagents?: SubagentManager;
+  agents?: AgentStore;
 }
 
 export class AgentEngine {
@@ -90,10 +108,41 @@ export class AgentEngine {
   // in-place (never copied/snapshotted), across specs()/deferredIndex()/executeCall's ctx. See
   // the NOTE in turn() below.
   private loadedTools = new Map<string, Set<string>>();
+  // Thread registry (1d-iv, for thread.list): SESSION-scoped, mirrors loadedSkills/loadedTools
+  // above in lifetime (never cleared per-turn). Seeded lazily (via threadList()) with the main
+  // thread entry on first read/turn, then appended to by the spawn bridge as children are
+  // registered/completed. Never a snapshot — entries are mutated in place by completeThread.
+  private threads = new Map<string, ThreadInfo[]>();
   constructor(private readonly cfg: EngineConfig) {}
 
   /** True while a turn is executing for the session. */
   isRunning(sessionId: string): boolean { return this.runningTurns.has(sessionId); }
+
+  /** Lazily seeds the main thread entry for a session on first read/turn. */
+  private threadList(sessionId: string): ThreadInfo[] {
+    let list = this.threads.get(sessionId);
+    if (!list) {
+      list = [{ threadId: MAIN_THREAD, status: "running" }];
+      this.threads.set(sessionId, list);
+    }
+    return list;
+  }
+
+  /** Registers a new (child) thread entry — called by the spawn bridge when a subagent starts. */
+  private registerThread(sessionId: string, info: ThreadInfo): void {
+    this.threadList(sessionId).push(info);
+  }
+
+  /** Marks a thread (main or child) completed with its stop reason, in place. */
+  private completeThread(sessionId: string, threadId: string, stopReason: "end_turn" | "aborted" | "error"): void {
+    const t = this.threadList(sessionId).find((t) => t.threadId === threadId);
+    if (t) { t.status = "completed"; t.stopReason = stopReason; }
+  }
+
+  /** All threads for a session (thread.list): main first, then children in registration order. */
+  threadsFor(sessionId: string): ThreadInfo[] {
+    return this.threadList(sessionId);
+  }
 
   async runTurn(sessionId: string): Promise<void> {
     if (this.runningTurns.has(sessionId)) throw new Error(`turn already running for ${sessionId}`);
@@ -343,11 +392,82 @@ export class AgentEngine {
         return { finalText: lastText, stopReason: stop === "aborted" ? "aborted" : "end_turn" };
       }
 
+      // spawn_agent calls in this round run CONCURRENTLY (parallel subagent fan-out), computed
+      // BEFORE the per-call loop below so N spawns in one assistant message don't serialize —
+      // each child runs its own full runThread() to completion via SubagentManager.run (which
+      // enforces maxConcurrent + a timeout), and the collected outcomes are consumed by the loop
+      // below in the model's ORIGINAL call order (a plain Map keyed by callId, not the resolution
+      // order of Promise.all). Only active when both cfg.subagents and cfg.agents are wired
+      // (daemon.ts) AND this is a depth-0 thread — a depth>0 (child) thread trying to spawn is
+      // denied in the loop below instead (belt-and-braces: its own specs already exclude
+      // spawn_agent via excludeTools, so this only matters if a provider ignores that).
+      const spawnOutcomes = new Map<string, { output: string; isError: boolean }>();
+      const spawnCalls = this.cfg.subagents && this.cfg.agents && opts.depth === 0
+        ? calls.filter((c) => c.name === "spawn_agent")
+        : [];
+      if (spawnCalls.length > 0) {
+        await Promise.all(spawnCalls.map(async (call) => {
+          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown } = {};
+          try { parsed = JSON.parse(call.argsJson || "{}"); } catch { /* defensive: empty prompt below */ }
+          const prompt = typeof parsed.prompt === "string" ? parsed.prompt : "";
+          const agentType = typeof parsed.agentType === "string" ? parsed.agentType : undefined;
+          const modelOverride = typeof parsed.model === "string" ? parsed.model : undefined;
+          const childId = "th_" + randomUUID().slice(0, 8);
+          const def = this.cfg.agents!.resolve(agentType, opts.cwd);
+          this.emit(sessionId, {
+            type: "thread_started", sessionId, threadId: childId, parentThreadId: threadId,
+            agentType: agentType ?? "general-purpose", prompt,
+          });
+          this.registerThread(sessionId, {
+            threadId: childId, parentThreadId: threadId, agentType: agentType ?? "general-purpose", status: "running",
+          });
+          const result = await this.cfg.subagents!.run(async (childSignal) => {
+            const childLoaded = new Set<string>();
+            const instructionsFull = this.buildInstructionsFull(def.instructions, opts.cwd, childLoaded, meta.approvalPolicy);
+            return this.runThread({
+              sessionId,
+              threadId: childId,
+              instructionsFull,
+              input: [{ type: "message", role: "user", content: prompt }], // FRESH — no parent history
+              cwd: opts.cwd,
+              model: modelOverride ?? def.model ?? opts.model,
+              meta, // SAME object — the child inherits the parent's (possibly later-mutated) approval policy
+              depth: opts.depth + 1,
+              signal: childSignal,
+              loaded: childLoaded,
+              excludeTools: new Set(["spawn_agent", "ask_user", "exit_plan_mode"]),
+              allowTools: def.allowTools,
+            });
+          });
+          const stopReason = result.ok ? result.value.stopReason : "error";
+          this.emit(sessionId, { type: "thread_completed", sessionId, threadId: childId, stopReason });
+          this.completeThread(sessionId, childId, stopReason);
+          spawnOutcomes.set(call.callId, result.ok
+            ? { output: result.value.finalText || "the subagent finished without a final message", isError: false }
+            : { output: `subagent (${agentType ?? "general-purpose"}) ${result.error}`, isError: true });
+        }));
+      }
+
       for (const call of calls) {
         this.emit(sessionId, { type: "tool_call", sessionId, threadId, callId: call.callId, name: call.name, argsJson: call.argsJson });
         input.push({ type: "function_call", callId: call.callId, name: call.name, argsJson: call.argsJson });
 
         let outcome: { output: string; isError: boolean };
+        const spawnOutcome = spawnOutcomes.get(call.callId);
+        if (spawnOutcome) {
+          outcome = spawnOutcome;
+          this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
+          input.push({ type: "tool_result", callId: call.callId, output: outcome.output, isError: outcome.isError });
+          continue;
+        }
+        if (call.name === "spawn_agent" && opts.depth > 0) {
+          // Belt-and-braces: a child thread's specs already exclude spawn_agent (excludeTools
+          // above), so this only fires if a provider ignores the tool list and calls it anyway.
+          outcome = { output: "subagents cannot spawn further subagents", isError: true };
+          this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
+          input.push({ type: "tool_result", callId: call.callId, output: outcome.output, isError: outcome.isError });
+          continue;
+        }
         const decision = this.cfg.gate.evaluate(call.name, meta.approvalPolicy);
         // Worktree tools are MUTATING (gate.ts), so under `ask` policy (the DEFAULT) `decision` is
         // "ask", not "allow" — checked here, BEFORE the generic `decision === "ask"` branch below,

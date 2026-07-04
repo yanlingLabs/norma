@@ -22,6 +22,7 @@ import { registerTaskTools } from "./agent/tools/tasks";
 import { registerPlanTool } from "./agent/tools/plan";
 import { registerNotebookTool } from "./agent/tools/notebook";
 import { registerWorktreeTools } from "./agent/tools/worktree";
+import { registerSpawnAgentTool } from "./agent/tools/spawn";
 import { McpManager } from "./agent/mcp/manager";
 import { PermissionGate } from "./agent/gate";
 import { ApprovalBroker } from "./agent/approvals";
@@ -29,7 +30,9 @@ import { QuestionBroker } from "./agent/questions";
 import { TaskStore } from "./agent/task-store";
 import { PlanBroker } from "./agent/plans";
 import { WorktreeManager } from "./agent/worktree";
-import { AgentEngine } from "./agent/engine";
+import { AgentStore } from "./agent/agents";
+import { SubagentManager } from "./agent/subagents";
+import { AgentEngine, SYSTEM_PROMPT } from "./agent/engine";
 import { BashReviewer } from "./agent/reviewer";
 import { Compactor } from "./agent/compactor";
 import { SessionDirectories } from "./agent/dirs";
@@ -139,6 +142,9 @@ export async function startDaemon(opts: {
     registerNotebookTool(registry);
     const worktrees = new WorktreeManager({ baseRef: settings?.worktree?.baseRef });
     registerWorktreeTools(registry);
+    const agents = new AgentStore({ normaHome, trust: trustStore, baseInstructions: SYSTEM_PROMPT });
+    const subagents = new SubagentManager({ maxConcurrent: settings?.subagents?.maxConcurrent });
+    registerSpawnAgentTool(registry);
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
     await mcp.startAll(settings?.mcpServers ?? {});
     // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled && !disabled);
@@ -174,6 +180,8 @@ export async function startDaemon(opts: {
       plans: plans ?? undefined,
       setPolicy: (sid, pol) => store.setApprovalPolicy(sid, pol),
       worktrees,
+      agents,
+      subagents,
       reviewer,
       reviewerEnabled: reviewerCfg?.enabled,
       reviewerAllow: reviewerCfg?.allow ?? [],
