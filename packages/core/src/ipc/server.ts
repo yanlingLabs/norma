@@ -7,6 +7,7 @@ import {
   BgListParams, BgPeekParams, BgKillParams, BgKillAllParams,
   SessionSteerParams, SessionInterruptParams, SessionCompactParams, SkillsListParams, McpListParams,
   PluginsListParams, AskUserRespondParams, TaskListParams, PlanRespondParams, SessionSetPolicyParams,
+  ThreadListParams,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
@@ -242,6 +243,10 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       case METHODS.taskList: {
         const p = parseParams(TaskListParams, params);
         return { ok: true, tasks: opts.tasks?.list(p.sessionId) ?? [] };
+      }
+      case METHODS.threadList: {
+        const p = parseParams(ThreadListParams, params);
+        return { ok: true, threads: opts.engine?.threadsFor(p.sessionId) ?? [] };
       }
       case METHODS.planRespond: {
         const p = parseParams(PlanRespondParams, params);

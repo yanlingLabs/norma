@@ -395,6 +395,31 @@ describe("daemon IPC", () => {
     c.close();
   });
 
+  test("thread.list without an engine → empty threads", async () => {
+    await boot(); // no provider → no engine
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "threader-noeng");
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global" });
+    const noEngine = await c.request(METHODS.threadList, { sessionId: created.sessionId });
+    expect(noEngine.result).toEqual({ ok: true, threads: [] });
+    c.close();
+  });
+
+  test("thread.list with an engine → main thread seeded lazily on first read", async () => {
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const fake = new FakeProvider([
+      [{ type: "text_delta", delta: "done" }, { type: "done", stopReason: "end_turn" }],
+    ]);
+    await boot({}, fake);
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "threader");
+    const cwd = mkdtempSync(join(tmpdir(), "norma-threadlist-"));
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", cwd, approvalPolicy: "auto" });
+    const list = await c.request(METHODS.threadList, { sessionId: created.sessionId });
+    expect(list.result).toEqual({ ok: true, threads: [{ threadId: "main", status: "running" }] });
+    c.close();
+  });
+
   test("without a provider, sessions behave as Phase 0 (echo only, no agent events)", async () => {
     await boot(); // no provider injected
     const c = await TestClient.connect(daemon.socketPath);

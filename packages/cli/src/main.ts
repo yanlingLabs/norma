@@ -185,6 +185,10 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
       console.log(`${DIM}⛿ entered worktree ${e.name} (branch ${e.branch})${RESET}`);
     } else if (e.type === "worktree_exited") {
       console.log(`${DIM}⟲ left worktree ${e.name}${e.removed ? " (removed)" : ""}${RESET}`);
+    } else if (e.type === "thread_started") {
+      console.log(`${DIM}⌥ spawned ${e.agentType} subagent${RESET}`);
+    } else if (e.type === "thread_completed") {
+      console.log(`${DIM}✓ subagent done${e.stopReason !== "end_turn" ? ` (${e.stopReason})` : ""}${RESET}`);
     } else if (e.type === "agent_error") {
       console.error(`agent error: ${e.message}`);
     } else if (e.type === "turn_completed") {

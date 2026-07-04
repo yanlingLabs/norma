@@ -4,7 +4,7 @@ import {
   SessionAddDirResult, SessionSetCwdResult, TrustDirResult,
   BgListResult, BgPeekResult, BgKillResult, BgKillAllResult,
   SessionSteerResult, SessionInterruptResult, SessionCompactResult, SkillsListResult,
-  PluginsListResult, AskUserRespondResult, TaskListResult,
+  PluginsListResult, AskUserRespondResult, TaskListResult, ThreadListResult,
   PlanRespondResult, SessionSetPolicyResult, type ApprovalPolicy,
   ConnWriter, type WritableSocket,
 } from "@norma/protocol";
@@ -152,6 +152,9 @@ export class NormaClient {
   }
   async taskList(params: { sessionId: string }): Promise<{ ok: true; tasks: Array<{ id: string; subject: string; status: "pending" | "in_progress" | "completed"; activeForm?: string }> }> {
     return this.validated(TaskListResult, await this.request(METHODS.taskList, params), METHODS.taskList);
+  }
+  async threadList(params: { sessionId: string }): Promise<{ ok: true; threads: Array<{ threadId: string; parentThreadId?: string; agentType?: string; status: "running" | "completed"; stopReason?: string }> }> {
+    return this.validated(ThreadListResult, await this.request(METHODS.threadList, params), METHODS.threadList);
   }
   async planRespond(params: { sessionId: string; callId: string; approved: boolean; autoAccept?: boolean; feedback?: string }): Promise<{ ok: true; alreadyResolved: boolean }> {
     return this.validated(PlanRespondResult, await this.request(METHODS.planRespond, params), METHODS.planRespond);

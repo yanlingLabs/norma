@@ -145,6 +145,14 @@ describe("NormaClient", () => {
     client.close();
   });
 
+  test("threadList client method round-trip (main thread seeded lazily on first read)", async () => {
+    await boot();
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "th", onEvent: () => {} });
+    const { sessionId } = await client.createSession("global");
+    expect(await client.threadList({ sessionId })).toEqual({ ok: true, threads: [{ threadId: "main", status: "running" }] });
+    client.close();
+  });
+
   test("init prompt reaches the session (canned NORMA.md-generation prompt)", async () => {
     const { INIT_PROMPT } = await import("../src/main");
     expect(INIT_PROMPT).toMatch(/NORMA\.md/i);
