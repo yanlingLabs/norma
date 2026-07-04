@@ -9,7 +9,9 @@ public actor NormaClient {
     private let clientName: String
     private let requestTimeout: Duration
 
-    private var transport: NormaTransport?
+    // internal (not private): NormaClient+Reconnect.swift needs to close a stale transport when a
+    // deliberate close() lands mid-reconnect (Task 9 review fix 2).
+    var transport: NormaTransport?
     private var decoder = LineDecoder()
     private var nextId = 1
     private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
@@ -20,6 +22,11 @@ public actor NormaClient {
     // an unexpected transport drop (the latter triggers reconnectLoop, the former must not).
     var everConnected = false
     var deliberatelyClosed = false
+    // Task 9 review fix 1: guards startReconnect() against re-entrancy — a transport drop that
+    // lands WHILE a reconnectLoop is already running (e.g. the replacement transport itself drops
+    // mid-handshake) must not spawn a second concurrent loop. reconnectLoop() clears this on every
+    // exit path (defer), so a later, genuinely-new disconnect can still trigger reconnection.
+    var reconnecting = false
 
     public nonisolated let events: AsyncStream<NormaEvent>
     nonisolated let eventsCont: AsyncStream<NormaEvent>.Continuation // internal: Task 9's reconnect extension yields states

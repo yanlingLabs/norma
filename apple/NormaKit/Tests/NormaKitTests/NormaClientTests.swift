@@ -3,7 +3,7 @@ import NormaProtocol
 @testable import NormaKit
 
 /// Scripted transport: records outbound lines; the test feeds inbound lines/closure manually.
-final class ScriptedTransport: NormaTransport, @unchecked Sendable {
+final class ScriptedTransport: NormaTransport, SentLineRecording, @unchecked Sendable {
     let incoming: AsyncStream<TransportEvent>
     private let cont: AsyncStream<TransportEvent>.Continuation
     private let lock = NSLock()
@@ -25,8 +25,14 @@ final class ScriptedTransport: NormaTransport, @unchecked Sendable {
     func dropConnection() { cont.yield(.closed(nil)) }
 }
 
+/// Conformed to by any test transport that records the lines it has sent, so `waitForSent` can be
+/// reused across scripted transports (ScriptedTransport, FlakySendTransport, ...).
+protocol SentLineRecording: AnyObject {
+    var sent: [String] { get }
+}
+
 /// Polls until the transport has `count` sent lines (the actor pump is async).
-func waitForSent(_ t: ScriptedTransport, count: Int, timeout: TimeInterval = 2) async throws -> [String] {
+func waitForSent(_ t: some SentLineRecording, count: Int, timeout: TimeInterval = 2) async throws -> [String] {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
         if t.sent.count >= count { return t.sent }
@@ -38,6 +44,36 @@ func waitForSent(_ t: ScriptedTransport, count: Int, timeout: TimeInterval = 2) 
 
 func decodeLine(_ s: String) -> [String: Any] {
     (try? JSONSerialization.jsonObject(with: Data(s.utf8))) as? [String: Any] ?? [:]
+}
+
+/// Like ScriptedTransport, but `send()` throws starting with the SECOND call — the first call
+/// (hello, during connect()) succeeds and is recorded normally; every call after that fails
+/// before it can record anything, simulating a transport whose socket dies right as a caller
+/// tries to write to it.
+final class FlakySendTransport: NormaTransport, SentLineRecording, @unchecked Sendable {
+    let incoming: AsyncStream<TransportEvent>
+    private let cont: AsyncStream<TransportEvent>.Continuation
+    private let lock = NSLock()
+    private var _sent: [String] = []
+    private var sendCalls = 0
+    var sent: [String] { lock.lock(); defer { lock.unlock() }; return _sent }
+
+    init() {
+        var c: AsyncStream<TransportEvent>.Continuation!
+        incoming = AsyncStream { c = $0 }
+        cont = c
+    }
+    func open() async throws {}
+    func send(_ data: Data) async throws {
+        lock.lock()
+        sendCalls += 1
+        let isFirstCall = sendCalls == 1
+        if isFirstCall { _sent.append(String(decoding: data, as: UTF8.self).trimmingCharacters(in: .newlines)) }
+        lock.unlock()
+        if !isFirstCall { throw RpcError(code: -6, message: "simulated socket write failure") }
+    }
+    func close() { cont.finish() }
+    func feed(_ line: String) { cont.yield(.data(Data((line + "\n").utf8))) }
 }
 
 final class NormaClientTests: XCTestCase {
@@ -144,5 +180,49 @@ final class NormaClientTests: XCTestCase {
         try await connected
         do { _ = try await client.request("session.list", params: nil); XCTFail("expected timeout") }
         catch let e as RpcError { XCTAssertTrue(e.message.contains("timed out")) }
+    }
+
+    /// AMENDMENT 4 regression: a send() failure (not a timeout, not a server error response) must
+    /// surface via sendFailed()'s own error/code — "transport send failed" — distinct from the
+    /// timeout path's "timed out" wording.
+    func testSendFailureResumesWithTransportError() async throws {
+        let t = FlakySendTransport()
+        let client = NormaClient(makeTransport: { t }, token: "tok", clientName: "flaky")
+        async let connected: Void = client.connect()
+        let hello = try await waitForSent(t, count: 1)[0]
+        t.feed(#"{"jsonrpc":"2.0","id":\#(decodeLine(hello)["id"] as! Int),"result":{"ok":true}}"#)
+        try await connected
+
+        do {
+            _ = try await client.request("session.list", params: nil)
+            XCTFail("expected throw")
+        } catch let e as RpcError {
+            XCTAssertEqual(e.code, -5)
+            XCTAssertTrue(e.message.contains("transport send failed"), "got: \(e.message)")
+        }
+    }
+
+    /// AMENDMENT 3 regression: close() must fail pending requests immediately rather than leaving
+    /// them to linger until their per-request timeout — assert both the error and that it resolves
+    /// well under the (5s default) request timeout.
+    func testDeliberateCloseFailsPendingImmediately() async throws {
+        let t = ScriptedTransport()
+        let client = makeClient(t)
+        async let connected: Void = client.connect()
+        let hello = try await waitForSent(t, count: 1)[0]
+        t.feed(#"{"jsonrpc":"2.0","id":\#(decodeLine(hello)["id"] as! Int),"result":{"ok":true}}"#)
+        try await connected
+
+        async let r: JSONValue = client.request("session.list", params: nil)
+        _ = try await waitForSent(t, count: 2)
+        let start = Date()
+        await client.close()
+        do {
+            _ = try await r
+            XCTFail("expected throw")
+        } catch let e as RpcError {
+            XCTAssertEqual(e.message, "connection closed")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(start), 2.0, "close() must fail pending requests promptly, not wait out the request timeout")
     }
 }

@@ -25,8 +25,12 @@ public final class UnixSocketTransport: NormaTransport, @unchecked Sendable {
                 guard let self else { return }
                 switch state {
                 case .ready:
-                    if resumed.trip() { k.resume() }
-                    self.receiveLoop()
+                    // Defense-in-depth: only the caller that actually resumed the continuation
+                    // may start the receive loop — a post-cancel spurious .ready must not.
+                    if resumed.trip() {
+                        k.resume()
+                        self.receiveLoop()
+                    }
                 case .failed(let err):
                     if resumed.trip() { k.resume(throwing: err) }
                     self.yieldClosed(err)
@@ -36,7 +40,8 @@ public final class UnixSocketTransport: NormaTransport, @unchecked Sendable {
                 }
             }
             conn.start(queue: queue)
-            queue.asyncAfter(deadline: .now() + 3) {
+            queue.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self else { return }
                 if resumed.trip() {
                     self.conn.cancel()
                     k.resume(throwing: RpcError(code: -4, message: "unix socket connect timed out"))
