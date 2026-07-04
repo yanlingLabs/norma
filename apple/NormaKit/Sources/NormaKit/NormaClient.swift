@@ -36,6 +36,9 @@ public actor NormaClient {
     var attachedSessionId: String?
     var lastSeq: Int = 0
 
+    /// The session this client is currently attached to (nil when detached).
+    public var attachedSession: String? { attachedSessionId }
+
     public init(
         makeTransport: @escaping @Sendable () -> NormaTransport,
         token: String,
@@ -79,6 +82,7 @@ public actor NormaClient {
         failAllPending(RpcError(code: -1, message: "connection closed"))
         transport?.close()
         transport = nil
+        eventsCont.finish() // deliberate close: the event stream ENDS — consumers' for-await loops exit
     }
 
     private func startPump(_ t: NormaTransport) {
@@ -208,6 +212,39 @@ extension SessionEvent {
         case .worktreeExited(let v): return v.seq
         case .threadStarted(let v): return v.seq
         case .threadCompleted(let v): return v.seq
+        }
+    }
+
+    /// Uniform sessionId accessor across all variants (sibling of `seq`).
+    public var sessionId: String {
+        switch self {
+        case .sessionCreated(let v): return v.sessionId
+        case .harnessAttached(let v): return v.sessionId
+        case .harnessDetached(let v): return v.sessionId
+        case .userMessage(let v): return v.sessionId
+        case .turnStarted(let v): return v.sessionId
+        case .assistantMessage(let v): return v.sessionId
+        case .assistantDelta(let v): return v.sessionId
+        case .toolCall(let v): return v.sessionId
+        case .toolResult(let v): return v.sessionId
+        case .approvalRequested(let v): return v.sessionId
+        case .approvalResolved(let v): return v.sessionId
+        case .turnCompleted(let v): return v.sessionId
+        case .agentError(let v): return v.sessionId
+        case .directoryAdded(let v): return v.sessionId
+        case .bgTaskStarted(let v): return v.sessionId
+        case .bgTaskOutput(let v): return v.sessionId
+        case .bgTaskExited(let v): return v.sessionId
+        case .checkpoint(let v): return v.sessionId
+        case .questionAsked(let v): return v.sessionId
+        case .questionResolved(let v): return v.sessionId
+        case .taskUpdated(let v): return v.sessionId
+        case .planPresented(let v): return v.sessionId
+        case .planResolved(let v): return v.sessionId
+        case .worktreeEntered(let v): return v.sessionId
+        case .worktreeExited(let v): return v.sessionId
+        case .threadStarted(let v): return v.sessionId
+        case .threadCompleted(let v): return v.sessionId
         }
     }
 }

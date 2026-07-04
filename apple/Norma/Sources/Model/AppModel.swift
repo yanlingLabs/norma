@@ -32,7 +32,7 @@ final class AppModel: ObservableObject {
             } catch {
                 attempt += 1
                 connectionSummary = "daemon unreachable — retrying…"
-                let backoff = min(0.5 * pow(2.0, Double(min(attempt, 5) - 1)), 10.0)
+                let backoff = min(0.5 * pow(2.0, Double(attempt - 1)), 10.0)
                 try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
                 if Task.isCancelled { return }
             }
@@ -64,7 +64,7 @@ final class AppModel: ObservableObject {
                 await refocus(onto: v.sessionId) // most-recent focus (spec §4.4, 2b subset)
                 return
             }
-            guard sessionId(of: e) == focusedSessionId else { return }
+            guard e.sessionId == focusedSessionId else { return }
             session.apply(e)
         case .connection(let s):
             session.apply(connection: s)
@@ -84,7 +84,22 @@ final class AppModel: ObservableObject {
         session.reset()
         focusedSessionId = sessionId
         // Full replay from 0 rebuilds tasks/pending state through the reducer.
-        _ = try? await client.attach(sessionId: sessionId, fromSeq: 0)
+        do {
+            _ = try await client.attach(sessionId: sessionId, fromSeq: 0)
+        } catch {
+            // Target vanished or transport hiccuped: reconcile with NormaKit's ground truth
+            // (attach() rolled its state back), then fall back to the newest surviving session.
+            focusedSessionId = await client.attachedSession
+            if let sessions = try? await client.listSessions(),
+               let newest = sessions.max(by: { $0.createdAt < $1.createdAt }),
+               newest.sessionId != sessionId {
+                session.reset()
+                focusedSessionId = newest.sessionId
+                if (try? await client.attach(sessionId: newest.sessionId, fromSeq: 0)) == nil {
+                    focusedSessionId = await client.attachedSession // reconcile again on double failure
+                }
+            }
+        }
         connectionSummary = summaryLine()
     }
 
@@ -92,38 +107,5 @@ final class AppModel: ObservableObject {
         if session.state.status == .disconnected { return "daemon unreachable" }
         if let sid = focusedSessionId { return "session \(sid.prefix(10))" }
         return "connected — no session yet"
-    }
-
-    private func sessionId(of e: SessionEvent) -> String {
-        // SessionEvent.seq's sibling accessor: every variant carries sessionId.
-        switch e {
-        case .sessionCreated(let v): return v.sessionId
-        case .harnessAttached(let v): return v.sessionId
-        case .harnessDetached(let v): return v.sessionId
-        case .userMessage(let v): return v.sessionId
-        case .turnStarted(let v): return v.sessionId
-        case .assistantMessage(let v): return v.sessionId
-        case .assistantDelta(let v): return v.sessionId
-        case .toolCall(let v): return v.sessionId
-        case .toolResult(let v): return v.sessionId
-        case .approvalRequested(let v): return v.sessionId
-        case .approvalResolved(let v): return v.sessionId
-        case .turnCompleted(let v): return v.sessionId
-        case .agentError(let v): return v.sessionId
-        case .directoryAdded(let v): return v.sessionId
-        case .bgTaskStarted(let v): return v.sessionId
-        case .bgTaskOutput(let v): return v.sessionId
-        case .bgTaskExited(let v): return v.sessionId
-        case .checkpoint(let v): return v.sessionId
-        case .questionAsked(let v): return v.sessionId
-        case .questionResolved(let v): return v.sessionId
-        case .taskUpdated(let v): return v.sessionId
-        case .planPresented(let v): return v.sessionId
-        case .planResolved(let v): return v.sessionId
-        case .worktreeEntered(let v): return v.sessionId
-        case .worktreeExited(let v): return v.sessionId
-        case .threadStarted(let v): return v.sessionId
-        case .threadCompleted(let v): return v.sessionId
-        }
     }
 }

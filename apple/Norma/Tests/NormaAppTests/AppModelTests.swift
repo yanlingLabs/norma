@@ -108,6 +108,11 @@ final class AppModelTests: XCTestCase {
         t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"turn_started","seq":2,"sessionId":"s_b","ts":6,"threadId":"main"}}"#)
         await waitUntil { model.session.state.status == .thinking }
         XCTAssertEqual(model.session.state.status, .thinking)
+
+        // stale s_a event after refocus must be ignored (filter is the divergence guard)
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"turn_completed","seq":3,"sessionId":"s_a","ts":7,"threadId":"main","stopReason":"end_turn","inputTokens":1,"outputTokens":1}}"#)
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(model.session.state.status, .thinking) // s_a's turn_completed did NOT flip us to idle
     }
 
     func testNoSessionsMeansConnectedIdleUnattached() async throws {
