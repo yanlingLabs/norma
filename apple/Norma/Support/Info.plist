@@ -8,6 +8,8 @@
 	<string>Norma</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.norma.app</string>
 	<key>CFBundleInfoDictionaryVersion</key>

@@ -127,6 +127,15 @@ public actor NormaClient {
             // Transient deltas bypass dedupe/lastSeq entirely (their seq = server lastSeq;
             // a naive `seq <= lastSeq` drop would kill every delta).
             if case .assistantDelta = e { eventsCont.yield(.session(e)); return }
+            // The seq dedupe/lastSeq bookkeeping is scoped to the currently attached session
+            // ONLY. `lastSeq` is a per-session cursor; applying it globally would drop a
+            // cross-session event (e.g. a new session's session_created, seq 1, broadcast while
+            // attached to an older/higher-seq session) as a false "already seen" duplicate.
+            // Events for any other session (or when nothing is attached) bypass the gate.
+            guard let attached = attachedSessionId, e.sessionId == attached else {
+                eventsCont.yield(.session(e))
+                return
+            }
             let seq = e.seq
             if seq <= lastSeq { return } // replay overlap after resync — already seen
             lastSeq = seq
