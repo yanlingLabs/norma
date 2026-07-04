@@ -10,6 +10,7 @@ final class AppModel: ObservableObject {
     private let client: NormaClient
     private var focusedSessionId: String?
     private var pumpTask: Task<Void, Never>?
+    private var selfCreatedSessionId: String?
 
     init(makeTransport: @escaping @Sendable () -> NormaTransport, token: String, clientName: String = "orb") {
         client = NormaClient(makeTransport: makeTransport, token: token, clientName: clientName)
@@ -57,12 +58,39 @@ final class AppModel: ObservableObject {
         Task { await client.close() }
     }
 
+    /// Field summon path: a session to talk to, creating one if none is focused.
+    func ensureFocusedSession() async -> String? {
+        if let sid = focusedSessionId { return sid }
+        guard let created = try? await client.createSession(scope: "global", cwd: NSHomeDirectory()) else { return nil }
+        selfCreatedSessionId = created.sessionId // the broadcast for our own create must not re-refocus
+        await refocus(onto: created.sessionId)
+        return focusedSessionId
+    }
+
+    /// Field submit: steer a running turn, otherwise send (starts a turn). CLI parity.
+    func sendOrSteer(_ text: String) async -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let sid = await ensureFocusedSession() else { return false }
+        if session.state.turnRunning {
+            return (try? await client.steer(sessionId: sid, text: trimmed)) != nil
+        }
+        return (try? await client.send(sessionId: sid, text: trimmed)) != nil
+    }
+
+    func interruptTurn() async {
+        guard let sid = focusedSessionId else { return }
+        _ = try? await client.interrupt(sessionId: sid)
+    }
+
     private func handle(_ ev: NormaEvent) async {
         switch ev {
         case .session(let e):
-            if case .sessionCreated(let v) = e, v.sessionId != focusedSessionId {
-                await refocus(onto: v.sessionId) // most-recent focus (spec §4.4, 2b subset)
-                return
+            if case .sessionCreated(let v) = e {
+                if v.sessionId == selfCreatedSessionId { selfCreatedSessionId = nil; return }
+                if v.sessionId != focusedSessionId {
+                    await refocus(onto: v.sessionId) // most-recent focus (spec §4.4, 2b subset)
+                    return
+                }
             }
             guard e.sessionId == focusedSessionId else { return }
             session.apply(e)
