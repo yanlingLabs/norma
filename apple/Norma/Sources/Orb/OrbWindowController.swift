@@ -131,6 +131,11 @@ final class OrbWindowController: ObservableObject {
     }
 
     func toggleField() {
-        surface == .field ? collapseToOrb() : expandToField()
+        if !isVisible {
+            // Summon while hidden: bring the orb back first, then expand — never
+            // expand an ordered-out panel (makeKey on a hidden window + nil screen).
+            show()
+        }
+        surface == .orb ? expandToField() : collapseToOrb()
     }
 }
