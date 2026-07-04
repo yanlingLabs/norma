@@ -16,9 +16,10 @@ describe("streamAction", () => {
     expect(streamAction(true, { type: "assistant_message", threadId: "main" })).toEqual({ action: "swallow_final", streaming: false });
   });
 
-  test("assistant_message without prior deltas prints in full (replay/resume path)", () => {
+  test("assistant_message without prior deltas prints in full (replay/resume path); child message mid-stream closes line first", () => {
     expect(streamAction(false, { type: "assistant_message", threadId: "main" })).toEqual({ action: "print_full", streaming: false });
-    expect(streamAction(true, { type: "assistant_message", threadId: "th_1" })).toEqual({ action: "print_full", streaming: true });
+    expect(streamAction(true, { type: "assistant_message", threadId: "th_1" })).toEqual({ action: "close_then_print_full", streaming: true });
+    expect(streamAction(false, { type: "assistant_message", threadId: "th_1" })).toEqual({ action: "print_full", streaming: false });
   });
 
   test("any other event mid-stream closes the dangling line first (e.g. agent_error with partial text)", () => {

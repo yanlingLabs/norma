@@ -136,7 +136,11 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
     if (sa.action === "write_delta") { process.stdout.write(`${AQUA}${(e as { delta: string }).delta}${RESET}`); }
     else if (sa.action === "close_line") process.stdout.write("\n");
     applyEvent(wd, e, Date.now());
-    if (e.type === "assistant_message") { if (sa.action === "print_full") console.log(`${AQUA}${e.text}${RESET}`); else process.stdout.write("\n"); }
+    if (e.type === "assistant_message") {
+      if (sa.action === "close_then_print_full") { process.stdout.write("\n"); console.log(`${AQUA}${e.text}${RESET}`); }
+      else if (sa.action === "print_full") console.log(`${AQUA}${e.text}${RESET}`);
+      else process.stdout.write("\n");
+    }
     else if (e.type === "tool_call") console.log(`${DIM}⚙ ${e.name} ${e.argsJson.slice(0, 120)}${RESET}`);
     else if (e.type === "tool_result") console.log(`${DIM}  ↳ ${e.isError ? "ERROR: " : ""}${e.output.split("\n")[0]?.slice(0, 120) ?? ""}${RESET}`);
     else if (e.type === "approval_requested") {

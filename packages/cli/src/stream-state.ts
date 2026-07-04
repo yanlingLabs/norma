@@ -1,4 +1,4 @@
-export type StreamAction = "write_delta" | "close_line" | "swallow_final" | "print_full" | "none";
+export type StreamAction = "write_delta" | "close_line" | "swallow_final" | "print_full" | "close_then_print_full" | "none";
 
 /** Pure streaming-print decision: MAIN-thread assistant_deltas stream to stdout without a
  *  trailing newline; the final assistant_message then just terminates the line (never
@@ -15,7 +15,10 @@ export function streamAction(
   }
   if (e.type === "assistant_message") {
     if (e.threadId === "main" && streaming) return { action: "swallow_final", streaming: false };
-    return { action: "print_full", streaming };
+    // A non-main (child) message landing mid-stream must close the dangling main line first —
+    // unreachable in today's blocking child fan-out, but defensive against future interleaving.
+    if (streaming) return { action: "close_then_print_full", streaming: true };
+    return { action: "print_full", streaming: false };
   }
   if (streaming) return { action: "close_line", streaming: false };
   return { action: "none", streaming: false };
