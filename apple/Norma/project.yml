@@ -1,0 +1,63 @@
+name: Norma
+options:
+  bundleIdPrefix: com.norma
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+packages:
+  NormaKit:
+    path: ../NormaKit
+  NormaProtocol:
+    path: ../NormaProtocol
+targets:
+  Norma:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+      - path: Support/AppIcon.icns
+    dependencies:
+      - package: NormaKit
+      - package: NormaProtocol
+    info:
+      path: Support/Info.plist
+      properties:
+        CFBundleName: Norma
+        CFBundleDisplayName: Norma
+        CFBundleIdentifier: com.norma.app
+        CFBundleIconFile: AppIcon
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSUIElement: true
+        LSMinimumSystemVersion: "26.0"
+        NSPrincipalClass: NSApplication
+    entitlements:
+      path: Support/Norma.entitlements
+      properties:
+        com.apple.security.cs.disable-library-validation: true
+    settings:
+      base:
+        CODE_SIGN_IDENTITY: "Apple Development"
+        DEVELOPMENT_TEAM: 37N77U9RSZ
+        CODE_SIGN_STYLE: Manual
+        SWIFT_VERSION: "5.9"
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
+  NormaAppTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: [Tests/NormaAppTests]
+    dependencies:
+      - target: Norma
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Norma.app/Contents/MacOS/Norma"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+schemes:
+  Norma:
+    build:
+      targets:
+        Norma: all
+        NormaAppTests: [test]
+    test:
+      targets: [NormaAppTests]

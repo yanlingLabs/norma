@@ -160,6 +160,46 @@ describe("daemon IPC", () => {
     a.close();
   });
 
+  test("G2: session_created broadcasts to every authed harness (spec §4.4), even one attached to nothing", async () => {
+    await boot();
+    const a = await TestClient.connect(daemon.socketPath);
+    const b = await TestClient.connect(daemon.socketPath);
+    await a.hello(harnessToken, "client-a");
+    await b.hello(harnessToken, "client-b"); // b never attaches to anything
+
+    const { result: created } = await a.request(METHODS.sessionCreate, { scope: "global" });
+
+    // b, attached to nothing, still learns about the brand-new session (this is the live-gate bug:
+    // previously only attachments received session_created, and a new session has none yet).
+    const seenByB = await b.waitForNotification((n) =>
+      n.method === METHODS.event && n.params.type === "session_created" && n.params.sessionId === created.sessionId);
+    expect(seenByB.params.scope).toBe("global");
+
+    // a (the creator) gets it too — clients dedupe on sessionId/seq.
+    const seenByA = await a.waitForNotification((n) =>
+      n.method === METHODS.event && n.params.type === "session_created" && n.params.sessionId === created.sessionId);
+    expect(seenByA.params.scope).toBe("global");
+
+    a.close(); b.close();
+  });
+
+  test("G2: a harness whose hello failed never joins the broadcast set — receives no session_created", async () => {
+    await boot();
+    const a = await TestClient.connect(daemon.socketPath);
+    const bad = await TestClient.connect(daemon.socketPath);
+    await a.hello(harnessToken, "client-a");
+    const failed = await bad.hello("nope-bad-token", "never-authed");
+    expect(failed.error.code).toBe(ERR.UNAUTHORIZED);
+
+    await a.request(METHODS.sessionCreate, { scope: "global" });
+
+    // Give the (nonexistent) delivery a beat, then confirm nothing arrived on the unauthed socket.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(bad.notifications).toHaveLength(0);
+
+    a.close(); bad.close();
+  });
+
   test("attach to nonexistent session → NOT_FOUND; send without attach → NOT_FOUND", async () => {
     await boot();
     const c = await TestClient.connect(daemon.socketPath);

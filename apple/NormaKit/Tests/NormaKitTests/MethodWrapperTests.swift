@@ -112,4 +112,37 @@ final class MethodWrapperTests: XCTestCase {
         t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"assistant_delta","seq":6,"sessionId":"s_1","ts":3,"threadId":"main","delta":"x"}}"#)
         guard case .session(.assistantDelta) = await iter.next() else { return XCTFail("delta wrongly deduped") }
     }
+
+    /// G2 live-gate fix: the seq<=lastSeq dedupe/lastSeq bookkeeping is scoped to the attached
+    /// session only. A cross-session event (e.g. a fresh `session_created` broadcast for some
+    /// OTHER session) must bypass the gate entirely — even while attached elsewhere at a much
+    /// higher lastSeq — and must not perturb dedupe for the attached session afterward.
+    func testCrossSessionEventBypassesAttachedSessionDedupe() async throws {
+        let (client, t) = try await connected()
+        // attach to s_1 fromSeq 5, server reports lastSeq 8
+        async let attached = client.attach(sessionId: "s_1", fromSeq: 5)
+        let sent = try await waitForSent(t, count: 2)
+        t.feed(#"{"jsonrpc":"2.0","id":\#(decodeLine(sent[1])["id"] as! Int),"result":{"ok":true,"lastSeq":8}}"#)
+        _ = try await attached
+
+        var iter = client.events.makeAsyncIterator()
+        // a brand-new OTHER session broadcasts session_created at seq 1 — must NOT be dropped
+        // even though 1 <= lastSeq(8) for the attached session.
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"session_created","seq":1,"sessionId":"s_2","ts":1,"scope":"global"}}"#)
+        guard case .session(.sessionCreated(let created)) = await iter.next() else {
+            return XCTFail("cross-session event wrongly dropped by attached-session dedupe")
+        }
+        XCTAssertEqual(created.sessionId, "s_2")
+        XCTAssertEqual(created.seq, 1)
+
+        // dedupe for the ATTACHED session is untouched by the cross-session event: a stale
+        // s_1 event (seq 4 <= lastSeq 8) is still dropped.
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"turn_started","seq":4,"sessionId":"s_1","ts":2,"threadId":"main"}}"#)
+        // fresh s_1 event to prove the iterator moves past the dropped one.
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"assistant_message","seq":9,"sessionId":"s_1","ts":3,"threadId":"main","text":"done"}}"#)
+        guard case .session(.assistantMessage(let m)) = await iter.next() else {
+            return XCTFail("stale attached-session event not dropped, or fresh one not delivered")
+        }
+        XCTAssertEqual(m.seq, 9)
+    }
 }

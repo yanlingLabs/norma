@@ -36,6 +36,9 @@ public actor NormaClient {
     var attachedSessionId: String?
     var lastSeq: Int = 0
 
+    /// The session this client is currently attached to (nil when detached).
+    public var attachedSession: String? { attachedSessionId }
+
     public init(
         makeTransport: @escaping @Sendable () -> NormaTransport,
         token: String,
@@ -52,6 +55,9 @@ public actor NormaClient {
     }
 
     /// Open the transport, start the read pump, authenticate. Throws on transport or hello failure.
+    /// CONTRACT: a successful return IS the "connected" signal — no `.connection(.connected)`
+    /// event is yielded for the INITIAL connect (AsyncStream pre-iterator buffering would make
+    /// it the first value every consumer sees). Reconnects DO yield `.connection` states.
     public func connect() async throws {
         let t = makeTransport()
         transport = t
@@ -76,6 +82,7 @@ public actor NormaClient {
         failAllPending(RpcError(code: -1, message: "connection closed"))
         transport?.close()
         transport = nil
+        eventsCont.finish() // deliberate close: the event stream ENDS — consumers' for-await loops exit
     }
 
     private func startPump(_ t: NormaTransport) {
@@ -120,6 +127,15 @@ public actor NormaClient {
             // Transient deltas bypass dedupe/lastSeq entirely (their seq = server lastSeq;
             // a naive `seq <= lastSeq` drop would kill every delta).
             if case .assistantDelta = e { eventsCont.yield(.session(e)); return }
+            // The seq dedupe/lastSeq bookkeeping is scoped to the currently attached session
+            // ONLY. `lastSeq` is a per-session cursor; applying it globally would drop a
+            // cross-session event (e.g. a new session's session_created, seq 1, broadcast while
+            // attached to an older/higher-seq session) as a false "already seen" duplicate.
+            // Events for any other session (or when nothing is attached) bypass the gate.
+            guard let attached = attachedSessionId, e.sessionId == attached else {
+                eventsCont.yield(.session(e))
+                return
+            }
             let seq = e.seq
             if seq <= lastSeq { return } // replay overlap after resync — already seen
             lastSeq = seq
@@ -205,6 +221,39 @@ extension SessionEvent {
         case .worktreeExited(let v): return v.seq
         case .threadStarted(let v): return v.seq
         case .threadCompleted(let v): return v.seq
+        }
+    }
+
+    /// Uniform sessionId accessor across all variants (sibling of `seq`).
+    public var sessionId: String {
+        switch self {
+        case .sessionCreated(let v): return v.sessionId
+        case .harnessAttached(let v): return v.sessionId
+        case .harnessDetached(let v): return v.sessionId
+        case .userMessage(let v): return v.sessionId
+        case .turnStarted(let v): return v.sessionId
+        case .assistantMessage(let v): return v.sessionId
+        case .assistantDelta(let v): return v.sessionId
+        case .toolCall(let v): return v.sessionId
+        case .toolResult(let v): return v.sessionId
+        case .approvalRequested(let v): return v.sessionId
+        case .approvalResolved(let v): return v.sessionId
+        case .turnCompleted(let v): return v.sessionId
+        case .agentError(let v): return v.sessionId
+        case .directoryAdded(let v): return v.sessionId
+        case .bgTaskStarted(let v): return v.sessionId
+        case .bgTaskOutput(let v): return v.sessionId
+        case .bgTaskExited(let v): return v.sessionId
+        case .checkpoint(let v): return v.sessionId
+        case .questionAsked(let v): return v.sessionId
+        case .questionResolved(let v): return v.sessionId
+        case .taskUpdated(let v): return v.sessionId
+        case .planPresented(let v): return v.sessionId
+        case .planResolved(let v): return v.sessionId
+        case .worktreeEntered(let v): return v.sessionId
+        case .worktreeExited(let v): return v.sessionId
+        case .threadStarted(let v): return v.sessionId
+        case .threadCompleted(let v): return v.sessionId
         }
     }
 }

@@ -166,6 +166,46 @@ final class ReconnectTests: XCTestCase {
         try await Task.sleep(nanoseconds: 1_500_000_000)
         XCTAssertTrue(tB.sent.isEmpty, "close() during backoff must abort the reconnect attempt")
     }
+
+    func testReattachServerErrorKeepsConnectionAndDetaches() async throws {
+        let tA = ScriptedTransport()
+        let tB = ScriptedTransport()
+        let box = TransportBox(transports: [tA, tB])
+        let client = NormaClient(makeTransport: { box.next() }, token: "tok", clientName: "m1")
+
+        // connect + attach on A
+        async let connected: Void = client.connect()
+        let helloA = try await waitForSent(tA, count: 1)[0]
+        tA.feed(#"{"jsonrpc":"2.0","id":\#(decodeLine(helloA)["id"] as! Int),"result":{"ok":true}}"#)
+        try await connected
+        async let attached = client.attach(sessionId: "s_gone", fromSeq: 0)
+        let sentA = try await waitForSent(tA, count: 2)
+        tA.feed(#"{"jsonrpc":"2.0","id":\#(decodeLine(sentA[1])["id"] as! Int),"result":{"ok":true,"lastSeq":3}}"#)
+        _ = try await attached
+
+        var iter = client.events.makeAsyncIterator()
+        // drop A → reconnect via B: answer hello OK, answer re-attach with a SERVER error
+        tA.dropConnection()
+        let helloB = try await waitForSent(tB, count: 1, timeout: 5)[0]
+        tB.feed(#"{"jsonrpc":"2.0","id":\#(decodeLine(helloB)["id"] as! Int),"result":{"ok":true}}"#)
+        let reattach = try await waitForSent(tB, count: 2)[1]
+        XCTAssertEqual(decodeLine(reattach)["method"] as? String, "session.attach")
+        tB.feed(#"{"jsonrpc":"2.0","id":\#(decodeLine(reattach)["id"] as! Int),"error":{"code":-32600,"message":"unknown session"}}"#)
+
+        // states: disconnected → reconnecting(1) → CONNECTED (not an endless retry)
+        var states: [ConnectionState] = []
+        for _ in 0..<3 {
+            if case .connection(let s)? = await iter.next() { states.append(s) }
+        }
+        XCTAssertEqual(states.last, .connected)
+        // detached: a fresh attach must be possible; internal session pointer cleared
+        let detached = await client.attachedSessionId
+        XCTAssertNil(detached)
+        // and B stays the live transport: a new request goes out on B, not a third transport
+        Task { _ = try? await client.request("session.list", params: nil) }
+        let after = try await waitForSent(tB, count: 3)
+        XCTAssertEqual(decodeLine(after[2])["method"] as? String, "session.list")
+    }
 }
 
 /// Thread-safe FIFO of scripted transports for the reconnect factory. Also counts calls: a

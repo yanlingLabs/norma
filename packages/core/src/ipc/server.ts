@@ -72,6 +72,13 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
   const preAuthMaxLine = opts.preAuthMaxLine ?? 64 * 1024;
   let connections = 0;
 
+  // Every currently-authed harness-role connection, across all sessions. A brand-new session has
+  // no attachments yet, so its session_created event can't reach anyone through the hub's
+  // per-session fan-out — instead it's broadcast here to every harness so other harnesses (e.g. an
+  // orb attached to a different, older session) learn about it and can offer to follow (spec §4.4).
+  // Added on successful hello (role === "harness"); removed on socket close.
+  const harnessConns = new Set<ConnState>();
+
   function parseParams<S extends z.ZodTypeAny>(schema: S, params: unknown): z.infer<S> {
     const result = schema.safeParse(params);
     if (!result.success) {
@@ -112,6 +119,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         connections--;
         if (socket.data.helloTimer) clearTimeout(socket.data.helloTimer);
         if (socket.data.hubClient) hub.detach(socket.data.hubClient);
+        harnessConns.delete(socket.data);
       },
       async data(socket, chunk) {
         let lines: string[];
@@ -159,6 +167,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       socket.data.clientName = p.clientName;
       if (socket.data.helloTimer) { clearTimeout(socket.data.helloTimer); socket.data.helloTimer = null; }
       socket.data.decoder = new LineDecoder(); // authed: default 8 MiB line cap
+      if (p.role === "harness") harnessConns.add(socket.data);
       return { ok: true, serverVersion: opts.serverVersion, protocolVersion: PROTOCOL_VERSION };
     }
 
@@ -169,6 +178,15 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         const p = parseParams(SessionCreateParams, params);
         const sessionId = opts.store.createSession(p.scope, { cwd: p.cwd, approvalPolicy: p.approvalPolicy });
         const trusted = p.cwd ? (opts.trust?.isTrusted(p.cwd) ?? false) : false;
+        // Broadcast the session_created event to every authed harness (not just attachments —
+        // a brand-new session has none) so other harnesses can offer to follow (spec §4.4).
+        const created = opts.store.read(sessionId, 0)[0];
+        if (created) {
+          for (const conn of harnessConns) {
+            try { conn.writer.enqueue(encodeLine({ jsonrpc: "2.0", method: METHODS.event, params: created })); }
+            catch { /* dead socket — its close() handler will evict it from harnessConns */ }
+          }
+        }
         return { sessionId, trusted };
       }
       case METHODS.sessionList:

@@ -225,4 +225,23 @@ final class NormaClientTests: XCTestCase {
         }
         XCTAssertLessThan(Date().timeIntervalSince(start), 2.0, "close() must fail pending requests promptly, not wait out the request timeout")
     }
+
+    func testDeliberateCloseFinishesEventStream() async throws {
+        let t = ScriptedTransport()
+        let client = NormaClient(makeTransport: { t }, token: "tok", clientName: "close-ends")
+        async let connected: Void = client.connect()
+        let hello = try await waitForSent(t, count: 1)[0]
+        t.feed(#"{"jsonrpc":"2.0","id":\#(decodeLine(hello)["id"] as! Int),"result":{"ok":true}}"#)
+        try await connected
+        var iter = client.events.makeAsyncIterator()
+        await client.close()
+        // the stream must END (nil), not hang — bounded by the test's own timeout behavior
+        let ev = await iter.next()
+        if case .connection(.disconnected)? = ev {
+            let final = await iter.next()
+            XCTAssertNil(final)
+        } else {
+            XCTAssertNil(ev)
+        }
+    }
 }
