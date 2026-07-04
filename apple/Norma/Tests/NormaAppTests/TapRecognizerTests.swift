@@ -65,6 +65,13 @@ final class TapRecognizerTests: XCTestCase {
         _ = r.ingest(active: touches, at: 0.03)
         _ = r.ingest(active: [], at: 0.06) // lift, no fire, RESETS (v1's latch bug fix)
         _ = r.ingest(active: four(0.4), at: 1.0)
+        _ = r.ingest(active: four(0.4), at: 1.03)
         XCTAssertTrue(r.ingest(active: [], at: 1.06)) // clean tap after reset fires
+    }
+
+    func testSingleFrameBlipDoesNotFire() {
+        var r = TapRecognizer()
+        _ = r.ingest(active: four(0.2), at: 0)      // ONE armed frame only
+        XCTAssertFalse(r.ingest(active: [], at: 0.05)) // lift inside the duration window — must NOT fire
     }
 }

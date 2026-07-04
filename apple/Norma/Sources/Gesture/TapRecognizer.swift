@@ -6,16 +6,10 @@ struct TapConfig {
     var maxDuration = 0.18
     var maxFingerTravel: Float = 0.018
     var maxCentroidTravel: Float = 0.012
-    // v1's raw callback compares `fourFingerSampleCount >= 2`, but that count
-    // includes the arm frame itself (set to 1 the instant 4 fingers are first
-    // seen), so ">= 2" only ever filters a frame rate too low to matter on
-    // real MultitouchSupport hardware (60-120Hz — any perceptible dwell
-    // yields many samples). Ported here as ">= 1" (arm frame counts) so a
-    // clean tap that produces exactly one intermediate callback before lift
-    // (as this recognizer's unit tests exercise) still fires; this is a
-    // sample-rate-independent restatement of the same real-world guarantee,
-    // not a behavior change on physical hardware.
-    var minFourFingerSamples = 1
+    // v1-tuned: >= 2 four-finger frames required so a single-callback-tick
+    // blip (palm brush set-down/lift within one reporting interval) can
+    // never fire as a tap.
+    var minFourFingerSamples = 2
     static let v1 = TapConfig()
 }
 
