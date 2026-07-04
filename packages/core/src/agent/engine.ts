@@ -517,8 +517,14 @@ export class AgentEngine {
       }
       let action: "keep" | "remove" = "keep";
       try { const a = JSON.parse(call.argsJson || "{}"); if (a.action === "remove") action = "remove"; } catch { /* default to keep */ }
+      // Capture the worktree dir BEFORE exit() clears the manager's active-session entry, so we
+      // can drop it from SessionDirectories below — on BOTH keep and remove: once exited we're
+      // back in the original repo either way, and a lingering root (especially one whose dir was
+      // just deleted by {remove}) must not stick around in the allowed-roots list.
+      const activeDir = worktrees.active(sessionId)?.dir;
       const res = worktrees.exit(sessionId, action);
       this.cfg.store.setCwd(sessionId, res.originalCwd);
+      if (activeDir) this.cfg.dirs.remove(sessionId, activeDir);
       onCwd(res.originalCwd); // SAME-TURN revert
       this.emit(sessionId, { type: "worktree_exited", sessionId, threadId, name: res.name, action, removed: res.removed });
       return {

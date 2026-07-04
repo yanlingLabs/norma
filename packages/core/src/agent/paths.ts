@@ -13,10 +13,21 @@ function canonAncestor(target: string): string {
  * Resolve `p` (relative → roots[0]) and verify it stays within ANY root.
  * Symlink-hardened: the deepest existing ancestor is realpathed before the
  * containment check. Throws on escape.
+ *
+ * Per-root resilient: a root whose `realpathSync` throws (vanished/renamed —
+ * e.g. a worktree dir removed by `exit_worktree {remove}` that still lingers
+ * in SessionDirectories' `added` set) is SKIPPED rather than fatal, so one
+ * stale root can never brick resolution against the other, still-valid
+ * roots. Mirrors the try/catch tolerance in dirs.ts's `canon`/`roots`.
  */
 export function resolveWithinAny(roots: string[], p: string): string {
   if (roots.length === 0) throw new Error("no allowed directories configured");
-  const reals = roots.map((r) => realpathSync(r));
+  const reals: string[] = [];
+  for (const r of roots) {
+    try { reals.push(realpathSync(r)); }
+    catch { /* vanished/renamed root — skip, don't let it break resolution against the others */ }
+  }
+  if (reals.length === 0) throw new Error(`path is outside the allowed directories: ${p}`);
   const target = isAbsolute(p) ? resolve(p) : resolve(reals[0]!, p);
   const probe = canonAncestor(target);
   for (const root of reals) {

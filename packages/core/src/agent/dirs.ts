@@ -22,6 +22,19 @@ export class SessionDirectories {
     set.add(this.canon(dir));
   }
 
+  /** Undo a prior `add` (e.g. a worktree that was entered then exited/removed). Deletes both the
+   *  canonical form (works if `dir` still exists on disk) and the raw literal (works once `dir`
+   *  has been deleted, since `canon` then falls back to the literal path) — whichever matches what
+   *  `add` actually stored. A no-op if `dir` was never added. Without this, a since-vanished root
+   *  lingers in the `added` set forever; `resolveWithinAny`'s per-root resilience (paths.ts) is a
+   *  defensive backstop for that case, but this keeps the roots list itself accurate. */
+  remove(sessionId: string, dir: string): void {
+    const set = this.added.get(sessionId);
+    if (!set) return;
+    set.delete(this.canon(dir));
+    set.delete(dir);
+  }
+
   has(sessionId: string, dir: string): boolean {
     return this.roots(sessionId).includes(this.canon(dir));
   }

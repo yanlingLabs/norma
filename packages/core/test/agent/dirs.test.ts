@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionDirectories } from "../../src/agent/dirs";
@@ -38,5 +38,37 @@ describe("SessionDirectories", () => {
     expect(sd.roots("s1")).toContain(ghost); // canon() falls back to the literal path
     sd.add("s1", "/tmp/norma-nonexistent-added-zzz");
     expect(() => sd.has("s1", "/tmp/norma-nonexistent-added-zzz")).not.toThrow();
+  });
+
+  // Regression (S1): exit_worktree {remove} deletes the worktree dir from disk but, without a
+  // remove() method, it lingered forever in the `added` set — resolveWithinAny then had to
+  // realpath a since-deleted root on every subsequent fs call.
+  test("remove() undoes a prior add() — the dir no longer appears in roots()/has()", () => {
+    const cwd = realDir(); const added = realDir();
+    const sd = new SessionDirectories(() => [cwd]);
+    sd.add("s1", added);
+    expect(sd.roots("s1")).toContain(added);
+    sd.remove("s1", added);
+    expect(sd.roots("s1")).not.toContain(added);
+    expect(sd.has("s1", added)).toBe(false);
+  });
+
+  test("remove() still works after the added dir was deleted from disk (the worktree {remove} case)", () => {
+    const cwd = realDir();
+    const gone = join(realDir(), "will-be-removed");
+    mkdirSync(gone);
+    const sd = new SessionDirectories(() => [cwd]);
+    sd.add("s1", gone); // canonicalized while it still exists
+    expect(sd.roots("s1")).toContain(gone);
+    rmSync(gone, { recursive: true });
+    expect(() => sd.remove("s1", gone)).not.toThrow();
+    expect(sd.roots("s1")).not.toContain(gone);
+  });
+
+  test("remove() on a dir that was never added is a harmless no-op", () => {
+    const cwd = realDir(); const notAdded = realDir();
+    const sd = new SessionDirectories(() => [cwd]);
+    expect(() => sd.remove("s1", notAdded)).not.toThrow();
+    expect(sd.roots("s1")).not.toContain(notAdded);
   });
 });

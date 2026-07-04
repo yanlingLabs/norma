@@ -33,4 +33,20 @@ describe("resolveWithinAny", () => {
     expect(resolveWithin(a, "q.txt")).toBe(join(a, "q.txt"));
     expect(() => resolveWithin(a, "/etc/hosts")).toThrow(/outside/);
   });
+
+  // Regression (S1): exit_worktree {remove} deletes the worktree dir from disk but it lingers in
+  // SessionDirectories' `added` set (no remove() existed). A naive `roots.map(realpathSync)` up
+  // front then throws ENOENT for that one vanished root — bricking resolution against every OTHER
+  // (still-valid) root, i.e. every fs tool for the rest of the session. A vanished root must be
+  // skipped, not fatal.
+  test("a vanished/nonexistent root does not break resolution against the other, valid roots", () => {
+    const a = realDir();
+    writeFileSync(join(a, "x.txt"), "");
+    const ghost = join(a, "..", "norma-vanished-root-" + Date.now());
+    expect(() => resolveWithinAny([a, ghost], "x.txt")).not.toThrow();
+    expect(resolveWithinAny([a, ghost], "x.txt")).toBe(join(a, "x.txt"));
+    expect(resolveWithinAny([a, ghost], join(a, "x.txt"))).toBe(join(a, "x.txt"));
+    // order shouldn't matter — the ghost root can be first too
+    expect(resolveWithinAny([ghost, a], join(a, "x.txt"))).toBe(join(a, "x.txt"));
+  });
 });

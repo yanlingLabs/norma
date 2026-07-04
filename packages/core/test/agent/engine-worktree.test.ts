@@ -144,6 +144,43 @@ describe.if(isMac)("AgentEngine: worktree bridge (enter/exit_worktree)", () => {
     expect(existsSync(join(wtDir, "back.txt"))).toBe(false);
   });
 
+  // Regression (S1, final review): exit_worktree {remove} deletes the worktree dir from disk.
+  // Before the fix, that dir lingered in SessionDirectories' `added` set (no dirs.remove()
+  // existed), and resolveWithinAny's `roots.map(realpathSync)` threw ENOENT for that one vanished
+  // root — bricking EVERY subsequent fs tool call for the rest of the session, even ones against
+  // the perfectly valid original repo. This pins that a same-turn follow-up write after
+  // exit_worktree {remove} still succeeds.
+  test("exit_worktree {remove} → worktree_exited emitted; same-turn follow-up write still succeeds (fs tools not bricked)", async () => {
+    const { engine, store, sessionId, cwd } = setup([
+      [{ type: "tool_call", callId: "e1", name: "enter_worktree", argsJson: JSON.stringify({ name: "feat5" }) }, done("tool_calls")],
+      [{ type: "tool_call", callId: "x1", name: "exit_worktree", argsJson: JSON.stringify({ action: "remove" }) }, done("tool_calls")],
+      [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "after-remove.txt", content: "z" }) }, done("tool_calls")],
+      text("done"),
+    ]);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const entered = events.find((e) => e.type === "worktree_entered");
+    const wtDir = (entered as any).path as string;
+
+    const exited = events.find((e) => e.type === "worktree_exited");
+    expect(exited).toMatchObject({ name: "feat5", action: "remove", removed: true });
+    expect(existsSync(wtDir)).toBe(false); // the worktree dir is really gone from disk
+
+    const exitResult = events.find((e) => e.type === "tool_result" && e.callId === "x1");
+    expect(exitResult).toMatchObject({ isError: false });
+
+    // store.setCwd reverted to the original repo
+    expect(store.meta(sessionId).cwd).toBe(cwd);
+
+    // THE FIX: a same-turn follow-up write against the ORIGINAL repo must succeed — not throw
+    // ENOENT / come back as an fs error because a stale, now-deleted worktree root is still in
+    // the session's allowed-roots list.
+    const writeResult = events.find((e) => e.type === "tool_result" && e.callId === "w1");
+    expect(writeResult).toMatchObject({ isError: false });
+    expect(existsSync(join(cwd, "after-remove.txt"))).toBe(true);
+  });
+
   test("cfg.worktrees absent → enter_worktree returns the placeholder (no event, no cwd change)", async () => {
     const { engine, store, sessionId, cwd } = setup(
       [
