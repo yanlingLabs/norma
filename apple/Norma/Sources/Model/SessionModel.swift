@@ -13,6 +13,8 @@ struct OrbSessionState: Equatable {
     var tasks: [TaskItem] = []
     var pendingApprovalIds: Set<String> = []
     var turnRunning = false
+    var streamingText = ""
+    var lastReply: String? = nil
 
     var taskCounts: (done: Int, total: Int) {
         (tasks.filter { $0.status == "completed" }.count, tasks.count)
@@ -29,6 +31,7 @@ enum SessionReducer {
         case .turnStarted(let v) where v.threadId == mainThread:
             s.turnRunning = true
             s.status = .thinking
+            s.streamingText = ""
         case .toolCall(let v) where v.threadId == mainThread:
             if s.pendingApprovalIds.isEmpty { s.status = .toolRunning(name: v.name) }
         case .toolResult(let v) where v.threadId == mainThread:
@@ -48,6 +51,11 @@ enum SessionReducer {
             s = resolvePending(s, callId: v.callId)
         case .planResolved(let v):
             s = resolvePending(s, callId: v.callId)
+        case .assistantDelta(let v) where v.threadId == mainThread:
+            s.streamingText += v.delta
+        case .assistantMessage(let v) where v.threadId == mainThread:
+            s.lastReply = v.text
+            s.streamingText = ""
         case .turnCompleted(let v) where v.threadId == mainThread:
             s.turnRunning = false
             s.pendingApprovalIds = []

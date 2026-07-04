@@ -30,6 +30,12 @@ final class SessionModelTests: XCTestCase {
     func taskUpdated(id: String, subject: String, status: String, seq: Int = 6) -> SessionEvent {
         ev(#"{"type":"task_updated","seq":\#(seq),"sessionId":"s","ts":0,"threadId":"main","task":{"id":"\#(id)","subject":"\#(subject)","status":"\#(status)"}}"#)
     }
+    func delta(_ text: String, seq: Int = 2, thread: String = "main") -> SessionEvent {
+        ev(#"{"type":"assistant_delta","seq":\#(seq),"sessionId":"s","ts":0,"threadId":"\#(thread)","delta":"\#(text)"}"#)
+    }
+    func assistantMessage(_ text: String, seq: Int = 5, thread: String = "main") -> SessionEvent {
+        ev(#"{"type":"assistant_message","seq":\#(seq),"sessionId":"s","ts":0,"threadId":"\#(thread)","text":"\#(text)"}"#)
+    }
 
     func testTurnLifecycleDrivesStatus() {
         var s = OrbSessionState()
@@ -120,5 +126,34 @@ final class SessionModelTests: XCTestCase {
         XCTAssertEqual(m.state.status, .idle)
         m.apply(turnStarted())
         XCTAssertEqual(m.state.status, .thinking)
+    }
+
+    func testDeltasAccumulateAndFinalSwaps() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, turnStarted())
+        s = SessionReducer.reduce(s, delta("Hel"))
+        s = SessionReducer.reduce(s, delta("lo", seq: 3))
+        XCTAssertEqual(s.streamingText, "Hello")
+        s = SessionReducer.reduce(s, assistantMessage("Hello there"))
+        XCTAssertEqual(s.lastReply, "Hello there")
+        XCTAssertEqual(s.streamingText, "")
+    }
+
+    func testNewTurnClearsStreamingKeepsLastReply()  {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, turnStarted())
+        s = SessionReducer.reduce(s, delta("old"))
+        s = SessionReducer.reduce(s, assistantMessage("old answer"))
+        s = SessionReducer.reduce(s, turnCompleted())
+        s = SessionReducer.reduce(s, turnStarted(seq: 10))
+        XCTAssertEqual(s.streamingText, "")
+        XCTAssertEqual(s.lastReply, "old answer") // visible until the new reply streams
+    }
+
+    func testChildThreadDeltasIgnored() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, turnStarted())
+        s = SessionReducer.reduce(s, delta("child", thread: "th_1"))
+        XCTAssertEqual(s.streamingText, "")
     }
 }
