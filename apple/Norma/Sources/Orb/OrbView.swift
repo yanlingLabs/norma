@@ -14,10 +14,6 @@ struct OrbView: View {
         }
         return state.status.pillText
     }
-    private var taskText: String? {
-        let c = session.state.taskCounts
-        return c.total > 0 ? "☑ \(c.done)/\(c.total)" : nil
-    }
 
     var body: some View {
         // Orb DEAD-CENTER of the 260×110 frame (v1 contract — window center == orb center).
@@ -36,21 +32,6 @@ struct OrbView: View {
                     }
                 }
                 .animation(.spring(response: 0.32, dampingFraction: 0.78), value: pillText)
-            }
-            .overlay(alignment: .bottom) {
-                Group {
-                    if let text = taskText {
-                        Text(text)
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.primary)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .glassEffect(.regular, in: Capsule())
-                            .overlay(Capsule().strokeBorder(.white.opacity(0.5), lineWidth: 1))
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
-                    }
-                }
-                .animation(.spring(response: 0.32, dampingFraction: 0.78), value: taskText)
             }
             .frame(width: OrbMetrics.windowSize.width, height: OrbMetrics.windowSize.height)
             // v1 LAW: no .drawingGroup() — rasterizing freezes the shimmer (PointerRenderer.swift:56-60).

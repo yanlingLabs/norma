@@ -1,9 +1,9 @@
 import AppKit
 
 enum OrbMetrics {
-    /// v1 PointerRenderer: 260×110 view; the orb sits dead-center so the follower's
+    /// v1 PointerRenderer: 380×110 view; the orb sits dead-center so the follower's
     /// "window center == orb center" math holds; the pill overlays without layout.
-    static let windowSize = NSSize(width: 260, height: 110)
+    static let windowSize = NSSize(width: 380, height: 110)
     static let orbDiameter: CGFloat = 60
 }
 
