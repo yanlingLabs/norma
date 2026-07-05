@@ -115,6 +115,79 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.session.state.status, .thinking) // s_a's turn_completed did NOT flip us to idle
     }
 
+    func testSendOrSteerCreatesSessionWhenNoneAndSends() async throws {
+        let t = AppScriptedTransport()
+        let model = AppModel(makeTransport: { t }, token: "tok")
+        let startTask = Task { await model.start() }
+        defer { startTask.cancel(); model.stop() }
+        await answerHandshake(t, sessions: "[]")
+        await waitUntil { model.session.state.status == .idle }
+
+        async let sent = model.sendOrSteer("hello")
+        await waitUntilSent(t, 3)
+        let create = lineJSON(t.sent[2])
+        XCTAssertEqual(create["method"] as? String, "session.create")
+        // REAL daemon wire order: broadcast BEFORE the RPC response.
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"session_created","seq":1,"sessionId":"s_new","ts":0,"scope":"global"}}"#)
+        t.feed(#"{"jsonrpc":"2.0","id":\#(create["id"] as! Int),"result":{"sessionId":"s_new","trusted":true}}"#)
+        // exactly ONE attach must follow (either path — never both)
+        await waitUntilSent(t, 4)
+        let attach = lineJSON(t.sent[3])
+        XCTAssertEqual(attach["method"] as? String, "session.attach")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(attach["id"] as! Int),"result":{"ok":true,"lastSeq":1}}"#)
+        // then the send goes out
+        await waitUntilSent(t, 5)
+        let send = lineJSON(t.sent[4])
+        XCTAssertEqual(send["method"] as? String, "session.send")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(send["id"] as! Int),"result":{"seq":2}}"#)
+        let ok = await sent
+        XCTAssertTrue(ok)
+        // settle: no SECOND attach/reset thrash may trail in
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        let attaches = t.sent.filter { lineJSON($0)["method"] as? String == "session.attach" }
+        XCTAssertEqual(attaches.count, 1, "double refocus: \(t.sent)")
+    }
+
+    func testSendDuringRunningTurnSteers() async throws {
+        let t = AppScriptedTransport()
+        let model = AppModel(makeTransport: { t }, token: "tok")
+        let startTask = Task { await model.start() }
+        defer { startTask.cancel(); model.stop() }
+        await answerHandshake(t, sessions: #"[{"sessionId":"s_1","scope":"global","createdAt":1,"lastSeq":0}]"#)
+        await waitUntilSent(t, 3)
+        let attach = lineJSON(t.sent[2])
+        t.feed(#"{"jsonrpc":"2.0","id":\#(attach["id"] as! Int),"result":{"ok":true,"lastSeq":0}}"#)
+        await waitUntil { model.session.state.status == .idle }
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"turn_started","seq":1,"sessionId":"s_1","ts":0,"threadId":"main"}}"#)
+        await waitUntil { model.session.state.turnRunning }
+
+        async let sent = model.sendOrSteer("also do X")
+        await waitUntilSent(t, 4)
+        let steer = lineJSON(t.sent[3])
+        XCTAssertEqual(steer["method"] as? String, "session.steer")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(steer["id"] as! Int),"result":{"ok":true,"injected":true}}"#)
+        _ = await sent
+    }
+
+    func testInterruptTargetsFocusedSession() async throws {
+        let t = AppScriptedTransport()
+        let model = AppModel(makeTransport: { t }, token: "tok")
+        let startTask = Task { await model.start() }
+        defer { startTask.cancel(); model.stop() }
+        await answerHandshake(t, sessions: #"[{"sessionId":"s_1","scope":"global","createdAt":1,"lastSeq":0}]"#)
+        await waitUntilSent(t, 3)
+        let attach = lineJSON(t.sent[2])
+        t.feed(#"{"jsonrpc":"2.0","id":\#(attach["id"] as! Int),"result":{"ok":true,"lastSeq":0}}"#)
+        await waitUntil { model.session.state.status == .idle }
+
+        async let _: Void = model.interruptTurn()
+        await waitUntilSent(t, 4)
+        let intr = lineJSON(t.sent[3])
+        XCTAssertEqual(intr["method"] as? String, "session.interrupt")
+        XCTAssertEqual((intr["params"] as? [String: Any])?["sessionId"] as? String, "s_1")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(intr["id"] as! Int),"result":{"ok":true,"wasRunning":true}}"#)
+    }
+
     func testNoSessionsMeansConnectedIdleUnattached() async throws {
         let t = AppScriptedTransport()
         let model = AppModel(makeTransport: { t }, token: "tok")

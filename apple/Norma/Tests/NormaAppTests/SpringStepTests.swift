@@ -45,6 +45,14 @@ final class SpringStepTests: XCTestCase {
         XCTAssertLessThan(s.position.x, 20) // 120*100*(1/30)*(1/30) ≈ 13.3 max first-step travel
     }
 
+    func testPerSpringDtClampMatchesV1Sources() {
+        // v1 tunes the dt clamp ceiling per spring, not globally: the orb-following spring
+        // (PointerFollower.swift:154) clamps to 1/30, while the field's window-origin
+        // tracking spring (GlassFieldWindow.swift:1957) clamps to 1/20.
+        XCTAssertEqual(SpringConfig.v1.dtClampMax, 1.0 / 30.0)
+        XCTAssertEqual(SpringConfig.tracking.dtClampMax, 1.0 / 20.0)
+    }
+
     func testCriticallyDampedNoWildOvershoot() {
         // v1 tuning overshoots slightly but never oscillates wildly: after crossing the
         // target once, the max overshoot stays under 15% of the initial distance.

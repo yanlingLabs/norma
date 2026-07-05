@@ -42,6 +42,7 @@ targets:
         CODE_SIGN_STYLE: Manual
         SWIFT_VERSION: "5.9"
         MACOSX_DEPLOYMENT_TARGET: "26.0"
+        SWIFT_OBJC_BRIDGING_HEADER: Support/NormaBridge.h
   NormaAppTests:
     type: bundle.unit-test
     platform: macOS
