@@ -372,8 +372,41 @@ struct NormaFieldView: View {
             // its document view natively at the AppKit level — see that file's own doc — and its
             // SwiftUI frame height is already clamped to `morph.composerMaxHeight`, never
             // `.fixedSize()`-driven.)
+            //
+            // Wave-10 gate fix (root cause of "reply shows its middle band, can't scroll to the
+            // top, huge empty space at the bottom" — see `inlineResponse`'s geometry-trace doc
+            // below for the live measurement that proves this): wave-8 clipped the OVERFLOW so it
+            // could never paint past the shell's rounded-rect, but never addressed WHICH slice of
+            // the oversized content that clip window shows. This `.frame(width:height:)` had no
+            // `alignment:` — SwiftUI defaults to `.center` — so the (still-oversized, per the
+            // wave-8 doc above) `inlineResponse` ZStack is centered inside the true, clamped shell
+            // box before `.clipShape` crops it: for a reply taller than the shell, that exposes the
+            // content's vertical MIDDLE, not its top, and the manual scroll offset
+            // (`morph.responseScrollOffset`, wave-9) only slides content within a viewport that a
+            // sibling measurement view has ALREADY inflated to the content's own full height (see
+            // `inlineResponse`'s `GeometryReader` — SwiftUI proposes a stack's own FINAL resolved
+            // size back down to every child once a fixedSize sibling forces that stack larger than
+            // it was asked to be, confirmed live: `proxy.size` there reads the full reply height,
+            // not the shell's), so scrolling only pans which slice of that fixed, centered crop is
+            // shown — it can reach neither the true top (the clamp floors at 0, short of the
+            // negative offset centering would require) nor stop the tail from running out before
+            // the exposed window does (the "huge empty space" at the bottom). `alignment: .top`
+            // aligns that same oversized content's TOP edge to the shell's top instead — at rest
+            // (`responseScrollOffset == 0`) the exposed slice is the content's own top (line one),
+            // and the existing scroll clamp (`MorphModel.maxResponseScrollOffset` — already
+            // correct, verified in the wave-9 gate) now lands the reply's last line exactly flush
+            // with the shell's bottom edge at max offset. Same fix also un-hides
+            // `revealDraftButton`/`historyPositionText` below (topTrailing-anchored inside the same
+            // ZStack) for any reply long enough to trigger this — they were centered off-screen
+            // above the shell right along with the reply text.
             composerOrResponseContent
-                .frame(width: composerFinal.width, height: composerFinal.height)
+                .frame(width: composerFinal.width, height: composerFinal.height, alignment: .top)
+                // Wave-10 gate fix: names this frame's own box as the ground-truth "what the user
+                // actually sees" viewport (see `inlineResponse`'s `.onGeometryChange` below) so the
+                // reply content's rendered position can be measured relative to it regardless of
+                // how many frames/ZStacks sit in between — this is what proved the centering above
+                // and (re-run after the fix) proves the reply now rests at the top.
+                .coordinateSpace(.named("normaResponseShellTrace"))
                 .clipShape(
                     RoundedRectangle(
                         cornerRadius: morphedCornerRadius(for: composerShape),
@@ -600,6 +633,28 @@ struct NormaFieldView: View {
             // exactly as the `ScrollView` version did.
             GeometryReader { proxy in
                 responseContentBody
+                    // Wave-10 gate fix: geometry-trace hook (paired with the fix's doc on
+                    // `composerOrResponseContent`'s frame above) — the content's ACTUAL rendered
+                    // top edge relative to `normaResponseShellTrace` (the real on-screen shell
+                    // viewport named there). A centered oversized child reads
+                    // minY == -(content height − shell height) / 2 at rest; top-aligned reads
+                    // minY == 0. Logged post-layout (`onGeometryChange`), so it reflects every
+                    // frame/offset in this chain, not just this one node — this is the live
+                    // measurement that proved the wave-10 root cause (`proxy.size.height` here
+                    // reads the FULL reply height, not the shell's, once the fixedSize measurement
+                    // twin above forces `inlineResponse`'s ZStack larger than the shell — SwiftUI
+                    // then re-proposes that larger, final resolved size back down to this
+                    // `GeometryReader` too) and (re-run after the fix) proves it's resolved.
+                    .onGeometryChange(
+                        for: CGFloat.self,
+                        of: { $0.frame(in: .named("normaResponseShellTrace")).minY }
+                    ) { minY in
+                        OrbDebug.log(
+                            "response content minY vs shell viewport: \(minY) "
+                            + "(shellHeight=\(proxy.size.height), responseHeight=\(morph.responseHeight), "
+                            + "offset=\(morph.responseScrollOffset))"
+                        )
+                    }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     // Short content centers within the available pill height; long content
                     // (natural height already >= proxy.size.height) is unaffected here and instead
