@@ -13,7 +13,7 @@ struct TaskItem: Equatable {
 /// (empty `reply`) apart from "no exchange at all" (empty array), and so a later wave can render
 /// prior turns without re-deriving pairing from the flat event log.
 struct Exchange: Equatable {
-    let prompt: String
+    var prompt: String
     var reply: String
 }
 
@@ -42,7 +42,12 @@ enum SessionReducer {
         var s = state
         switch event {
         case .userMessage(let v) where v.threadId == mainThread:
-            s.exchanges.append(Exchange(prompt: v.text, reply: ""))
+            if s.turnRunning, let last = s.exchanges.indices.last, s.exchanges[last].reply.isEmpty {
+                // Mid-turn steer: same turn, same exchange — the prompt grows (one turn = one exchange).
+                s.exchanges[last].prompt += "\n↳ \(v.text)"
+            } else {
+                s.exchanges.append(Exchange(prompt: v.text, reply: ""))
+            }
         case .turnStarted(let v) where v.threadId == mainThread:
             s.turnRunning = true
             s.status = .thinking
@@ -86,6 +91,9 @@ enum SessionReducer {
             s.pendingApprovalIds = []
             s.streamingText = ""
             s.status = .idle
+            if let last = s.exchanges.indices.last, s.exchanges[last].reply.isEmpty {
+                s.exchanges[last].reply = "⚠︎ \(v.message)"
+            }
         case .taskUpdated(let v): // any thread — tasks are session-wide
             if let i = s.tasks.firstIndex(where: { $0.id == v.task.id }) {
                 s.tasks[i].subject = v.task.subject

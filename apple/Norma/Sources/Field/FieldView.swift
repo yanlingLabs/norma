@@ -42,10 +42,12 @@ struct FieldView: View {
     /// `revealComposerDraftFromInlineResponse`, :1540-1545): there, hitting the right-arrow key
     /// at the caret's end PERMANENTLY cleared the shown response (`appState.clearVisibleResponse()`)
     /// — there was no way back to it from the UI. Here it's a plain toggle instead: `true` means
-    /// "the user asked to see the draft again"; it resets to `false` the instant a new prompt is
-    /// submitted, so the next reply naturally takes over the shell again once it arrives. W4
-    /// adds the swipe gesture that flips this same flag — the trailing chevron button below is
-    /// this wave's interim affordance for it.
+    /// "the user asked to see the draft again"; it resets to `false` when a new turn actually
+    /// STARTS (`.onChange(of: session.state.turnRunning)` in `body`), not when the composer is
+    /// submitted — a failed send never starts a turn, so the draft (and the fact it's showing)
+    /// survives the failure instead of being hidden behind a stale prior reply. W4 adds the
+    /// swipe gesture that flips this same flag — the trailing chevron button below is this
+    /// wave's interim affordance for it.
     @State private var showingDraft = false
 
     // MARK: Geometry — fixed final rects (this view's own internal layout, matching the old
@@ -98,6 +100,13 @@ struct FieldView: View {
                 .position(x: shellRect.midX, y: shellRect.midY)
         }
         .frame(width: FieldMetrics.size.width, height: FieldMetrics.size.height, alignment: .topLeading)
+        .onChange(of: session.state.turnRunning) { _, running in
+            // A NEW turn starting is the only reliable "the draft is done" signal (v1 parity —
+            // see `showingDraft` doc above). Flipping this synchronously on submit instead (the
+            // old behavior) meant a FAILED send — turnRunning never goes true — snapped the shell
+            // back to the stale prior reply, hiding the preserved draft the user just retyped.
+            if running { showingDraft = false }
+        }
     }
 
     // MARK: Actions row (v1 NavigationPill/SegmentCell constants — GlassFieldView.swift:1916-1939:
@@ -204,11 +213,11 @@ struct FieldView: View {
             .padding(.vertical, 6)
     }
 
-    /// Submitting always brings the draft-hiding/response-showing state back to its default —
-    /// the freshly-submitted turn's reply should occupy the shell once it arrives, not stay
-    /// hidden behind a stale `showingDraft = true` from a previous reply.
+    /// Does NOT touch `showingDraft` synchronously — see the `.onChange(of: turnRunning)` in
+    /// `body`. Flipping it here (the old behavior) raced a FAILED send: `onSubmit()` returning
+    /// an error never starts a turn, so the shell would already be showing (and then keep
+    /// showing) the stale prior reply instead of the intact, resubmittable draft.
     private func submitFromComposer() {
-        showingDraft = false
         onSubmit()
     }
 

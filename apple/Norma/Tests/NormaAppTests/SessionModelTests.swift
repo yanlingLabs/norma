@@ -200,4 +200,48 @@ final class SessionModelTests: XCTestCase {
             Exchange(prompt: "second", reply: "second reply"),
         ])
     }
+
+    /// Real wire order (send appends the user_message BEFORE the turn starts): user_message("A")
+    /// arrives while turnRunning is still false (idle from the previous turn), so it correctly
+    /// starts a fresh exchange. Then turn_started flips turnRunning true. A steer mid-turn is a
+    /// SECOND user_message(main) with no intervening turn_started — it must fold into the SAME
+    /// exchange (grow the prompt) rather than open a second one, so the eventual reply lands on
+    /// the exchange the user was actually looking at.
+    func testMidTurnSteerFoldsIntoSameExchange() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, userMessage("A", seq: 1))
+        s = SessionReducer.reduce(s, turnStarted(seq: 2))
+        s = SessionReducer.reduce(s, userMessage("B", seq: 3)) // steer: turnRunning already true
+        s = SessionReducer.reduce(s, assistantMessage("done", seq: 4))
+        XCTAssertEqual(s.exchanges.count, 1)
+        XCTAssertEqual(s.exchanges[0].prompt, "A\n↳ B")
+        XCTAssertEqual(s.exchanges[0].reply, "done")
+    }
+
+    /// Regression: two sequential (non-steer) turns — each user_message arrives with turnRunning
+    /// false (the prior turn already completed) — still produce two separate exchanges.
+    func testSequentialTurnsAfterCompletionStillProduceTwoExchanges() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, userMessage("first", seq: 1))
+        s = SessionReducer.reduce(s, turnStarted(seq: 2))
+        s = SessionReducer.reduce(s, assistantMessage("first reply", seq: 3))
+        s = SessionReducer.reduce(s, turnCompleted(seq: 4))
+        s = SessionReducer.reduce(s, userMessage("second", seq: 5))
+        s = SessionReducer.reduce(s, turnStarted(seq: 6))
+        s = SessionReducer.reduce(s, assistantMessage("second reply", seq: 7))
+        XCTAssertEqual(s.exchanges, [
+            Exchange(prompt: "first", reply: "first reply"),
+            Exchange(prompt: "second", reply: "second reply"),
+        ])
+    }
+
+    /// An errored turn (agent_error, no assistant_message) fills the still-empty exchange's
+    /// reply with the error message instead of leaving it blank forever.
+    func testAgentErrorFillsEmptyReplyOnLastExchange() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, userMessage("do the thing", seq: 1))
+        s = SessionReducer.reduce(s, turnStarted(seq: 2))
+        s = SessionReducer.reduce(s, ev(#"{"type":"agent_error","seq":3,"sessionId":"s","ts":0,"threadId":"main","message":"boom"}"#))
+        XCTAssertEqual(s.exchanges, [Exchange(prompt: "do the thing", reply: "⚠︎ boom")])
+    }
 }
