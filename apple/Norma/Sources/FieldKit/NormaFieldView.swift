@@ -165,8 +165,9 @@ struct NormaFieldView: View {
             : 0
         let thinkingDirection: CGFloat = morph.corner.isLeft ? 1 : -1
         // GATE-4 FIX (item 1): this used to be a fixed CENTER point 66pt from the orb, so as
-        // the caption text grew ("thinking…" → "☑ n/m working…" → a long tool name) the label
-        // expanded EQUALLY in both directions — including back toward the orb it sits beside,
+        // the caption text grew ("Reticulating…" → "Reticulating… ☑ n/m" — wave-6's whimsical
+        // verb, formerly "thinking…" → "☑ n/m working…"/a tool name) the label expanded EQUALLY
+        // in both directions — including back toward the orb it sits beside,
         // visually crowding it as text lengthened. Pin the ORB-ADJACENT (near) edge instead, a
         // fixed gap outside the collapsed orb's own bubble radius, and let growth extend only
         // toward the FAR edge — away from the orb. `morph.corner` is permanently `.topLeft`

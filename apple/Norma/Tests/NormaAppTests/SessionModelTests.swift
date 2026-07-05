@@ -127,9 +127,10 @@ final class SessionModelTests: XCTestCase {
         session.apply(taskUpdated(id: "1", subject: "a", status: "in_progress", seq: 7))
         session.apply(taskUpdated(id: "1", subject: "a", status: "completed", seq: 8))
         let adapter = FieldStateAdapter(session: session)
-        // Still turnRunning (turn_completed hasn't arrived yet) — the "all done" pill is
-        // expected here (spec: only IDLE hides it), not a regression this test guards.
-        XCTAssertEqual(adapter.statusText, "☑ 1/1 working…")
+        // Still turnRunning (turn_completed hasn't arrived yet), but the only task already
+        // completed and NOTHING is in_progress any more — wave-6 item 2 hides the "☑ n/m" suffix
+        // in exactly this situation, so only the bare working verb shows (not "<verb>… ☑ 1/1").
+        XCTAssertEqual(adapter.statusText, "\(session.state.workingVerb)…")
 
         session.apply(turnCompleted(seq: 9))
         XCTAssertEqual(adapter.statusText, "")
@@ -186,10 +187,121 @@ final class SessionModelTests: XCTestCase {
         XCTAssertEqual(s.status, .approvalNeeded(count: 1)) // pending survives the reconnect
     }
 
-    func testWorkingPillText() {
-        XCTAssertEqual(workingPillText(done: 0, total: 4), "☑ 1/4 working…")
-        XCTAssertEqual(workingPillText(done: 3, total: 4), "☑ 4/4 working…")
-        XCTAssertEqual(workingPillText(done: 4, total: 4), "☑ 4/4 working…")
+    // MARK: Whimsical working verb (wave 6 gate item 1: CC-style random verb per turn replaces
+    // the static "thinking…"/tool name) + task counts gated on in-progress (wave 6 gate item 2)
+
+    /// (a) Tasks may exist (even all pending) but nothing is `.in_progress` yet — bare verb, no
+    /// "☑ n/m" suffix at all.
+    func testWorkingPillTextIsBareVerbWhenNoTaskActive() {
+        XCTAssertEqual(workingPillText(verb: "Reticulating", hasActiveTask: false, done: 0, total: 0), "Reticulating…")
+        XCTAssertEqual(workingPillText(verb: "Reticulating", hasActiveTask: false, done: 0, total: 3), "Reticulating…")
+    }
+
+    /// (b) At least one task `.in_progress` — verb plus the "☑ n/m" suffix (n = completed + 1,
+    /// clamped to total).
+    func testWorkingPillTextAppendsCountsWhenTaskActive() {
+        XCTAssertEqual(workingPillText(verb: "Noodling", hasActiveTask: true, done: 0, total: 4), "Noodling… ☑ 1/4")
+        XCTAssertEqual(workingPillText(verb: "Noodling", hasActiveTask: true, done: 3, total: 4), "Noodling… ☑ 4/4")
+        XCTAssertEqual(workingPillText(verb: "Noodling", hasActiveTask: true, done: 4, total: 4), "Noodling… ☑ 4/4")
+    }
+
+    func testHasActiveTaskTracksInProgressStatus() {
+        var s = OrbSessionState()
+        XCTAssertFalse(s.hasActiveTask)
+        s = SessionReducer.reduce(s, taskUpdated(id: "1", subject: "a", status: "pending"))
+        XCTAssertFalse(s.hasActiveTask)
+        s = SessionReducer.reduce(s, taskUpdated(id: "1", subject: "a", status: "in_progress", seq: 7))
+        XCTAssertTrue(s.hasActiveTask)
+        s = SessionReducer.reduce(s, taskUpdated(id: "1", subject: "a", status: "completed", seq: 8))
+        XCTAssertFalse(s.hasActiveTask)
+    }
+
+    /// The reducer stays PURE — it must never roll a verb itself (that would make `reduce`
+    /// nondeterministic given identical inputs). Only `SessionModel.apply` does, right after
+    /// calling `reduce` — see its seam comment.
+    func testReducerNeverRollsWorkingVerb() {
+        var s = OrbSessionState()
+        XCTAssertEqual(s.workingVerb, "")
+        s = SessionReducer.reduce(s, turnStarted())
+        XCTAssertEqual(s.workingVerb, "")
+    }
+
+    /// (d) Two turns can carry different verbs — tested via directly injected `workingVerb`
+    /// values (not real randomness, which could flake by coincidentally repeating), proving the
+    /// composition just reflects whatever `workingVerb` currently holds rather than memoizing or
+    /// staling the first turn's word.
+    func testDifferentInjectedVerbsAcrossTurnsProduceDifferentPillText() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, turnStarted())
+        s.workingVerb = "Reticulating" // stand-in for turn 1's store-side roll
+        XCTAssertEqual(
+            workingPillText(verb: s.workingVerb, hasActiveTask: s.hasActiveTask, done: s.taskCounts.done, total: s.taskCounts.total),
+            "Reticulating…"
+        )
+
+        s = SessionReducer.reduce(s, turnCompleted(seq: 9))
+        s = SessionReducer.reduce(s, turnStarted(seq: 10))
+        s.workingVerb = "Noodling" // stand-in for turn 2's (different) roll
+        XCTAssertEqual(
+            workingPillText(verb: s.workingVerb, hasActiveTask: s.hasActiveTask, done: s.taskCounts.done, total: s.taskCounts.total),
+            "Noodling…"
+        )
+    }
+
+    /// Sanity on the extracted list itself: a real, sizeable, duplicate-free word set, and
+    /// `random()` only ever returns members of it.
+    func testWorkingVerbsListIsSizeableAndDuplicateFree() {
+        XCTAssertGreaterThanOrEqual(WorkingVerbs.all.count, 40)
+        XCTAssertEqual(Set(WorkingVerbs.all).count, WorkingVerbs.all.count)
+        for _ in 0..<20 {
+            XCTAssertTrue(WorkingVerbs.all.contains(WorkingVerbs.random()))
+        }
+    }
+
+    /// End-to-end store wiring: `turnStarted(main)` rolls a real verb (member of the curated
+    /// list), it stays STABLE across mid-turn tool activity (not re-rolled per event), and
+    /// `FieldStateAdapter.statusText` shows exactly that verb with no tool name and no "☑ n/m"
+    /// suffix while no task is `.in_progress` — this is item 1's "tool names no longer shown"
+    /// requirement, exercised through a real `toolCall`.
+    @MainActor
+    func testTurnStartedRollsWorkingVerbStableWithinTurnAndHidesToolName() {
+        let session = SessionModel()
+        session.markConnected()
+        session.apply(turnStarted())
+        let verb = session.state.workingVerb
+        XCTAssertTrue(WorkingVerbs.all.contains(verb))
+
+        session.apply(toolCall("bash"))
+        XCTAssertEqual(session.state.workingVerb, verb) // no re-roll mid-turn
+        let adapter = FieldStateAdapter(session: session)
+        XCTAssertEqual(adapter.statusText, "\(verb)…") // NOT "⚙ bash" — tool name no longer shown
+
+        session.apply(toolResult())
+        XCTAssertEqual(session.state.workingVerb, verb)
+    }
+
+    /// (a) Tasks exist (all pending, none in_progress) — the pill shows only the verb.
+    @MainActor
+    func testStatusTextShowsVerbOnlyWhileTasksPendingNotActive() {
+        let session = SessionModel()
+        session.markConnected()
+        session.apply(turnStarted())
+        session.apply(taskUpdated(id: "1", subject: "a", status: "pending"))
+        session.apply(taskUpdated(id: "2", subject: "b", status: "pending", seq: 7))
+        let adapter = FieldStateAdapter(session: session)
+        XCTAssertEqual(adapter.statusText, "\(session.state.workingVerb)…")
+    }
+
+    /// (b) One task in_progress — the pill appends "☑ n/m".
+    @MainActor
+    func testStatusTextAppendsCountsWhileTaskInProgress() {
+        let session = SessionModel()
+        session.markConnected()
+        session.apply(turnStarted())
+        session.apply(taskUpdated(id: "1", subject: "a", status: "pending"))
+        session.apply(taskUpdated(id: "2", subject: "b", status: "in_progress", seq: 7))
+        let adapter = FieldStateAdapter(session: session)
+        XCTAssertEqual(adapter.statusText, "\(session.state.workingVerb)… ☑ 1/2")
     }
 
     @MainActor

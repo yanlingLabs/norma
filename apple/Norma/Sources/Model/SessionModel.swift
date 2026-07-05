@@ -39,6 +39,24 @@ struct OrbSessionState: Equatable {
     /// (`agentError`) — since a queued steer never survives past the turn it was queued for.
     var queuedSteers: [String] = []
 
+    /// CC-style whimsical working verb for the current turn (wave 6 gate item 1) — e.g.
+    /// "Reticulating", "Noodling" (see `WorkingVerbs`). The REDUCER never sets this (it must stay
+    /// pure, no randomness) — `SessionModel.apply` rolls it right after `reduce` on
+    /// `turnStarted(main)`, so it's stable for the whole turn and only re-rolled at the next one.
+    /// Tests that drive `SessionReducer.reduce` directly (not through `SessionModel`) can set this
+    /// field themselves to test composition without depending on randomness.
+    var workingVerb: String = ""
+
+    /// Wave-6 gate item 2: whether the pill's "☑ n/m" task-count suffix should show at all — ONLY
+    /// while at least one task is actively `.in_progress`. A task list that exists but is idle
+    /// (nothing in progress yet) or one where every task is already `.completed` shows the bare
+    /// verb with no counts (the wave-4 batch-reset above already handles clearing a finished
+    /// batch's counts once the NEXT run's first task arrives; this additionally hides the suffix
+    /// for the current batch's own idle/tail-end moments).
+    var hasActiveTask: Bool {
+        tasks.contains { $0.status == "in_progress" }
+    }
+
     var taskCounts: (done: Int, total: Int) {
         (tasks.filter { $0.status == "completed" }.count, tasks.count)
     }
@@ -185,6 +203,16 @@ final class SessionModel: ObservableObject {
 
     func apply(_ event: SessionEvent) {
         state = SessionReducer.reduce(state, event)
+        // Store-level impurity seam (wave 6, item 1): `SessionReducer.reduce` must stay pure —
+        // no `Bool`/`Int`/`Array.randomElement` inside it, or two calls with identical inputs
+        // could produce different outputs, which breaks the reducer's testability/replay
+        // contract. So the ONE random roll a turn needs happens HERE, right after the pure
+        // reduce, keyed off the same `turnStarted(main)` case the reducer used to flip
+        // `turnRunning`/`status` — this is the one and only place `workingVerb` is assigned by
+        // production code; `OrbSessionState.workingVerb`'s doc comment points back here.
+        if case .turnStarted(let v) = event, v.threadId == "main" {
+            state.workingVerb = WorkingVerbs.random()
+        }
     }
 
     func apply(connection: ConnectionState) {

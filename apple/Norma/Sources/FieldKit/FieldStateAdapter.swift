@@ -33,36 +33,31 @@ final class FieldStateAdapter: ObservableObject {
 
     /// v1 `GlassFieldView.narrationCaption` (GlassFieldView.swift:271-275), rebound to
     /// `SessionModel`'s own pill vocabulary — v1's `appState.modelStatusText` / `.statusText`
-    /// free-form narration slots have no v2 equivalent, so this reads `workingPillText` while a
-    /// turn is running against known tasks, else `OrbStatus.pillText`, else v1's literal
-    /// "thinking..." default (only reachable if `turnRunning` is somehow true while `status` is
-    /// still `.idle` — the reducer never actually produces that combination, since
-    /// `.turnStarted` sets both together, but this is the same defensive fallback the pre-fix
-    /// code had).
+    /// free-form narration slots have no v2 equivalent.
     ///
-    /// GATE-3 FIX (F3): only returns `""` when there is truly nothing to report (`status ==
-    /// .idle` and no turn running) — this is deliberate, not a leftover gap: the collapsed-orb
-    /// pill's reveal condition (`NormaFieldView`'s `hasStatusPill`) now gates directly on
-    /// "`statusText` non-empty," mirroring the pre-transplant `OrbView.pillText`'s contract
-    /// (nil only for true idle) and v1's own `narrationCaption` (`GlassFieldView.swift:273`:
-    /// `if !appState.statusText.isEmpty { return appState.statusText }`). Before this fix the
-    /// function ALWAYS returned a non-empty string (the `"thinking..."` fallback fired even at
-    /// true idle), which — combined with a reveal condition keyed off this emptiness — would
-    /// have shown a permanent bogus "thinking..." pill; keyed instead off `isThinking` (the
-    /// prior, still-live bug), disconnected/needs-approval pills never showed at all outside an
-    /// active turn. Covers every `OrbStatus` case: `.disconnected`/`.approvalNeeded`/
-    /// `.toolRunning` all have non-nil `pillText` regardless of `turnRunning`; `.thinking` does
-    /// too ("thinking…"); only `.idle` is nil, and only then (with no turn running) is `""`
-    /// returned.
+    /// Wave 6 gate rework: `.thinking`/`.toolRunning` no longer read `OrbStatus.pillText` (it
+    /// returns nil for both now) — they compose `workingPillText(verb:hasActiveTask:done:total:)`
+    /// instead, so the collapsed pill shows the turn's CC-style whimsical verb ("Reticulating…")
+    /// rather than a static "thinking…"/tool name, with "☑ n/m" appended only while a task is
+    /// actually `.in_progress`. `.approvalNeeded`/`.disconnected` are checked FIRST and win
+    /// outright even mid-turn — they're the only two `OrbStatus` cases whose `pillText` is
+    /// non-nil, so this two-branch shape (status override, else working-verb composition) is
+    /// exhaustive without a `default`/fallback case.
+    ///
+    /// GATE-3 FIX (F3, preserved): only returns `""` when there is truly nothing to report
+    /// (`status == .idle` and no turn running) — the collapsed-orb pill's reveal condition
+    /// (`NormaFieldView`'s `hasStatusPill`) gates directly on "`statusText` non-empty," mirroring
+    /// the pre-transplant `OrbView.pillText`'s contract (nil only for true idle).
     var statusText: String {
-        let counts = session.state.taskCounts
+        let s = session.state
         let text: String
-        if session.state.turnRunning, counts.total > 0 {
-            text = workingPillText(done: counts.done, total: counts.total)
-        } else if let pillText = session.state.status.pillText {
-            text = pillText
+        if let pillText = s.status.pillText {
+            text = pillText // .approvalNeeded / .disconnected — override even mid-turn
+        } else if s.turnRunning {
+            let counts = s.taskCounts
+            text = workingPillText(verb: s.workingVerb, hasActiveTask: s.hasActiveTask, done: counts.done, total: counts.total)
         } else {
-            text = session.state.turnRunning ? "thinking..." : ""
+            text = "" // true idle: status.pillText nil (.idle) and no turn running
         }
         // Gate-3 (F3) empirical evidence hook: NORMA_ORB_DEBUG=1 traces every actual change so a
         // "disconnected" pill (or any other non-empty status) reaching the collapsed orb can be
