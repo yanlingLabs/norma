@@ -155,10 +155,26 @@ struct NormaFieldView: View {
             ? 1 - smoothstep(0.04, 0.22, morph.progress)
             : 0
         let thinkingDirection: CGFloat = morph.corner.isLeft ? 1 : -1
-        let thinkingPillCenter = CGPoint(
-            x: collapsedCenter.x + thinkingDirection * 66,
+        // GATE-4 FIX (item 1): this used to be a fixed CENTER point 66pt from the orb, so as
+        // the caption text grew ("thinking…" → "☑ n/m working…" → a long tool name) the label
+        // expanded EQUALLY in both directions — including back toward the orb it sits beside,
+        // visually crowding it as text lengthened. Pin the ORB-ADJACENT (near) edge instead, a
+        // fixed gap outside the collapsed orb's own bubble radius, and let growth extend only
+        // toward the FAR edge — away from the orb. `morph.corner` is permanently `.topLeft`
+        // (`isLeft` always true) per `MorphModel`'s own doc, so `thinkingDirection` is always
+        // `+1` today and growth is always rightward; the general (direction-aware) form below
+        // still pins correctly if that ever changes.
+        let thinkingEdgeGap: CGFloat = morph.orbBubbleSize / 2 + 10
+        let thinkingNearEdgeX = collapsedCenter.x + thinkingDirection * thinkingEdgeGap
+        // `FieldThinkingPill` caps its own width at `.maxWidth` — sizing the (invisible)
+        // alignment box to that same cap and aligning the label to its near edge means short
+        // captions sit flush at the pinned anchor and long ones grow only toward the box's far
+        // edge, never back past the anchor.
+        let thinkingBoxCenter = CGPoint(
+            x: thinkingNearEdgeX + thinkingDirection * FieldThinkingPill.maxWidth / 2,
             y: collapsedCenter.y
         )
+        let thinkingAlignment: Alignment = thinkingDirection > 0 ? .leading : .trailing
         let navOrbRect = CGRect(
             x: navFinal.minX,
             y: navFinal.midY - morph.orbBubbleSize / 2,
@@ -187,7 +203,8 @@ struct NormaFieldView: View {
                 rendersSideGlass: rendersSideGlass,
                 collapsedCenter: collapsedCenter,
                 thinkingReveal: thinkingReveal,
-                thinkingPillCenter: thinkingPillCenter,
+                thinkingBoxCenter: thinkingBoxCenter,
+                thinkingAlignment: thinkingAlignment,
                 navGlassRect: navGlassRect,
                 haloColor: haloColor
             )
@@ -220,7 +237,8 @@ struct NormaFieldView: View {
         rendersSideGlass: Bool,
         collapsedCenter: CGPoint,
         thinkingReveal: Double,
-        thinkingPillCenter: CGPoint,
+        thinkingBoxCenter: CGPoint,
+        thinkingAlignment: Alignment,
         navGlassRect: CGRect,
         haloColor: Color
     ) -> some View {
@@ -288,16 +306,12 @@ struct NormaFieldView: View {
                         .allowsHitTesting(false)
                     }
 
-                    if thinkingReveal > 0 {
-                        // The glass-only layer (no visible text) doesn't
-                        // need the live caption, but threading it through
-                        // keeps the capsule width consistent with the
-                        // inked layer above.
-                        FieldThinkingPill(caption: adapter.statusText, contentOpacity: 0, drawsGlass: true)
-                            .fixedSize()
-                            .position(x: thinkingPillCenter.x, y: thinkingPillCenter.y)
-                            .allowsHitTesting(false)
-                    }
+                    // GATE-4 FIX (item 3): the status label used to have a matching glass-only
+                    // "ghost" layer in here (invisible text, `drawsGlass: true`) purely so its
+                    // Liquid Glass material could morph alongside the composer/nav-pill glass in
+                    // this same `GlassEffectContainer`. De-pilling the label (bare text, no
+                    // capsule chrome at all — see `FieldThinkingPill`) removes the glass surface
+                    // it was ghosting for, so there's nothing left to render here.
                 }
             }
             .id(morph.glassRefreshGeneration)
@@ -355,9 +369,20 @@ struct NormaFieldView: View {
             }
 
             if thinkingReveal > 0 {
-                FieldThinkingPill(caption: adapter.statusText, contentOpacity: thinkingReveal, drawsGlass: false)
-                    .fixedSize()
-                    .position(x: thinkingPillCenter.x, y: thinkingPillCenter.y)
+                // GATE-4 FIX (item 1 + 3): an invisible box, sized to `FieldThinkingPill`'s own
+                // width cap and pinned at `thinkingBoxCenter`, with the label aligned to its
+                // near (orb-adjacent) edge via `thinkingAlignment` — this is what makes the
+                // label's near edge stay fixed while it only grows toward the far edge (see
+                // `thinkingBoxCenter`'s doc above, in `composerBody`). The label itself is bare
+                // text (no glass/stroke chrome — item 3); legibility comes from
+                // `GlassForegroundLegibility`'s difference blend below, same as every other label
+                // in this file.
+                Color.clear
+                    .frame(width: FieldThinkingPill.maxWidth, height: FieldThinkingPill.height)
+                    .overlay(alignment: thinkingAlignment) {
+                        FieldThinkingPill(caption: adapter.statusText, contentOpacity: thinkingReveal)
+                    }
+                    .position(x: thinkingBoxCenter.x, y: thinkingBoxCenter.y)
                     .modifier(GlassForegroundLegibility())
                     .allowsHitTesting(false)
             }
@@ -921,39 +946,48 @@ private struct SegmentCell: View {
     }
 }
 
-// MARK: - FieldThinkingPill (v1 GlassFieldView.swift:2563-2595, verbatim)
+// MARK: - FieldThinkingPill (GATE-4 item 3: de-pilled — was v1 GlassFieldView.swift:2563-2595,
+// a Capsule with glass/stroke chrome behind the caption; now bare text, no chrome at all)
 
+/// The collapsed-orb status readout ("thinking…", "☑ n/m working…", "disconnected", …). No
+/// longer a literal pill — GATE-4 item 3 removes the capsule glass/stroke chrome v1 drew behind
+/// this text; a floating label reads better next to the (also chrome-free) orb than a second
+/// small chip would. Legibility comes entirely from `GlassForegroundLegibility`'s difference
+/// blend at the call site (pure white in, inverted against whatever's behind the field — see
+/// that modifier's doc), the same mechanism every other label in this file relies on.
 private struct FieldThinkingPill: View {
+    /// Cap on the label's width before `lineLimit`/`truncationMode` kick in. Also the width of
+    /// the fixed (invisible) alignment box `NormaFieldView.composerMorphedContent` pins this to
+    /// (see `thinkingBoxCenter`'s doc in `composerBody`) — sizing that box to the same cap means
+    /// a long caption grows only toward the box's far edge, never back past the pinned near edge.
+    static let maxWidth: CGFloat = 220
+    /// Height of that same fixed alignment box. Purely a layout constant (this view has no
+    /// visible chrome to size) — keeps the label vertically centered on the same row the old
+    /// capsule occupied.
+    static let height: CGFloat = 28
+
     var caption: String = "thinking..."
     var contentOpacity: Double = 1
-    var drawsGlass = true
 
     var body: some View {
-        ZStack {
-            if drawsGlass {
-                Capsule()
-                    .fill(Color.clear)
-                    .glassEffect(.regular, in: Capsule())
-            } else {
-                Capsule()
-                    .strokeBorder(.white.opacity(0.5), lineWidth: 1)
-            }
-
-            // White (not .primary) so the outer GlassForegroundLegibility
-            // wrap produces a clean inversion. `.primary` resolves to
-            // black in light mode and white in dark mode, which is
-            // already the inverse of the typical glass background —
-            // diff-blending it would yield near-white in both modes.
-            Text(caption)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.white)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .opacity(contentOpacity)
-                .padding(.horizontal, 14)
-        }
-        .frame(minWidth: 82, maxWidth: 220, minHeight: 28, idealHeight: 28, maxHeight: 28)
-        .fixedSize(horizontal: true, vertical: true)
+        // White (not .primary) so the outer GlassForegroundLegibility
+        // wrap produces a clean inversion. `.primary` resolves to
+        // black in light mode and white in dark mode, which is
+        // already the inverse of the typical glass background —
+        // diff-blending it would yield near-white in both modes.
+        Text(caption)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .opacity(contentOpacity)
+            // `alignment: .leading` (not the frame default `.center`) so the text itself hugs
+            // this view's own leading edge rather than centering inside the width cap below —
+            // paired with the fixed leading-aligned box at the call site, this is what makes a
+            // SHORT caption sit flush at the pinned near-edge anchor instead of floating
+            // somewhere in the middle of unused width.
+            .frame(maxWidth: Self.maxWidth, alignment: .leading)
+            .fixedSize(horizontal: true, vertical: true)
     }
 }
 

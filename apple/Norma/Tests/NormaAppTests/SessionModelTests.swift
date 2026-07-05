@@ -85,6 +85,77 @@ final class SessionModelTests: XCTestCase {
         XCTAssertEqual(s.taskCounts.total, 2)
     }
 
+    // MARK: Task list current-run scoping (gate wave-4 item 2 — "tasks never clear")
+
+    /// (a) A brand-new task id arriving right after the current list finished completely (no
+    /// in_progress, everything completed) is the start of a new batch — the finished batch's
+    /// counts must not carry forward and inflate the new list's total.
+    func testNewTaskAfterFullCompletionResetsCounts() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, taskUpdated(id: "1", subject: "a", status: "pending"))
+        s = SessionReducer.reduce(s, taskUpdated(id: "2", subject: "b", status: "pending", seq: 7))
+        s = SessionReducer.reduce(s, taskUpdated(id: "3", subject: "c", status: "pending", seq: 8))
+        s = SessionReducer.reduce(s, taskUpdated(id: "1", subject: "a", status: "completed", seq: 9))
+        s = SessionReducer.reduce(s, taskUpdated(id: "2", subject: "b", status: "completed", seq: 10))
+        s = SessionReducer.reduce(s, taskUpdated(id: "3", subject: "c", status: "completed", seq: 11))
+        XCTAssertEqual(s.taskCounts.done, 3)
+        XCTAssertEqual(s.taskCounts.total, 3)
+
+        // Next run's first task_create (a brand-new, never-seen id) arrives — must reset, not
+        // accumulate onto the finished 3/3 batch.
+        s = SessionReducer.reduce(s, taskUpdated(id: "4", subject: "d", status: "pending", seq: 12))
+        XCTAssertEqual(s.tasks.map(\.id), ["4"])
+        XCTAssertEqual(s.taskCounts.done, 0)
+        XCTAssertEqual(s.taskCounts.total, 1)
+
+        // The rest of the new batch arriving doesn't resurrect the old one either.
+        s = SessionReducer.reduce(s, taskUpdated(id: "5", subject: "e", status: "pending", seq: 13))
+        s = SessionReducer.reduce(s, taskUpdated(id: "6", subject: "f", status: "pending", seq: 14))
+        XCTAssertEqual(s.taskCounts.done, 0)
+        XCTAssertEqual(s.taskCounts.total, 3)
+    }
+
+    /// (b) Once the turn that finished the tasks actually completes (idle), the "☑ n/m working…"
+    /// pill must disappear entirely, not linger at "n/n". `FieldStateAdapter.statusText` is the
+    /// thing the collapsed orb's pill visibility (`hasStatusPill`) actually reads.
+    @MainActor
+    func testIdleAfterFullCompletionHasNoWorkingPillText() {
+        let session = SessionModel()
+        session.markConnected()
+        session.apply(turnStarted())
+        session.apply(taskUpdated(id: "1", subject: "a", status: "pending"))
+        session.apply(taskUpdated(id: "1", subject: "a", status: "in_progress", seq: 7))
+        session.apply(taskUpdated(id: "1", subject: "a", status: "completed", seq: 8))
+        let adapter = FieldStateAdapter(session: session)
+        // Still turnRunning (turn_completed hasn't arrived yet) — the "all done" pill is
+        // expected here (spec: only IDLE hides it), not a regression this test guards.
+        XCTAssertEqual(adapter.statusText, "☑ 1/1 working…")
+
+        session.apply(turnCompleted(seq: 9))
+        XCTAssertEqual(adapter.statusText, "")
+    }
+
+    /// (c) A new task created MID-RUN (something from the current batch still in_progress) must
+    /// NOT be treated as a new batch — it just grows the current list normally.
+    func testMidRunTaskAddDoesNotResetCounts() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, taskUpdated(id: "1", subject: "a", status: "pending"))
+        s = SessionReducer.reduce(s, taskUpdated(id: "2", subject: "b", status: "pending", seq: 7))
+        s = SessionReducer.reduce(s, taskUpdated(id: "1", subject: "a", status: "in_progress", seq: 8))
+        s = SessionReducer.reduce(s, taskUpdated(id: "3", subject: "c", status: "pending", seq: 9))
+        XCTAssertEqual(s.tasks.map(\.id), ["1", "2", "3"])
+        XCTAssertEqual(s.taskCounts.done, 0)
+        XCTAssertEqual(s.taskCounts.total, 3)
+
+        s = SessionReducer.reduce(s, taskUpdated(id: "1", subject: "a", status: "completed", seq: 10))
+        // Task 1 done, task 2 still merely pending (not in_progress) — NOT "no task in_progress
+        // AND all completed" (task 2/3 aren't completed), so a new id here still must not reset.
+        s = SessionReducer.reduce(s, taskUpdated(id: "4", subject: "d", status: "pending", seq: 11))
+        XCTAssertEqual(s.tasks.map(\.id), ["1", "2", "3", "4"])
+        XCTAssertEqual(s.taskCounts.done, 1)
+        XCTAssertEqual(s.taskCounts.total, 4)
+    }
+
     func testTurnCompletedClearsPendingApprovals() {
         var s = OrbSessionState()
         s = SessionReducer.reduce(s, turnStarted())

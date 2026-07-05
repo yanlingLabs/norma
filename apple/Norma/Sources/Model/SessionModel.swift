@@ -99,6 +99,38 @@ enum SessionReducer {
                 s.tasks[i].subject = v.task.subject
                 s.tasks[i].status = v.task.status
             } else {
+                // GATE-4 FIX (item 2 — "tasks never clear"): `v.task.id` not being in `s.tasks`
+                // means the daemon just called `task_create`, never `task_update` (see
+                // `packages/core/src/agent/tools/tasks.ts`: only `task_create` can mint a new
+                // id; `task_update` 404s on an unknown one — `TaskStore.create`'s ids are a
+                // monotonic session-wide counter, `String(m.size + 1)`, so they're never reused
+                // either). The daemon's `TaskStore` never removes tasks (no delete op exists —
+                // see its doc) and the wire protocol has no "deleted" status
+                // (`TaskSchema.status` is pending/in_progress/completed only,
+                // packages/protocol/src/events.ts) — by design, session task HISTORY is kept
+                // forever for CLI/replay purposes. That's correct for the CLI, but this orb pill
+                // is a CURRENT-RUN indicator, not a session history view: upserting forever into
+                // one flat array made `taskCounts` (done/total) accumulate across every task
+                // list the session ever had, so completing one 3-task run and starting a new one
+                // showed "☑ 4/6 working…" instead of "☑ 1/3 working…" — the old, finished batch
+                // visually never went away.
+                //
+                // Fix, scoped entirely to this reducer (no daemon change — see wave-4 report for
+                // why a daemon-side "deleted" status is out of scope this wave): a brand-new
+                // task id arriving while the CURRENT list has nothing in_progress and every
+                // existing task is already completed is exactly "the start of a new batch" —
+                // there is no in-flight work the old entries could still be tracking. Clear the
+                // finished batch before appending the new task, so the pill's counts reset to
+                // just the new list. A new task id arriving mid-run (something still
+                // pending/in_progress) is NOT a batch boundary and must NOT reset — the two
+                // conditions below are individually sufficient (an all-completed list trivially
+                // has nothing in_progress) but both are spelled out to match that reasoning
+                // explicitly rather than relying on one to imply the other.
+                if !s.tasks.isEmpty,
+                   !s.tasks.contains(where: { $0.status == "in_progress" }),
+                   s.tasks.allSatisfy({ $0.status == "completed" }) {
+                    s.tasks.removeAll()
+                }
                 s.tasks.append(TaskItem(id: v.task.id, subject: v.task.subject, status: v.task.status))
             }
         default:
