@@ -36,6 +36,9 @@ final class SessionModelTests: XCTestCase {
     func assistantMessage(_ text: String, seq: Int = 5, thread: String = "main") -> SessionEvent {
         ev(#"{"type":"assistant_message","seq":\#(seq),"sessionId":"s","ts":0,"threadId":"\#(thread)","text":"\#(text)"}"#)
     }
+    func userMessage(_ text: String, seq: Int = 1, thread: String = "main") -> SessionEvent {
+        ev(#"{"type":"user_message","seq":\#(seq),"sessionId":"s","ts":0,"threadId":"\#(thread)","text":"\#(text)","clientName":"cli"}"#)
+    }
 
     func testTurnLifecycleDrivesStatus() {
         var s = OrbSessionState()
@@ -169,5 +172,32 @@ final class SessionModelTests: XCTestCase {
         s = SessionReducer.reduce(s, delta("more", seq: 11))
         s = SessionReducer.reduce(s, ev(#"{"type":"agent_error","seq":12,"sessionId":"s","ts":0,"threadId":"main","message":"boom"}"#))
         XCTAssertEqual(s.streamingText, "")
+    }
+
+    // MARK: Exchange pairing (2c wave 2 task 3 — inline response reads exchanges, not lastReply)
+
+    func testUserAndAssistantMessagePairIntoOneExchange() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, userMessage("hi there"))
+        s = SessionReducer.reduce(s, assistantMessage("hello!", seq: 2))
+        XCTAssertEqual(s.exchanges, [Exchange(prompt: "hi there", reply: "hello!")])
+    }
+
+    func testAssistantMessageWithoutPriorUserMessageCreatesEmptyPromptExchange() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, assistantMessage("orphan reply"))
+        XCTAssertEqual(s.exchanges, [Exchange(prompt: "", reply: "orphan reply")])
+    }
+
+    func testTwoTurnsProduceTwoOrderedExchanges() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, userMessage("first", seq: 1))
+        s = SessionReducer.reduce(s, assistantMessage("first reply", seq: 2))
+        s = SessionReducer.reduce(s, userMessage("second", seq: 3))
+        s = SessionReducer.reduce(s, assistantMessage("second reply", seq: 4))
+        XCTAssertEqual(s.exchanges, [
+            Exchange(prompt: "first", reply: "first reply"),
+            Exchange(prompt: "second", reply: "second reply"),
+        ])
     }
 }

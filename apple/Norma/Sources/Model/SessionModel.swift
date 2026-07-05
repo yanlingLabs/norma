@@ -8,6 +8,15 @@ struct TaskItem: Equatable {
     var status: String
 }
 
+/// A user prompt paired with its reply — the field's inline-response shell (2c wave 2 task 3)
+/// reads `exchanges.last` instead of the flat `lastReply` string so it can tell "no reply yet"
+/// (empty `reply`) apart from "no exchange at all" (empty array), and so a later wave can render
+/// prior turns without re-deriving pairing from the flat event log.
+struct Exchange: Equatable {
+    let prompt: String
+    var reply: String
+}
+
 struct OrbSessionState: Equatable {
     var status: OrbStatus = .disconnected // until markConnected() — M2 contract
     var tasks: [TaskItem] = []
@@ -15,6 +24,10 @@ struct OrbSessionState: Equatable {
     var turnRunning = false
     var streamingText = ""
     var lastReply: String? = nil
+    /// Ordered prompt/reply pairs, oldest first. `user_message(main)` appends a new exchange
+    /// with an empty reply; `assistant_message(main)` fills in the LAST exchange's reply (or, if
+    /// none exists yet, appends one with an empty prompt) — see `SessionReducer.reduce`.
+    var exchanges: [Exchange] = []
 
     var taskCounts: (done: Int, total: Int) {
         (tasks.filter { $0.status == "completed" }.count, tasks.count)
@@ -28,6 +41,8 @@ enum SessionReducer {
     static func reduce(_ state: OrbSessionState, _ event: SessionEvent) -> OrbSessionState {
         var s = state
         switch event {
+        case .userMessage(let v) where v.threadId == mainThread:
+            s.exchanges.append(Exchange(prompt: v.text, reply: ""))
         case .turnStarted(let v) where v.threadId == mainThread:
             s.turnRunning = true
             s.status = .thinking
@@ -56,6 +71,11 @@ enum SessionReducer {
         case .assistantMessage(let v) where v.threadId == mainThread:
             s.lastReply = v.text
             s.streamingText = ""
+            if s.exchanges.isEmpty {
+                s.exchanges.append(Exchange(prompt: "", reply: v.text))
+            } else {
+                s.exchanges[s.exchanges.count - 1].reply = v.text
+            }
         case .turnCompleted(let v) where v.threadId == mainThread:
             s.turnRunning = false
             s.pendingApprovalIds = []
