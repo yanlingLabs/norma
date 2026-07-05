@@ -132,6 +132,16 @@ final class FieldStateAdapter: ObservableObject {
         Binding(get: { self.composerDraft }, set: { self.composerDraft = $0 })
     }
 
+    /// GATE-3 FIX (round 3, F4): moved here (from a private `@State` inside `NormaFieldView`) so
+    /// `GlassRootView` can drive it directly from `.onChange(of: controller.surface)` — the only
+    /// place that knows "a fresh summon just happened." `true` = the composer/draft is what the
+    /// shell shows; `false` = the inline response occupies the shell instead. v1's home-state
+    /// contract: the COMPOSER is the default on every summon (see `GlassRootView`'s `.field` case
+    /// for the one exception — an actively streaming turn). `NormaFieldView` still owns the two
+    /// other writers: the reveal-draft chevron (`true`, user asked to see the draft again) and the
+    /// turn-just-started transition (`false`, a new reply takes the shell back over).
+    @Published var showingDraft: Bool = false
+
     // MARK: - Callbacks (task B wires real behavior)
 
     /// Wired by `GlassRootView` to its own `submit(_:)`, which forwards to

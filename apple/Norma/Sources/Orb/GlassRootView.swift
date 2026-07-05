@@ -43,6 +43,22 @@ struct GlassRootView: View {
                     adapter.composerDraft = ""
                 case .field:
                     adapter.composerDraft = draftCache.restore() ?? ""
+                    // GATE-3 FIX (round 3, F4 — root cause): the composer is v1's HOME state on
+                    // every summon, not whatever reply happened to occupy the shell when the
+                    // field was last collapsed — without this, re-summoning a session that
+                    // already has a reply reopened straight into the (non-editable) inline
+                    // response view, so the ComposerTextView never mounted and typing went
+                    // nowhere (empirically confirmed: zero AXTextArea/AXTextField in the AX tree
+                    // post-expand). The one exception mirrors the response's own "takes the shell
+                    // over" trigger below (`session.state.turnRunning` flip): a turn that's
+                    // ACTIVELY STREAMING (running, with text already arriving) keeps the response
+                    // view rather than yanking it away for an empty composer.
+                    if summonShowsComposer(
+                        turnRunning: session.state.turnRunning,
+                        streamingText: session.state.streamingText
+                    ) {
+                        adapter.showingDraft = true
+                    }
                 }
             }
             .onChange(of: controller.exchangeIndex) { _, newValue in
@@ -80,4 +96,15 @@ struct GlassRootView: View {
             // failure: text stays in the composer — the draft is never lost (spec §6)
         }
     }
+}
+
+/// GATE-3 FIX (round 3, F4) — the summon home-state rule, extracted pure so it's unit-testable
+/// (`SummonHomeStateTests`): on every orb→field expand the COMPOSER is the home state (v1
+/// semantics — the response occupies the shell only after a submit / while streaming), EXCEPT
+/// when a turn is actively streaming (running with reply text already arriving), in which case
+/// the in-flight response keeps the shell. `turnRunning` alone (no streamed text yet — the
+/// shimmer-only "thinking" state) still summons into the composer: nothing readable would be
+/// yanked away, and the user summoning mid-think almost certainly wants to type.
+func summonShowsComposer(turnRunning: Bool, streamingText: String) -> Bool {
+    !(turnRunning && !streamingText.isEmpty)
 }

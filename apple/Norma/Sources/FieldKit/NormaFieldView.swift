@@ -75,9 +75,9 @@ struct NormaFieldView: View {
     @Namespace private var glassNamespace
 
     @State private var composerContentHeight: CGFloat = 22
-    /// v1 port of `onTextFieldRightEdge` (see the file header's INLINE RESPONSE note) — `true`
-    /// means "the user asked to see the draft again"; reset when a new turn actually starts.
-    @State private var showingDraft = false
+    /// GATE-3 FIX (round 3, F4): moved onto `FieldStateAdapter` (`adapter.showingDraft`) — see
+    /// that property's doc for why (this view no longer owns the sole write to it; a fresh
+    /// summon needs to force it too, and that decision lives in `GlassRootView`, not here).
     @State private var shimmer = 0.0
 
     /// v1 default halo tint (`appState.visualCustomization.haloNSColor`'s factory default) —
@@ -197,7 +197,7 @@ struct NormaFieldView: View {
             // v2 "inline response" addition (not v1): a NEW turn starting is the only reliable
             // "the draft reveal is done" signal — mirrors Field/FieldView.swift's identical rule.
             if running {
-                showingDraft = false
+                adapter.showingDraft = false
             }
         }
     }
@@ -353,8 +353,9 @@ struct NormaFieldView: View {
     // (v2's OWN design, ported into v1's chrome — see file header's INLINE RESPONSE note)
 
     /// v1 parity: the inline response occupies the shell whenever there's something to show,
-    /// unless the user asked to see the draft again (`showingDraft`).
-    private var showsInlineResponse: Bool { hasReply && !showingDraft }
+    /// unless the user asked to see the draft again (`adapter.showingDraft`) — or a fresh summon
+    /// forced it (see `FieldStateAdapter.showingDraft`'s doc + `GlassRootView`'s `.field` case).
+    private var showsInlineResponse: Bool { hasReply && !adapter.showingDraft }
 
     private var hasReply: Bool {
         adapter.isThinking || !(adapter.visibleResponse?.isEmpty ?? true)
@@ -470,7 +471,7 @@ struct NormaFieldView: View {
     /// left to trigger it — see FOCUS COORDINATOR note).
     private var revealDraftButton: some View {
         Button {
-            showingDraft = true
+            adapter.showingDraft = true
         } label: {
             Image(systemName: "chevron.left")
                 .font(.system(size: 12, weight: .semibold))
