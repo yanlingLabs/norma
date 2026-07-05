@@ -61,6 +61,25 @@ final class MorphModel: ObservableObject {
     /// Task B: this is the AppKit panel's real frame size whenever
     /// `OrbWindowController.surface == .orb`.
     let collapsedWindowSize = CGSize(width: 240, height: 140)
+
+    /// GATE-3 FIX (F1, root cause #2): which of `collapsedWindowSize`/`windowSize` the AppKit
+    /// panel is ACTUALLY sized to right now — `NormaFieldView.body` requests this as its outer
+    /// `.frame(...)`, instead of unconditionally requesting `windowSize`. Root cause: `
+    /// NSHostingView` resizes its own window to match its SwiftUI content's requested frame on
+    /// every `windowDidLayout` (confirmed live via a symbolicated stack trace —
+    /// `NSHostingView.windowDidLayout()` → `updateAnimatedWindowSize(_:)` →
+    /// `-[NSWindow _setFrameCommon:display:fromServer:]`; this fires unconditionally, it is NOT
+    /// gated by `NSHostingView.sizingOptions`). With the outer frame permanently requesting the
+    /// full 480×440 `windowSize`, that mechanism silently grew the panel back to 480×440 on the
+    /// very first layout pass — even at boot, before any expand was ever triggered — undoing the
+    /// 240×140 `contentRect` `OrbWindowController.init` constructs the panel with and every later
+    /// `panel.setFrame(..., size: collapsedWindowSize)` call (`finishCollapse()`). Since the
+    /// composer's visible geometry already morphs off `progress` independent of this outer frame
+    /// (see `NormaFieldView`'s own doc — the frame only changes at the two hard resize instants,
+    /// never mid-morph), keeping this in lockstep with `OrbWindowController`'s own two
+    /// `panel.setFrame` calls (`expandToField()`/`finishCollapse()`) makes NSHostingView's
+    /// auto-resize AGREE with our explicit sizing instead of fighting it.
+    @Published var activeWindowSize: CGSize = CGSize(width: 240, height: 140)
     /// Composer pill width. Height is dynamic (`composerHeight`).
     let composerWidth: CGFloat = 360
     /// Initial / minimum composer height — matches a single line of text

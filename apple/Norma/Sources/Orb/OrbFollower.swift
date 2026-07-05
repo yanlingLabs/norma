@@ -149,24 +149,33 @@ final class OrbFollower {
     }
 
     /// The tracking spring's target: the glass anchor (magnetic target, or cursor + baseOffset),
-    /// fenced so the EXPANDED frame always fits on-screen (`fenceAnchorForTopLeftCorner` —
-    /// replaces v1's per-corner switching), then mapped to a window origin via `FieldCorner`
-    /// (always `.topLeft`) using whichever panel size is currently active (`isExpanded`).
+    /// fenced so the ACTIVE frame (whichever size the panel is currently sized to —
+    /// `collapsedWindowSize` while `.orb`, `windowSize` while `.field`) always fits on-screen
+    /// (`fenceAnchorForTopLeftCorner` — replaces v1's per-corner switching), then mapped to a
+    /// window origin via `FieldCorner` (always `.topLeft`).
+    ///
+    /// GATE-3 FIX (F1): this used to fence against `morphModel.windowSize` (the EXPANDED
+    /// 480×440 frame) UNCONDITIONALLY, even while collapsed. Because `.topLeft`'s anchor sits
+    /// near the WINDOW'S TOP with the frame growing ~338pt downward from it (`haloPadding` +
+    /// `navOffset` above, the rest below — see `fenceAnchorForTopLeftCorner`'s own derivation),
+    /// that fence forced `anchor.y >= bounds.minY + 338` at all times — a constraint sized for
+    /// the 440pt-tall expanded frame, not the 140pt-tall collapsed one. The COLLAPSED orb was
+    /// therefore clamped out of roughly the bottom third of every screen regardless of cursor
+    /// position: it rode too high and never followed the cursor down into that band (measured:
+    /// on expand the fence is correctly protective; while merely collapsed it was needlessly
+    /// fencing against a frame size the panel isn't even using). Fencing against `activeSize`
+    /// instead lets the collapsed orb track the cursor almost anywhere on screen (only a small
+    /// ~38pt margin near the very edges, sized to the ACTUAL 140pt-tall collapsed frame), while
+    /// still fully protecting the expanded field once `isExpanded` flips true.
     private func targetOrigin() -> CGPoint {
-        let raw = magneticTarget ?? CGPoint(x: cursorLocation.x + baseOffset.x, y: cursorLocation.y + baseOffset.y)
-        let anchor = fenceAnchorForTopLeftCorner(
-            raw,
-            expandedSize: morphModel.windowSize,
-            haloPadding: morphModel.haloPadding,
-            navOffset: morphModel.navPillHeight + morphModel.interPillGap,
-            visibleFrame: currentVisibleFrame()
-        )
         let activeSize = isExpanded ? morphModel.windowSize : morphModel.collapsedWindowSize
-        return morphModel.corner.windowOrigin(
-            glassAnchor: anchor,
-            morph: morphModel,
-            windowSize: activeSize,
-            surface: .composer
+        return followerTargetOrigin(
+            cursorLocation: cursorLocation,
+            magneticTarget: magneticTarget,
+            baseOffset: baseOffset,
+            activeSize: activeSize,
+            morphModel: morphModel,
+            visibleFrame: currentVisibleFrame()
         )
     }
 
@@ -182,4 +191,33 @@ final class OrbFollower {
         lastPublished = point
         onWindowOriginChange?(point)
     }
+}
+
+/// PURE extraction of `OrbFollower.targetOrigin()`'s math (gate-3 fix F1) — no CADisplayLink, no
+/// live cursor tracker, no screen enumeration beyond the passed-in `visibleFrame` — so the
+/// corrected fence-sizing behavior (fence against `activeSize`, not always the expanded frame)
+/// has direct unit coverage without needing a running app/display link.
+@MainActor
+func followerTargetOrigin(
+    cursorLocation: CGPoint,
+    magneticTarget: CGPoint?,
+    baseOffset: CGPoint,
+    activeSize: CGSize,
+    morphModel: MorphModel,
+    visibleFrame: CGRect
+) -> CGPoint {
+    let raw = magneticTarget ?? CGPoint(x: cursorLocation.x + baseOffset.x, y: cursorLocation.y + baseOffset.y)
+    let anchor = fenceAnchorForTopLeftCorner(
+        raw,
+        expandedSize: activeSize,
+        haloPadding: morphModel.haloPadding,
+        navOffset: morphModel.navPillHeight + morphModel.interPillGap,
+        visibleFrame: visibleFrame
+    )
+    return morphModel.corner.windowOrigin(
+        glassAnchor: anchor,
+        morph: morphModel,
+        windowSize: activeSize,
+        surface: .composer
+    )
 }

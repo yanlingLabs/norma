@@ -35,14 +35,46 @@ final class FieldStateAdapter: ObservableObject {
     /// `SessionModel`'s own pill vocabulary — v1's `appState.modelStatusText` / `.statusText`
     /// free-form narration slots have no v2 equivalent, so this reads `workingPillText` while a
     /// turn is running against known tasks, else `OrbStatus.pillText`, else v1's literal
-    /// "thinking..." default (`OrbStatus.pillText` returns `nil` for `.idle`).
+    /// "thinking..." default (only reachable if `turnRunning` is somehow true while `status` is
+    /// still `.idle` — the reducer never actually produces that combination, since
+    /// `.turnStarted` sets both together, but this is the same defensive fallback the pre-fix
+    /// code had).
+    ///
+    /// GATE-3 FIX (F3): only returns `""` when there is truly nothing to report (`status ==
+    /// .idle` and no turn running) — this is deliberate, not a leftover gap: the collapsed-orb
+    /// pill's reveal condition (`NormaFieldView`'s `hasStatusPill`) now gates directly on
+    /// "`statusText` non-empty," mirroring the pre-transplant `OrbView.pillText`'s contract
+    /// (nil only for true idle) and v1's own `narrationCaption` (`GlassFieldView.swift:273`:
+    /// `if !appState.statusText.isEmpty { return appState.statusText }`). Before this fix the
+    /// function ALWAYS returned a non-empty string (the `"thinking..."` fallback fired even at
+    /// true idle), which — combined with a reveal condition keyed off this emptiness — would
+    /// have shown a permanent bogus "thinking..." pill; keyed instead off `isThinking` (the
+    /// prior, still-live bug), disconnected/needs-approval pills never showed at all outside an
+    /// active turn. Covers every `OrbStatus` case: `.disconnected`/`.approvalNeeded`/
+    /// `.toolRunning` all have non-nil `pillText` regardless of `turnRunning`; `.thinking` does
+    /// too ("thinking…"); only `.idle` is nil, and only then (with no turn running) is `""`
+    /// returned.
     var statusText: String {
         let counts = session.state.taskCounts
+        let text: String
         if session.state.turnRunning, counts.total > 0 {
-            return workingPillText(done: counts.done, total: counts.total)
+            text = workingPillText(done: counts.done, total: counts.total)
+        } else if let pillText = session.state.status.pillText {
+            text = pillText
+        } else {
+            text = session.state.turnRunning ? "thinking..." : ""
         }
-        return session.state.status.pillText ?? "thinking..."
+        // Gate-3 (F3) empirical evidence hook: NORMA_ORB_DEBUG=1 traces every actual change so a
+        // "disconnected" pill (or any other non-empty status) reaching the collapsed orb can be
+        // observed directly from a headless launch, without a screenshot.
+        if text != lastLoggedStatusText {
+            lastLoggedStatusText = text
+            OrbDebug.log("FieldStateAdapter.statusText → \(text.isEmpty ? "<empty>" : "\"\(text)\"")")
+        }
+        return text
     }
+
+    private var lastLoggedStatusText: String?
 
     /// v1's `appState.presentationMode == .thinking` seam — rebound 1:1 to `state.turnRunning`
     /// (2c/2e has no separate "presentation mode," turnRunning is the only signal there is).

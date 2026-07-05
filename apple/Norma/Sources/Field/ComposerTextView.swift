@@ -34,7 +34,16 @@ struct ComposerTextView: NSViewRepresentable {
         let textView = CommandTextView()
         textView.delegate = context.coordinator
         textView.font = .systemFont(ofSize: 14)
-        textView.textColor = .labelColor
+        // GATE-3 FIX (F2): this composer is rendered inside `NormaFieldView.composerOrResponseContent`,
+        // which is wrapped in `.modifier(GlassForegroundLegibility())` — `.blendMode(.difference)`
+        // against the glass surface beneath (see that type + `GlassChromeColor`'s doc). Difference
+        // inverts cleanly ONLY against a pure-white source (`white − bg = inverse(bg)`); v1's own
+        // `composerForegroundColor` (TextField/ComposerTextView.swift) hardcodes `.white` for exactly
+        // this reason and documents the failure mode by name: "`.labelColor` would be ... already the
+        // inverse of the typical glass tone — so subtracting it from the background would produce
+        // near-white in both modes (the washed-out 'full white' symptom)" — i.e. typed text renders
+        // invisible. `.labelColor` here was the transplant regression; `.white` restores v1 parity.
+        textView.textColor = .white
         textView.isRichText = false
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.drawsBackground = false
@@ -47,7 +56,7 @@ struct ComposerTextView: NSViewRepresentable {
         textView.autoresizingMask = [.width]
         textView.typingAttributes = [
             .font: textView.font ?? .systemFont(ofSize: 14),
-            .foregroundColor: NSColor.labelColor
+            .foregroundColor: NSColor.white
         ]
         textView.insertionPointColor = .controlAccentColor
         textView.string = text

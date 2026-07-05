@@ -186,7 +186,20 @@ final class OrbWindowController: ObservableObject {
 
         guard surface == .orb else { return }
 
-        let anchor = currentGlassAnchor()
+        // Gate-3 fix (F1): the collapsed orb now tracks the cursor across the FULL screen
+        // (`OrbFollower.targetOrigin()` no longer over-fences it against the expanded frame's
+        // size — see that type's doc). That means the orb can genuinely be sitting right at a
+        // screen edge when the user expands, so the raw anchor is re-fenced HERE, against the
+        // real `windowSize` about to be applied, before computing the resize origin — otherwise
+        // a bottom/edge-hugging orb could expand partially off-screen on this one hard
+        // `setFrame` cut (the follower's own per-frame fence only kicks in on the NEXT tick).
+        let anchor = fenceAnchorForTopLeftCorner(
+            currentGlassAnchor(),
+            expandedSize: morphModel.windowSize,
+            haloPadding: morphModel.haloPadding,
+            navOffset: morphModel.navPillHeight + morphModel.interPillGap,
+            visibleFrame: (panel.screen ?? NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? .zero
+        )
         let origin = morphModel.corner.windowOrigin(
             glassAnchor: anchor,
             morph: morphModel,
@@ -194,6 +207,10 @@ final class OrbWindowController: ObservableObject {
             surface: .composer
         )
         panel.setFrame(NSRect(origin: origin, size: morphModel.windowSize), display: false)
+        // Gate-3 fix (F1, root cause #2): keep `NormaFieldView`'s outer `.frame(...)` request in
+        // lockstep with this resize — see `MorphModel.activeWindowSize`'s doc for why (NSHostingView
+        // otherwise silently resizes this panel back to whatever the SwiftUI content requests).
+        morphModel.activeWindowSize = morphModel.windowSize
         follower.isExpanded = true
         follower.snapWindowOrigin(to: origin)
 
@@ -358,6 +375,9 @@ final class OrbWindowController: ObservableObject {
             surface: .composer
         )
         panel.setFrame(NSRect(origin: origin, size: morphModel.collapsedWindowSize), display: false)
+        // Gate-3 fix (F1, root cause #2): see the matching line in `expandToField()` +
+        // `MorphModel.activeWindowSize`'s doc.
+        morphModel.activeWindowSize = morphModel.collapsedWindowSize
         follower.isExpanded = false
         follower.snapWindowOrigin(to: origin)
 

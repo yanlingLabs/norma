@@ -89,7 +89,17 @@ struct NormaFieldView: View {
         GeometryReader { geo in
             composerBody(in: geo.size)
         }
-        .frame(width: morph.windowSize.width, height: morph.windowSize.height)
+        // GATE-3 FIX (F1, root cause #2): was `morph.windowSize` (the fixed 480×440 EXPANDED
+        // size) unconditionally — see `MorphModel.activeWindowSize`'s doc for why that silently
+        // grew the AppKit panel back to 480×440 even while collapsed (an `NSHostingView` internal
+        // auto-resize-to-content-size behavior, confirmed live via a symbolicated stack trace).
+        // `activeWindowSize` tracks whichever size `OrbWindowController` actually has the panel
+        // set to, flipping at the exact same two instants (`expandToField()`/`finishCollapse()`)
+        // — the composer's own visible geometry already morphs off `progress` independent of this
+        // outer frame (see the corner-pinned `.topLeft` geometry helpers below, none of which
+        // depend on this size for that corner), so this has no effect on the morph animation
+        // itself, only on what physical AppKit frame size NSHostingView converges the window to.
+        .frame(width: morph.activeWindowSize.width, height: morph.activeWindowSize.height)
     }
 
     // MARK: - composerBody (v1 GlassFieldView.swift:313-438, verbatim minus dashboard/chat/image)
@@ -130,7 +140,18 @@ struct NormaFieldView: View {
         let sideContentContainedReveal = sideContentReveal * smoothstep(0.94, 1.0, glassSplitProgress)
         let rendersSideGlass = morph.progress >= 0.48
         let collapsedCenter = CGPoint(x: composerShape.midX, y: composerShape.midY)
-        let thinkingReveal = adapter.isThinking
+        // GATE-3 FIX (F3): the deleted pre-transplant `OrbView` showed its status pill whenever
+        // `pillText != nil` (disconnected / needs-approval / n-of-m-working), NOT only while a
+        // turn was actively running — gating this on `adapter.isThinking` (turnRunning) instead
+        // meant the collapsed orb showed NO pill at all while disconnected or awaiting approval
+        // (both states with `turnRunning == false`). `adapter.statusText` is now `""` exactly
+        // when there's truly nothing to report (see its doc), so gating on non-emptiness here
+        // restores that pill for every `OrbStatus`, matching v1's own reveal rule too
+        // (`GlassFieldView.swift:273`: `if !appState.statusText.isEmpty { return
+        // appState.statusText }`). Kept as `thinkingReveal` (not renamed) since it still drives
+        // the SAME fade-in curve, now for "has a status pill" rather than strictly "is thinking."
+        let hasStatusPill = !adapter.statusText.isEmpty
+        let thinkingReveal = hasStatusPill
             ? 1 - smoothstep(0.04, 0.22, morph.progress)
             : 0
         let thinkingDirection: CGFloat = morph.corner.isLeft ? 1 : -1
@@ -856,10 +877,16 @@ private struct FieldIconButton: View {
 // MARK: - GlassChromeColor (v1 GlassFieldView.swift:2628-2641, verbatim)
 
 /// Shared foreground/accent palette for all controls drawn on top of the
-/// Liquid Glass surfaces. Composer text uses the same all-white source in
-/// `ComposerTextView` (v1; v2's `ComposerTextView` uses `.labelColor` — see
-/// Field/ComposerTextView.swift — since it isn't drawn through
-/// `GlassForegroundLegibility`'s difference blend).
+/// Liquid Glass surfaces. Composer text uses the same all-white source as
+/// this palette (`Field/ComposerTextView.swift`'s `textColor`/typing
+/// attributes) — GATE-3 FIX (F2): an earlier revision of this comment
+/// claimed `ComposerTextView` used `.labelColor` because it "isn't drawn
+/// through `GlassForegroundLegibility`'s difference blend"; that premise was
+/// false — `composerOrResponseContent` above (which hosts `ComposerTextView`
+/// while composing) IS wrapped in `.modifier(GlassForegroundLegibility())`
+/// just like every other layer here, so `.labelColor` washed out to
+/// near-invisible text under the difference blend (the exact "washed-out
+/// full white symptom" the paragraph below describes). Fixed to `.white`.
 ///
 /// Every glyph/label colour here is **pure white** — no light/dark-mode
 /// branching. The chrome is rendered through `GlassForegroundLegibility`
