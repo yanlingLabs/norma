@@ -165,6 +165,13 @@ struct GlassRootView: View {
     /// there is nothing extra to arrive for a field the user is already looking at.
     private func handleTurnCompleted() {
         guard controller.surface == .orb else { return }
+        // Final-review I1: never auto-expand a HIDDEN panel (menu "Hide Orb") — expanding an
+        // ordered-out panel re-creates the b8e1f8b wedge (surface=.field while invisible, next
+        // summon collapses instead of opening). A hidden orb marks the answer unread instead.
+        guard controller.isVisible else {
+            adapter.hasUnread = true
+            return
+        }
         guard !(session.state.exchanges.last?.reply.isEmpty ?? true) else { return }
         if controller.follower.isCursorCalm() {
             OrbDebug.log("answer arrived: expanding")
