@@ -8,6 +8,11 @@ struct SpringConfig {
     var snapSpeed: CGFloat
     var glideDistance: CGFloat
     var glideSpeed: CGFloat
+    /// Per-spring dt clamp ceiling. v1 tunes this per spring, not globally: the orb-following
+    /// spring (PointerFollower.swift:154) clamps to 1/30, while the field's window-origin
+    /// tracking spring (GlassFieldWindow.swift:1957) clamps to 1/20. Defaults to 1/30 so
+    /// `.v1` doesn't need to restate it.
+    var dtClampMax: TimeInterval = 1.0 / 30.0
 
     static let v1 = SpringConfig(
         stiffness: 120.0, damping: 22.0,
@@ -17,11 +22,13 @@ struct SpringConfig {
 
     /// v1's window-origin tracking spring (GlassFieldWindow.swift:1960-1961, snap/glide
     /// thresholds 1949/1972) — softer than `.v1`'s orb-following spring: the panel trails the
-    /// glass anchor rather than snapping to it, so the field doesn't fight the morph.
+    /// glass anchor rather than snapping to it, so the field doesn't fight the morph. Its dt
+    /// clamp is also wider on top (1/20 vs `.v1`'s 1/30) — GlassFieldWindow.swift:1957.
     static let tracking = SpringConfig(
         stiffness: 75.0, damping: 18.0,
         snapDistance: 0.35, snapSpeed: 18,
-        glideDistance: 8, glideSpeed: 80
+        glideDistance: 8, glideSpeed: 80,
+        dtClampMax: 1.0 / 20.0
     )
 }
 
@@ -36,10 +43,15 @@ struct SpringState: Equatable {
     var velocity: CGPoint
 }
 
-/// One physics step — semantics identical to v1 PointerFollower.step(), extracted pure.
+/// One physics step — semantics identical to v1 PointerFollower.step()/GlassFieldWindow's
+/// track step, extracted pure. The dt clamp ceiling is per-`config`, not hardcoded: v1's
+/// orb-following spring (PointerFollower.swift:154) clamps to [1/240, 1/30], while v1's field
+/// window-origin tracking spring (GlassFieldWindow.swift:1957) clamps to [1/240, 1/20] —
+/// `SpringConfig.v1` vs `SpringConfig.tracking` carry those two ceilings respectively via
+/// `dtClampMax`.
 func springStep(_ state: SpringState, target: CGPoint, dt rawDt: TimeInterval, config: SpringConfig) -> (state: SpringState, tier: SpringTier) {
     var s = state
-    let dt = max(1.0 / 240.0, min(rawDt, 1.0 / 30.0))
+    let dt = max(1.0 / 240.0, min(rawDt, config.dtClampMax))
 
     let dx = target.x - s.position.x
     let dy = target.y - s.position.y

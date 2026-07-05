@@ -31,6 +31,11 @@ final class OrbWindowController: ObservableObject {
     /// monitor's key-routing) — rendering reads `morphModel.progress`, not this.
     @Published private(set) var surface: Surface = .orb
 
+    /// Test-only convenience — `morphModel.progress` is already reachable via `@testable
+    /// import`, but tests read through this name so they don't reach past the controller's
+    /// public surface into its collaborator's internals.
+    var morphProgressForTesting: Double { morphModel.progress }
+
     /// Wired in Task 6: the controller exposes callbacks, it does NOT import AppModel.
     /// Returns send success — GlassRootView's submit() gates the draft clear on this so a
     /// failed/disconnected send never loses the composed text (spec §6).
@@ -116,6 +121,24 @@ final class OrbWindowController: ObservableObject {
     /// continuously by the tracking spring (which keeps running: the field follows the cursor
     /// too, wave 2's whole point).
     func expandToField() {
+        // RETARGET (v1 parity — GlassFieldWindow.swift:765-772's `midHide` re-show): a
+        // re-summon arrived while a collapse morph is still in flight. `surface` is still
+        // `.field` here — it only flips to `.orb` inside `finishCollapse()`, which itself
+        // only runs once the morph SETTLES with `morphTarget == 0` (see `morphTick()`).
+        // Teardown therefore never ran: the panel is still keyable, still key, the focus
+        // snapshot and key monitor are still live. So there is nothing to re-acquire — just
+        // reverse the spring's target back toward 1 from wherever `progress` currently sits
+        // (no snap, no discontinuity) and bail out before any of the "cold start" setup below
+        // re-runs. Flipping `morphTarget` here doubles as clearing the pending collapse
+        // completion: `finishCollapse()` is gated on `morphTarget == 0` read FRESH at settle
+        // time (there's no captured completion closure to go stale), so once the target is 1
+        // the stale collapse-teardown can never fire — it settles at 1 instead of 0.
+        if surface == .field && morphTarget == 0 {
+            startMorph(target: 1)
+            OrbDebug.log("expandToField: retarget mid-collapse re-summon, morphTarget=1")
+            return
+        }
+
         guard surface == .orb else { return }
 
         externalFocus = ExternalFocusSnapshot.captureCurrent()
@@ -154,7 +177,17 @@ final class OrbWindowController: ObservableObject {
             // expand an ordered-out panel (makeKey on a hidden window + nil screen).
             show()
         }
-        surface == .orb ? expandToField() : collapseToOrb()
+        if surface == .field && morphTarget == 0 {
+            // Mid-collapse re-summon: v1 semantics are that a tap DURING the collapse
+            // reopens (see `expandToField()`'s retarget path) rather than being dropped or
+            // queuing a second collapse. Only a tap while fully open (or still expanding)
+            // closes — that's the `else` below, unchanged.
+            expandToField()
+        } else if surface == .orb {
+            expandToField()
+        } else {
+            collapseToOrb()
+        }
     }
 
     // MARK: Morph spring
