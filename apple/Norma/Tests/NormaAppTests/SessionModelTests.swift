@@ -304,6 +304,55 @@ final class SessionModelTests: XCTestCase {
         XCTAssertEqual(adapter.statusText, "\(session.state.workingVerb)… ☑ 1/2")
     }
 
+    // MARK: - Wave-7 gate item 2: FieldStateAdapter.isWorkingVerb (animated spinner/sheen gate)
+
+    /// A running turn with no override pill (`.thinking`) is exactly the "working verb" branch of
+    /// `statusText` — the animated spinner + sheen (`NormaFieldView`) should apply.
+    @MainActor
+    func testIsWorkingVerbTrueWhileTurnRunningWithNoOverridePill() {
+        let session = SessionModel()
+        session.markConnected()
+        session.apply(turnStarted())
+        let adapter = FieldStateAdapter(session: session)
+        XCTAssertTrue(adapter.isWorkingVerb)
+    }
+
+    /// `.approvalNeeded` overrides `statusText` "even mid-turn" (per its own doc) — the turn is
+    /// still running (`testApprovalCycleCountsAndRestores`'s "turn still running" comment) but the
+    /// pill shown is the static "needs approval" text, not the verb, so the animation must NOT
+    /// apply here.
+    @MainActor
+    func testIsWorkingVerbFalseWhenApprovalNeededEvenWhileTurnRunning() {
+        let session = SessionModel()
+        session.markConnected()
+        session.apply(turnStarted())
+        session.apply(approvalRequested(callId: "c1"))
+        XCTAssertTrue(session.state.turnRunning) // still running — override wins regardless
+        let adapter = FieldStateAdapter(session: session)
+        XCTAssertFalse(adapter.isWorkingVerb)
+        XCTAssertEqual(adapter.statusText, "needs approval")
+    }
+
+    /// True idle (never connected, or connected with nothing running) — no pill at all, so
+    /// obviously nothing to animate.
+    @MainActor
+    func testIsWorkingVerbFalseWhenIdle() {
+        let session = SessionModel()
+        session.markConnected()
+        let adapter = FieldStateAdapter(session: session)
+        XCTAssertFalse(adapter.isWorkingVerb)
+    }
+
+    /// Disconnected (the other override pill) — same "static override, no animation" contract as
+    /// `.approvalNeeded` above.
+    @MainActor
+    func testIsWorkingVerbFalseWhenDisconnected() {
+        let session = SessionModel() // markConnected() never called: status stays .disconnected
+        let adapter = FieldStateAdapter(session: session)
+        XCTAssertFalse(adapter.isWorkingVerb)
+        XCTAssertEqual(adapter.statusText, "disconnected")
+    }
+
     @MainActor
     func testSessionModelStorePublishesAndMarksConnected() {
         let m = SessionModel()

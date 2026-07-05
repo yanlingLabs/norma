@@ -45,12 +45,23 @@ final class MorphModel: ObservableObject {
     @Published var composerHeight: CGFloat = 44
     /// Wave-5 gate item 3: natural (unclamped) height of the inline response's own content —
     /// pinned/live prompt + reply + the queued-steer line, whichever are showing — measured live
-    /// by `NormaFieldView.inlineResponse` via a background `GeometryReader` + `PreferenceKey`
-    /// (mirrors `composerHeight`'s doc above / `composerContentHeight`'s actual live mechanism,
-    /// ported to the read side since there's no NSTextView to report it here). Drives the shell
-    /// height while a response is showing (`NormaFieldView.clampedResponseHeight(in:)`), clamped
-    /// to the window's own usable vertical space so the pill never grows past the halo padding —
-    /// anything taller keeps scrolling internally, same as before this wave.
+    /// by `NormaFieldView.inlineResponse`. Drives the shell height while a response is showing
+    /// (`NormaFieldView.clampedResponseHeight(in:)`), clamped to the window's own usable vertical
+    /// space so the pill never grows past the halo padding — anything taller keeps scrolling
+    /// internally, same as before this wave.
+    ///
+    /// Wave-7 gate fix: the ORIGINAL measurement mechanism (a background `GeometryReader` +
+    /// `PreferenceKey`, mirroring `composerContentHeight`'s NSTextView-driven doc above) never
+    /// actually worked — confirmed empirically (live daemon run, real long reply): the reported
+    /// height latched at its very first measurement (0, from the placeholder "thinking" state)
+    /// and never updated again despite the underlying `GeometryReader` continuing to compute
+    /// correct, growing values every render (verified via a raw diagnostic log directly in that
+    /// closure). No `.onPreferenceChange` attachment point tried — the immediate ancestor, or one
+    /// above `GlassForegroundLegibility`'s `.compositingGroup()` — ever saw those updates. Fixed by
+    /// replacing the whole `PreferenceKey` plumbing with `.onGeometryChange(for:of:action:)` (the
+    /// modern, direct replacement for exactly this pattern — no bubbling required), applied to a
+    /// hidden, non-scrolling twin of the response content (see `NormaFieldView.inlineResponse`'s
+    /// doc for why a second copy is measured instead of the visible, `ScrollView`-hosted one).
     @Published var responseHeight: CGFloat = 0
     /// Incremented when macOS moves the panel into a new compositor context
     /// (Space/screen changes). Rebuilding the glass subtree forces SwiftUI's

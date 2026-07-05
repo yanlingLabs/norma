@@ -75,10 +75,6 @@ struct NormaFieldView: View {
     @Namespace private var glassNamespace
 
     @State private var composerContentHeight: CGFloat = 22
-    /// GATE-3 FIX (round 3, F4): moved onto `FieldStateAdapter` (`adapter.showingDraft`) — see
-    /// that property's doc for why (this view no longer owns the sole write to it; a fresh
-    /// summon needs to force it too, and that decision lives in `GlassRootView`, not here).
-    @State private var shimmer = 0.0
 
     /// v1 default halo tint (`appState.visualCustomization.haloNSColor`'s factory default) —
     /// there is no visualCustomization system in v2 yet, so this is a fixed placeholder; a later
@@ -116,6 +112,12 @@ struct NormaFieldView: View {
         let composerTargetHeight = showsInlineResponse
             ? clampedResponseHeight(in: windowSize)
             : clampedComposerHeight()
+        // Wave-7 gate item 1 empirical evidence hook: NORMA_ORB_DEBUG=1 traces the shell-height
+        // CONSUMER every render, paired with `inlineResponse`'s measurement-site hook below — this
+        // pair of log lines is what proved the growth bug live (`responseHeight` latched at 0
+        // forever) and now proves the fix (`responseHeight` tracks the reply and `shell height`
+        // follows it up to `maxShellHeight`).
+        let _ = OrbDebug.log("shell height: \(composerTargetHeight) (showsInlineResponse=\(showsInlineResponse), responseHeight=\(morph.responseHeight), windowSize=\(windowSize), maxShellHeight=\(maxShellHeight(in: windowSize)))")
         let composerFinal = composerFinalRect(in: windowSize, height: composerTargetHeight)
         let orbPoint = morph.corner.orbAnchorInWindow(
             windowSize: windowSize,
@@ -390,7 +392,11 @@ struct NormaFieldView: View {
                 Color.clear
                     .frame(width: FieldThinkingPill.maxWidth, height: FieldThinkingPill.height)
                     .overlay(alignment: thinkingAlignment) {
-                        FieldThinkingPill(caption: adapter.statusText, contentOpacity: thinkingReveal)
+                        FieldThinkingPill(
+                            caption: adapter.statusText,
+                            contentOpacity: thinkingReveal,
+                            animated: adapter.isWorkingVerb
+                        )
                     }
                     .position(x: thinkingBoxCenter.x, y: thinkingBoxCenter.y)
                     .modifier(GlassForegroundLegibility())
@@ -505,6 +511,46 @@ struct NormaFieldView: View {
     /// draft-reveal chevron, exactly like the pre-transplant `Field/FieldView.swift` did.
     private var inlineResponse: some View {
         ZStack(alignment: .topTrailing) {
+            // Wave-7 gate fix (item 1 root cause, two compounding bugs found empirically, in
+            // order):
+            //
+            // (1) A `GeometryReader`/`PreferenceKey` measuring background that lives INSIDE a
+            // `ScrollView`'s own content does not reliably re-fire once the ScrollView has
+            // completed its first layout pass — confirmed empirically (live daemon run, real long
+            // reply): the reported height latched at 0 (the very first "isThinkingOnly" placeholder
+            // measurement) and never updated again even once a genuine multi-line reply replaced
+            // it — `morph.responseHeight` stayed 0 forever, so the shell never grew past its floor.
+            // First fix attempt: measure a hidden, NON-scrolling twin of the same content instead
+            // (below) — confirmed via a raw diagnostic log directly inside the measuring
+            // `GeometryReader`'s closure that this DOES correctly report a true, growing height on
+            // every re-render (140 → 156 → 172… as a streamed reply grew).
+            //
+            // (2) But routing that correct, changing value through `.preference(key:value:)` +
+            // an ancestor `.onPreferenceChange` never worked, at ANY ancestor tried (the immediate
+            // `ZStack` below, and — a second attempt — `composerOrResponseContent`'s call site
+            // above `GlassForegroundLegibility`'s `.compositingGroup()`): `onPreferenceChange`
+            // fired exactly once per mount, always reporting the key's `defaultValue` (0), and
+            // never again despite the producer visibly recomputing correct, changing values the
+            // whole time (same raw-log evidence as above). This reproduces regardless of the
+            // ScrollView entirely — the PreferenceKey plumbing itself is the unreliable part in
+            // this view tree, not just the ScrollView-nested case from (1).
+            //
+            // FIX: bypass `PreferenceKey`/`onPreferenceChange` entirely and use `.onGeometryChange`
+            // (the modern, direct replacement for this exact pattern) on the hidden twin — it reads
+            // the view's own resolved geometry and invokes the action closure whenever the derived
+            // value changes, with no bubbling required. This is measured live: log evidence below
+            // confirms `morph.responseHeight` now tracks the growing reply and the shell grows with it.
+            responseContentBody
+                .frame(width: morph.composerWidth, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .onGeometryChange(for: CGFloat.self, of: { $0.size.height }) { newHeight in
+                    OrbDebug.log("response content measured: \(newHeight)")
+                    morph.responseHeight = newHeight
+                }
+                .opacity(0)
+                .accessibilityHidden(true)
+                .allowsHitTesting(false)
+
             // GeometryReader hands the ScrollView's own (== composerFinal's) height down so
             // short replies can be vertically centered instead of pinned to the top — a
             // ScrollView always reports "fill the box" as its OWN size (that's how scrolling
@@ -513,70 +559,12 @@ struct NormaFieldView: View {
             // sat flush against the top of a much taller pill (user report: "riding high").
             GeometryReader { proxy in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
-                        if let prompt = adapter.displayedPrompt {
-                            Text(prompt)
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(.white.opacity(0.65)) // difference-blend-safe secondary
-                                .lineLimit(2)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        if !replyText.isEmpty {
-                            Text(replyText)
-                                .font(.system(size: 13))
-                                // GATE-3 F6b: under GlassForegroundLegibility's difference blend,
-                                // .primary is BLACK in Light mode -> |0 - bg| = bg -> invisible.
-                                // Pure white is the only correct foreground here (same rule as the
-                                // composer text and thinking pill; see the F2 comment below).
-                                .foregroundStyle(.white)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        if isThinkingOnly {
-                            shimmerRow
-                        }
-                        // Wave-5 gate item 2: a message sent mid-turn is folded silently into the
-                        // prompt above — this line is the only visible confirmation it was
-                        // actually accepted and is waiting for the next round boundary, not lost.
-                        if let queuedText = adapter.queuedText {
-                            Text("⧗ \(queuedText)")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.white.opacity(0.5)) // difference-blend-safe, dimmed
-                                .lineLimit(2)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-                    // Same leading/trailing/vertical insets as `composerContent` (see the shared
-                    // constants above the type header) — `textLeadingInset` reserves the exact
-                    // same 12+26+8 gutter the composer's icon column occupies, so this text's
-                    // leading edge lands on the SAME x as composer text; the trailing/vertical
-                    // paddings mirror the composer's outer 12h/6v exactly.
-                    .padding(.leading, Self.textLeadingInset)
-                    .padding(.trailing, Self.contentHorizontalPadding)
-                    .padding(.vertical, Self.contentVerticalPadding)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    // Wave-5 gate item 3: measure this VStack's OWN natural height (prompt + reply
-                    // + queued line, at the padding above — BEFORE the `.frame(minHeight:...)`
-                    // below stretches it to fill the pill) via a background GeometryReader +
-                    // PreferenceKey, and republish it onto `morph.responseHeight` — mirrors
-                    // `ComposerTextView.onContentHeightChange` driving `composerContentHeight`,
-                    // just measured from SwiftUI layout instead of an NSTextView self-report since
-                    // there's no text view backing this side.
-                    .background(
-                        GeometryReader { contentProxy in
-                            Color.clear.preference(
-                                key: ResponseContentHeightKey.self,
-                                value: contentProxy.size.height
-                            )
-                        }
-                    )
-                    // Short content centers within the available pill height; long content
-                    // (natural height already >= proxy.size.height) is unaffected and scrolls
-                    // normally, top-anchored, exactly as before.
-                    .frame(minHeight: proxy.size.height, alignment: .center)
-                }
-                .onPreferenceChange(ResponseContentHeightKey.self) { height in
-                    morph.responseHeight = height
+                    responseContentBody
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        // Short content centers within the available pill height; long content
+                        // (natural height already >= proxy.size.height) is unaffected and scrolls
+                        // normally, top-anchored, exactly as before.
+                        .frame(minHeight: proxy.size.height, alignment: .center)
                 }
             }
 
@@ -595,6 +583,55 @@ struct NormaFieldView: View {
         }
     }
 
+    /// Wave-7 gate fix: the inline response's actual textual content (prompt + reply + shimmer/
+    /// working-verb row + queued line), extracted so BOTH the hidden measurement twin and the
+    /// real, visible `ScrollView` render the IDENTICAL view — see `inlineResponse`'s doc for why
+    /// a second, non-scrolling copy is what actually measures the natural height now.
+    @ViewBuilder
+    private var responseContentBody: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let prompt = adapter.displayedPrompt {
+                Text(prompt)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.65)) // difference-blend-safe secondary
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if !replyText.isEmpty {
+                Text(replyText)
+                    .font(.system(size: 13))
+                    // GATE-3 F6b: under GlassForegroundLegibility's difference blend,
+                    // .primary is BLACK in Light mode -> |0 - bg| = bg -> invisible.
+                    // Pure white is the only correct foreground here (same rule as the
+                    // composer text and thinking pill; see the F2 comment below).
+                    .foregroundStyle(.white)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if isThinkingOnly {
+                shimmerRow
+            }
+            // Wave-5 gate item 2: a message sent mid-turn is folded silently into the
+            // prompt above — this line is the only visible confirmation it was
+            // actually accepted and is waiting for the next round boundary, not lost.
+            if let queuedText = adapter.queuedText {
+                Text("⧗ \(queuedText)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.5)) // difference-blend-safe, dimmed
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        // Same leading/trailing/vertical insets as `composerContent` (see the shared
+        // constants above the type header) — `textLeadingInset` reserves the exact
+        // same 12+26+8 gutter the composer's icon column occupies, so this text's
+        // leading edge lands on the SAME x as composer text; the trailing/vertical
+        // paddings mirror the composer's outer 12h/6v exactly.
+        .padding(.leading, Self.textLeadingInset)
+        .padding(.trailing, Self.contentHorizontalPadding)
+        .padding(.vertical, Self.contentVerticalPadding)
+    }
+
     /// v1's `onTextFieldRightEdge` seam (see file header), ported as a visible trailing chevron
     /// rather than a caret-position-triggered key handler (there is no caret-navigation surface
     /// left to trigger it — see FOCUS COORDINATOR note).
@@ -610,20 +647,28 @@ struct NormaFieldView: View {
         .buttonStyle(.plain)
     }
 
-    /// v1 LAW (PointerRenderer.swift:28-39): the animation lives INSIDE this Group, not on an
-    /// outer view, so it doesn't get canceled by an unrelated transaction (e.g. the reply text
-    /// arriving). No `.drawingGroup()` anywhere in this file either — that would rasterize and
-    /// freeze the shimmer.
+    /// Wave-7 gate item 2: the collapsed orb's status pill (`FieldThinkingPill`) shows the
+    /// CC-style whimsical working verb ("Reticulating…") — this expanded-shell counterpart used
+    /// to show a bare, static "…" regardless, never the actual verb. Now shows the SAME animated
+    /// treatment (leading star spinner + sweeping sheen, `adapter.isWorkingVerb`-gated exactly
+    /// like the collapsed pill) so the verb reads consistently whichever surface is showing it.
+    /// v1 LAW (PointerRenderer.swift:28-39): `WorkingSpinnerGlyph`/`SheenText` each scope their
+    /// own animation state INSIDE their own view, not on an outer view here, so neither gets
+    /// canceled by an unrelated transaction (e.g. the reply text arriving). No `.drawingGroup()`
+    /// anywhere in this file either — that would rasterize and freeze them.
     private var shimmerRow: some View {
-        Group {
-            Text("…")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.65)) // difference-blend-safe secondary
-                .opacity(0.35 + 0.5 * shimmer)
-        }
-        .onAppear {
-            withAnimation(.linear(duration: 0.9).repeatForever(autoreverses: true)) {
-                shimmer = 1.0
+        HStack(spacing: 4) {
+            if adapter.isWorkingVerb {
+                WorkingSpinnerGlyph(font: .system(size: 13, weight: .semibold))
+                SheenText(text: adapter.statusText, font: .system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.65)) // difference-blend-safe secondary
+            } else {
+                // Override pills (disconnected/needs approval) or an edge-case empty caption:
+                // plain, unanimated text — same convention as `FieldThinkingPill`'s `animated`
+                // gate.
+                Text(adapter.statusText.isEmpty ? "…" : adapter.statusText)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.65)) // difference-blend-safe secondary
             }
         }
     }
@@ -738,20 +783,6 @@ struct NormaFieldView: View {
         let pillRadius = min(shorter / 2, 22)
         let t = min(1, max(0, (shorter - 48) / 60))
         return circleRadius * (1 - t) + pillRadius * t
-    }
-}
-
-// MARK: - ResponseContentHeightKey (wave-5 gate item 3)
-
-/// Carries `inlineResponse`'s own natural content height (prompt + reply + queued line) up from
-/// its background `GeometryReader` to the `.onPreferenceChange` that republishes it onto
-/// `morph.responseHeight` — see that property's doc and `NormaFieldView.clampedResponseHeight(in:)`.
-/// `reduce` takes the latest value (there is only ever one reporting view in the tree at a time),
-/// same convention as every other single-producer SwiftUI `PreferenceKey`.
-private struct ResponseContentHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
     }
 }
 
@@ -1040,6 +1071,11 @@ private struct FieldThinkingPill: View {
 
     var caption: String = "thinking..."
     var contentOpacity: Double = 1
+    /// Wave-7 gate item 2: true exactly while `caption` is the CC-style working-verb composition
+    /// (`FieldStateAdapter.isWorkingVerb`) — gates the animated leading star spinner + sweeping
+    /// sheen text. The override pills (`disconnected`/`needs approval`) pass `false` and keep the
+    /// original plain, unanimated text.
+    var animated: Bool = false
 
     var body: some View {
         // White (not .primary) so the outer GlassForegroundLegibility
@@ -1047,19 +1083,93 @@ private struct FieldThinkingPill: View {
         // black in light mode and white in dark mode, which is
         // already the inverse of the typical glass background —
         // diff-blending it would yield near-white in both modes.
-        Text(caption)
-            .font(.system(size: 11, weight: .medium))
-            .foregroundStyle(.white)
-            .lineLimit(1)
-            .truncationMode(.tail)
-            .opacity(contentOpacity)
-            // `alignment: .leading` (not the frame default `.center`) so the text itself hugs
-            // this view's own leading edge rather than centering inside the width cap below —
-            // paired with the fixed leading-aligned box at the call site, this is what makes a
-            // SHORT caption sit flush at the pinned near-edge anchor instead of floating
-            // somewhere in the middle of unused width.
-            .frame(maxWidth: Self.maxWidth, alignment: .leading)
-            .fixedSize(horizontal: true, vertical: true)
+        HStack(spacing: 4) {
+            if animated {
+                WorkingSpinnerGlyph(font: .system(size: 11, weight: .medium))
+                SheenText(text: caption, font: .system(size: 11, weight: .medium))
+                    .foregroundStyle(.white)
+            } else {
+                Text(caption)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.white)
+            }
+        }
+        .lineLimit(1)
+        .truncationMode(.tail)
+        .opacity(contentOpacity)
+        // `alignment: .leading` (not the frame default `.center`) so the text itself hugs
+        // this view's own leading edge rather than centering inside the width cap below —
+        // paired with the fixed leading-aligned box at the call site, this is what makes a
+        // SHORT caption sit flush at the pinned near-edge anchor instead of floating
+        // somewhere in the middle of unused width.
+        .frame(maxWidth: Self.maxWidth, alignment: .leading)
+        .fixedSize(horizontal: true, vertical: true)
+    }
+}
+
+// MARK: - WorkingSpinnerGlyph / SheenText (wave-7 gate item 2: CC-style animated working verb)
+
+/// Claude Code's own terminal spinner cycles through this exact star-frame sequence at roughly
+/// 8fps. `TimelineView(.periodic(from:by:))` derives the current frame purely from wall-clock
+/// time — no `@State` counter, no `withAnimation` — so the spinner pauses/stops the instant this
+/// view is removed from the tree (both call sites are already condition-gated on
+/// `adapter.isWorkingVerb`/`isThinkingOnly`, so it disappears the moment the turn ends), matching
+/// the "stop when the turn ends" requirement with no extra plumbing needed.
+private struct WorkingSpinnerGlyph: View {
+    static let frames: [String] = ["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"]
+    static let frameInterval: TimeInterval = 1.0 / 8.0
+
+    var font: Font
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: Self.frameInterval)) { context in
+            let tick = Int(context.date.timeIntervalSinceReferenceDate / Self.frameInterval)
+            let index = ((tick % Self.frames.count) + Self.frames.count) % Self.frames.count
+            Text(Self.frames[index])
+                .font(font)
+                .foregroundStyle(.white) // difference-blend-safe, same convention as every glyph here
+        }
+    }
+}
+
+/// v1's sweeping-sheen mechanism — ported from the pre-transplant `Orb/OrbView.swift`'s
+/// `statusPill(_:)` ("v1 thinking pill with the sweeping sheen, generalized to any status text"),
+/// the "old thinking pill" this wave's brief points at. A `LinearGradient` masked to the text's
+/// own glyphs sweeps across, driven by a repeating `sweep` state var, blended `.plusLighter` so it
+/// only ever brightens — difference-blend-safe (white family only), matching the outer
+/// `GlassForegroundLegibility` convention every other label in this file already follows.
+/// v1 LAW (PointerRenderer.swift:28-39): the animation lives INSIDE this Group, not on an outer
+/// view, so an unrelated transaction (e.g. the reply text arriving) never cancels it. No
+/// `.drawingGroup()` either — would rasterize and freeze the sweep.
+private struct SheenText: View {
+    var text: String
+    var font: Font
+
+    @State private var sweep = 0.0
+
+    var body: some View {
+        Group {
+            Text(text)
+                .font(font)
+                .overlay(
+                    GeometryReader { proxy in
+                        let w = proxy.size.width
+                        LinearGradient(
+                            colors: [.clear, .white.opacity(0.85), .clear],
+                            startPoint: .leading, endPoint: .trailing
+                        )
+                        .frame(width: w * 0.55)
+                        .offset(x: -w * 0.55 + w * 1.1 * sweep)
+                        .blendMode(.plusLighter)
+                    }
+                    .mask(Text(text).font(font))
+                )
+        }
+        .onAppear {
+            withAnimation(.linear(duration: 1.1).repeatForever(autoreverses: false)) {
+                sweep = 1.0
+            }
+        }
     }
 }
 

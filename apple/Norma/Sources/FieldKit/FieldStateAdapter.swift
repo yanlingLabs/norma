@@ -71,6 +71,17 @@ final class FieldStateAdapter: ObservableObject {
 
     private var lastLoggedStatusText: String?
 
+    /// Wave-7 gate item 2: true exactly when `statusText` is currently showing the CC-style
+    /// working-verb composition (`workingPillText`) — i.e. the SAME branch of `statusText` above
+    /// — as opposed to an override pill (`disconnected`/`needs approval`, which win outright even
+    /// mid-turn) or true idle. `NormaFieldView`'s animated spinner + sheen (the star-frame glyph
+    /// cycling + text sweep) is gated on this so only the actual "working" verb animates; the
+    /// static override pills stay plain, unanimated text.
+    var isWorkingVerb: Bool {
+        let s = session.state
+        return s.status.pillText == nil && s.turnRunning
+    }
+
     /// v1's `appState.presentationMode == .thinking` seam — rebound 1:1 to `state.turnRunning`
     /// (2c/2e has no separate "presentation mode," turnRunning is the only signal there is).
     var isThinking: Bool { session.state.turnRunning }
