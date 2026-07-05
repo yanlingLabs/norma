@@ -7,22 +7,16 @@ import CoreGraphics
 /// bubble at the orb into a full rounded rectangle, content inside fades in late, the breathing
 /// halo ramps its glow, and the orb window fades out on the same curve.
 ///
-/// NAME COLLISION: v2 already has an `Orb/MorphModel.swift` (the current, deliberately-thin
-/// approximation this transplant exists to replace) declaring `final class MorphModel` in the
-/// SAME module/target — Xcode is a single flat "Norma" target (see project.yml), so two
-/// top-level types named `MorphModel` cannot coexist. The TYPE here is renamed
-/// `FieldKitMorphModel` (everything else — properties, values, doc comments — is otherwise
-/// verbatim from v1). The FILE also had to be renamed to `FieldKitMorphModel.swift`: the brief's
-/// instruction was to keep it `MorphModel.swift`, but the Swift build system independently
-/// rejects two source files with the same basename in one target ("filename … used twice …
-/// filenames are used to distinguish private declarations with the same name") even once the
-/// type itself no longer collides — this is a hard compile error, not a style choice, so the
-/// COMPILE TARGET requirement wins over the literal filename instruction. Task B's swap is
-/// expected to delete `Orb/MorphModel.swift` and rename both the type and this file back to
-/// `MorphModel`/`MorphModel.swift` at that point, once the old approximation is gone.
+/// TASK A/B NAME COLLISION, NOW RESOLVED: task A (the additive port) had to name this type
+/// `FieldKitMorphModel` and this file `FieldKitMorphModel.swift` because v2's flat "Norma" target
+/// (project.yml: one `sources: [Sources]` entry) still declared the OLD thin approximation as
+/// `Orb/MorphModel.swift`'s `final class MorphModel` at the time — two top-level types (and two
+/// files) named `MorphModel` in one module is a redeclaration error. Task B (this swap) deletes
+/// that old approximation, so both the type and this file are renamed back to `MorphModel` /
+/// `MorphModel.swift` here, per task A's report.
 ///
-/// CUT vs v1 (dashboard/chat surfaces don't exist post-transplant — task A only ports the
-/// composer path): `surface: GlassFieldSurface`, `dashboardOrbPoint`, `dashboardFinalRect`,
+/// CUT vs v1 (dashboard/chat surfaces don't exist post-transplant — only the composer path is
+/// ported): `surface: GlassFieldSurface`, `dashboardOrbPoint`, `dashboardFinalRect`,
 /// `chatPlacement`, `isChatSidebarCollapsed`, `chatSurfaceMotionBlur`, `dashboardContentSize`,
 /// `dashboardWindowSize`, `dashboardCornerRadius` are all dropped — nothing in the composer path
 /// (v1 GlassFieldView.composerBody) reads `morph.surface` or any dashboard/chat member (verified
@@ -30,7 +24,7 @@ import CoreGraphics
 /// chat routing, GlassFieldView.swift:299/301, both outside composerBody). `screenshotPillHeight`
 /// / `screenshotPillWidth` are also dropped — images/screenshots are cut per the brief.
 @MainActor
-final class FieldKitMorphModel: ObservableObject {
+final class MorphModel: ObservableObject {
     /// 0 = fully orb (tiny bubble centered on the cursor companion),
     /// 1 = fully expanded composer pill docked at the chosen corner. Only the
     /// composer pill (reset icon + text field) participates in this morph —
@@ -39,7 +33,11 @@ final class FieldKitMorphModel: ObservableObject {
     /// True only for the orb -> field leg. The orb glass tint should not
     /// reappear during field -> orb collapse as progress approaches zero.
     @Published var isOpening: Bool = true
-    /// Which corner of the composer pill sits over the orb.
+    /// Which corner of the composer pill sits over the orb. Task B (window choreography + edge
+    /// fence) pins this at `.topLeft` FOREVER by user directive — v1's per-corner switching
+    /// (`FieldCorner.choose`) is replaced by continuously fencing the tracking spring's TARGET
+    /// anchor instead (`fenceAnchorForTopLeftCorner`, `FieldKit/FieldCorner.swift`), so the
+    /// expanded frame always fits on-screen without ever needing a different corner.
     @Published var corner: FieldCorner = .topLeft
     /// Current height of the composer pill. Starts at a single-line height
     /// and grows as the user types (or wraps). Updated by the SwiftUI view
@@ -52,11 +50,16 @@ final class FieldKitMorphModel: ObservableObject {
 
     /// Outer window size. Sized to fit nav pill + composer + screenshot pill
     /// slot + generous halo padding on every side so the breathing glow never
-    /// hits the window edge and hard-cuts.
+    /// hits the window edge and hard-cuts. Task B: this is the AppKit panel's
+    /// real frame size while `OrbWindowController.surface == .field` (from the
+    /// instant an expand starts until a collapse fully settles) — see
+    /// `OrbWindowController.expandToField()`/`finishCollapse()`.
     let windowSize = CGSize(width: 480, height: 440)
     /// Compact panel size used while the UI is collapsed to the cursor orb.
     /// The same SwiftUI glass remains alive; only the AppKit container
     /// shrinks so the idle state is not a full-screen-sized transparent panel.
+    /// Task B: this is the AppKit panel's real frame size whenever
+    /// `OrbWindowController.surface == .orb`.
     let collapsedWindowSize = CGSize(width: 240, height: 140)
     /// Composer pill width. Height is dynamic (`composerHeight`).
     let composerWidth: CGFloat = 360

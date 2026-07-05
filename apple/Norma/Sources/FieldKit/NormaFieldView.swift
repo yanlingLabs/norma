@@ -58,20 +58,20 @@ import AppKit
 /// same shell" behavior (`showsInlineResponse`/`showingDraft`/shimmer) is v2's OWN existing
 /// design (`Field/FieldView.swift`, wave 2c task 3), ported into v1's real composer chrome here
 /// rather than re-invented — this is the "inline response rendering" + "shimmer" the brief asks
-/// to keep. Simplified relative to `Field/FieldView.swift`: no `displayedPrompt`/
-/// `historyPositionText` — those read exchange prompt/count directly, which
-/// `FieldStateAdapter`'s spec doesn't expose (only the merged `visibleResponse` string), so they
-/// are dropped rather than reaching past the adapter's contract.
+/// to keep. Task A simplified relative to `Field/FieldView.swift` by dropping `displayedPrompt`/
+/// `historyPositionText` (those read exchange prompt/count directly, which `FieldStateAdapter`'s
+/// original spec didn't expose). Task B adds both back onto `FieldStateAdapter` (fed from
+/// `exchangeIndex` + `session.state.exchanges`, mirroring the old `Field/FieldView.swift` exactly)
+/// and reads them here in `inlineResponse` below.
 ///
 /// COMPOSER CONTENT HEIGHT: v1's `ComposerTextView` reports live text height via
 /// `onContentHeightChange`, driving `composerContentHeight` so the pill grows with typed text.
-/// v2's `ComposerTextView` (Field/ComposerTextView.swift) has no such callback (the brief says
-/// reuse it as-is, not re-port v1's). `composerContentHeight` is kept as `@State` — and
-/// `clampedComposerHeight()` kept verbatim — but with nothing driving it yet, so the pill sits at
-/// a fixed `composerMinHeight`-ish height until a later wave adds the measurement hook.
+/// Task B ports the same callback onto v2's `ComposerTextView` (`Field/ComposerTextView.swift`)
+/// and wires it below, so `composerContentHeight`/`clampedComposerHeight()` (kept verbatim from
+/// task A) are now actually driven by the live text measurement instead of sitting fixed.
 struct NormaFieldView: View {
     @ObservedObject var adapter: FieldStateAdapter
-    @ObservedObject var morph: FieldKitMorphModel
+    @ObservedObject var morph: MorphModel
     @Namespace private var glassNamespace
 
     @State private var composerContentHeight: CGFloat = 22
@@ -375,7 +375,8 @@ struct NormaFieldView: View {
 
             ComposerTextView(
                 text: adapter.draftBinding,
-                onSubmit: { adapter.onSubmit(adapter.composerDraft) }
+                onSubmit: { adapter.onSubmit(adapter.composerDraft) },
+                onContentHeightChange: { height in composerContentHeight = height }
             )
             .overlay(alignment: .topLeading) {
                 if adapter.composerDraft.isEmpty {
@@ -399,12 +400,21 @@ struct NormaFieldView: View {
     }
 
     /// v2's inline-response shell (`Field/FieldView.swift`'s `inlineResponse`), ported into v1's
-    /// composer chrome. Simplified relative to that existing view: no `displayedPrompt`/
-    /// `historyPositionText` — see the file header's INLINE RESPONSE note for why.
+    /// composer chrome. Task B adds back `displayedPrompt`/`historyPositionText` (dropped by task
+    /// A — see the file header's INLINE RESPONSE note): a swipe-pinned historical exchange now
+    /// shows its own prompt small above the reply, plus an "n/m" position readout next to the
+    /// draft-reveal chevron, exactly like the pre-transplant `Field/FieldView.swift` did.
     private var inlineResponse: some View {
         ZStack(alignment: .topTrailing) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 6) {
+                    if let prompt = adapter.displayedPrompt {
+                        Text(prompt)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                     if !replyText.isEmpty {
                         Text(replyText)
                             .font(.system(size: 13))
@@ -419,8 +429,18 @@ struct NormaFieldView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            revealDraftButton
-                .padding(6)
+            HStack(spacing: 6) {
+                if let historyPositionText = adapter.historyPositionText {
+                    Text(historyPositionText)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .modifier(GlassSurface(drawsBorder: false))
+                }
+                revealDraftButton
+            }
+            .padding(6)
         }
     }
 
@@ -439,10 +459,10 @@ struct NormaFieldView: View {
         .buttonStyle(.plain)
     }
 
-    /// v1 LAW (PointerRenderer.swift:28-39, mirrored throughout v2 — e.g. `OrbView`): the
-    /// animation lives INSIDE this Group, not on an outer view, so it doesn't get canceled by an
-    /// unrelated transaction (e.g. the reply text arriving). No `.drawingGroup()` anywhere in
-    /// this file either — that would rasterize and freeze the shimmer.
+    /// v1 LAW (PointerRenderer.swift:28-39): the animation lives INSIDE this Group, not on an
+    /// outer view, so it doesn't get canceled by an unrelated transaction (e.g. the reply text
+    /// arriving). No `.drawingGroup()` anywhere in this file either — that would rasterize and
+    /// freeze the shimmer.
     private var shimmerRow: some View {
         Group {
             Text("…")

@@ -66,10 +66,27 @@ final class FieldStateAdapter: ObservableObject {
 
     /// Task B hook (mirrors `OrbWindowController.exchangeIndex`): which historical exchange, if
     /// any, `visibleResponse` should read instead of the live stream / most recent reply. `nil`
-    /// = live/most-recent. Nobody sets this yet in task A — wired by whatever replaces the
-    /// 2-finger swipe recognizer's target once `NormaFieldView` is actually hung off a
-    /// controller.
+    /// = live/most-recent. Wired by `GlassRootView`'s `.onChange(of: controller.exchangeIndex)`
+    /// (the 2-finger swipe recognizer's target lives on the controller, not here).
     @Published var exchangeIndex: Int?
+
+    /// v1 parity restored (task B): `Field/FieldView.swift` (v2's pre-transplant approximation)
+    /// showed the pinned exchange's own prompt, small, above its reply while browsing history —
+    /// task A dropped this since the adapter's original spec only exposed the merged
+    /// `visibleResponse` string, not exchange prompt/count. Non-`nil` only while `exchangeIndex`
+    /// points at a real, non-empty prompt.
+    var displayedPrompt: String? {
+        guard let index = exchangeIndex, session.state.exchanges.indices.contains(index) else { return nil }
+        let prompt = session.state.exchanges[index].prompt
+        return prompt.isEmpty ? nil : prompt
+    }
+
+    /// v1 parity restored (task B): the subtle "n/m" position readout `Field/FieldView.swift`
+    /// showed next to the draft-reveal chevron while browsing a swipe-pinned historical exchange.
+    var historyPositionText: String? {
+        guard let index = exchangeIndex, session.state.exchanges.indices.contains(index) else { return nil }
+        return "\(index + 1)/\(session.state.exchanges.count)"
+    }
 
     // MARK: - Composer draft
 
@@ -83,9 +100,18 @@ final class FieldStateAdapter: ObservableObject {
         Binding(get: { self.composerDraft }, set: { self.composerDraft = $0 })
     }
 
-    // MARK: - Callbacks (task B wires real behavior; no-op until then)
+    // MARK: - Callbacks (task B wires real behavior)
 
+    /// Wired by `GlassRootView` to its own `submit(_:)`, which forwards to
+    /// `OrbWindowController.onSubmit` (the app-level send chain) and only clears the draft /
+    /// resets `exchangeIndex` on a successful send — a failed send never loses the composed text.
     var onSubmit: (String) -> Void = { _ in }
+    /// Wired by `GlassRootView` to clear `composerDraft` — the xmark button in `NormaFieldView`'s
+    /// `composerContent`.
     var onClearMessage: () -> Void = {}
+    /// Wired by `GlassRootView` to `OrbWindowController.collapseToOrb()`. No `NormaFieldView`
+    /// affordance calls this yet (v1's own `onCollapse` was likewise driven almost entirely by
+    /// Esc, which `OrbWindowController`'s key monitor already calls directly) — kept wired for
+    /// parity/future use, same status as task A's unwired reset-icon slot.
     var onCollapse: () -> Void = {}
 }

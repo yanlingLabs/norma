@@ -15,9 +15,16 @@ import SwiftUI
 ///   - Placeholder rendering: moved OUT of this view into `FieldView`, which overlays a plain
 ///     SwiftUI `Text` when `text.isEmpty` — v1 didn't have composer placeholder text at all
 ///     (its "placeholder" was an image-capture pill), so there's no v1 shape to port here.
+///
+/// Task B (v1 field transplant, window choreography) adds back v1's `onContentHeightChange`
+/// (`TextField/ComposerTextView.swift:39,301-315`, verbatim measurement: laid-out text height
+/// via `NSLayoutManager.usedRect(for:)` plus the container's vertical insets, deduped to >0.5pt
+/// changes) so `NormaFieldView`'s composer pill can grow with typed/wrapped text instead of
+/// sitting fixed at `composerMinHeight`.
 struct ComposerTextView: NSViewRepresentable {
     @Binding var text: String
     var onSubmit: () -> Void
+    var onContentHeightChange: (CGFloat) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -57,6 +64,7 @@ struct ComposerTextView: NSViewRepresentable {
         DispatchQueue.main.async { [weak textView] in
             guard let textView else { return }
             _ = textView.window?.makeFirstResponder(textView)
+            context.coordinator.reportHeight(textView)
         }
         return scrollView
     }
@@ -72,6 +80,7 @@ struct ComposerTextView: NSViewRepresentable {
             width: max(1, nsView.contentSize.width),
             height: .greatestFiniteMagnitude
         )
+        context.coordinator.reportHeight(textView)
 
         let window = textView.window
         if window?.firstResponder !== textView {
@@ -83,6 +92,7 @@ struct ComposerTextView: NSViewRepresentable {
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: ComposerTextView
+        private var lastReportedHeight: CGFloat = -1
 
         init(_ parent: ComposerTextView) {
             self.parent = parent
@@ -91,6 +101,25 @@ struct ComposerTextView: NSViewRepresentable {
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
             parent.text = textView.string
+            reportHeight(textView)
+        }
+
+        /// v1 port (`TextField/ComposerTextView.swift:301-315`, verbatim measurement): the
+        /// laid-out text height plus the container's vertical insets, so the composer starts
+        /// single-line and grows as the user writes instead of reserving multi-line space up
+        /// front. Deduped (>0.5pt) so tiny rounding jitter doesn't spam `onContentHeightChange`.
+        func reportHeight(_ textView: NSTextView) {
+            guard let layoutManager = textView.layoutManager,
+                  let container = textView.textContainer else { return }
+            layoutManager.ensureLayout(for: container)
+            let usedRect = layoutManager.usedRect(for: container)
+            let insetsHeight = textView.textContainerInset.height * 2
+            let height = ceil(usedRect.height + insetsHeight)
+            guard abs(height - lastReportedHeight) > 0.5 else { return }
+            lastReportedHeight = height
+            DispatchQueue.main.async { [weak self] in
+                self?.parent.onContentHeightChange(height)
+            }
         }
     }
 }

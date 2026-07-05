@@ -11,18 +11,32 @@ private final class KeyableNonActivatingPanel: NSPanel {
     override var canBecomeMain: Bool { acceptsKeyInput }
 }
 
-/// Owns the orb/field panel. Wave 2 (v1 morph+follow engine): the panel is no longer a static
-/// window with a discrete content switch — it's permanently `FieldMetrics.size`, one
-/// always-following panel, and orb↔field is a continuous 0…1 `morphModel.progress` driven by
-/// its own spring. ARCHITECTURE NOTE (v1's converged lesson) still holds: this panel IS the
-/// field window's collapsed state — 2c expands it in place so the glassEffectID morph stays
-/// inside one GlassEffectContainer. Do not add a second window for the field.
+/// Owns the orb/field panel. Task B (v1 field transplant, window choreography): the panel is no
+/// longer a single fixed size — mirroring v1's real `GlassFieldWindowController` (`show()`/
+/// `showCollapsedOrb()`/`hide()`), it is `morphModel.collapsedWindowSize` (240×140) while
+/// collapsed and `morphModel.windowSize` (480×440) while expanded, resized at exactly two
+/// instants: `expandToField()` resizes UP (with v1's origin math) BEFORE starting the morph
+/// (mirrors v1 `show()`'s order — the frame never changes DURING the morph, only content
+/// geometry does); `finishCollapse()` resizes DOWN only once the collapse morph has fully
+/// SETTLED (mirrors v1 `hide()`'s `settleCollapsedOrb()`). Both resizes keep the SAME physical
+/// glass-anchor screen point (`currentGlassAnchor()`) — the panel expands/collapses IN PLACE,
+/// never jumping. ARCHITECTURE NOTE (v1's converged lesson) still holds: this panel IS the field
+/// window's collapsed state — expansion happens in place so the glassEffectID morph stays inside
+/// one GlassEffectContainer (now owned by `NormaFieldView` itself). Do not add a second window
+/// for the field.
+///
+/// EDGE FENCE (user directive, replaces v1's per-corner switching): `morphModel.corner` stays
+/// `.topLeft` FOREVER — `OrbFollower`'s tracking spring fences its target anchor instead
+/// (`fenceAnchorForTopLeftCorner`) so the expanded frame always fits on-screen from wherever the
+/// anchor ends up, even while collapsed. `follower.isExpanded` mirrors `surface` exactly (see
+/// `OrbFollower`'s own doc) so its continuous per-frame `setFrameOrigin` always targets whichever
+/// size the panel is ACTUALLY sized to right now.
 @MainActor
 final class OrbWindowController: ObservableObject {
     enum Surface { case orb, field }
 
-    let follower = OrbFollower()
-    let morphModel = MorphModel()
+    let follower: OrbFollower
+    let morphModel: MorphModel
     private let panel: KeyableNonActivatingPanel
     private(set) var isVisible = false
     /// Derived, not driven directly by callers: `.field` the instant an expand STARTS,
@@ -50,8 +64,8 @@ final class OrbWindowController: ObservableObject {
     /// below (from the scroll monitor) and `finishCollapse()` move it from inside this class;
     /// `resetExchangeIndex()` is the one external hook (`GlassRootView.submit()` calls it on a
     /// successful send — the same place the draft-clear-on-success logic already lives).
-    /// `FieldView` additionally resets it the instant a new turn actually STARTS, mirroring
-    /// `showingDraft`'s own reset rule, via the same `onChange(of: session.state.turnRunning)`.
+    /// `GlassRootView` additionally resets it the instant a new turn actually STARTS, mirroring
+    /// the draft-cache reset rule, via `.onChange(of: session.state.turnRunning)`.
     @Published private(set) var exchangeIndex: Int?
 
     func resetExchangeIndex() {
@@ -64,7 +78,7 @@ final class OrbWindowController: ObservableObject {
     private var scrollMonitor: Any?
     private var externalFocus: ExternalFocusSnapshot?
 
-    // MARK: Morph spring (60Hz Timer — v1 GlassFieldWindow.swift:1795-1852)
+    // MARK: Morph spring (60Hz Timer — v1 GlassFieldWindow.swift:1795-1845)
 
     private var morphTimer: Timer?
     private var lastMorphTick = CACurrentMediaTime()
@@ -73,10 +87,15 @@ final class OrbWindowController: ObservableObject {
 
     init(session: SessionModel) {
         self.session = session
-        // v1 PointerOverlayWindow configuration, verbatim, except the panel is now always
-        // FieldMetrics.size — there is no more orb-sized frame to switch to/from.
+        let morph = MorphModel()
+        self.morphModel = morph
+        self.follower = OrbFollower(morphModel: morph)
+
+        // v1 PointerOverlayWindow configuration, verbatim, except the panel now starts sized to
+        // the COLLAPSED geometry (task B: the panel resizes between `collapsedWindowSize` and
+        // `windowSize` as the field expands/collapses — see the type doc above).
         panel = KeyableNonActivatingPanel(
-            contentRect: NSRect(origin: .zero, size: FieldMetrics.size),
+            contentRect: NSRect(origin: .zero, size: morph.collapsedWindowSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -100,10 +119,11 @@ final class OrbWindowController: ObservableObject {
             self?.collapseToOrb()
         }
 
-        // ARCHITECTURE NOTE above: GlassRootView (not OrbView) is the panel's content — it owns
-        // the single GlassEffectContainer and renders both surfaces off `morphModel.progress`.
+        // ARCHITECTURE NOTE above: GlassRootView (not OrbView) is the panel's content — it hosts
+        // `NormaFieldView` (FieldKit), which owns its own `GlassEffectContainer` and renders the
+        // whole orb↔field morph off `morphModel.progress`.
         panel.contentView = NSHostingView(
-            rootView: GlassRootView(session: session, controller: self, morphModel: morphModel)
+            rootView: GlassRootView(session: session, controller: self, morphModel: morph)
         )
     }
 
@@ -134,23 +154,30 @@ final class OrbWindowController: ObservableObject {
 
     /// Expands the collapsed orb into the field IN PLACE: captures external focus, makes the
     /// panel keyable and key, flips `surface` to `.field` immediately (so a fast Esc/flick can
-    /// reverse the morph before it settles), and starts the morph spring toward 1. The panel's
-    /// FRAME never changes here — it's already `FieldMetrics.size`, and its origin is owned
-    /// continuously by the tracking spring (which keeps running: the field follows the cursor
-    /// too, wave 2's whole point).
+    /// reverse the morph before it settles), and starts the morph spring toward 1.
+    ///
+    /// Task B: mirrors v1 `show()`'s exact order (GlassFieldWindow.swift:695-773) — the panel is
+    /// resized UP to `morphModel.windowSize` at the current glass-anchor point BEFORE the morph
+    /// starts (the frame itself never changes DURING the morph, only the content geometry does);
+    /// only afterward does `morphTarget` flip to 1. `follower.isExpanded = true` right after the
+    /// resize keeps the tracking spring's per-frame target consistent with the panel's new real
+    /// size, and `follower.snapWindowOrigin(to:)` avoids a one-frame "catch up" jump from the
+    /// spring's stale pre-resize position.
     func expandToField() {
         // RETARGET (v1 parity — GlassFieldWindow.swift:765-772's `midHide` re-show): a
         // re-summon arrived while a collapse morph is still in flight. `surface` is still
         // `.field` here — it only flips to `.orb` inside `finishCollapse()`, which itself
         // only runs once the morph SETTLES with `morphTarget == 0` (see `morphTick()`).
-        // Teardown therefore never ran: the panel is still keyable, still key, the focus
-        // snapshot and key monitor are still live. So there is nothing to re-acquire — just
-        // reverse the spring's target back toward 1 from wherever `progress` currently sits
-        // (no snap, no discontinuity) and bail out before any of the "cold start" setup below
-        // re-runs. Flipping `morphTarget` here doubles as clearing the pending collapse
-        // completion: `finishCollapse()` is gated on `morphTarget == 0` read FRESH at settle
-        // time (there's no captured completion closure to go stale), so once the target is 1
-        // the stale collapse-teardown can never fire — it settles at 1 instead of 0.
+        // Teardown therefore never ran: the panel is still keyable, still key, still sized
+        // to `morphModel.windowSize`, and the focus snapshot and key monitor are still live.
+        // So there is nothing to re-acquire (no resize either — the panel is already the
+        // right size) — just reverse the spring's target back toward 1 from wherever
+        // `progress` currently sits (no snap, no discontinuity) and bail out before any of
+        // the "cold start" setup below re-runs. Flipping `morphTarget` here doubles as
+        // clearing the pending collapse completion: `finishCollapse()` is gated on
+        // `morphTarget == 0` read FRESH at settle time (there's no captured completion
+        // closure to go stale), so once the target is 1 the stale collapse-teardown can
+        // never fire — it settles at 1 instead of 0.
         if surface == .field && morphTarget == 0 {
             startMorph(target: 1)
             OrbDebug.log("expandToField: retarget mid-collapse re-summon, morphTarget=1")
@@ -158,6 +185,17 @@ final class OrbWindowController: ObservableObject {
         }
 
         guard surface == .orb else { return }
+
+        let anchor = currentGlassAnchor()
+        let origin = morphModel.corner.windowOrigin(
+            glassAnchor: anchor,
+            morph: morphModel,
+            windowSize: morphModel.windowSize,
+            surface: .composer
+        )
+        panel.setFrame(NSRect(origin: origin, size: morphModel.windowSize), display: false)
+        follower.isExpanded = true
+        follower.snapWindowOrigin(to: origin)
 
         externalFocus = ExternalFocusSnapshot.captureCurrent()
         panel.acceptsKeyInput = true
@@ -193,8 +231,21 @@ final class OrbWindowController: ObservableObject {
         OrbDebug.log("expandToField: morphTarget=1")
     }
 
-    /// `TrackpadHorizontalSwipeResult.performAcceptedFeedback(if:)`'s handler: v1 parity
-    /// (MusicDynamicIslandPlugin/MediaDynamicIslandPlugin's `.left → previousTrack()`,
+    /// The physical screen point where the composer's chosen corner (`morphModel.corner`,
+    /// always `.topLeft`) currently sits, derived from the panel's ACTUAL live frame. Stable
+    /// across a resize — that's the whole "expand in place" property (see the type doc above):
+    /// resizing the panel only adds/removes interior space to the right/below this point, it
+    /// never moves the point itself, so this can be read BEFORE either `expandToField()`'s
+    /// up-resize or `finishCollapse()`'s down-resize to recover the exact anchor to resize
+    /// around, regardless of which size the panel currently is.
+    private func currentGlassAnchor() -> CGPoint {
+        let origin = panel.frame.origin
+        let size = panel.frame.size
+        let local = morphModel.corner.orbAnchorInWindow(windowSize: size, morph: morphModel)
+        return CGPoint(x: origin.x + local.x, y: origin.y + size.height - local.y)
+    }
+
+    /// v1 parity (MusicDynamicIslandPlugin/MediaDynamicIslandPlugin's `.left → previousTrack()`,
     /// `.right → nextTrack()`) maps `.left` to "older" and `.right` to "newer" here too — swipe
     /// left steps back into history, swipe right steps forward toward (and past, back to nil/
     /// live) the most recent exchange. Returns whether the index actually moved so the haptic
@@ -209,9 +260,9 @@ final class OrbWindowController: ObservableObject {
     }
 
     /// Starts the collapse morph toward 0. Teardown (monitor off, keyability off, focus
-    /// restore, `surface` → `.orb`) happens on COMPLETION (`finishCollapse()`), not here — the
-    /// tracking spring runs throughout so the shrinking glass keeps riding the cursor instead of
-    /// detaching mid-collapse (v1's "ghost circle" fix).
+    /// restore, panel resize DOWN, `surface` → `.orb`) happens on COMPLETION
+    /// (`finishCollapse()`), not here — the tracking spring runs throughout so the shrinking
+    /// glass keeps riding the cursor instead of detaching mid-collapse (v1's "ghost circle" fix).
     func collapseToOrb() {
         guard surface == .field else { return }
         startMorph(target: 0)
@@ -282,7 +333,11 @@ final class OrbWindowController: ObservableObject {
     }
 
     /// The collapse-completion teardown, shared by the morph settling naturally (`morphTick()`)
-    /// and `hide()`'s force-finish path.
+    /// and `hide()`'s force-finish path. Task B: mirrors v1 `settleCollapsedOrb()`
+    /// (GlassFieldWindow.swift:1493-1525) — resizes the panel back DOWN to
+    /// `morphModel.collapsedWindowSize` now that nobody will see the last bit of the morph,
+    /// keeping the SAME physical anchor point the field was just occupying (`currentGlassAnchor()`
+    /// reads the panel's CURRENT — still big — frame) so the shrink doesn't jump.
     private func finishCollapse() {
         if let keyMonitor {
             NSEvent.removeMonitor(keyMonitor)
@@ -294,6 +349,18 @@ final class OrbWindowController: ObservableObject {
         }
         panel.acceptsKeyInput = false
         panel.ignoresMouseEvents = true
+
+        let anchor = currentGlassAnchor()
+        let origin = morphModel.corner.windowOrigin(
+            glassAnchor: anchor,
+            morph: morphModel,
+            windowSize: morphModel.collapsedWindowSize,
+            surface: .composer
+        )
+        panel.setFrame(NSRect(origin: origin, size: morphModel.collapsedWindowSize), display: false)
+        follower.isExpanded = false
+        follower.snapWindowOrigin(to: origin)
+
         externalFocus?.restore()
         externalFocus = nil
         surface = .orb

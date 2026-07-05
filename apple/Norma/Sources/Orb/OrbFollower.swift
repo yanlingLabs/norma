@@ -1,20 +1,26 @@
 import AppKit
 import QuartzCore
 
-/// Cursor-following spring driver. Wave 2 (v1 morph+follow engine) repurposes this: the spring
-/// no longer drives an "orb center" for a small orb-sized window — it drives the WINDOW ORIGIN
-/// of the permanently `FieldMetrics.size` panel, using `.tracking` (v1 GlassFieldWindow.swift:
-/// 1950-1975). The glass anchor (cursor + (24,-24), or a sticky magnetic target) maps to the
-/// panel's top-left corner via `fieldFrame`'s own clamp math — reused verbatim rather than
-/// duplicated, since it's the exact same "top-left anchored, grows down-right, clamped inside
-/// the visible frame" computation wave 1 already had. ONE display-link loop total; it now runs
-/// THROUGHOUT both the orb and field surfaces (the "always-following" panel), not just while
-/// collapsed. v1 differences kept from wave 1: (1) Timer → CADisplayLink with a 30-120
-/// preferred range, PAUSED when settled (D9: 0 fps); (2) commandedTarget (agent move_pointer)
-/// not ported — Phase 5 (see phase-2-carryover.md).
+/// Cursor-following spring driver. Wave 2 (v1 morph+follow engine) repurposed this to drive the
+/// WINDOW ORIGIN of the orb/field panel, using `.tracking` (v1 GlassFieldWindow.swift:1950-1975).
+/// Task B (v1 field transplant, window choreography + edge fence): the panel is no longer a
+/// single fixed size — it's `morphModel.collapsedWindowSize` (240×140) while
+/// `OrbWindowController.surface == .orb` and `morphModel.windowSize` (480×440) while `== .field`
+/// (`isExpanded` below mirrors that exactly, set by the controller at the same instants it
+/// actually resizes the panel) — so the target-origin math now goes through `FieldCorner`
+/// (always `.topLeft`, per user directive) instead of the old fixed-size `fieldFrame` clamp.
+/// EDGE FENCE (replaces v1's per-corner switching, `FieldCorner.choose`): the raw anchor (cursor
+/// + baseOffset, or a sticky magnetic target) is fenced by `fenceAnchorForTopLeftCorner` so the
+/// EXPANDED frame always fits on-screen from wherever the anchor ends up, even while collapsed —
+/// the orb visibly stops at the fence while the cursor keeps going past it, v1's "pin" behavior.
+/// ONE display-link loop total; it runs THROUGHOUT both surfaces (the "always-following" panel),
+/// not just while collapsed. v1 differences kept from wave 1: (1) Timer → CADisplayLink with a
+/// 30-120 preferred range, PAUSED when settled (D9: 0 fps); (2) commandedTarget (agent
+/// move_pointer) not ported — Phase 5 (see phase-2-carryover.md).
 @MainActor
 final class OrbFollower {
     private let cursorTracker = CursorTracker()
+    private let morphModel: MorphModel
     private var link: CADisplayLink?
     private var lastUpdate = CACurrentMediaTime()
     private var spring = SpringState(position: .zero, velocity: .zero)
@@ -23,6 +29,14 @@ final class OrbFollower {
     private let baseOffset = CGPoint(x: 24, y: -24) // v1
     private let config = SpringConfig.tracking
     private var lastCursorSampleTime = CACurrentMediaTime()
+
+    /// Mirrors `OrbWindowController.surface == .field`: `true` from the instant an expand STARTS
+    /// (before the panel even resizes) until a collapse fully SETTLES — exactly when the real
+    /// AppKit panel is actually sized `morphModel.windowSize` rather than
+    /// `morphModel.collapsedWindowSize`. The follower only ever calls `setFrameOrigin` (it never
+    /// resizes the panel itself), so it must always target the origin math for whichever size
+    /// the panel ACTUALLY is right now, or the two would fight every frame.
+    var isExpanded = false
 
     var onCursorLocationChange: ((CGPoint) -> Void)?
     /// Renamed from wave 1's `onOrbCenterChange`: the published value is now the panel's
@@ -35,6 +49,21 @@ final class OrbFollower {
     var onFastFlick: (() -> Void)?
     private(set) var cursorLocation = NSEvent.mouseLocation
     var currentWindowOrigin: CGPoint { spring.position }
+
+    init(morphModel: MorphModel) {
+        self.morphModel = morphModel
+    }
+
+    /// Snaps the tracking spring directly onto `origin` with zero velocity — called by the
+    /// controller right after it manually resizes the panel (`expandToField()`/
+    /// `finishCollapse()`) so the spring doesn't visibly "catch up" from its pre-resize position
+    /// on the next tick. v1 parity: `show()`/`showCollapsedOrb()`/`settleCollapsedOrb()` all
+    /// reset `originPos`/`targetOrigin`/`velocity` the same way (GlassFieldWindow.swift:
+    /// 581-583/742-746/1504-1506).
+    func snapWindowOrigin(to origin: CGPoint) {
+        spring = SpringState(position: origin, velocity: .zero)
+        lastPublished = origin
+    }
 
     func start() {
         guard link == nil else { return }
@@ -119,13 +148,26 @@ final class OrbFollower {
         link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 120, preferred: 120)
     }
 
-    /// The tracking spring's target: the glass anchor (magnetic target, or cursor + baseOffset)
-    /// mapped to a top-left-anchored, visible-frame-clamped window origin. Reuses `fieldFrame`
-    /// (Field/FieldPlacement.swift) rather than re-deriving the same math — `orbCenter` there is
-    /// exactly our anchor concept, wave 1 named it before the field could follow continuously.
+    /// The tracking spring's target: the glass anchor (magnetic target, or cursor + baseOffset),
+    /// fenced so the EXPANDED frame always fits on-screen (`fenceAnchorForTopLeftCorner` —
+    /// replaces v1's per-corner switching), then mapped to a window origin via `FieldCorner`
+    /// (always `.topLeft`) using whichever panel size is currently active (`isExpanded`).
     private func targetOrigin() -> CGPoint {
-        let anchor = magneticTarget ?? CGPoint(x: cursorLocation.x + baseOffset.x, y: cursorLocation.y + baseOffset.y)
-        return fieldFrame(orbCenter: anchor, visibleFrame: currentVisibleFrame()).origin
+        let raw = magneticTarget ?? CGPoint(x: cursorLocation.x + baseOffset.x, y: cursorLocation.y + baseOffset.y)
+        let anchor = fenceAnchorForTopLeftCorner(
+            raw,
+            expandedSize: morphModel.windowSize,
+            haloPadding: morphModel.haloPadding,
+            navOffset: morphModel.navPillHeight + morphModel.interPillGap,
+            visibleFrame: currentVisibleFrame()
+        )
+        let activeSize = isExpanded ? morphModel.windowSize : morphModel.collapsedWindowSize
+        return morphModel.corner.windowOrigin(
+            glassAnchor: anchor,
+            morph: morphModel,
+            windowSize: activeSize,
+            surface: .composer
+        )
     }
 
     /// The visible frame of whichever screen currently contains the cursor — v1 resolved the
