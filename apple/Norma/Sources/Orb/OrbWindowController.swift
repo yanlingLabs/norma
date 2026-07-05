@@ -290,6 +290,14 @@ final class OrbWindowController: ObservableObject {
             result.performAcceptedFeedback { direction in
                 self.handleAcceptedSwipe(direction)
             }
+            // Wave-8 gate item 2 empirical evidence hook: NORMA_ORB_DEBUG=1 traces every
+            // scroll-wheel sample's PASSED (event handed back to AppKit — reaches the reply's
+            // ScrollView) vs CONSUMED (swallowed here for swipe-navigation tracking) decision,
+            // paired with the raw deltas/phase that drove it — this is what proves a vertical
+            // two-finger drag reaches the reply instead of being silently swallowed by an
+            // in-progress horizontal-swipe lock (see `TrackpadHorizontalSwipeRecognizer`'s
+            // un-latch fix).
+            OrbDebug.log("scroll monitor: \(result.consumesScroll ? "CONSUMED" : "PASSED") result=\(result) dx=\(event.scrollingDeltaX) dy=\(event.scrollingDeltaY) phase=\(event.phase)")
             return result.consumesScroll ? nil : event
         }
 

@@ -351,8 +351,35 @@ struct NormaFieldView: View {
             // v1's ComposerSideFocusGlowLayer (keyboard-focus ring on the reset/clear icons) is
             // cut here — see the file header's FOCUS COORDINATOR note.
 
+            // Wave-8 gate fix (item 1): `inlineResponse`'s hidden measurement twin
+            // (`responseContentBody.fixedSize(horizontal: false, vertical: true)`, used to drive
+            // `morph.responseHeight` — see that property's doc) reports its own natural/ideal
+            // height upward regardless of what size its ancestors propose, which inflates the
+            // reported size of the `ZStack` wrapping it (`inlineResponse` itself) whenever a long
+            // reply's natural height exceeds the shell's clamped `composerFinal.height`. A bare
+            // `.frame(width:height:)` only PROPOSES that size to the child and REPORTS it
+            // upward to `.position(...)` for centering — it does not clip an oversized child's
+            // actual paint, so that overflow rendered past the shell's rounded-rect edge on both
+            // the top AND bottom (the `.position(...)` below centers the oversized content on the
+            // frame's midpoint, so the extra height spills both ways) — exactly the screenshot
+            // symptom (reply text visible above/below the glass, over the desktop). `.clipShape`
+            // right after `.frame(...)` clips to that frame's reported bounds — same corner
+            // radius the glass shell itself is drawn with (`morphedCornerRadius(for:
+            // composerShape)`, this function's own shell-shape formula) — so the content layer
+            // can never paint outside the shell's rounded-rect regardless of what any interior
+            // measurement-only child reports. (`composerContent`, the composer branch, has no
+            // equivalent risk: `ComposerTextView` is a real `NSScrollView`/`NSTextView` that clips
+            // its document view natively at the AppKit level — see that file's own doc — and its
+            // SwiftUI frame height is already clamped to `morph.composerMaxHeight`, never
+            // `.fixedSize()`-driven.)
             composerOrResponseContent
                 .frame(width: composerFinal.width, height: composerFinal.height)
+                .clipShape(
+                    RoundedRectangle(
+                        cornerRadius: morphedCornerRadius(for: composerShape),
+                        style: .continuous
+                    )
+                )
                 .position(x: composerFinal.midX, y: composerFinal.midY)
                 .opacity(contentReveal)
                 .modifier(GlassForegroundLegibility())

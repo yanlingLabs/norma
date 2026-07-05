@@ -198,6 +198,31 @@ final class TrackpadHorizontalSwipeRecognizer {
 
         if isHorizontalSample {
             isTrackingHorizontal = true
+        } else if !didTriggerForCurrentGesture,
+                  absY >= configuration.minimumDelta,
+                  absY > absX * configuration.horizontalDominanceRatio {
+            // Wave-8 gate fix (item 2 root cause): `isTrackingHorizontal` used to be sticky —
+            // once ANY single sample tipped past the dominance ratio, every later sample of the
+            // SAME physical gesture was accumulated/consumed (`.tracking`, `consumesScroll ==
+            // true`) even if the gesture then settled into an obviously vertical drag, because
+            // nothing ever set it back to `false` short of `.began`/idle-timeout/a terminal
+            // phase. Real two-finger gesture onset is noisy — the first sample or two of a
+            // perfectly ordinary VERTICAL scroll can easily tip `absX > absY *
+            // horizontalDominanceRatio` for one event before the user's hand settles — so a
+            // single noisy onset sample silently swallowed the user's entire vertical scroll
+            // attempt, starving the inline reply's ScrollView of every subsequent scroll-wheel
+            // event even though neither the overall gesture nor most of its samples were
+            // horizontal. Un-latching on a clearly VERTICAL-dominant sample (same ratio, mirrored)
+            // lets that settle correct itself — but only before this gesture has actually
+            // COMMITTED to a horizontal swipe (`didTriggerForCurrentGesture`); once `.swiped` has
+            // fired, later samples (e.g. trailing momentum) must keep being consumed exactly as
+            // before, unaffected by this un-latch. `accumulatedX`/`accumulatedY` are cleared too
+            // so a later, genuinely horizontal run within the SAME physical gesture starts
+            // counting fresh distance/dominance instead of inheriting the aborted lock's partial
+            // accumulation.
+            isTrackingHorizontal = false
+            accumulatedX = 0
+            accumulatedY = 0
         }
 
         guard isTrackingHorizontal else {
