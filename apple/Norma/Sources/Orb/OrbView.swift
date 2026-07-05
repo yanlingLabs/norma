@@ -3,12 +3,23 @@ import SwiftUI
 /// v1 BlueOrb port (PointerRenderer.swift) — AppState → SessionModel, presentationMode →
 /// session.state.status.pillText. v1's GlassSurface modifier (field-only, ports in 2c) is
 /// replaced here with a plain `.glassEffect` capsule for the pills.
+///
+/// Wave 2 (v1 morph+follow engine): the orb no longer sits dead-center of its own small
+/// window — the panel is now always `FieldMetrics.size`, and the orb circle is pinned at the
+/// glass anchor corner (`OrbMetrics.anchorRect`, top-left of the panel — the SAME corner the
+/// tracking spring keeps under the cursor). It fades OUT as `FieldView`'s composer shell fades
+/// in over the SAME progress band, both views permanently present in `GlassRootView`'s
+/// ZStack — no more `if surface` insertion/removal.
 struct OrbView: View {
     @ObservedObject var session: SessionModel
     /// Shared with `GlassRootView`'s single `GlassEffectContainer` (D8): the orb circle and
     /// the field's composer shell both tag `glassEffectID("norma-shell", in: glassNamespace)`
-    /// so they morph into each other instead of cross-fading as separate views.
+    /// so the glass unifies them as the lerp positions each — instead of cross-fading as
+    /// separate, unrelated shapes.
     var glassNamespace: Namespace.ID
+    /// `morphModel.progress`, injected rather than observed directly — `GlassRootView` owns
+    /// the `@ObservedObject` subscription (D8/point 4: rendering off `morphModel.progress`).
+    var progress: Double
     @State private var shimmer = 0.0
 
     private var pillText: String? {
@@ -19,8 +30,14 @@ struct OrbView: View {
         return state.status.pillText
     }
 
+    /// v1's crossfade band, simplified to one for our two-surface model (no side-glass/nav
+    /// pill/image-row staggering to reproduce): the orb fades OUT as the field fades IN,
+    /// meeting at the midpoint.
+    private var orbOpacity: Double { 1 - smoothstep(0.3, 0.7, progress) }
+
     var body: some View {
-        // Orb DEAD-CENTER of the 260×110 frame (v1 contract — window center == orb center).
+        // Orb pinned at the panel's glass-anchor corner (top-left, OrbMetrics.anchorRect) —
+        // GlassRootView's ZStack(alignment: .topLeading) places it there with no extra offset.
         // Pills hang off via overlays; overlay content doesn't participate in layout.
         orbView
             .overlay(alignment: .leading) {
@@ -37,7 +54,9 @@ struct OrbView: View {
                 }
                 .animation(.spring(response: 0.32, dampingFraction: 0.78), value: pillText)
             }
-            .frame(width: OrbMetrics.windowSize.width, height: OrbMetrics.windowSize.height)
+            .frame(width: OrbMetrics.orbDiameter, height: OrbMetrics.orbDiameter, alignment: .topLeading)
+            .opacity(orbOpacity)
+            .allowsHitTesting(orbOpacity > 0.5)
             // v1 LAW: no .drawingGroup() — rasterizing freezes the shimmer (PointerRenderer.swift:56-60).
             .onAppear {
                 withAnimation(.linear(duration: 1.8).repeatForever(autoreverses: false)) {

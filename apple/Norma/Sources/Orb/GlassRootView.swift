@@ -1,11 +1,14 @@
 import SwiftUI
 
 /// Owns the ONE `GlassEffectContainer` and the `@Namespace` shared by both surfaces (D3/D4/D8).
-/// Switches on `controller.surface`: `.orb` renders the existing orb layout, `.field` renders
-/// `FieldView`. Both branches tag their glass shell with the same `glassEffectID("norma-shell",
-/// in: glassNamespace)` + `.glassEffectTransition(.matchedGeometry)` (v1 GlassFieldView.swift:
-/// 490-502) so the orb circle morphs into the composer capsule in place, instead of the field
-/// cross-fading in as a second window/view.
+///
+/// Wave 2 (v1 morph+follow engine): the discrete `switch controller.surface` render died —
+/// `OrbView` and `FieldView` are now BOTH permanently in the ZStack, each computing its own
+/// geometry/opacity off `morphModel.progress` (injected here as an `@ObservedObject` so this
+/// view actually re-renders every 60Hz morph tick; `controller` is observed only for `surface`,
+/// which now drives input/draft logic exclusively — see `onChange` below and the Esc monitor
+/// in `OrbWindowController`). `controller.surface` still flips `.orb` ⇄ `.field` (immediately on
+/// expand, on collapse COMPLETION), so the draft stash/restore contract is unchanged.
 ///
 /// Draft ownership lives ENTIRELY here, not in `FieldView` or the controller: `@State draft` is
 /// the live text; `DraftCache` is where it goes to survive a collapse (field → orb stashes it;
@@ -13,24 +16,25 @@ import SwiftUI
 struct GlassRootView: View {
     @ObservedObject var session: SessionModel
     @ObservedObject var controller: OrbWindowController
+    @ObservedObject var morphModel: MorphModel
     @Namespace private var glassNamespace
     @State private var draft = ""
     private let draftCache = DraftCache()
 
     var body: some View {
         GlassEffectContainer(spacing: 6) {
-            switch controller.surface {
-            case .orb:
-                OrbView(session: session, glassNamespace: glassNamespace)
-            case .field:
+            ZStack(alignment: .topLeading) {
+                OrbView(session: session, glassNamespace: glassNamespace, progress: morphModel.progress)
                 FieldView(
                     session: session,
                     draft: $draft,
                     glassNamespace: glassNamespace,
+                    progress: morphModel.progress,
                     onSubmit: submit
                 )
             }
         }
+        .frame(width: FieldMetrics.size.width, height: FieldMetrics.size.height, alignment: .topLeading)
         .onChange(of: controller.surface) { _, newSurface in
             switch newSurface {
             case .orb:
