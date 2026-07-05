@@ -63,6 +63,29 @@ final class MorphModel: ObservableObject {
     /// hidden, non-scrolling twin of the response content (see `NormaFieldView.inlineResponse`'s
     /// doc for why a second copy is measured instead of the visible, `ScrollView`-hosted one).
     @Published var responseHeight: CGFloat = 0
+    /// Wave-9 gate fix (v1 mechanism port — see `Core/ScrollRedirector.swift` +
+    /// `TextField/GlassFieldWindow.swift.scrollComposer` in v1, and the wave-9 report for the
+    /// full empirical trail): AppKit's normal hit-test dispatch never reaches
+    /// `NormaFieldView.inlineResponse`'s scrollable viewport — `GlassForegroundLegibility`'s
+    /// `.compositingGroup()` + `.blendMode(.difference)` (applied over the whole
+    /// composer/response content layer) silently breaks the AppKit-level hit-testing a real
+    /// `NSScrollView` needs to receive `-scrollWheel:`, confirmed live via synthesized CGEvent
+    /// scroll probes posted at the panel's screen position (offset never moved with a plain
+    /// SwiftUI `ScrollView` in place; moves reliably once driven through this property instead).
+    /// v1 hit the exact same click-through-adjacent problem (its composer was PERMANENTLY
+    /// mouse-inert) and solved it the same way: never rely on hit-test dispatch at all — capture
+    /// the raw scroll deltas upstream (v1: a session-level `CGEventTap`; here:
+    /// `OrbWindowController`'s existing local scroll monitor, which the wave-8 fix already proved
+    /// reliably observes every vertical-dominant sample) and drive the scrolled position directly.
+    /// v1 drove an AppKit `NSClipView`'s bounds origin (`clipView.scroll(to:)`); this is v2's
+    /// equivalent for a plain SwiftUI viewport — `inlineResponse` applies it as a manual
+    /// `.offset(y: -responseScrollOffset)` inside a `.clipped()` frame, no `ScrollView` in that
+    /// viewport at all. `OrbWindowController.applyResponseScroll(deltaY:)` is the only writer;
+    /// `maxResponseScrollOffset`/`clampResponseScrollOffset()` below keep it in
+    /// `[0, responseHeight - responseViewportHeight]` from both sides (a new scroll delta, and a
+    /// reactive re-clamp whenever `responseHeight` itself changes — e.g. a shorter historical
+    /// exchange gets swiped in after scrolling deep into a longer one).
+    @Published var responseScrollOffset: CGFloat = 0
     /// Incremented when macOS moves the panel into a new compositor context
     /// (Space/screen changes). Rebuilding the glass subtree forces SwiftUI's
     /// native Liquid Glass backing view to reacquire refraction/shadow state.
@@ -121,4 +144,40 @@ final class MorphModel: ObservableObject {
     /// Gap between the glass elements and the window edge — reserved for
     /// the breathing halo to bloom into without clipping.
     let haloPadding: CGFloat = 60
+
+    // MARK: - Wave-9 gate fix: manual response-scroll clamp (see `responseScrollOffset`'s doc)
+
+    /// Same formula as `NormaFieldView.maxShellHeight(in:)` (window height minus halo padding on
+    /// both edges, minus the nav pill's reserved slot) — duplicated rather than shared because
+    /// that method takes a caller-supplied `windowSize` for `GeometryReader` flexibility, while
+    /// this is only ever consulted from `OrbWindowController` while `surface == .field`, at which
+    /// point the panel is always sized to `windowSize` exactly (the outer frame never changes
+    /// mid-morph — see `activeWindowSize`'s doc).
+    var responseViewportHeight: CGFloat {
+        let reserved = 2 * haloPadding + navPillHeight + interPillGap
+        return max(composerMinHeight, windowSize.height - reserved)
+    }
+
+    /// How far `responseScrollOffset` can travel before the reply's bottom edge reaches the
+    /// viewport's bottom edge. Zero (nothing to scroll) whenever the reply fits without it.
+    var maxResponseScrollOffset: CGFloat {
+        max(0, responseHeight - responseViewportHeight)
+    }
+
+    /// Re-clamps `responseScrollOffset` into `[0, maxResponseScrollOffset]` from whichever side
+    /// changed — a new scroll delta (`OrbWindowController.applyResponseScroll(deltaY:)`) or a
+    /// changed `responseHeight` (streamed reply growing/shrinking, or a swiped-in exchange with a
+    /// different length).
+    func clampResponseScrollOffset() {
+        responseScrollOffset = min(max(responseScrollOffset, 0), maxResponseScrollOffset)
+    }
+}
+
+/// Wave-9 gate fix: pure delta-application + clamp math, extracted so it's directly unit-testable
+/// without an `OrbWindowController`/AppKit panel — same convention as `ExchangeNavigation.swift`'s
+/// `navigateExchange` (the AppKit-adjacent caller, `OrbWindowController.applyResponseScroll
+/// (deltaY:)`, stays a thin wrapper around this). See `MorphModel.responseScrollOffset`'s doc for
+/// the sign convention (`current - deltaY`, matching v1's AppKit clip-origin convention).
+func clampedResponseScrollOffset(current: CGFloat, deltaY: CGFloat, maxOffset: CGFloat) -> CGFloat {
+    min(max(current - deltaY, 0), max(0, maxOffset))
 }

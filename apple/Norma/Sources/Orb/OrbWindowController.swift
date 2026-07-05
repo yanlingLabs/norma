@@ -285,20 +285,63 @@ final class OrbWindowController: ObservableObject {
         // but the filter costs nothing) never gets routed here.
         swipeRecognizer.reset()
         scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel]) { [weak self] event in
-            guard let self, event.window === panel else { return event }
+            guard let self else { return event }
+            // Real trackpad events arrive bound to the panel (`event.window === panel` — proven
+            // live in wave 8: 80 consecutive real samples). Synthesized scroll events
+            // (accessibility/automation tooling, and this project's own CGEvent verification
+            // probes) can NEVER take that path: macOS's window server refuses to route a
+            // synthesized scroll to a borderless nonactivating panel (verified empirically in
+            // wave 9 — `.cghidEventTap` and `.cgSessionEventTap` posts over the panel's visible
+            // pixels with the cursor warped there never reached this app at all), and
+            // `CGEventPostToPid` delivers them with NO window binding (`event.window == nil`,
+            // `windowNumber == 0`). A nil-window scroll event reaching this single-panel app has
+            // no other possible target — AppKit drops it after monitors run — so treating one as
+            // panel-directed while the cursor is actually inside the panel's frame is safe and
+            // makes the surface driveable by synthetic events, same spirit as v1's
+            // ScrollRedirector consuming raw CGEvents that never had a window at all.
+            let panelDirected = event.window === panel
+                || (event.window == nil && panel.frame.contains(NSEvent.mouseLocation))
+            guard panelDirected else {
+                // Wave-9 diagnostic (debug-gated, permanent): without this branch a rejected
+                // sample vanished silently, leaving "no log lines" ambiguous between "no events
+                // arrived at the app" and "events arrived but failed the window guard".
+                OrbDebug.log("scroll monitor: NON-PANEL window=\(event.window.map { String(describing: type(of: $0)) } ?? "nil") num=\(event.windowNumber) dy=\(event.scrollingDeltaY)")
+                return event
+            }
             let result = swipeRecognizer.handle(event)
             result.performAcceptedFeedback { direction in
                 self.handleAcceptedSwipe(direction)
             }
-            // Wave-8 gate item 2 empirical evidence hook: NORMA_ORB_DEBUG=1 traces every
-            // scroll-wheel sample's PASSED (event handed back to AppKit — reaches the reply's
-            // ScrollView) vs CONSUMED (swallowed here for swipe-navigation tracking) decision,
-            // paired with the raw deltas/phase that drove it — this is what proves a vertical
-            // two-finger drag reaches the reply instead of being silently swallowed by an
-            // in-progress horizontal-swipe lock (see `TrackpadHorizontalSwipeRecognizer`'s
-            // un-latch fix).
-            OrbDebug.log("scroll monitor: \(result.consumesScroll ? "CONSUMED" : "PASSED") result=\(result) dx=\(event.scrollingDeltaX) dy=\(event.scrollingDeltaY) phase=\(event.phase)")
-            return result.consumesScroll ? nil : event
+
+            // Wave-9 gate fix (v1 mechanism port — see `MorphModel.responseScrollOffset`'s doc
+            // and the wave-9 report): wave 8 proved every vertical-dominant sample reaches this
+            // monitor and gets handed back to AppKit (`.ignored` → PASSED, `return event`) — but
+            // AppKit's normal hit-test dispatch never actually delivers it to the reply's
+            // viewport (`GlassForegroundLegibility`'s `.compositingGroup()` breaks that path,
+            // confirmed via synthesized CGEvent probes). v1 never trusted that dispatch either
+            // (its composer was permanently `ignoresMouseEvents = true`): its `ScrollRedirector`
+            // CGEventTap drove the AppKit clip-view bounds directly off the raw deltas and
+            // swallowed the event at the tap. Same idea here, scoped to this monitor: an
+            // `.ignored` sample (not part of a horizontal swipe) while the inline response is
+            // actually showing drives `responseScrollOffset` directly and is swallowed ourselves,
+            // rather than handed back to a dispatch path that silently drops it. A `.ignored`
+            // sample while the COMPOSER is showing (or there's no reply at all) still falls
+            // through to `return event` unchanged — this fix is scoped to the reply only, per the
+            // wave-9 brief.
+            var consumed = result.consumesScroll
+            if case .ignored = result, self.isShowingInlineResponse() {
+                self.applyResponseScroll(deltaY: event.scrollingDeltaY)
+                consumed = true
+            }
+
+            // Wave-8 gate item 2 empirical evidence hook, extended for wave 9: NORMA_ORB_DEBUG=1
+            // traces every scroll-wheel sample's CONSUMED (swallowed here — either swipe-tracking
+            // or, new in wave 9, manually driving the reply's scroll offset) vs PASSED (handed
+            // back to AppKit unchanged) decision, paired with the raw deltas/phase that drove it
+            // and the resulting offset — this is what proves a vertical two-finger drag actually
+            // moves the reply now instead of being silently dropped by AppKit's hit-test dispatch.
+            OrbDebug.log("scroll monitor: \(consumed ? "CONSUMED" : "PASSED") result=\(result) dx=\(event.scrollingDeltaX) dy=\(event.scrollingDeltaY) phase=\(event.phase) responseScrollOffset=\(self.morphModel.responseScrollOffset)")
+            return consumed ? nil : event
         }
 
         OrbDebug.log("expandToField: morphTarget=1")
@@ -349,6 +392,42 @@ final class OrbWindowController: ObservableObject {
             setShowingDraft?(true)
         }
         return true
+    }
+
+    /// Wave-9 gate fix: mirrors `NormaFieldView.showsInlineResponse` (`hasReply &&
+    /// !adapter.showingDraft`) using the state this controller already has direct access to
+    /// (`session.state`, and `isShowingDraft` — the same composer-hop seam `handleAcceptedSwipe`
+    /// above reads), rather than reaching into `FieldStateAdapter` (which this controller
+    /// deliberately doesn't import — see `isShowingDraft`'s own doc). Gates the scroll monitor's
+    /// manual `responseScrollOffset` drive to exactly the surface it's meant for: showing the
+    /// composer (or nothing at all) leaves an `.ignored` scroll sample untouched (`return event`),
+    /// unchanged from before this wave.
+    private func isShowingInlineResponse() -> Bool {
+        guard isShowingDraft?() != true else { return false }
+        return session.state.turnRunning || !(session.state.exchanges.last?.reply.isEmpty ?? true)
+    }
+
+    /// Wave-9 gate fix — ported from v1's `GlassFieldWindow.scrollComposer` (manual AppKit
+    /// clip-view bounds scroll; see `MorphModel.responseScrollOffset`'s doc for the full
+    /// mechanism and why hit-test dispatch can't be trusted here). Drives
+    /// `morphModel.responseScrollOffset` directly off the raw vertical delta instead.
+    ///
+    /// Sign: `NSEvent.scrollingDeltaY` already bakes in the user's System Settings "natural
+    /// scrolling" preference — a two-finger drag UP (fingers move toward the top of the trackpad)
+    /// reports a NEGATIVE `scrollingDeltaY` under natural scrolling and is the gesture that reveals
+    /// content further DOWN the reply (the conventional "scroll down" motion). Revealing content
+    /// further down means the visible window into the reply moves further from its top, i.e.
+    /// `responseScrollOffset` must INCREASE — hence the negation below (v1's own AppKit clip-origin
+    /// convention, `origin.y -= deltaY` in `GlassFieldWindow.scrollComposer`, is the same negation
+    /// for the same reason, just expressed in AppKit's bounds-origin terms instead of a SwiftUI
+    /// offset). Verified empirically against synthesized CGEvent scroll probes — see the wave-9
+    /// report.
+    private func applyResponseScroll(deltaY: CGFloat) {
+        morphModel.responseScrollOffset = clampedResponseScrollOffset(
+            current: morphModel.responseScrollOffset,
+            deltaY: deltaY,
+            maxOffset: morphModel.maxResponseScrollOffset
+        )
     }
 
     /// Starts the collapse morph toward 0. Teardown (monitor off, keyability off, focus

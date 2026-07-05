@@ -573,26 +573,41 @@ struct NormaFieldView: View {
                 .onGeometryChange(for: CGFloat.self, of: { $0.size.height }) { newHeight in
                     OrbDebug.log("response content measured: \(newHeight)")
                     morph.responseHeight = newHeight
+                    // Wave-9 gate fix: a changed height can shrink `maxResponseScrollOffset`
+                    // below wherever the user had manually scrolled to (shorter swiped-in
+                    // exchange, or — defensively — a reply that shrinks) — re-clamp from this
+                    // side too, not just from `applyResponseScroll`'s own clamp on each delta.
+                    morph.clampResponseScrollOffset()
                 }
                 .opacity(0)
                 .accessibilityHidden(true)
                 .allowsHitTesting(false)
 
-            // GeometryReader hands the ScrollView's own (== composerFinal's) height down so
-            // short replies can be vertically centered instead of pinned to the top — a
-            // ScrollView always reports "fill the box" as its OWN size (that's how scrolling
-            // works), so the outer `.frame(...).center` composerOrResponseContent gets wrapped
-            // in (composerMorphedContent) never reaches this far in: a short reply otherwise
-            // sat flush against the top of a much taller pill (user report: "riding high").
+            // Wave-9 gate fix (root cause — see `MorphModel.responseScrollOffset`'s doc): a plain
+            // SwiftUI `ScrollView` here never actually scrolled — `GlassForegroundLegibility`'s
+            // `.compositingGroup()` + `.blendMode(.difference)` (applied to the whole
+            // composer/response layer, `composerMorphedContent` above) silently breaks the
+            // AppKit-level hit-testing a real `NSScrollView` needs to receive `-scrollWheel:`,
+            // confirmed live via synthesized CGEvent scroll probes (`OrbWindowController`'s local
+            // scroll monitor logged every sample reaching it — proven in wave 8 — yet the
+            // ScrollView's own offset never moved). Ported v1's fix instead of chasing the hit-test
+            // gap: `OrbWindowController.applyResponseScroll(deltaY:)` now drives
+            // `morph.responseScrollOffset` directly from the same scroll monitor, and this is a
+            // manual, non-scrolling viewport that just renders wherever that offset points —
+            // `.offset` + `.clipped()` are both pure SwiftUI rendering, unaffected by the
+            // compositingGroup above them. `GeometryReader` still hands down the viewport's own
+            // (== composerFinal's) height so short replies center instead of pinning to the top,
+            // exactly as the `ScrollView` version did.
             GeometryReader { proxy in
-                ScrollView {
-                    responseContentBody
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        // Short content centers within the available pill height; long content
-                        // (natural height already >= proxy.size.height) is unaffected and scrolls
-                        // normally, top-anchored, exactly as before.
-                        .frame(minHeight: proxy.size.height, alignment: .center)
-                }
+                responseContentBody
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    // Short content centers within the available pill height; long content
+                    // (natural height already >= proxy.size.height) is unaffected here and instead
+                    // scrolls via the offset below, top-anchored, exactly as before.
+                    .frame(minHeight: proxy.size.height, alignment: .center)
+                    .offset(y: -morph.responseScrollOffset)
+                    .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
+                    .clipped()
             }
 
             HStack(spacing: 6) {

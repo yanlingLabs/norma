@@ -51,6 +51,11 @@ struct GlassRootView: View {
                     draftCache.stash(adapter.composerDraft)
                     adapter.composerDraft = ""
                 case .field:
+                    // Wave-9 gate fix: every fresh expand starts the reply scrolled to its top —
+                    // matches v1 (a freshly re-morphed composer never remembered a stale scroll
+                    // position either) and avoids a jarring mid-reply reopen if the content
+                    // changed while collapsed.
+                    morphModel.responseScrollOffset = 0
                     // Wave-3 gate item 2c: any summon path clears the unread blink — the field
                     // is about to show the reply (either the composer's home-state rule below
                     // yields to the answer-reveal one-shot, or there was never an unread reply
@@ -86,6 +91,10 @@ struct GlassRootView: View {
             }
             .onChange(of: controller.exchangeIndex) { _, newValue in
                 adapter.exchangeIndex = newValue
+                // Wave-9 gate fix: swiping to a different historical exchange swaps in different
+                // reply text entirely — start that reply scrolled to its top rather than
+                // carrying over wherever the PREVIOUS exchange happened to be scrolled to.
+                morphModel.responseScrollOffset = 0
             }
             .onChange(of: session.state.turnRunning) { _, running in
                 if running {
@@ -96,6 +105,9 @@ struct GlassRootView: View {
                     // the shell stayed on the emptied composer and replies never appeared).
                     controller.resetExchangeIndex()
                     adapter.showingDraft = false
+                    // Wave-9 gate fix: the new turn's reply starts empty and grows from the top —
+                    // don't carry over a scroll offset from whatever the shell showed before.
+                    morphModel.responseScrollOffset = 0
                     // Wave-3 gate item 2a: auto-collapse to the orb ONLY when this turn-start
                     // followed the field's own submit (`collapseOnTurnStart`, armed in
                     // `submit(_:)` below) — a turn that started for some other reason while the
