@@ -400,12 +400,17 @@ struct NormaFieldView: View {
             // ZStack) for any reply long enough to trigger this — they were centered off-screen
             // above the shell right along with the reply text.
             composerOrResponseContent
-                .frame(width: composerFinal.width, height: composerFinal.height, alignment: .top)
+                .frame(width: composerFinal.width, height: composerFinal.height, alignment: showsInlineResponse ? .top : .center)
                 // Wave-10 gate fix: names this frame's own box as the ground-truth "what the user
                 // actually sees" viewport (see `inlineResponse`'s `.onGeometryChange` below) so the
                 // reply content's rendered position can be measured relative to it regardless of
                 // how many frames/ZStacks sit in between — this is what proved the centering above
                 // and (re-run after the fix) proves the reply now rests at the top.
+                // Wave-10b fix: conditional alignment — `.top` pins reply to the shell's top edge
+                // (required for scrollable viewport semantics), while `.center` restores the
+                // composer's single-line vertical centering within the shell. Multi-line composer
+                // growth (composerHeight-driven) keeps working: centered content expands downward
+                // from center is correct for that case too.
                 .coordinateSpace(.named("normaResponseShellTrace"))
                 .clipShape(
                     RoundedRectangle(
