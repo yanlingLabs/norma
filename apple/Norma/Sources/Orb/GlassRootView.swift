@@ -71,9 +71,12 @@ struct GlassRootView: View {
             .onChange(of: session.state.turnRunning) { _, running in
                 // A NEW turn starting is the only reliable "browsing history is over" signal
                 // (v1 parity, ported from the pre-transplant `Field/FieldView.swift`) — the
-                // live/streaming reply takes the shell back over from whatever was pinned.
+                // live/streaming reply takes the shell back over from whatever was pinned
+                // AND from the composer (showingDraft flip lost in the transplant: without it
+                // the shell stayed on the emptied composer and replies never appeared).
                 if running {
                     controller.resetExchangeIndex()
+                    adapter.showingDraft = false
                 }
             }
             .onChange(of: session.state.exchanges.count) { _, newCount in
