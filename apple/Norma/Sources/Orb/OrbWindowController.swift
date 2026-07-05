@@ -72,6 +72,42 @@ final class OrbWindowController: ObservableObject {
         exchangeIndex = nil
     }
 
+    // MARK: - Thinking-minimize choreography (wave-3 gate item 2)
+
+    /// One-shot latch: `GlassRootView.submit()` arms this on a send that succeeds WHILE THE
+    /// SESSION WAS IDLE (a genuine new-turn submit, not a mid-turn steer) — distinguishing "this
+    /// turn-start followed the field's OWN submit" (item 2a: auto-collapse) from "a turn started
+    /// for some other reason while the field happens to be open" (e.g. the user summoned the
+    /// field DURING an already-running turn to watch/steer — that path never arms this, and a
+    /// steer submit doesn't either, since `wasIdle` is false). `consumeCollapseOnTurnStart()` is
+    /// the only reader — it always clears the flag so a stale arm from an earlier submit can
+    /// never fire on a LATER, unrelated turn-start.
+    var collapseOnTurnStart = false
+
+    /// Consumes (and always clears) `collapseOnTurnStart` — one-shot by construction: a second
+    /// turn-start without a fresh submit in between returns `false`.
+    @discardableResult
+    func consumeCollapseOnTurnStart() -> Bool {
+        defer { collapseOnTurnStart = false }
+        return collapseOnTurnStart
+    }
+
+    /// One-shot latch: `GlassRootView`'s turn-completion handler arms this immediately before
+    /// calling `expandToField()` to reveal a finished answer (item 2b) — without it, the
+    /// existing summon-home-state rule (`summonShowsComposer`, v1 semantics: every summon opens
+    /// the COMPOSER unless a turn is actively streaming) would flip `showingDraft` back to
+    /// `true` on this very expand, since by definition the turn has already finished
+    /// (`turnRunning == false`) — hiding the very answer this auto-expand exists to reveal.
+    var expandForAnswerReveal = false
+
+    /// Consumes (and always clears) `expandForAnswerReveal` — one-shot, same shape as
+    /// `consumeCollapseOnTurnStart()` above.
+    @discardableResult
+    func consumeExpandForAnswerReveal() -> Bool {
+        defer { expandForAnswerReveal = false }
+        return expandForAnswerReveal
+    }
+
     private let session: SessionModel
     private let swipeRecognizer = TrackpadHorizontalSwipeRecognizer()
     private var keyMonitor: Any?

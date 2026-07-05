@@ -142,6 +142,13 @@ final class FieldStateAdapter: ObservableObject {
     /// turn-just-started transition (`false`, a new reply takes the shell back over).
     @Published var showingDraft: Bool = false
 
+    /// Wave-3 gate item 2c: true when a turn finished with a reply while the cursor was moving
+    /// too fast to auto-expand into (`GlassRootView`'s turn-completion handler, gated by
+    /// `OrbFollower.isCursorCalm`) — signals the collapsed orb should soft-blink until the field
+    /// is next summoned. Cleared unconditionally on every expand (`GlassRootView`'s
+    /// `.onChange(of: controller.surface)` `.field` case) — any summon path counts as "read."
+    @Published var hasUnread: Bool = false
+
     // MARK: - Callbacks (task B wires real behavior)
 
     /// Wired by `GlassRootView` to its own `submit(_:)`, which forwards to

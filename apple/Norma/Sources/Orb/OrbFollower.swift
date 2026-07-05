@@ -29,6 +29,9 @@ final class OrbFollower {
     private let baseOffset = CGPoint(x: 24, y: -24) // v1
     private let config = SpringConfig.tracking
     private var lastCursorSampleTime = CACurrentMediaTime()
+    /// Wave-3 gate item 2b: gates the answer-arrival auto-expand — see `CursorCalmTracker`'s doc
+    /// and `isCursorCalm(at:)` below.
+    private var calmTracker = CursorCalmTracker()
 
     /// Mirrors `OrbWindowController.surface == .field`: `true` from the instant an expand STARTS
     /// (before the panel even resizes) until a collapse fully SETTLES — exactly when the real
@@ -77,6 +80,7 @@ final class OrbFollower {
 
             cursorLocation = location
             lastCursorSampleTime = now
+            calmTracker.record(speed: speed, at: now)
 
             // Fast-flick: don't bail before updating state above — the tracking spring's
             // target is computed fresh from `cursorLocation` every tick, so simply having
@@ -110,6 +114,15 @@ final class OrbFollower {
         spring.velocity = .zero
         magneticTarget = nil
         lastPublished = CGPoint(x: CGFloat.greatestFiniteMagnitude, y: CGFloat.greatestFiniteMagnitude)
+        calmTracker = CursorCalmTracker()
+    }
+
+    /// Wave-3 gate item 2b: "has the cursor been calm (no fast movement) for the last ~0.4s?" —
+    /// `GlassRootView` checks this the instant a turn completes with a reply, deciding between
+    /// auto-expanding into the answer (calm) or marking the collapsed orb unread instead (not
+    /// calm — an unsolicited expand would visually snap open under a moving cursor).
+    func isCursorCalm(at time: TimeInterval = CACurrentMediaTime()) -> Bool {
+        calmTracker.isCalm(at: time)
     }
 
     /// Stickiness (Task 7) publishes its sticky element center here; nil clears it. Treated as

@@ -236,6 +236,21 @@ struct NormaFieldView: View {
                 )
             }
 
+            // Wave-3 gate item 2c: the collapsed orb soft-blinks while a finished reply is
+            // waiting unread (`adapter.hasUnread`, set by `GlassRootView`'s turn-completion
+            // handler when the cursor wasn't calm enough to auto-expand into it). Gated on
+            // `orbHaloIntensity` (same fade-with-progress curve as the halo above it) so the
+            // blink fades out the instant the user starts expanding — any summon clears
+            // `hasUnread` anyway (see that property's doc).
+            if adapter.hasUnread, orbHaloIntensity > 0 {
+                UnreadBlinkOverlay(
+                    center: collapsedCenter,
+                    size: max(composerShape.width, morph.orbBubbleSize),
+                    cornerRadius: morphedCornerRadius(for: composerShape),
+                    intensity: orbHaloIntensity
+                )
+            }
+
             if fieldHaloIntensity > 0 {
                 BreathingHalo(
                     center: CGPoint(x: composerFinal.midX, y: composerFinal.midY),
@@ -377,16 +392,35 @@ struct NormaFieldView: View {
         }
     }
 
+    // MARK: Shared composer/response insets (gate wave-3 text-alignment fix)
+    //
+    // v1 canonical composerContent padding (GlassFieldView.swift:943-986): 12pt horizontal / 6pt
+    // vertical around an HStack(spacing: 8) whose leading column is a fixed 26pt icon slot. Before
+    // this fix, `inlineResponse` used a DIFFERENT, uniform 12pt padding on every side with no
+    // leading reservation for that icon column — reply text started ~34pt to the LEFT of where
+    // composer text actually starts (12 + 26 + 8) and 6pt lower, so the composer↔response swap
+    // visibly jumped both horizontally and vertically (user report: "just need to align it
+    // properly"). Both branches now share these same named constants instead of each hardcoding
+    // its own magic numbers.
+    private static let contentHorizontalPadding: CGFloat = 12
+    private static let contentVerticalPadding: CGFloat = 6
+    private static let iconColumnWidth: CGFloat = 26
+    private static let iconColumnSpacing: CGFloat = 8
+    /// Where composer TEXT starts, measured from the shell's leading edge — `inlineResponse`
+    /// mirrors this exactly so reply text starts at the same x as composer text.
+    private static let textLeadingInset: CGFloat =
+        contentHorizontalPadding + iconColumnWidth + iconColumnSpacing
+
     @ViewBuilder
     private var composerContent: some View {
-        HStack(alignment: .center, spacing: 8) {
+        HStack(alignment: .center, spacing: Self.iconColumnSpacing) {
             VStack(alignment: .center, spacing: 6) {
                 // v1's reset icon ("arrow.counterclockwise", GlassFieldView.swift:946-949) has no
                 // backing action in FieldStateAdapter's contract (no context-reset hook in the
                 // brief's enumerated callback list) — kept as an equally-sized empty spacer so
                 // this column doesn't reflow when a real action is wired in later; only the clear
                 // button below is actually live.
-                Color.clear.frame(width: 26, height: 26)
+                Color.clear.frame(width: Self.iconColumnWidth, height: Self.iconColumnWidth)
                 if showsClearButton {
                     Button(action: adapter.onClearMessage) {
                         FieldIconButton(icon: "xmark", isFocused: false)
@@ -402,16 +436,24 @@ struct NormaFieldView: View {
             )
             .overlay(alignment: .topLeading) {
                 if adapter.composerDraft.isEmpty {
+                    // Offset by the SAME textContainerInset/lineFragmentPadding the real
+                    // NSTextView renders its glyphs at (`ComposerTextView.textContainerInset`) —
+                    // without this the placeholder sat flush at (0,0) while the caret/first
+                    // glyph render ~2pt right / 4pt down from there, so the placeholder visibly
+                    // overlapped the caret (user report: "placeholder overlapping the caret").
                     Text("Ask Norma…")
                         .font(.system(size: 14))
                         .foregroundStyle(.white.opacity(0.5)) // difference-blend-safe placeholder
+                        .padding(.leading, ComposerTextView.textContainerInset.width
+                            + ComposerTextView.lineFragmentPadding)
+                        .padding(.top, ComposerTextView.textContainerInset.height)
                         .allowsHitTesting(false)
                 }
             }
             .frame(height: max(22, min(composerContentHeight, morph.composerMaxHeight - 22)))
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .padding(.horizontal, Self.contentHorizontalPadding)
+        .padding(.vertical, Self.contentVerticalPadding)
     }
 
     private var showsClearButton: Bool {
@@ -428,32 +470,51 @@ struct NormaFieldView: View {
     /// draft-reveal chevron, exactly like the pre-transplant `Field/FieldView.swift` did.
     private var inlineResponse: some View {
         ZStack(alignment: .topTrailing) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 6) {
-                    if let prompt = adapter.displayedPrompt {
-                        Text(prompt)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.65)) // difference-blend-safe secondary
-                            .lineLimit(2)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+            // GeometryReader hands the ScrollView's own (== composerFinal's) height down so
+            // short replies can be vertically centered instead of pinned to the top — a
+            // ScrollView always reports "fill the box" as its OWN size (that's how scrolling
+            // works), so the outer `.frame(...).center` composerOrResponseContent gets wrapped
+            // in (composerMorphedContent) never reaches this far in: a short reply otherwise
+            // sat flush against the top of a much taller pill (user report: "riding high").
+            GeometryReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        if let prompt = adapter.displayedPrompt {
+                            Text(prompt)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.65)) // difference-blend-safe secondary
+                                .lineLimit(2)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        if !replyText.isEmpty {
+                            Text(replyText)
+                                .font(.system(size: 13))
+                                // GATE-3 F6b: under GlassForegroundLegibility's difference blend,
+                                // .primary is BLACK in Light mode -> |0 - bg| = bg -> invisible.
+                                // Pure white is the only correct foreground here (same rule as the
+                                // composer text and thinking pill; see the F2 comment below).
+                                .foregroundStyle(.white)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        if isThinkingOnly {
+                            shimmerRow
+                        }
                     }
-                    if !replyText.isEmpty {
-                        Text(replyText)
-                            .font(.system(size: 13))
-                            // GATE-3 F6b: under GlassForegroundLegibility's difference blend,
-                            // .primary is BLACK in Light mode -> |0 - bg| = bg -> invisible.
-                            // Pure white is the only correct foreground here (same rule as the
-                            // composer text and thinking pill; see the F2 comment below).
-                            .foregroundStyle(.white)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    if isThinkingOnly {
-                        shimmerRow
-                    }
+                    // Same leading/trailing/vertical insets as `composerContent` (see the shared
+                    // constants above the type header) — `textLeadingInset` reserves the exact
+                    // same 12+26+8 gutter the composer's icon column occupies, so this text's
+                    // leading edge lands on the SAME x as composer text; the trailing/vertical
+                    // paddings mirror the composer's outer 12h/6v exactly.
+                    .padding(.leading, Self.textLeadingInset)
+                    .padding(.trailing, Self.contentHorizontalPadding)
+                    .padding(.vertical, Self.contentVerticalPadding)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    // Short content centers within the available pill height; long content
+                    // (natural height already >= proxy.size.height) is unaffected and scrolls
+                    // normally, top-anchored, exactly as before.
+                    .frame(minHeight: proxy.size.height, alignment: .center)
                 }
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             HStack(spacing: 6) {
@@ -694,6 +755,40 @@ struct BreathingHalo: View {
         }
         .position(x: center.x, y: center.y)
         .allowsHitTesting(false)
+    }
+}
+
+// MARK: - UnreadBlinkOverlay (wave-3 gate item 2c)
+
+/// A soft bluish tint pulse on the collapsed orb, signaling a finished reply the user hasn't
+/// seen yet (`FieldStateAdapter.hasUnread` — set when a turn completed while the cursor was
+/// moving too fast to auto-expand into, see `GlassRootView.handleTurnCompleted()`).
+///
+/// v1 LAW (PointerRenderer.swift:28-39): the animation lives INSIDE this Group, not on an outer
+/// view, so it doesn't get canceled by an unrelated transaction (e.g. the morph progressing) —
+/// same rule `shimmerRow` follows. No `.drawingGroup()` here either, for the same reason.
+private struct UnreadBlinkOverlay: View {
+    var center: CGPoint
+    var size: CGFloat
+    var cornerRadius: CGFloat
+    var intensity: Double
+
+    @State private var pulse = 0.0
+
+    var body: some View {
+        Group {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                // 0.25...0.6 opacity pulse, per the wave-3 gate spec.
+                .fill(Color.blue.opacity((0.25 + 0.35 * pulse) * intensity))
+                .frame(width: size, height: size)
+                .position(x: center.x, y: center.y)
+                .allowsHitTesting(false)
+        }
+        .onAppear {
+            withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
+                pulse = 1.0
+            }
+        }
     }
 }
 

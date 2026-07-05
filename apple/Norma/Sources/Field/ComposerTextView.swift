@@ -22,6 +22,13 @@ import SwiftUI
 /// changes) so `NormaFieldView`'s composer pill can grow with typed/wrapped text instead of
 /// sitting fixed at `composerMinHeight`.
 struct ComposerTextView: NSViewRepresentable {
+    /// Single source of truth for the text container's inset — `makeNSView` applies these exact
+    /// values to the real `NSTextView`, and `NormaFieldView`'s placeholder overlay (gate wave-3
+    /// text-alignment fix) reads the SAME constants so "Ask Norma…" starts flush with where the
+    /// real caret/first glyph renders instead of drifting off and overlapping it.
+    static let textContainerInset = NSSize(width: 2, height: 4)
+    static let lineFragmentPadding: CGFloat = 0
+
     @Binding var text: String
     var onSubmit: () -> Void
     var onContentHeightChange: (CGFloat) -> Void = { _ in }
@@ -47,8 +54,8 @@ struct ComposerTextView: NSViewRepresentable {
         textView.isRichText = false
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.drawsBackground = false
-        textView.textContainerInset = NSSize(width: 2, height: 4)
-        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainerInset = Self.textContainerInset
+        textView.textContainer?.lineFragmentPadding = Self.lineFragmentPadding
         textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.heightTracksTextView = false
         textView.isHorizontallyResizable = false
