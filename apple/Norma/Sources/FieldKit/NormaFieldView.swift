@@ -404,7 +404,7 @@ struct NormaFieldView: View {
                 if adapter.composerDraft.isEmpty {
                     Text("Ask Norma…")
                         .font(.system(size: 14))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.white.opacity(0.5)) // difference-blend-safe placeholder
                         .allowsHitTesting(false)
                 }
             }
@@ -433,13 +433,18 @@ struct NormaFieldView: View {
                     if let prompt = adapter.displayedPrompt {
                         Text(prompt)
                             .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.white.opacity(0.65)) // difference-blend-safe secondary
                             .lineLimit(2)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     if !replyText.isEmpty {
                         Text(replyText)
                             .font(.system(size: 13))
+                            // GATE-3 F6b: under GlassForegroundLegibility's difference blend,
+                            // .primary is BLACK in Light mode -> |0 - bg| = bg -> invisible.
+                            // Pure white is the only correct foreground here (same rule as the
+                            // composer text and thinking pill; see the F2 comment below).
+                            .foregroundStyle(.white)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -455,7 +460,7 @@ struct NormaFieldView: View {
                 if let historyPositionText = adapter.historyPositionText {
                     Text(historyPositionText)
                         .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.white.opacity(0.65)) // difference-blend-safe secondary
                         .padding(.horizontal, 6)
                         .padding(.vertical, 3)
                         .modifier(GlassSurface(drawsBorder: false))
@@ -475,7 +480,7 @@ struct NormaFieldView: View {
         } label: {
             Image(systemName: "chevron.left")
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.white.opacity(0.65)) // difference-blend-safe secondary
                 .frame(width: 22, height: 22)
         }
         .buttonStyle(.plain)
@@ -489,7 +494,7 @@ struct NormaFieldView: View {
         Group {
             Text("…")
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.white.opacity(0.65)) // difference-blend-safe secondary
                 .opacity(0.35 + 0.5 * shimmer)
         }
         .onAppear {
