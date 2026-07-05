@@ -27,6 +27,7 @@ struct GlassRootView: View {
                 OrbView(session: session, glassNamespace: glassNamespace, progress: morphModel.progress)
                 FieldView(
                     session: session,
+                    controller: controller,
                     draft: $draft,
                     glassNamespace: glassNamespace,
                     progress: morphModel.progress,
@@ -53,6 +54,12 @@ struct GlassRootView: View {
             if await controller.onSubmit?(text) == true {
                 draft = ""
                 draftCache.clear()
+                // Wave 2c task 4: a successful send means the user is composing again, not
+                // browsing — drop any swipe-pinned historical exchange so the shell is free to
+                // pick up the new turn's reply (belt-and-suspenders alongside FieldView's own
+                // turnRunning-flip reset: this fires the instant success is known, not only once
+                // `turn_started` actually lands).
+                controller.resetExchangeIndex()
             }
             // failure: text stays in the composer — the draft is never lost (spec §6)
         }

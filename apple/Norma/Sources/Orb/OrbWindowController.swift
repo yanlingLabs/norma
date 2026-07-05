@@ -44,7 +44,24 @@ final class OrbWindowController: ObservableObject {
     /// Returns true when the key was consumed as an interrupt (turn running); false → collapse.
     var onEsc: (() -> Bool)?
 
+    /// Wave 2c task 4: which historical exchange (index into `session.state.exchanges`) the
+    /// field's shell is pinned to via an accepted 2-finger swipe — `nil` = live/draft view
+    /// (`ExchangeNavigation.swift`'s convention). `private(set)`: only `handleAcceptedSwipe`
+    /// below (from the scroll monitor) and `finishCollapse()` move it from inside this class;
+    /// `resetExchangeIndex()` is the one external hook (`GlassRootView.submit()` calls it on a
+    /// successful send — the same place the draft-clear-on-success logic already lives).
+    /// `FieldView` additionally resets it the instant a new turn actually STARTS, mirroring
+    /// `showingDraft`'s own reset rule, via the same `onChange(of: session.state.turnRunning)`.
+    @Published private(set) var exchangeIndex: Int?
+
+    func resetExchangeIndex() {
+        exchangeIndex = nil
+    }
+
+    private let session: SessionModel
+    private let swipeRecognizer = TrackpadHorizontalSwipeRecognizer()
     private var keyMonitor: Any?
+    private var scrollMonitor: Any?
     private var externalFocus: ExternalFocusSnapshot?
 
     // MARK: Morph spring (60Hz Timer — v1 GlassFieldWindow.swift:1795-1852)
@@ -55,6 +72,7 @@ final class OrbWindowController: ObservableObject {
     private var morphTarget: Double = 0
 
     init(session: SessionModel) {
+        self.session = session
         // v1 PointerOverlayWindow configuration, verbatim, except the panel is now always
         // FieldMetrics.size — there is no more orb-sized frame to switch to/from.
         panel = KeyableNonActivatingPanel(
@@ -158,7 +176,36 @@ final class OrbWindowController: ObservableObject {
             return event
         }
 
+        // Wave 2c task 4: same lifecycle as the Esc monitor above — installed only while
+        // `.field`, torn down on collapse completion (`finishCollapse()`). Window-scoped like
+        // the key monitor so a swipe elsewhere in the app (there's only ever this one panel,
+        // but the filter costs nothing) never gets routed here.
+        swipeRecognizer.reset()
+        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel]) { [weak self] event in
+            guard let self, event.window === panel else { return event }
+            let result = swipeRecognizer.handle(event)
+            result.performAcceptedFeedback { direction in
+                self.handleAcceptedSwipe(direction)
+            }
+            return result.consumesScroll ? nil : event
+        }
+
         OrbDebug.log("expandToField: morphTarget=1")
+    }
+
+    /// `TrackpadHorizontalSwipeResult.performAcceptedFeedback(if:)`'s handler: v1 parity
+    /// (MusicDynamicIslandPlugin/MediaDynamicIslandPlugin's `.left → previousTrack()`,
+    /// `.right → nextTrack()`) maps `.left` to "older" and `.right` to "newer" here too — swipe
+    /// left steps back into history, swipe right steps forward toward (and past, back to nil/
+    /// live) the most recent exchange. Returns whether the index actually moved so the haptic
+    /// only fires on an ACCEPTED swipe (D6), not on every threshold crossing (e.g. already at
+    /// the oldest exchange and swiping further left is a no-op, silently).
+    private func handleAcceptedSwipe(_ direction: TrackpadHorizontalSwipeDirection) -> Bool {
+        let navDirection: ExchangeNavDirection = direction == .left ? .older : .newer
+        let next = navigateExchange(exchangeIndex, direction: navDirection, count: session.state.exchanges.count)
+        guard next != exchangeIndex else { return false }
+        exchangeIndex = next
+        return true
     }
 
     /// Starts the collapse morph toward 0. Teardown (monitor off, keyability off, focus
@@ -241,11 +288,16 @@ final class OrbWindowController: ObservableObject {
             NSEvent.removeMonitor(keyMonitor)
             self.keyMonitor = nil
         }
+        if let scrollMonitor {
+            NSEvent.removeMonitor(scrollMonitor)
+            self.scrollMonitor = nil
+        }
         panel.acceptsKeyInput = false
         panel.ignoresMouseEvents = true
         externalFocus?.restore()
         externalFocus = nil
         surface = .orb
+        exchangeIndex = nil
 
         OrbDebug.log("collapseToOrb: complete")
     }

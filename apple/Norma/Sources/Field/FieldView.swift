@@ -29,9 +29,18 @@ import SwiftUI
 /// must carry `.glassEffectID("norma-shell", in:)` tagged with the SAME `Namespace.ID` the orb
 /// circle uses (D8 — that's what makes the orb morph into the composer), so this view also
 /// takes `glassNamespace: Namespace.ID` from `GlassRootView`, plus `progress: Double` for the
-/// geometry/opacity math above.
+/// geometry/opacity math above. Wave 2c task 4 adds one more: `controller: OrbWindowController`
+/// — `exchangeIndex` (the swipe-navigated history position) lives there, not in local `@State`,
+/// because the swipe recognizer/scroll monitor that drives it also lives on the controller
+/// (sharing the Esc key monitor's field-surface lifecycle), so the controller is the one owner
+/// both this view and `OrbWindowController` itself read/mutate it through.
 struct FieldView: View {
     @ObservedObject var session: SessionModel
+    /// Wave 2c task 4: read for `exchangeIndex` (which historical exchange, if any, the shell is
+    /// pinned to via a 2-finger swipe) and to reset it back to live on a new turn start — see
+    /// the `onChange(of: session.state.turnRunning)` below. The swipe recognizer itself lives on
+    /// the controller (its scroll monitor shares the Esc key monitor's lifecycle), not here.
+    @ObservedObject var controller: OrbWindowController
     @Binding var draft: String
     var glassNamespace: Namespace.ID
     var progress: Double
@@ -45,9 +54,11 @@ struct FieldView: View {
     /// "the user asked to see the draft again"; it resets to `false` when a new turn actually
     /// STARTS (`.onChange(of: session.state.turnRunning)` in `body`), not when the composer is
     /// submitted — a failed send never starts a turn, so the draft (and the fact it's showing)
-    /// survives the failure instead of being hidden behind a stale prior reply. W4 adds the
-    /// swipe gesture that flips this same flag — the trailing chevron button below is this
-    /// wave's interim affordance for it.
+    /// survives the failure instead of being hidden behind a stale prior reply. W4 correction:
+    /// the 2-finger swipe does NOT flip this flag as originally expected here — it drives a
+    /// separate `controller.exchangeIndex` (which historical exchange, if any, is pinned into
+    /// the shell) so browsing history and "show me the draft" stay orthogonal; this toggle keeps
+    /// its pre-W4 meaning, and the trailing chevron button below is still its only affordance.
     @State private var showingDraft = false
 
     // MARK: Geometry — fixed final rects (this view's own internal layout, matching the old
@@ -105,7 +116,13 @@ struct FieldView: View {
             // see `showingDraft` doc above). Flipping this synchronously on submit instead (the
             // old behavior) meant a FAILED send — turnRunning never goes true — snapped the shell
             // back to the stale prior reply, hiding the preserved draft the user just retyped.
-            if running { showingDraft = false }
+            if running {
+                showingDraft = false
+                // Wave 2c task 4: same rule, same trigger — a swipe-pinned historical exchange
+                // must not keep occupying the shell once a new turn is actually running; the
+                // live/streaming reply takes it back over exactly like `showingDraft` above.
+                controller.resetExchangeIndex()
+            }
         }
     }
 
@@ -137,19 +154,33 @@ struct FieldView: View {
     // MARK: Shell — the piece the orb circle morphs into (D8), showing EITHER the composer OR
     // the inline response, never both (v1 parity: Core/AppState.swift `composerDisplayText`).
 
+    /// Wave 2c task 4: a swipe has pinned the shell to a specific past exchange — the live
+    /// streaming/thinking state belongs to the CURRENT turn, not whatever the user swiped back
+    /// to, so both flip off while browsing (the `!isBrowsingHistory &&` guards below). This is
+    /// belt-and-suspenders alongside the turn-start reset (`onChange` in `body`): it only matters
+    /// for the edge case of swiping into history WHILE a turn happens to already be running.
+    private var isBrowsingHistory: Bool { controller.exchangeIndex != nil }
+
     private var isStreaming: Bool {
-        session.state.turnRunning && !session.state.streamingText.isEmpty
+        !isBrowsingHistory && session.state.turnRunning && !session.state.streamingText.isEmpty
     }
 
     /// Turn running, agent hasn't started streaming text yet — the shimmer-only "thinking" state.
     private var isThinking: Bool {
-        session.state.turnRunning && session.state.streamingText.isEmpty
+        !isBrowsingHistory && session.state.turnRunning && session.state.streamingText.isEmpty
     }
 
-    private var currentExchange: Exchange? { session.state.exchanges.last }
+    /// `exchangeIndex` != nil and in range → that historical exchange; otherwise the live/most
+    /// recent one (`exchanges.last`, unchanged from pre-W4 behavior).
+    private var displayedExchange: Exchange? {
+        if let index = controller.exchangeIndex, session.state.exchanges.indices.contains(index) {
+            return session.state.exchanges[index]
+        }
+        return session.state.exchanges.last
+    }
 
     private var hasReply: Bool {
-        isStreaming || isThinking || !(currentExchange?.reply.isEmpty ?? true)
+        isStreaming || isThinking || !(displayedExchange?.reply.isEmpty ?? true)
     }
 
     /// v1 parity: the inline response occupies the shell whenever there's something to show,
@@ -157,7 +188,21 @@ struct FieldView: View {
     private var showsInlineResponse: Bool { hasReply && !showingDraft }
 
     private var replyText: String {
-        isStreaming ? session.state.streamingText : (currentExchange?.reply ?? "")
+        isStreaming ? session.state.streamingText : (displayedExchange?.reply ?? "")
+    }
+
+    /// Non-nil only while browsing history — shown as a small label above the reply so a
+    /// navigated-to exchange reads as "prompt small + reply" per the brief, without disturbing
+    /// the live view's existing (prompt-less) layout.
+    private var displayedPrompt: String? {
+        guard isBrowsingHistory, let prompt = displayedExchange?.prompt, !prompt.isEmpty else { return nil }
+        return prompt
+    }
+
+    /// Subtle "n/m" position readout while browsing history (2-finger swipe navigation, W4).
+    private var historyPositionText: String? {
+        guard let index = controller.exchangeIndex else { return nil }
+        return "\(index + 1)/\(session.state.exchanges.count)"
     }
 
     private var shell: some View {
@@ -228,6 +273,15 @@ struct FieldView: View {
         ZStack(alignment: .topTrailing) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 6) {
+                    // W4: only present while browsing a swiped-to historical exchange — the live
+                    // view keeps its existing (prompt-less) layout untouched.
+                    if let prompt = displayedPrompt {
+                        Text(prompt)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                     if !replyText.isEmpty {
                         Text(replyText)
                             .font(.system(size: 13))
@@ -242,8 +296,18 @@ struct FieldView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            revealDraftButton
-                .padding(6)
+            HStack(spacing: 6) {
+                if let historyPositionText {
+                    Text(historyPositionText)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .modifier(GlassSurface(drawsBorder: false))
+                }
+                revealDraftButton
+            }
+            .padding(6)
         }
     }
 
