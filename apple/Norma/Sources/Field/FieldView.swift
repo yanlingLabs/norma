@@ -124,6 +124,12 @@ struct FieldView: View {
                 controller.resetExchangeIndex()
             }
         }
+        .onChange(of: session.state.exchanges.count) { _, newCount in
+            // Session refocus/reset shrinks (or swaps) the history — a stale pin must not survive.
+            if let index = controller.exchangeIndex, index >= newCount {
+                controller.resetExchangeIndex()
+            }
+        }
     }
 
     // MARK: Actions row (v1 NavigationPill/SegmentCell constants — GlassFieldView.swift:1916-1939:
@@ -202,7 +208,9 @@ struct FieldView: View {
     /// Subtle "n/m" position readout while browsing history (2-finger swipe navigation, W4).
     private var historyPositionText: String? {
         guard let index = controller.exchangeIndex else { return nil }
-        return "\(index + 1)/\(session.state.exchanges.count)"
+        let count = session.state.exchanges.count
+        guard index < count else { return nil }
+        return "\(index + 1)/\(count)"
     }
 
     private var shell: some View {
@@ -312,8 +320,9 @@ struct FieldView: View {
     }
 
     /// v1's `onTextFieldRightEdge` seam (see `showingDraft` doc above), ported as a visible
-    /// trailing chevron rather than a caret-position-triggered key handler — W4 adds the swipe
-    /// that flips the same `showingDraft` flag.
+    /// trailing chevron rather than a caret-position-triggered key handler. W4 adds a separate
+    /// 2-finger swipe navigation (driven by `controller.exchangeIndex`), while this chevron
+    /// only reveals the draft toggle.
     private var revealDraftButton: some View {
         Button {
             showingDraft = true
