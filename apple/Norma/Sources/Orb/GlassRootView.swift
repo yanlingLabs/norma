@@ -23,19 +23,23 @@ struct GlassRootView: View {
         self.controller = controller
         self.morphModel = morphModel
         _adapter = StateObject(wrappedValue: FieldStateAdapter(session: session))
+        // NOTE: do NOT touch `adapter` here. Accessing a @StateObject's wrappedValue inside
+        // init mutates a pre-installation THROWAWAY instance — the installed adapter keeps the
+        // default no-op closures (live-gate bug: typing worked, Enter silently did nothing).
+        // Wiring lives in body via wireCallbacks(); the closures are plain vars (not
+        // @Published), so per-render reassignment is idempotent and publishes nothing.
+    }
 
-        // Wired here, once, rather than via `.onAppear`: `OrbWindowController.init` constructs
-        // this view exactly ONCE for the field panel's entire lifetime (it never reassigns
-        // `NSHostingView.rootView`), so this initializer body also runs exactly once — no risk
-        // of rewiring on every SwiftUI re-render, and no dependency on SwiftUI's appear-timing
-        // (which, for a permanently-offscreen-until-shown panel, is worth not relying on).
+    /// Idempotent callback wiring onto the INSTALLED adapter (see init NOTE).
+    private func wireCallbacks() {
         adapter.onSubmit = { [self] text in submit(text) }
         adapter.onClearMessage = { [adapter] in adapter.composerDraft = "" }
         adapter.onCollapse = { [controller] in controller.collapseToOrb() }
     }
 
     var body: some View {
-        NormaFieldView(adapter: adapter, morph: morphModel)
+        wireCallbacks()
+        return NormaFieldView(adapter: adapter, morph: morphModel)
             .onChange(of: controller.surface) { _, newSurface in
                 switch newSurface {
                 case .orb:
