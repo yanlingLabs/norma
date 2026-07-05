@@ -43,6 +43,15 @@ final class MorphModel: ObservableObject {
     /// and grows as the user types (or wraps). Updated by the SwiftUI view
     /// from the composer's reported content height.
     @Published var composerHeight: CGFloat = 44
+    /// Wave-5 gate item 3: natural (unclamped) height of the inline response's own content —
+    /// pinned/live prompt + reply + the queued-steer line, whichever are showing — measured live
+    /// by `NormaFieldView.inlineResponse` via a background `GeometryReader` + `PreferenceKey`
+    /// (mirrors `composerHeight`'s doc above / `composerContentHeight`'s actual live mechanism,
+    /// ported to the read side since there's no NSTextView to report it here). Drives the shell
+    /// height while a response is showing (`NormaFieldView.clampedResponseHeight(in:)`), clamped
+    /// to the window's own usable vertical space so the pill never grows past the halo padding —
+    /// anything taller keeps scrolling internally, same as before this wave.
+    @Published var responseHeight: CGFloat = 0
     /// Incremented when macOS moves the panel into a new compositor context
     /// (Space/screen changes). Rebuilding the glass subtree forces SwiftUI's
     /// native Liquid Glass backing view to reacquire refraction/shadow state.

@@ -120,6 +120,17 @@ final class FieldStateAdapter: ObservableObject {
         return "\(index + 1)/\(session.state.exchanges.count)"
     }
 
+    /// Wave-5 gate item 2: messages sent while a turn is running are folded silently into the
+    /// current exchange's prompt (`SessionReducer`'s mid-turn-steer branch) — this surfaces them
+    /// so `NormaFieldView` can render a small "⧗ queued: …" line instead of the send appearing to
+    /// vanish. `nil` when nothing is queued (the common case: idle, or a turn running with no
+    /// steer sent yet) so the view can gate the line's reveal on non-nil, same convention as
+    /// `displayedPrompt`/`historyPositionText` above.
+    var queuedText: String? {
+        guard !session.state.queuedSteers.isEmpty else { return nil }
+        return "queued: " + session.state.queuedSteers.joined(separator: "; ")
+    }
+
     // MARK: - Composer draft
 
     /// v1's composer text (`appState.composerDisplayText` / `appState.updateComposerText`),

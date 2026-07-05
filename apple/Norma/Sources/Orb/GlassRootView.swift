@@ -35,6 +35,11 @@ struct GlassRootView: View {
         adapter.onSubmit = { [self] text in submit(text) }
         adapter.onClearMessage = { [adapter] in adapter.composerDraft = "" }
         adapter.onCollapse = { [controller] in controller.collapseToOrb() }
+        // Wave-5 gate item 4: the composer-hop seam — `OrbWindowController.handleAcceptedSwipe`
+        // needs to read/write `adapter.showingDraft` but can't reach the adapter directly (see
+        // `OrbWindowController.isShowingDraft`'s doc).
+        controller.isShowingDraft = { [adapter] in adapter.showingDraft }
+        controller.setShowingDraft = { [adapter] value in adapter.showingDraft = value }
     }
 
     var body: some View {

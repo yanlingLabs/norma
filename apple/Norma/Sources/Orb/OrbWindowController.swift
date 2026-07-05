@@ -58,6 +58,18 @@ final class OrbWindowController: ObservableObject {
     /// Returns true when the key was consumed as an interrupt (turn running); false → collapse.
     var onEsc: (() -> Bool)?
 
+    /// Wave-5 gate item 4: the composer-hop seam — `handleAcceptedSwipe` below needs to know
+    /// whether the shell is CURRENTLY showing the composer (`FieldStateAdapter.showingDraft`) to
+    /// decide the swipe against the field's full position space (history ⟷ response ⟷ composer,
+    /// see `navigateFieldSwipe`), but that flag lives on the adapter `GlassRootView` owns, not
+    /// here (the controller doesn't import FieldKit's adapter type). Wired idempotently by
+    /// `GlassRootView.wireCallbacks()`, same pattern/lifecycle as `FieldStateAdapter`'s own
+    /// `onSubmit`/`onClearMessage`/`onCollapse` closures.
+    var isShowingDraft: (() -> Bool)?
+    /// Wired by `GlassRootView.wireCallbacks()` to `adapter.showingDraft = `. The other half of
+    /// the composer-hop seam above.
+    var setShowingDraft: ((Bool) -> Void)?
+
     /// Wave 2c task 4: which historical exchange (index into `session.state.exchanges`) the
     /// field's shell is pinned to via an accepted 2-finger swipe — `nil` = live/draft view
     /// (`ExchangeNavigation.swift`'s convention). `private(set)`: only `handleAcceptedSwipe`
@@ -298,17 +310,36 @@ final class OrbWindowController: ObservableObject {
         return CGPoint(x: origin.x + local.x, y: origin.y + size.height - local.y)
     }
 
-    /// v1 parity (MusicDynamicIslandPlugin/MediaDynamicIslandPlugin's `.left → previousTrack()`,
-    /// `.right → nextTrack()`) maps `.left` to "older" and `.right` to "newer" here too — swipe
-    /// left steps back into history, swipe right steps forward toward (and past, back to nil/
-    /// live) the most recent exchange. Returns whether the index actually moved so the haptic
-    /// only fires on an ACCEPTED swipe (D6), not on every threshold crossing (e.g. already at
-    /// the oldest exchange and swiping further left is a no-op, silently).
+    /// Wave-5 gate item 4 (user directive, addendum): the v1 music-player convention (`.left →
+    /// previousTrack()`, `.right → nextTrack()`) is REPLACED by page-flip/browser-back — physical
+    /// `.right` means back/older, `.left` means forward/newer (`exchangeNavDirection(for:)`,
+    /// `Field/ExchangeNavigation.swift`). The decision now covers the field's FULL position
+    /// space, not just history: swiping "newer" past the live (nil) view hops into the composer;
+    /// swiping "older" from the composer hops back to the response, when there's a reply to
+    /// return to (`navigateFieldSwipe`, same file — extracted pure so it's table-tested).
+    /// Returns whether the swipe actually moved anything so the haptic only fires on an ACCEPTED
+    /// swipe (D6), not on every threshold crossing (e.g. already at the oldest exchange and
+    /// swiping further "older" is a no-op, silently — same as before this wave).
     private func handleAcceptedSwipe(_ direction: TrackpadHorizontalSwipeDirection) -> Bool {
-        let navDirection: ExchangeNavDirection = direction == .left ? .older : .newer
-        let next = navigateExchange(exchangeIndex, direction: navDirection, count: session.state.exchanges.count)
-        guard next != exchangeIndex else { return false }
-        exchangeIndex = next
+        let navDirection = exchangeNavDirection(for: direction)
+        let showingDraft = isShowingDraft?() ?? false
+        let hasReply = session.state.turnRunning
+            || !(session.state.exchanges.last?.reply.isEmpty ?? true)
+        guard let target = navigateFieldSwipe(
+            exchangeIndex: exchangeIndex,
+            showingDraft: showingDraft,
+            hasReply: hasReply,
+            direction: navDirection,
+            count: session.state.exchanges.count
+        ) else { return false }
+
+        switch target {
+        case .exchange(let next):
+            if showingDraft { setShowingDraft?(false) }
+            exchangeIndex = next
+        case .composer:
+            setShowingDraft?(true)
+        }
         return true
     }
 

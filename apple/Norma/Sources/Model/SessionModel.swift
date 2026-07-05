@@ -28,6 +28,16 @@ struct OrbSessionState: Equatable {
     /// with an empty reply; `assistant_message(main)` fills in the LAST exchange's reply (or, if
     /// none exists yet, appends one with an empty prompt) — see `SessionReducer.reduce`.
     var exchanges: [Exchange] = []
+    /// Wave-5 gate item 2: messages sent while a turn is already running go down `session.steer`
+    /// — the daemon queues them and drains at the next round boundary, and the reducer folds each
+    /// one into the current exchange's growing prompt ("↳ text", see the `.userMessage` case
+    /// below) so the eventual reply lands on the exchange the user was actually looking at. That
+    /// fold is silent from the UI's perspective though — nothing showed the user their message
+    /// had actually been accepted and was waiting, not lost. This mirrors the fold 1:1 (appended
+    /// in the same branch) so it's always in sync with what got folded, and clears whenever the
+    /// turn the queued text was riding on ends — absorbed (`turnCompleted`) or died
+    /// (`agentError`) — since a queued steer never survives past the turn it was queued for.
+    var queuedSteers: [String] = []
 
     var taskCounts: (done: Int, total: Int) {
         (tasks.filter { $0.status == "completed" }.count, tasks.count)
@@ -45,6 +55,9 @@ enum SessionReducer {
             if s.turnRunning, let last = s.exchanges.indices.last, s.exchanges[last].reply.isEmpty {
                 // Mid-turn steer: same turn, same exchange — the prompt grows (one turn = one exchange).
                 s.exchanges[last].prompt += "\n↳ \(v.text)"
+                // Wave-5 gate item 2: surface the queued message separately from the fold above
+                // so the UI can show it as visibly "queued" rather than silently absorbed.
+                s.queuedSteers.append(v.text)
             } else {
                 s.exchanges.append(Exchange(prompt: v.text, reply: ""))
             }
@@ -86,11 +99,13 @@ enum SessionReducer {
             s.pendingApprovalIds = []
             s.streamingText = ""
             s.status = .idle
+            s.queuedSteers = [] // the turn absorbed whatever was queued for it
         case .agentError(let v) where v.threadId == mainThread:
             s.turnRunning = false
             s.pendingApprovalIds = []
             s.streamingText = ""
             s.status = .idle
+            s.queuedSteers = [] // the turn died with whatever was queued for it
             if let last = s.exchanges.indices.last, s.exchanges[last].reply.isEmpty {
                 s.exchanges[last].reply = "⚠︎ \(v.message)"
             }

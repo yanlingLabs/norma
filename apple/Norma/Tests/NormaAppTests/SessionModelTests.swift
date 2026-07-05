@@ -315,4 +315,59 @@ final class SessionModelTests: XCTestCase {
         s = SessionReducer.reduce(s, ev(#"{"type":"agent_error","seq":3,"sessionId":"s","ts":0,"threadId":"main","message":"boom"}"#))
         XCTAssertEqual(s.exchanges, [Exchange(prompt: "do the thing", reply: "⚠︎ boom")])
     }
+
+    // MARK: Queued steer indicator (wave-5 gate item 2 — the mid-turn fold above was silent;
+    // this surfaces it separately so the UI can show "queued" instead of appearing to swallow it)
+
+    func testMidTurnSteerAppendsToQueuedSteers() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, userMessage("A", seq: 1))
+        s = SessionReducer.reduce(s, turnStarted(seq: 2))
+        XCTAssertTrue(s.queuedSteers.isEmpty) // nothing queued yet, still just the original prompt
+        s = SessionReducer.reduce(s, userMessage("B", seq: 3)) // steer
+        XCTAssertEqual(s.queuedSteers, ["B"])
+        s = SessionReducer.reduce(s, userMessage("C", seq: 4)) // a second steer in the same turn
+        XCTAssertEqual(s.queuedSteers, ["B", "C"])
+        // The fold into the exchange prompt still happens too — this is additive, not a replacement.
+        XCTAssertEqual(s.exchanges[0].prompt, "A\n↳ B\n↳ C")
+    }
+
+    func testTurnCompletedClearsQueuedSteers() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, userMessage("A", seq: 1))
+        s = SessionReducer.reduce(s, turnStarted(seq: 2))
+        s = SessionReducer.reduce(s, userMessage("B", seq: 3))
+        s = SessionReducer.reduce(s, turnCompleted(seq: 4))
+        XCTAssertTrue(s.queuedSteers.isEmpty)
+    }
+
+    func testAgentErrorClearsQueuedSteers() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, userMessage("A", seq: 1))
+        s = SessionReducer.reduce(s, turnStarted(seq: 2))
+        s = SessionReducer.reduce(s, userMessage("B", seq: 3))
+        s = SessionReducer.reduce(s, ev(#"{"type":"agent_error","seq":4,"sessionId":"s","ts":0,"threadId":"main","message":"boom"}"#))
+        XCTAssertTrue(s.queuedSteers.isEmpty)
+    }
+
+    /// `FieldStateAdapter.queuedText` is what `NormaFieldView`'s queued-line actually reads —
+    /// covers the "queued: <text>" join format directly, through a live `SessionModel`.
+    @MainActor
+    func testQueuedTextReflectsQueuedSteersAndClearsOnCompletion() {
+        let session = SessionModel()
+        session.markConnected()
+        session.apply(userMessage("A", seq: 1))
+        session.apply(turnStarted(seq: 2))
+        let adapter = FieldStateAdapter(session: session)
+        XCTAssertNil(adapter.queuedText) // nothing queued yet
+
+        session.apply(userMessage("B", seq: 3))
+        XCTAssertEqual(adapter.queuedText, "queued: B")
+
+        session.apply(userMessage("C", seq: 4))
+        XCTAssertEqual(adapter.queuedText, "queued: B; C")
+
+        session.apply(turnCompleted(seq: 5))
+        XCTAssertNil(adapter.queuedText)
+    }
 }

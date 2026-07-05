@@ -106,7 +106,16 @@ struct NormaFieldView: View {
 
     @ViewBuilder
     private func composerBody(in windowSize: CGSize) -> some View {
-        let composerTargetHeight = clampedComposerHeight()
+        // Wave-5 gate item 3: the shell's target height now follows whichever content is
+        // actually occupying it — the response's own measured height (prompt + reply + queued
+        // line) while `showsInlineResponse`, else the composer's live-typed-text height exactly
+        // as before. Both are clamped, but to different caps: the composer's cap is a fixed
+        // constant (`composerMaxHeight`); the response's is the window's own remaining vertical
+        // room (`clampedResponseHeight(in:)`) since a reply can legitimately want to fill nearly
+        // the whole field before its internal ScrollView takes over.
+        let composerTargetHeight = showsInlineResponse
+            ? clampedResponseHeight(in: windowSize)
+            : clampedComposerHeight()
         let composerFinal = composerFinalRect(in: windowSize, height: composerTargetHeight)
         let orbPoint = morph.corner.orbAnchorInWindow(
             windowSize: windowSize,
@@ -525,6 +534,16 @@ struct NormaFieldView: View {
                         if isThinkingOnly {
                             shimmerRow
                         }
+                        // Wave-5 gate item 2: a message sent mid-turn is folded silently into the
+                        // prompt above — this line is the only visible confirmation it was
+                        // actually accepted and is waiting for the next round boundary, not lost.
+                        if let queuedText = adapter.queuedText {
+                            Text("⧗ \(queuedText)")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.white.opacity(0.5)) // difference-blend-safe, dimmed
+                                .lineLimit(2)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
                     // Same leading/trailing/vertical insets as `composerContent` (see the shared
                     // constants above the type header) — `textLeadingInset` reserves the exact
@@ -535,10 +554,28 @@ struct NormaFieldView: View {
                     .padding(.trailing, Self.contentHorizontalPadding)
                     .padding(.vertical, Self.contentVerticalPadding)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    // Wave-5 gate item 3: measure this VStack's OWN natural height (prompt + reply
+                    // + queued line, at the padding above — BEFORE the `.frame(minHeight:...)`
+                    // below stretches it to fill the pill) via a background GeometryReader +
+                    // PreferenceKey, and republish it onto `morph.responseHeight` — mirrors
+                    // `ComposerTextView.onContentHeightChange` driving `composerContentHeight`,
+                    // just measured from SwiftUI layout instead of an NSTextView self-report since
+                    // there's no text view backing this side.
+                    .background(
+                        GeometryReader { contentProxy in
+                            Color.clear.preference(
+                                key: ResponseContentHeightKey.self,
+                                value: contentProxy.size.height
+                            )
+                        }
+                    )
                     // Short content centers within the available pill height; long content
                     // (natural height already >= proxy.size.height) is unaffected and scrolls
                     // normally, top-anchored, exactly as before.
                     .frame(minHeight: proxy.size.height, alignment: .center)
+                }
+                .onPreferenceChange(ResponseContentHeightKey.self) { height in
+                    morph.responseHeight = height
                 }
             }
 
@@ -608,6 +645,26 @@ struct NormaFieldView: View {
         let pillHeight = composerContentHeight + chromeHeight
         return min(morph.composerMaxHeight,
                    max(morph.composerMinHeight, pillHeight))
+    }
+
+    /// Wave-5 gate item 3: the window's own remaining vertical room for the shell's content —
+    /// window height minus `haloPadding` on both the top and bottom edges (the breathing halo's
+    /// clearance, see `MorphModel.haloPadding`'s doc) minus the nav pill + inter-pill gap reserved
+    /// above it (mirrors `composerFinalRect`'s own `P + navOffset` top reservation for `.topLeft`,
+    /// the only corner in play — see `MorphModel.corner`'s doc). This is the response shell's
+    /// growth ceiling; anything the content wants beyond it keeps scrolling internally instead
+    /// (the `ScrollView` in `inlineResponse` already handles that, unchanged by this wave).
+    private func maxShellHeight(in windowSize: CGSize) -> CGFloat {
+        let reserved = 2 * morph.haloPadding + morph.navPillHeight + morph.interPillGap
+        return max(morph.composerMinHeight, windowSize.height - reserved)
+    }
+
+    /// Clamp the live-measured response content height (`morph.responseHeight`, fed by
+    /// `inlineResponse`'s background `GeometryReader` — see that property's doc) into the pill
+    /// range: never smaller than the composer's own minimum (so the shell doesn't shrink below
+    /// the standard pill height for a one-line reply), never taller than `maxShellHeight(in:)`.
+    private func clampedResponseHeight(in windowSize: CGSize) -> CGFloat {
+        min(maxShellHeight(in: windowSize), max(morph.composerMinHeight, morph.responseHeight))
     }
 
     /// Final (settled) composer rectangle in window SwiftUI coords. The composer is always
@@ -680,6 +737,20 @@ struct NormaFieldView: View {
         let pillRadius = min(shorter / 2, 22)
         let t = min(1, max(0, (shorter - 48) / 60))
         return circleRadius * (1 - t) + pillRadius * t
+    }
+}
+
+// MARK: - ResponseContentHeightKey (wave-5 gate item 3)
+
+/// Carries `inlineResponse`'s own natural content height (prompt + reply + queued line) up from
+/// its background `GeometryReader` to the `.onPreferenceChange` that republishes it onto
+/// `morph.responseHeight` — see that property's doc and `NormaFieldView.clampedResponseHeight(in:)`.
+/// `reduce` takes the latest value (there is only ever one reporting view in the tree at a time),
+/// same convention as every other single-producer SwiftUI `PreferenceKey`.
+private struct ResponseContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 
