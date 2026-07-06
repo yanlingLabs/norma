@@ -52,6 +52,17 @@ final class OrbFollower {
     /// the panel ACTUALLY is right now, or the two would fight every frame.
     var isExpanded = false
 
+    /// Fix E/F (anim-fidelity restore, v1 parity — `isCollapsing`, GlassFieldWindow.swift:1908/
+    /// 1927/1933): mirrors `OrbWindowController.morphTarget == 0`, set by the controller at the
+    /// single seam its own target actually changes (`startMorph(target:)`, plus a reset in
+    /// `finishCollapse()` for the natural-settle completion that call doesn't itself observe).
+    /// Note this is true for the WHOLE collapse — from `collapseToOrb()`'s call until either the
+    /// morph settles or a retarget reverses it — even though `isExpanded` ALSO stays true for
+    /// that same span (it only flips at `finishCollapse()`); `tick()` below needs both to tell
+    /// "still mid-expand, not yet formed" (Fix E: freeze) apart from "collapsing" (Fix F: snap,
+    /// unconditionally, v1's own bypass of the freeze).
+    var isCollapsing = false
+
     var onCursorLocationChange: ((CGPoint) -> Void)?
     /// Renamed from wave 1's `onOrbCenterChange`: the published value is now the panel's
     /// window origin, not an orb center.
@@ -152,7 +163,32 @@ final class OrbFollower {
         let dt = now - lastUpdate
         lastUpdate = now
 
-        let (next, tier) = springStep(spring, target: targetOrigin(), dt: dt, config: config)
+        // Fix E (anim-fidelity restore, v1 parity — GlassFieldWindow.swift:1927's gate `progress >
+        // 0.85 || isCollapsing`): while the field is mid-EXPAND (not collapsing) and hasn't mostly
+        // formed yet, hold the window at wherever `expandToField()`'s `snapWindowOrigin(to:)`
+        // already put it, instead of springing toward the live cursor — springing this early
+        // visibly fights the morph (the glass shape is still inflating from the orb; a
+        // simultaneously drifting panel reads as the shape "sliding" mid-grow). `isCollapsing`
+        // bypasses this unconditionally (v1's own bypass, same gate) — Fix F below takes over
+        // instead, keeping the shrinking bubble glued to the cursor the whole way down.
+        if isExpanded, !isCollapsing, morphModel.progress < 0.85 {
+            return
+        }
+
+        let target = targetOrigin()
+        let next: SpringState
+        let tier: SpringTier
+        if isCollapsing {
+            // Fix F (v1 parity, GlassFieldWindow.swift:1933-1945): no 75/18 spring lag while
+            // collapsing — pin the tracking spring's position DIRECTLY onto the target every
+            // tick, velocity zeroed, so the shrinking bubble stays glued to the cursor instead of
+            // trailing behind on the lagged spring (visible before this fix as a "ghost circle"
+            // detaching from the cursor mid-collapse).
+            next = SpringState(position: target, velocity: .zero)
+            tier = .active
+        } else {
+            (next, tier) = springStep(spring, target: target, dt: dt, config: config)
+        }
 
         // Task 2 (fluid orb acceleration tap): (velocity - lastVelocity) / dt, this tick's real
         // dt — the same one just fed to `springStep` above. Clamped to [1/240, config.dtClampMax]

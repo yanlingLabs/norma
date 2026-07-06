@@ -633,6 +633,17 @@ final class OrbWindowController: ObservableObject {
 
     private func startMorph(target: Double) {
         morphTarget = target
+        // Fix E/F seam (anim-fidelity restore, v1 parity — `isCollapsing`, GlassFieldWindow.swift:
+        // 1908/1927/1933): the single place `morphTarget` actually changes, in EITHER direction —
+        // mirrors it onto the follower so its own tick() can tell "collapsing" apart from
+        // "(re-)expanding" (v1 computes this fresh every tick as `morphTimer != nil && morphTarget
+        // == 0`; stored here instead since v2's `morphTarget` is private to this controller, not
+        // reachable from `OrbFollower`). A retarget back to 1 (`expandToField()`'s mid-collapse
+        // re-summon path) flows through this same call, so it flips back to `false` in exactly
+        // the place v1's own computed property would — no separate reset needed on that path.
+        // `finishCollapse()` resets it too, for the natural-settle completion this call doesn't
+        // itself observe.
+        follower.isCollapsing = (target == 0)
         guard morphTimer == nil else { return }
         lastMorphTick = CACurrentMediaTime()
         morphTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
@@ -776,6 +787,11 @@ final class OrbWindowController: ObservableObject {
         // `MorphModel.activeWindowSize`'s doc.
         morphModel.activeWindowSize = morphModel.collapsedWindowSize
         follower.isExpanded = false
+        // Fix E/F: the natural-settle completion this reaches via `morphTick()` (as opposed to a
+        // retarget back to 1, which `startMorph(target:)` itself already resets) — the collapse
+        // that was in flight is now over, so the next expand must start fresh, not still read as
+        // "collapsing" from this cycle's stale latch.
+        follower.isCollapsing = false
         follower.snapWindowOrigin(to: origin)
 
         externalFocus?.restore()
