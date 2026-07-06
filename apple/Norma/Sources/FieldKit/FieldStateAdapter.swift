@@ -351,4 +351,32 @@ final class FieldStateAdapter: ObservableObject {
     /// Esc, which `OrbWindowController`'s key monitor already calls directly) — kept wired for
     /// parity/future use, same status as task A's unwired reset-icon slot.
     var onCollapse: () -> Void = {}
+
+    // MARK: - Task 6: FieldFocus (virtual keyboard focus — see FieldFocus.swift's header)
+
+    /// 2d-i keyboard focus (virtual — the composer text view keeps firstResponder; see
+    /// FieldFocus.swift). Reset to .composer on every surface change.
+    @Published var focusedElement: FieldFocusElement = .composer
+
+    /// Wired by GlassRootView → OrbWindowController.requestExpandToWindow().
+    var onExpandToWindow: () -> Void = {}
+
+    // MARK: - Gate r7: window-surface controls (same-panel window morph)
+
+    /// Wired by GlassRootView → `OrbWindowController.collapseWindowToOrb()`. The window's red/yellow
+    /// traffic lights, Esc, and the 4-finger tap all route here — the window always collapses back
+    /// to the ORB (v1 parity: the large surface never returns to the field).
+    var onWindowClose: () -> Void = {}
+    /// Wired by GlassRootView → `OrbWindowController.zoomToggleWindow()`. The green traffic light.
+    var onWindowZoom: () -> Void = {}
+
+    // MARK: - Task 7: interaction-needed pulses
+
+    /// Spec §3: the daemon needs a human — a pending approval, question, or plan (the reducer
+    /// folds all three into `.approvalNeeded`). Drives the chevron's amber pulse and the
+    /// fluid's action pulse; 2d-iii turns this into actual cards in the chat window.
+    var interactionNeeded: Bool {
+        if case .approvalNeeded = session.state.status { return true }
+        return false
+    }
 }

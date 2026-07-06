@@ -52,6 +52,56 @@ final class OrbFollower {
     /// the panel ACTUALLY is right now, or the two would fight every frame.
     var isExpanded = false
 
+    /// Fix E/F (anim-fidelity restore, v1 parity — `isCollapsing`, GlassFieldWindow.swift:1908/
+    /// 1927/1933): mirrors `OrbWindowController.morphTarget == 0`, set by the controller at the
+    /// single seam its own target actually changes (`startMorph(target:)`, plus a reset in
+    /// `finishCollapse()` for the natural-settle completion that call doesn't itself observe).
+    /// Note this is true for the WHOLE collapse — from `collapseToOrb()`'s call until either the
+    /// morph settles or a retarget reverses it — even though `isExpanded` ALSO stays true for
+    /// that same span (it only flips at `finishCollapse()`); `tick()` below needs both to tell
+    /// "still mid-expand, not yet formed" (Fix E: freeze) apart from "collapsing" (Fix F: snap,
+    /// unconditionally, v1's own bypass of the freeze).
+    var isCollapsing = false
+
+    /// Gate r7 (same-panel window morph): while the window surface is open the panel is a large,
+    /// LOCKED frame — THIS follower must NOT spring it toward the cursor (its own tracking spring is
+    /// scoped to the small orb/field frame's `FieldCorner` geometry, a different shape entirely).
+    /// Distinct from `stop()`: the display link stays alive (paused) and the spring/cursor state is
+    /// preserved, so `OrbWindowController.finishWindowCollapse()` can resume tracking from a snapped
+    /// origin once the collapse settles. Set true by `presentWindowSurface()`, back to false by
+    /// `finishWindowCollapse()`.
+    ///
+    /// Gate r8: this does NOT mean the panel is motionless throughout — while COLLAPSING (`surface
+    /// == .window`, morph target 0), `OrbWindowController.morphTick()` rides the panel origin toward
+    /// the live cursor itself, each tick, via a SEPARATE path (`rideWindowCollapseToCursor()`,
+    /// `panel.setFrame` directly) that bypasses this follower entirely — reusing `rawGlassAnchor()`
+    /// below for the same cursor-anchor convention, but none of this follower's own spring/fence
+    /// math (wrong geometry for the window's centered-content layout). `windowStationary` staying
+    /// true for that whole span is exactly what's wanted: THIS follower's link must stay paused so
+    /// the two mechanisms never fight over the same panel frame.
+    var windowStationary = false {
+        didSet {
+            guard windowStationary != oldValue else { return }
+            if windowStationary {
+                link?.isPaused = true
+            } else {
+                wake()
+            }
+        }
+    }
+
+    /// Gate r8: the raw (un-fenced) glass-anchor target this follower's own tracking spring chases
+    /// — cursor + `baseOffset`, or the sticky magnetic target if one is set (the same precedence
+    /// `targetOrigin()` below uses, factored out so it's reachable without also pulling in that
+    /// method's `FieldCorner`/fence mapping, which is scoped to the small orb/field frame's own
+    /// geometry). Exposed (not `private`) so `OrbWindowController`'s window-collapse cursor-ride
+    /// (gate r8, `rideWindowCollapseToCursor()`) can converge on the SAME anchor convention the
+    /// follower resumes tracking from at settle (`finishWindowCollapse()` wakes this follower right
+    /// after) — no offset mismatch at the handoff.
+    func rawGlassAnchor() -> CGPoint {
+        magneticTarget ?? CGPoint(x: cursorLocation.x + baseOffset.x, y: cursorLocation.y + baseOffset.y)
+    }
+
     var onCursorLocationChange: ((CGPoint) -> Void)?
     /// Renamed from wave 1's `onOrbCenterChange`: the published value is now the panel's
     /// window origin, not an orb center.
@@ -148,11 +198,39 @@ final class OrbFollower {
     }
 
     @objc private func tick() {
+        // Gate r7: the window surface is stationary — the link is paused while `windowStationary`,
+        // so this normally won't fire at all; belt against a stray tick moving the locked frame.
+        if windowStationary { return }
         let now = CACurrentMediaTime()
         let dt = now - lastUpdate
         lastUpdate = now
 
-        let (next, tier) = springStep(spring, target: targetOrigin(), dt: dt, config: config)
+        // Fix E (anim-fidelity restore, v1 parity — GlassFieldWindow.swift:1927's gate `progress >
+        // 0.85 || isCollapsing`): while the field is mid-EXPAND (not collapsing) and hasn't mostly
+        // formed yet, hold the window at wherever `expandToField()`'s `snapWindowOrigin(to:)`
+        // already put it, instead of springing toward the live cursor — springing this early
+        // visibly fights the morph (the glass shape is still inflating from the orb; a
+        // simultaneously drifting panel reads as the shape "sliding" mid-grow). `isCollapsing`
+        // bypasses this unconditionally (v1's own bypass, same gate) — Fix F below takes over
+        // instead, keeping the shrinking bubble glued to the cursor the whole way down.
+        if isExpanded, !isCollapsing, morphModel.progress < 0.85 {
+            return
+        }
+
+        let target = targetOrigin()
+        let next: SpringState
+        let tier: SpringTier
+        if isCollapsing {
+            // Fix F (v1 parity, GlassFieldWindow.swift:1933-1945): no 75/18 spring lag while
+            // collapsing — pin the tracking spring's position DIRECTLY onto the target every
+            // tick, velocity zeroed, so the shrinking bubble stays glued to the cursor instead of
+            // trailing behind on the lagged spring (visible before this fix as a "ghost circle"
+            // detaching from the cursor mid-collapse).
+            next = SpringState(position: target, velocity: .zero)
+            tier = .active
+        } else {
+            (next, tier) = springStep(spring, target: target, dt: dt, config: config)
+        }
 
         // Task 2 (fluid orb acceleration tap): (velocity - lastVelocity) / dt, this tick's real
         // dt — the same one just fed to `springStep` above. Clamped to [1/240, config.dtClampMax]
@@ -179,6 +257,9 @@ final class OrbFollower {
     }
 
     private func wake() {
+        // Gate r7: cursor samples keep arriving while the window is open — never let them un-pause
+        // the link and start moving the locked window frame.
+        guard !windowStationary else { return }
         guard let link else { return }
         if link.isPaused {
             lastUpdate = CACurrentMediaTime() // don't integrate the paused gap

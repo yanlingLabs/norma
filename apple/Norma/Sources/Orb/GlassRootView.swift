@@ -19,27 +19,23 @@ struct GlassRootView: View {
     /// (see `FluidModel`'s doc, `FieldKit/FluidOrbView.swift`). Held only to pass down to
     /// `NormaFieldView`, which itself only passes it further down to `FluidOrbSlot`.
     let fluidModel: FluidModel
-    @StateObject private var adapter: FieldStateAdapter
+    // NOTE: owned by `OrbWindowController.fieldAdapter` (Task 2d-i.2), not here — the chat
+    // window shares this same instance for drafts/replies/focus. Injected as `@ObservedObject`,
+    // so the memberwise init suffices (no custom init needed).
+    @ObservedObject var adapter: FieldStateAdapter
     private let draftCache = DraftCache()
-
-    init(session: SessionModel, controller: OrbWindowController, morphModel: MorphModel, fluidModel: FluidModel) {
-        self.session = session
-        self.controller = controller
-        self.morphModel = morphModel
-        self.fluidModel = fluidModel
-        _adapter = StateObject(wrappedValue: FieldStateAdapter(session: session))
-        // NOTE: do NOT touch `adapter` here. Accessing a @StateObject's wrappedValue inside
-        // init mutates a pre-installation THROWAWAY instance — the installed adapter keeps the
-        // default no-op closures (live-gate bug: typing worked, Enter silently did nothing).
-        // Wiring lives in body via wireCallbacks(); the closures are plain vars (not
-        // @Published), so per-render reassignment is idempotent and publishes nothing.
-    }
 
     /// Idempotent callback wiring onto the INSTALLED adapter (see init NOTE).
     private func wireCallbacks() {
         adapter.onSubmit = { [self] text in submit(text) }
         adapter.onClearMessage = { [adapter] in adapter.composerDraft = "" }
         adapter.onCollapse = { [controller] in controller.collapseToOrb() }
+        adapter.onExpandToWindow = { [controller] in controller.requestExpandToWindow() }
+        // Gate r7 (same-panel window morph): the window's traffic lights / zoom route back to the
+        // controller — red+yellow collapse to the orb, green toggles zoom. Esc + the 4-finger tap
+        // use `collapseWindowToOrb()` directly (key monitor / AppDelegate summon router).
+        adapter.onWindowClose = { [controller] in controller.collapseWindowToOrb() }
+        adapter.onWindowZoom = { [controller] in controller.zoomToggleWindow() }
         // Wave-5 gate item 4: the composer-hop seam — `OrbWindowController.handleAcceptedSwipe`
         // needs to read/write `adapter.showingDraft` but can't reach the adapter directly (see
         // `OrbWindowController.isShowingDraft`'s doc).
@@ -55,7 +51,14 @@ struct GlassRootView: View {
                 case .orb:
                     draftCache.stash(adapter.composerDraft)
                     adapter.composerDraft = ""
+                    // Task 6 (FieldFocus): virtual focus never survives a surface change — a
+                    // collapse must not leave the chevron (or any future 2d-iii element) latched
+                    // focused for the NEXT summon.
+                    adapter.focusedElement = .composer
                 case .field:
+                    // Task 6 (FieldFocus): every fresh summon starts on the composer — same
+                    // "focus never survives a surface change" rule as the `.orb` case above.
+                    adapter.focusedElement = .composer
                     // Wave-9 gate fix: every fresh expand starts the reply scrolled to its top —
                     // matches v1 (a freshly re-morphed composer never remembered a stale scroll
                     // position either) and avoids a jarring mid-reply reopen if the content
@@ -92,6 +95,14 @@ struct GlassRootView: View {
                     ) {
                         adapter.showingDraft = true
                     }
+                case .window:
+                    // Gate r7 (same-panel window morph): `presentWindowSurface()` flips
+                    // `.field` → `.window` on the SAME panel — the window branch (`WindowSurfaceView`)
+                    // renders off this SAME `adapter`, so the in-progress draft must survive the
+                    // handoff untouched, not get stashed-and-cleared like a real collapse-to-orb
+                    // (that happens on the `.orb` case when the window later collapses back). Nothing
+                    // to reset here.
+                    break
                 }
             }
             .onChange(of: controller.exchangeIndex) { _, newValue in

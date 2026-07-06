@@ -49,6 +49,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let orb = OrbWindowController(session: model.session)
         orbController = orb
 
+        // Gate r7 (ARCHITECTURE PIVOT): the window is now a THIRD morph target of the orb panel
+        // itself (`OrbWindowController.presentWindowSurface()`), not a separate `ChatWindowController`
+        // panel — the whole `ChatWindow/*` layer is deleted. Expand-to-window is driven entirely
+        // inside the controller (chevron → `requestExpandToWindow()`), so there is no cross-controller
+        // `onExpandToWindow`/`onClose` wiring left to do.
+
         orb.onSubmit = { [weak self] text in
             guard let model = self?.appModel else { return false }
             let ok = await model.sendOrSteer(text)
@@ -83,7 +89,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             TriggerHub.shared.didTrigger
                 .sink { [weak orb] in
                     Haptics.gestureRecognized()
-                    orb?.toggleField()
+                    guard let orb else { return }
+                    // Gate r7: the window surface is the SAME panel now, so window-open == orb visible
+                    // with `surface == .window`. A 4-finger tap while the window is open collapses it
+                    // back to the orb (the SAME 140/22 spring the morph uses); otherwise toggle field.
+                    switch summonToggleAction(surface: orb.surface, windowVisible: orb.isVisible) {
+                    case .closeWindow: orb.collapseWindowToOrb()
+                    case .toggleField: orb.toggleField()
+                    }
                 }
                 .store(in: &cancellables)
 
