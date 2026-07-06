@@ -2,6 +2,17 @@ import Foundation
 import Combine
 import SwiftUI
 
+/// Task 2 (fluid orb): the three states the fluid-orb bubble can render — derived purely from
+/// `SessionModel`'s turn/task/unread state by `FieldStateAdapter.fluidState` below. `.idle` means
+/// no fluid view should even be mounted; the other two carry a fill `level` (0…1) the view maps to
+/// the bubble's liquid height, plus a color (blue while working, amber while holding an unread
+/// reply — the view owns that color choice, not this enum).
+enum FluidState: Equatable {
+    case idle
+    case working(level: Double)
+    case unread(level: Double)
+}
+
 /// The ONLY new design in this transplant (everything else in `FieldKit/` is a direct v1 port).
 /// A thin, v1-shaped facade over `SessionModel` so `NormaFieldView` (copied from v1
 /// `GlassFieldView`'s composer path) can read exactly the surface v1's `AppState` used to
@@ -165,6 +176,35 @@ final class FieldStateAdapter: ObservableObject {
     /// is next summoned. Cleared unconditionally on every expand (`GlassRootView`'s
     /// `.onChange(of: controller.surface)` `.field` case) — any summon path counts as "read."
     @Published var hasUnread: Bool = false
+
+    // MARK: - Task 2: fluid-orb state derivation
+
+    /// Last fill level observed while `fluidState` computed `.working` — the level `.unread`
+    /// holds once `hasUnread` flips true (the task/turn that produced the reply may already be
+    /// gone by then: `turnCompleted` clears `turnRunning` before the wave-3 calm-check even marks
+    /// the orb unread, see `OrbFollower.isCursorCalm`/`GlassRootView`'s turn-completion handler).
+    /// Updated at READ time inside `fluidState` (simpler than mirroring a `hasUnread` setter
+    /// observer, and just as correct: every `hasUnread` flip is preceded by at least one
+    /// `.working` read while the turn was running, since `NormaFieldView`/`GlassRootView` poll
+    /// `fluidState` continuously while mounted). Defaults to 0.5 — the same "no signal yet" level
+    /// `taskLevel` itself falls back to — so an (unexercised in practice) unread-before-any-work
+    /// edge case still renders a sane mid-fill bubble instead of an arbitrary stale value.
+    private var lastWorkingLevel: Double = 0.5
+
+    /// Derived, not stored: `hasUnread` wins outright (the reply is waiting, regardless of
+    /// whether a new turn has already started since); otherwise `turnRunning` renders the current
+    /// task-completion fill; otherwise there is nothing to show at all.
+    var fluidState: FluidState {
+        if hasUnread {
+            return .unread(level: lastWorkingLevel)
+        }
+        let s = session.state
+        guard s.turnRunning else { return .idle }
+        let counts = s.taskCounts
+        let level = counts.total > 0 ? Double(counts.done) / Double(counts.total) : 0.5
+        lastWorkingLevel = level
+        return .working(level: level)
+    }
 
     // MARK: - Callbacks (task B wires real behavior)
 

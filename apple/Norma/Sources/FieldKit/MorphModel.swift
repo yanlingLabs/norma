@@ -91,6 +91,19 @@ final class MorphModel: ObservableObject {
     /// native Liquid Glass backing view to reacquire refraction/shadow state.
     @Published var glassRefreshGeneration = 0
 
+    // MARK: - Task 2/3: fluid orb
+
+    /// The fluid orb's own physics state (`Orb/FluidSim.swift`, Task 1) — the render tick (Task 3)
+    /// owns advancing this every frame via `.step(dt:acceleration:targetLevel:)` and reads it back
+    /// out for the bubble's tilt/wave/level rendering. Lives here (rather than on the view) so it
+    /// survives across `FluidOrbView` remounts the same way `progress` etc. already do.
+    @Published var fluid: FluidSim = .rest
+    /// `OrbFollower`'s per-tick tracking-spring acceleration tap ((velocity − lastVelocity) / dt,
+    /// see `OrbFollower.tick()`) — the lateral/vertical "kick" the fluid sim's tilt/wave terms
+    /// react to. Written every display-link tick regardless of which surface is showing; the
+    /// render tick (Task 3) is the sole reader, feeding it straight into `fluid.step(acceleration:)`.
+    @Published var fluidAcceleration: CGVector = .zero
+
     /// Outer window size. Sized to fit nav pill + composer + screenshot pill
     /// slot + generous halo padding on every side so the breathing glow never
     /// hits the window edge and hard-cuts. Task B: this is the AppKit panel's

@@ -29,6 +29,12 @@ final class OrbFollower {
     private let baseOffset = CGPoint(x: 24, y: -24) // v1
     private let config = SpringConfig.tracking
     private var lastCursorSampleTime = CACurrentMediaTime()
+    /// Task 2 (fluid orb acceleration tap): the tracking spring's velocity as of the PREVIOUS
+    /// tick — `tick()` diffs against this to get `morphModel.fluidAcceleration`. Reset to `.zero`
+    /// alongside every place `spring.velocity` itself gets reset (`start()`/`snapWindowOrigin`)
+    /// so a fresh spring never reports a one-tick phantom acceleration spike computed against a
+    /// stale velocity left over from before the reset.
+    private var lastVelocity = CGPoint.zero
     /// Wave-3 gate item 2b: gates the answer-arrival auto-expand — see `CursorCalmTracker`'s doc
     /// and `isCursorCalm(at:)` below.
     private var calmTracker = CursorCalmTracker()
@@ -65,6 +71,7 @@ final class OrbFollower {
     /// 581-583/742-746/1504-1506).
     func snapWindowOrigin(to origin: CGPoint) {
         spring = SpringState(position: origin, velocity: .zero)
+        lastVelocity = .zero
         lastPublished = origin
     }
 
@@ -98,6 +105,7 @@ final class OrbFollower {
         cursorLocation = NSEvent.mouseLocation
         lastCursorSampleTime = CACurrentMediaTime()
         spring = SpringState(position: targetOrigin(), velocity: .zero)
+        lastVelocity = .zero
         publish(spring.position)
 
         let l = (NSScreen.main ?? NSScreen.screens[0]).displayLink(target: self, selector: #selector(tick))
@@ -139,6 +147,18 @@ final class OrbFollower {
         lastUpdate = now
 
         let (next, tier) = springStep(spring, target: targetOrigin(), dt: dt, config: config)
+
+        // Task 2 (fluid orb acceleration tap): (velocity - lastVelocity) / dt, this tick's real
+        // dt — the same one just fed to `springStep` above. Floored at the same 1/240 the spring
+        // integration itself floors `dt` to (`SpringStep.swift`'s `springStep`), so an
+        // arbitrarily-small/zero raw `dt` (e.g. two ticks landing back-to-back) can't divide the
+        // velocity delta into a NaN/unbounded spike — `FluidSim` (Task 1) clamps whatever comes
+        // out of this regardless, this floor just keeps the input itself finite.
+        let accelDt = max(dt, 1.0 / 240.0)
+        let v = next.velocity
+        morphModel.fluidAcceleration = CGVector(dx: (v.x - lastVelocity.x) / accelDt, dy: (v.y - lastVelocity.y) / accelDt)
+        lastVelocity = v
+
         spring = next
         publish(spring.position)
 

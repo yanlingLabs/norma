@@ -231,4 +231,14 @@ final class SessionModel: ObservableObject {
         state = OrbSessionState()
         if wasConnected { state.status = .idle }
     }
+
+    /// Test-only mutation seam (Task 2, fluid state derivation tests): lets tests set arbitrary
+    /// `OrbSessionState` fields directly (e.g. `turnRunning`, `tasks`) without constructing a full
+    /// `SessionEvent`/`SessionReducer` round trip for state combinations the real event stream
+    /// wouldn't produce on its own (e.g. "turnRunning with no tasks"). Internal, not `public` —
+    /// reachable from `FluidStateTests` via `@testable import Norma`, same convention as
+    /// `OrbWindowController.morphProgressForTesting`.
+    func applyForTesting(_ mutate: (inout OrbSessionState) -> Void) {
+        mutate(&state)
+    }
 }
