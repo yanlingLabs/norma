@@ -86,6 +86,15 @@ struct NormaFieldView: View {
 
     @State private var composerContentHeight: CGFloat = 22
 
+    /// Task 7: drives the expand chevron's amber pulse. `.onChange(of: adapter.interactionNeeded)`
+    /// below mirrors `interactionNeeded` onto this local `@State`; the `.animation(value:
+    /// chevronPulse)` modifier (scoped to the chevron's own `overlay` closure — v1 LAW: never on
+    /// an outer/ancestor view) fires a `.repeatForever(autoreverses: true)` opacity animation on
+    /// that single false→true transition, which then keeps autoreversing forever with no further
+    /// state churn needed — same local-animation-state convention as `WorkingSpinnerGlyph`/
+    /// `SheenText` elsewhere in this file.
+    @State private var chevronPulse = false
+
     /// v1 default halo tint (`appState.visualCustomization.haloNSColor`'s factory default) —
     /// there is no visualCustomization system in v2 yet, so this is a fixed placeholder; a later
     /// wave that adds user customization should rebind this to a real setting.
@@ -344,7 +353,7 @@ struct NormaFieldView: View {
             // itself on progress too was considered and rejected — mount stays driven purely by
             // fluidState/level (`FluidOrbSlot`'s own doc) so drain-visibility doesn't depend on
             // which surface happens to be showing.
-            FluidOrbSlot(fluid: fluid, state: adapter.fluidState, isStoppedFlash: adapter.showStoppedFlash, isHeld: adapter.isHoldingWork)
+            FluidOrbSlot(fluid: fluid, state: adapter.fluidState, isStoppedFlash: adapter.showStoppedFlash, isHeld: adapter.isHoldingWork, actionNeeded: adapter.interactionNeeded)
                 .frame(width: morph.orbBubbleSize, height: morph.orbBubbleSize)
                 .position(x: collapsedCenter.x, y: collapsedCenter.y)
                 .opacity(1 - smoothstep(0.0, 0.28, morph.progress))
@@ -461,9 +470,14 @@ struct NormaFieldView: View {
                 .frame(width: composerFinal.width, height: composerFinal.height)
                 .allowsHitTesting(false)
                 .overlay(alignment: .topTrailing) {
+                    // Task 7: amber pulse while the daemon needs a human (`adapter.
+                    // interactionNeeded`) — composes with (never replaces) the existing focus
+                    // ring below. v1 LAW: the `repeatForever` `.animation` is scoped to THIS
+                    // overlay closure alone, value-keyed on the local `chevronPulse` `@State`,
+                    // never hoisted onto an outer/ancestor view.
                     Image(systemName: "arrow.up.left.and.arrow.down.right")
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(adapter.interactionNeeded ? Color(red: 1.0, green: 0.72, blue: 0.30) : .white)
                         .frame(width: 22, height: 22)
                         .background(
                             Circle().stroke(.white.opacity(adapter.focusedElement == .expandChevron ? 0.9 : 0.0),
@@ -472,6 +486,11 @@ struct NormaFieldView: View {
                         .contentShape(Circle())
                         .onTapGesture { adapter.onExpandToWindow() }
                         .opacity(Double(contentReveal))
+                        .opacity(chevronPulse ? 1.0 : 0.45)
+                        .animation(adapter.interactionNeeded
+                            ? .easeInOut(duration: 0.5).repeatForever(autoreverses: true)
+                            : .default, value: chevronPulse)
+                        .onChange(of: adapter.interactionNeeded, initial: true) { _, needed in chevronPulse = needed }
                         // 36 (not `contentHorizontalPadding`'s 12) so this chevron's trailing
                         // 22pt tap target clears `revealDraftButton`'s top-trailing slot
                         // (HStack `.padding(6)` inside `inlineResponse`'s `.topTrailing` ZStack,

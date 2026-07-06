@@ -19,7 +19,7 @@ final class FluidTickPauseTests: XCTestCase {
 
     func testPausesWhenHeldSettledAndCalm() {
         let sim = settledSim(target: 0.5)
-        XCTAssertTrue(shouldPauseFluidTick(sim: sim, targetLevel: 0.5, isHeld: true, accelMagnitude: 0))
+        XCTAssertTrue(shouldPauseFluidTick(sim: sim, targetLevel: 0.5, isHeld: true, accelMagnitude: 0, actionNeeded: false))
     }
 
     /// `.unread`'s synthetic breathing must never freeze — `FieldStateAdapter.isHoldingWork` is
@@ -27,27 +27,27 @@ final class FluidTickPauseTests: XCTestCase {
     /// happens to look settled and a calm cursor must not pause.
     func testNeverPausesForUnread() {
         let sim = settledSim(target: 0.5)
-        XCTAssertFalse(shouldPauseFluidTick(sim: sim, targetLevel: 0.5, isHeld: false, accelMagnitude: 0))
+        XCTAssertFalse(shouldPauseFluidTick(sim: sim, targetLevel: 0.5, isHeld: false, accelMagnitude: 0, actionNeeded: false))
     }
 
     /// A `turnRunning` working fill must never freeze even if the level target hasn't moved in a
     /// while — `isHeld` is false the entire time a turn is running.
     func testNeverPausesWhileTurnRunning() {
         let sim = settledSim(target: 0.5)
-        XCTAssertFalse(shouldPauseFluidTick(sim: sim, targetLevel: 0.5, isHeld: false, accelMagnitude: 0))
+        XCTAssertFalse(shouldPauseFluidTick(sim: sim, targetLevel: 0.5, isHeld: false, accelMagnitude: 0, actionNeeded: false))
     }
 
     /// Held but still excited (a recent kick hasn't decayed out yet) — must not pause mid-motion.
     func testDoesNotPauseWhenHeldButExcited() {
         let sim = excitedSim(target: 0.5)
-        XCTAssertFalse(shouldPauseFluidTick(sim: sim, targetLevel: 0.5, isHeld: true, accelMagnitude: 0))
+        XCTAssertFalse(shouldPauseFluidTick(sim: sim, targetLevel: 0.5, isHeld: true, accelMagnitude: 0, actionNeeded: false))
     }
 
     /// Held and settled, but the cursor itself is currently moving — pausing here would freeze a
     /// bubble that's about to get kicked again on the very next real tick.
     func testDoesNotPauseWhenHeldSettledButCursorMoving() {
         let sim = settledSim(target: 0.5)
-        XCTAssertFalse(shouldPauseFluidTick(sim: sim, targetLevel: 0.5, isHeld: true, accelMagnitude: 800))
+        XCTAssertFalse(shouldPauseFluidTick(sim: sim, targetLevel: 0.5, isHeld: true, accelMagnitude: 800, actionNeeded: false))
     }
 
     /// Held but not yet converged to the target (mid task-count change) — must not pause early.
@@ -55,6 +55,6 @@ final class FluidTickPauseTests: XCTestCase {
         var s = FluidSim.rest
         for _ in 0..<300 { s = s.step(dt: 1.0/60.0, acceleration: .zero, targetLevel: 1.0) }
         s = s.step(dt: 1.0/60.0, acceleration: .zero, targetLevel: 0.25) // target just moved
-        XCTAssertFalse(shouldPauseFluidTick(sim: s, targetLevel: 0.25, isHeld: true, accelMagnitude: 0))
+        XCTAssertFalse(shouldPauseFluidTick(sim: s, targetLevel: 0.25, isHeld: true, accelMagnitude: 0, actionNeeded: false))
     }
 }

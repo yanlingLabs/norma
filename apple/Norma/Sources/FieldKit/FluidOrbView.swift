@@ -83,9 +83,17 @@ let fluidPauseAccelThreshold: Double = 5.0
 /// (`FluidSim.isSettled`), and the cursor is calm (`accelMagnitude` below `threshold` — a moving
 /// cursor's tilt/wave excitation would un-settle the sim again on the very next real step, so
 /// pausing while still excited would visibly freeze a moving bubble mid-motion).
-func shouldPauseFluidTick(sim: FluidSim, targetLevel: Double, isHeld: Bool, accelMagnitude: Double, threshold: Double = fluidPauseAccelThreshold) -> Bool {
+func shouldPauseFluidTick(sim: FluidSim, targetLevel: Double, isHeld: Bool, accelMagnitude: Double, actionNeeded: Bool, threshold: Double = fluidPauseAccelThreshold) -> Bool {
+    guard !actionNeeded else { return false }
     guard isHeld, accelMagnitude < threshold else { return false }
     return sim.isSettled(targetLevel: targetLevel)
+}
+
+/// Task 7: action-needed pulse — sharper and faster than unread's calm breathing (sin(t*1.5)*30,
+/// see `FluidOrbView.step`'s `.unread` branch) so the two are unmistakable at a glance (spec §3:
+/// ≥3× frequency, ≥2× amplitude). Pure for tests (`ActionPulseTests`).
+func actionNeededAccelBoost(t: TimeInterval) -> Double {
+    sin(t * 5.0) * 80
 }
 
 /// Task 3 (fluid orb): the liquid rendered inside the orb bubble — a `Canvas`-drawn fill whose
@@ -131,6 +139,15 @@ struct FluidOrbView: View {
     /// incomplete, amber if unread, or draining) with no stale slate residue.
     let isStoppedFlash: Bool
 
+    /// Task 7: true while `FieldStateAdapter.interactionNeeded` — the daemon is waiting on a
+    /// human (approval/question/plan). Threaded exactly like `isStoppedFlash` above: adds a hot
+    /// amber tint blend (see `tint` below, `isStoppedFlash` wins if both are somehow set) and an
+    /// extra lateral acceleration kick in `step(at:)` (`actionNeededAccelBoost`) so the bubble
+    /// pulses noticeably faster/harder than `.unread`'s calm breathing. Also feeds
+    /// `shouldPauseFluidTick`'s new guard — the tick must never freeze while this is true, since a
+    /// paused `TimelineView` would silently kill the pulse animation.
+    let actionNeeded: Bool
+
     /// Final-review Important-2 (D9 settled-tick freeze): true when the fluid is holding its
     /// level between turns (`FieldStateAdapter.isHoldingWork`'s doc) — the ONLY state `paused`
     /// below is ever allowed to go true for; `.unread`'s synthetic breathing and an actively-
@@ -165,6 +182,11 @@ struct FluidOrbView: View {
     /// deliberately unlike either working-blue or unread-amber so an Esc-interrupt reads as its
     /// own distinct, quieter event rather than a variant of either normal state.
     private static let stoppedTint = Color(red: 0.62, green: 0.66, blue: 0.72)
+
+    /// Task 7: hot amber — blended 50/50 into the active tint while `actionNeeded` is true (see
+    /// `tint` below). Deliberately hotter/more saturated than `unreadTint` so the action pulse
+    /// reads as a distinct, more urgent signal than a merely-unread reply.
+    private static let actionNeededTint = Color(red: 1.0, green: 0.62, blue: 0.20)
 
     /// Task-3 fix wave (review finding, "drain snaps amber → blue"): `FluidState.idle` carries no
     /// color of its own — without this, a dismissed-unread drain would snap the bubble from amber
@@ -265,9 +287,27 @@ struct FluidOrbView: View {
         }
     }
 
+    /// Task 7: 50/50 RGB blend toward `actionNeededTint` — `Color.resolve(in:)` (macOS 14+) is the
+    /// only way to read a plain literal `Color`'s components back out; a fresh default
+    /// `EnvironmentValues()` is fine here since these are opaque sRGB literals, not dynamic/
+    /// asset colors whose resolution would actually depend on the environment.
+    private static func blend(_ a: Color, toward b: Color, amount: Double) -> Color {
+        let ra = a.resolve(in: EnvironmentValues())
+        let rb = b.resolve(in: EnvironmentValues())
+        return Color(
+            .sRGB,
+            red: Double(ra.red) * (1 - amount) + Double(rb.red) * amount,
+            green: Double(ra.green) * (1 - amount) + Double(rb.green) * amount,
+            blue: Double(ra.blue) * (1 - amount) + Double(rb.blue) * amount,
+            opacity: Double(ra.opacity) * (1 - amount) + Double(rb.opacity) * amount
+        )
+    }
+
     private var tint: Color {
         if isStoppedFlash { return Self.stoppedTint }
-        return Self.activeTint(for: state) ?? lastTint
+        let base = Self.activeTint(for: state) ?? lastTint
+        if actionNeeded { return Self.blend(base, toward: Self.actionNeededTint, amount: 0.5) }
+        return base
     }
 
     private func step(at now: Date) {
@@ -291,6 +331,15 @@ struct FluidOrbView: View {
         case .idle:
             target = 0 // draining — see `state`'s doc
         }
+        // Task 7: action-needed pulse — layered on top of whatever the state switch above
+        // already contributed (independent of `.unread`'s own wobble; both can be active at once
+        // in principle, though `interactionNeeded` and `hasUnread` are not expected to co-occur in
+        // practice). Sharper/faster than `.unread`'s breathing so the two read as distinct signals
+        // (see `actionNeededAccelBoost`'s doc).
+        if actionNeeded {
+            let t = Date().timeIntervalSinceReferenceDate
+            acceleration.dx += actionNeededAccelBoost(t: t)
+        }
         fluid.sim = fluid.sim.step(dt: dt, acceleration: acceleration, targetLevel: target)
         OrbDebug.log("FluidOrbView.step dt=\(String(format: "%.4f", dt)) level=\(String(format: "%.3f", fluid.sim.level)) target=\(String(format: "%.2f", target))")
 
@@ -300,7 +349,7 @@ struct FluidOrbView: View {
         // `FluidModel.acceleration`'s `didSet` watches for the unpause kick, so pause/unpause agree
         // on what "calm" means.
         let accelMagnitude = hypot(fluid.acceleration.dx, fluid.acceleration.dy)
-        if shouldPauseFluidTick(sim: fluid.sim, targetLevel: target, isHeld: isHeld, accelMagnitude: accelMagnitude) {
+        if shouldPauseFluidTick(sim: fluid.sim, targetLevel: target, isHeld: isHeld, accelMagnitude: accelMagnitude, actionNeeded: actionNeeded) {
             paused = true
         }
     }
@@ -327,6 +376,12 @@ struct FluidOrbSlot: View {
     /// always-`state != .idle` case, so it was already keeping this view mounted; this flag only
     /// affects whether the mounted view's tick is allowed to freeze once settled.
     let isHeld: Bool
+    /// Task 7: threaded straight through to `FluidOrbView`'s action-pulse tint/acceleration boost
+    /// and the pause guard — exactly the same threading pattern as `isStoppedFlash` above. This
+    /// slot's own mount/drain decision is unchanged by it: `interactionNeeded` co-occurs with
+    /// `.approvalNeeded`, which folds into `OrbStatus` (not `FluidState`) — a turn can be
+    /// `.working`/`.unread` independently, so there's no new mount case to add here.
+    let actionNeeded: Bool
 
     var body: some View {
         // `state != .idle`: an active turn or an unread reply — always show. The second clause
@@ -337,7 +392,7 @@ struct FluidOrbSlot: View {
         // tree entirely: no more ticks, no more `@Published` writes, truly quiescent (D9) until
         // the next `.working`/`.unread`.
         if state != .idle || fluid.sim.level > 0.01 {
-            FluidOrbView(fluid: fluid, state: state, isStoppedFlash: isStoppedFlash, isHeld: isHeld)
+            FluidOrbView(fluid: fluid, state: state, isStoppedFlash: isStoppedFlash, actionNeeded: actionNeeded, isHeld: isHeld)
         } else {
             EmptyView()
         }

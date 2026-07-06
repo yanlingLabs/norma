@@ -360,4 +360,14 @@ final class FieldStateAdapter: ObservableObject {
 
     /// Wired by GlassRootView → OrbWindowController.requestExpandToWindow().
     var onExpandToWindow: () -> Void = {}
+
+    // MARK: - Task 7: interaction-needed pulses
+
+    /// Spec §3: the daemon needs a human — a pending approval, question, or plan (the reducer
+    /// folds all three into `.approvalNeeded`). Drives the chevron's amber pulse and the
+    /// fluid's action pulse; 2d-iii turns this into actual cards in the chat window.
+    var interactionNeeded: Bool {
+        if case .approvalNeeded = session.state.status { return true }
+        return false
+    }
 }
