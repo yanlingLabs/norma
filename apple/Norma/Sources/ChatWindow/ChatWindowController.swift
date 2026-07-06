@@ -92,6 +92,11 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         panel.titlebarAppearsTransparent = true
         panel.isMovableByWindowBackground = true
         panel.acceptsMouseMovedEvents = true
+        // Task-5 review catch: AppKit auto-hides key-capable panels when the app deactivates,
+        // and Norma (accessory, non-activating panels) is "deactivated" almost always — without
+        // this the window vanishes the moment the user clicks any other app, with close()/
+        // onClose never firing. Same explicit opt-out the orb panel carries.
+        panel.hidesOnDeactivate = false
         panel.delegate = self
 
         let hosting = NSHostingView(rootView: ChatWindowRootView(
