@@ -141,3 +141,76 @@ describe("read tools", () => {
     expect(res.output).not.toMatch(/\/etc\//);
   });
 });
+
+describe("ls tool", () => {
+  function makeRegistry(): ToolRegistry {
+    const r = new ToolRegistry();
+    registerReadTools(r);
+    return r;
+  }
+
+  test("lists entries sorted, dirs first then files, dirs suffixed with /", async () => {
+    const d = proj(); // a.txt (file), sub/ (dir)
+    const res = await makeRegistry().execute("ls", { path: d }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res).toEqual({ output: "sub/\na.txt", isError: false });
+  });
+
+  test("ignore globs filter entries by name (dirs and files alike)", async () => {
+    const d = proj();
+    writeFileSync(join(d, "z.log"), "noise\n");
+    mkdirSync(join(d, "node_modules"));
+    const res = await makeRegistry().execute(
+      "ls",
+      { path: d, ignore: ["*.log", "node_modules"] },
+      { cwd: d, roots: [d], sessionId: "s1" },
+    );
+    expect(res.isError).toBe(false);
+    expect(res.output).toBe("sub/\na.txt");
+    expect(res.output).not.toContain("z.log");
+    expect(res.output).not.toContain("node_modules");
+  });
+
+  test("path that is a file, not a directory, is a tool error", async () => {
+    const d = proj();
+    const res = await makeRegistry().execute("ls", { path: join(d, "a.txt") }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(true);
+    expect(res.output).toMatch(/not a directory/);
+  });
+
+  test("path that does not exist is a tool error", async () => {
+    const d = proj();
+    const res = await makeRegistry().execute("ls", { path: join(d, "nope") }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(true);
+    expect(res.output).toMatch(/does not exist/);
+  });
+
+  test("relative path is refused (absolute path required, CC LS parity)", async () => {
+    const d = proj();
+    const res = await makeRegistry().execute("ls", { path: "sub" }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(true);
+    expect(res.output).toMatch(/absolute/);
+  });
+
+  test("path outside the allowed roots is refused (same fence as read/glob)", async () => {
+    const d = proj();
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), "norma-ls-outside-")));
+    const res = await makeRegistry().execute("ls", { path: outside }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(true);
+    expect(res.output).toMatch(/outside/);
+  });
+
+  test("caps at 1000 entries with a trailing truncation line", async () => {
+    const d = realpathSync(mkdtempSync(join(tmpdir(), "norma-ls-big-")));
+    for (let i = 0; i < 1005; i++) writeFileSync(join(d, `f${String(i).padStart(4, "0")}.txt`), "");
+    const res = await makeRegistry().execute("ls", { path: d }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(false);
+    const lines = res.output.split("\n");
+    expect(lines).toHaveLength(1001); // 1000 entries + the truncation line
+    expect(lines[1000]).toBe("… (+5 more truncated)");
+  });
+
+  test("ls is registered alongside read/glob/grep", () => {
+    const names = makeRegistry().specs().map((s) => s.name);
+    expect(names).toEqual(expect.arrayContaining(["read", "glob", "grep", "ls"]));
+  });
+});

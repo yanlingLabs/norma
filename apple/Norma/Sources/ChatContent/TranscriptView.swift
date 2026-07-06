@@ -1,0 +1,132 @@
+import SwiftUI
+
+/// Spec §3: autoscroll only follows when the user is already near the bottom — v1 yanked
+/// unconditionally on every streaming chunk (donor ChatRootView.swift:514-522); this is the
+/// one deliberate improvement over the transplant.
+func shouldAutoscroll(nearBottom: Bool, contentGrew: Bool) -> Bool {
+    nearBottom && contentGrew
+}
+
+struct TranscriptView: View {
+    @ObservedObject var adapter: FieldStateAdapter
+    let tint: Color
+    @State private var nearBottom = true
+    @State private var showLatestPill = false
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    ForEach(Array(adapter.transcript.enumerated()), id: \.offset) { index, exchange in
+                        TranscriptExchangeRow(
+                            exchange: exchange,
+                            streamingText: index == adapter.transcript.count - 1 ? adapter.liveStreamingText : nil,
+                            tint: tint
+                        )
+                        .id(index)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+            .onScrollGeometryChange(for: Bool.self) { geo in
+                geo.contentOffset.y + geo.containerSize.height >= geo.contentSize.height - 40
+            } action: { _, isNear in
+                nearBottom = isNear
+                if isNear { showLatestPill = false }
+            }
+            // Task-4 review fix: onChange fires on ANY change — including the count DROPPING to
+            // zero on session refocus (SessionModel.reset() swaps exchanges wholesale). Only a
+            // genuine growth may follow/raise the pill; a reset must do neither.
+            .onChange(of: adapter.transcript.count) { old, new in
+                if new > old { follow(proxy) }
+            }
+            .onChange(of: adapter.liveStreamingText) { old, new in
+                if (new?.count ?? 0) > (old?.count ?? 0) { follow(proxy) }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if showLatestPill { latestPill(proxy) }
+            }
+        }
+    }
+
+    /// Extracted from `body` (Task-4 review, minor): the chained ScrollViewReader expression sat
+    /// at SourceKit's type-check complexity cliff — keep `body` shallow so future edits don't
+    /// tip it over.
+    private func latestPill(_ proxy: ScrollViewProxy) -> some View {
+        Button {
+            scrollToBottom(proxy)
+        } label: {
+            Label("latest", systemImage: "arrow.down")
+                .font(.system(size: 11, weight: .medium))
+                .padding(.horizontal, 10).padding(.vertical, 5)
+                .background(Capsule().fill(.thinMaterial))
+        }
+        .buttonStyle(.plain)
+        .padding(8)
+    }
+
+    private func follow(_ proxy: ScrollViewProxy) {
+        if shouldAutoscroll(nearBottom: nearBottom, contentGrew: true) {
+            scrollToBottom(proxy)
+        } else {
+            showLatestPill = true
+        }
+    }
+
+    private func scrollToBottom(_ proxy: ScrollViewProxy) {
+        let last = adapter.transcript.count - 1
+        guard last >= 0 else { return }
+        withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(last, anchor: .bottom) }
+    }
+}
+
+/// One exchange's rows — prompt bubble, GROUPED activity (LIVE-GATE G3 / r1b: `groupActivity`
+/// folds any UNBROKEN run of tool calls — even across different tool names — into one `.toolRun`
+/// sentence row, skips `.task` entirely), reply/streaming, stopped flag. A
+/// dedicated `View` (not a `@ViewBuilder` func on `TranscriptView`) because it owns its own
+/// expansion `@State` — which group indices are expanded — scoped per-exchange-row and reset on
+/// view recycle (fine: expansion is a transient reading aid, not persisted state).
+private struct TranscriptExchangeRow: View {
+    let exchange: Exchange
+    /// Non-nil only for the LAST exchange while a reply is actively streaming (v1's synthetic
+    /// trailing-stream mechanism) — `TranscriptView.body` computes this per-index so this view
+    /// stays a pure function of its own inputs.
+    let streamingText: String?
+    let tint: Color
+
+    @State private var expandedGroups: Set<Int> = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if !exchange.prompt.isEmpty {
+                TranscriptUserBubble(text: exchange.prompt, tint: tint)
+            }
+            ForEach(Array(groupActivity(exchange.activity).enumerated()), id: \.offset) { index, group in
+                switch group {
+                case .toolRun(let entries):
+                    TranscriptToolGroupRow(
+                        entries: entries,
+                        isExpanded: expandedGroups.contains(index),
+                        toggle: { toggle(index) }
+                    )
+                case .single(let item):
+                    TranscriptActivityRow(item: item)
+                }
+            }
+            if let streamingText {
+                TranscriptAssistantMessage(text: streamingText, isStreaming: true)
+            } else if !exchange.reply.isEmpty {
+                TranscriptAssistantMessage(text: exchange.reply, isStreaming: false)
+            }
+            if exchange.aborted { TranscriptStoppedRow() }
+        }
+    }
+
+    private func toggle(_ index: Int) {
+        if expandedGroups.contains(index) {
+            expandedGroups.remove(index)
+        } else {
+            expandedGroups.insert(index)
+        }
+    }
+}

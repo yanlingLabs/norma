@@ -1,0 +1,94 @@
+import { describe, expect, test } from "bun:test";
+import type { Task } from "@norma/protocol";
+import { renderTaskBlock, TASK_ICONS, trackLineStart, upsertTask } from "../src/task-block";
+
+function task(id: string, subject: string, status: Task["status"]): Task {
+  return { id, subject, status };
+}
+
+describe("upsertTask", () => {
+  test("appends a new task id, preserving arrival order", () => {
+    const t1 = task("1", "write tests", "pending");
+    const t2 = task("2", "ship it", "pending");
+    expect(upsertTask([], t1)).toEqual([t1]);
+    expect(upsertTask([t1], t2)).toEqual([t1, t2]);
+  });
+
+  test("replaces an existing id in place without reordering the list", () => {
+    const t1 = task("1", "write tests", "pending");
+    const t2 = task("2", "ship it", "pending");
+    const t1Done: Task = { ...t1, status: "in_progress" };
+    expect(upsertTask([t1, t2], t1Done)).toEqual([t1Done, t2]);
+  });
+
+  test("does not mutate the input array (pure)", () => {
+    const t1 = task("1", "write tests", "pending");
+    const original = [t1];
+    upsertTask(original, task("2", "ship it", "pending"));
+    expect(original).toEqual([t1]);
+  });
+});
+
+describe("renderTaskBlock", () => {
+  test("maps each status to its glyph and pairs it with the subject", () => {
+    const tasks = [task("1", "write tests", "pending"), task("2", "run tests", "in_progress"), task("3", "commit", "completed")];
+    expect(renderTaskBlock(tasks)).toEqual([
+      `${TASK_ICONS.pending} write tests`,
+      `${TASK_ICONS.in_progress} run tests`,
+      `${TASK_ICONS.completed} commit`,
+    ]);
+  });
+
+  test("empty task list renders nothing", () => {
+    expect(renderTaskBlock([])).toEqual([]);
+  });
+
+  test("all-completed task list renders nothing (CC parity: block disappears)", () => {
+    const tasks = [task("1", "write tests", "completed"), task("2", "ship it", "completed")];
+    expect(renderTaskBlock(tasks)).toEqual([]);
+  });
+
+  test("mix of completed and incomplete still renders the full list", () => {
+    const tasks = [task("1", "write tests", "completed"), task("2", "ship it", "pending")];
+    expect(renderTaskBlock(tasks)).toEqual([`${TASK_ICONS.completed} write tests`, `${TASK_ICONS.pending} ship it`]);
+  });
+});
+
+describe("trackLineStart (safe-repaint-point rule)", () => {
+  test("a write ending in a newline puts us at a safe fresh-line boundary", () => {
+    expect(trackLineStart(false, "hello\n")).toBe(true);
+    expect(trackLineStart(true, "hello\n")).toBe(true);
+  });
+
+  test("a non-empty write NOT ending in a newline leaves us mid-line (unsafe)", () => {
+    expect(trackLineStart(true, "partial delta chunk")).toBe(false);
+    expect(trackLineStart(false, "partial delta chunk")).toBe(false);
+  });
+
+  test("an empty write changes nothing — no bytes actually reached the terminal", () => {
+    expect(trackLineStart(true, "")).toBe(true);
+    expect(trackLineStart(false, "")).toBe(false);
+  });
+});
+
+describe("renderTaskBlock width truncation (final-review fix: erase math needs 1 logical line == 1 physical row)", () => {
+  const long = { id: "1", subject: "a".repeat(200), status: "pending" } as any;
+
+  test("a subject longer than the terminal truncates to columns-2 with an ellipsis (never wraps)", () => {
+    const lines = renderTaskBlock([long], 80);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.length).toBe(78); // columns - 2, ellipsis included
+    expect(lines[0]!.endsWith("…")).toBe(true);
+  });
+
+  test("short subjects pass through untouched at any width", () => {
+    const short = { id: "2", subject: "ship it", status: "pending" } as any;
+    expect(renderTaskBlock([short], 80)).toEqual([`${TASK_ICONS.pending} ship it`]);
+  });
+
+  test("undefined or tiny columns fall back to no truncation (pre-fix behavior)", () => {
+    expect(renderTaskBlock([long])[0]!.length).toBeGreaterThan(100);
+    expect(renderTaskBlock([long], 0)[0]!.length).toBeGreaterThan(100);
+    expect(renderTaskBlock([long], 2)[0]!.length).toBeGreaterThan(100);
+  });
+});

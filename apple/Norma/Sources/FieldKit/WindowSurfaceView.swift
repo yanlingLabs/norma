@@ -138,26 +138,12 @@ struct WindowSurfaceView: View {
             }
             .frame(height: chatWindowHeaderHeight)
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    if let prompt = adapter.displayedPrompt {
-                        Text(prompt)
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    if let position = adapter.historyPositionText {
-                        Text(position).font(.system(size: 11)).foregroundStyle(.tertiary)
-                    }
-                    Text(adapter.visibleResponse ?? "")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.primary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .padding(.vertical, 4)
+            TranscriptView(adapter: adapter, tint: Color(red: 0.45, green: 0.75, blue: 1.0))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            if !adapter.pinnedTasks.isEmpty {
+                pinnedTasksSection(adapter.pinnedTasks)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             if let queued = adapter.queuedText {
                 Text(queued).font(.system(size: 11)).foregroundStyle(.tertiary)
@@ -174,6 +160,41 @@ struct WindowSurfaceView: View {
         .padding(.horizontal, 16)
         .padding(.top, 14)
         .padding(.bottom, 16)
+    }
+
+    /// LIVE-GATE G4: the compact "what's left" list — up to 5 rows of `☐`/`◐`/`☑` + subject, with
+    /// a "+N more" tail when there are more than 5. Hidden entirely when `adapter.pinnedTasks` is
+    /// empty (the caller in `windowContent` already gates on that), so this is pure rendering, no
+    /// further emptiness logic here.
+    @ViewBuilder
+    private func pinnedTasksSection(_ tasks: [TaskItem]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Divider().opacity(0.5)
+            ForEach(Array(tasks.prefix(5).enumerated()), id: \.offset) { _, task in
+                HStack(spacing: 6) {
+                    Text(pinnedTaskGlyph(task.status))
+                    Text(task.subject)
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(task.status == "in_progress" ? .secondary : .tertiary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            }
+            if tasks.count > 5 {
+                Text("+\(tasks.count - 5) more")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func pinnedTaskGlyph(_ status: String) -> String {
+        switch status {
+        case "in_progress": return "◐"
+        case "completed": return "☑"
+        default: return "☐" // pending, or any unrecognized status
+        }
     }
 }
 

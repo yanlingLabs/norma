@@ -210,6 +210,28 @@ final class FieldStateAdapter: ObservableObject {
         return session.state.lastReply
     }
 
+    /// 2d-ii-a: the full transcript for the WINDOW's scrollback. The field keeps its single
+    /// pinned pair (`visibleResponse`/`displayedPrompt` honor `exchangeIndex`); the window
+    /// ignores exchangeIndex entirely — scrollback replaces swipe-history there (spec §3).
+    var transcript: [Exchange] { session.state.exchanges }
+
+    /// Live partial reply for the window's streaming row — deliberately NOT `visibleResponse`
+    /// (that one is exchangeIndex-pinned for the field).
+    var liveStreamingText: String? {
+        session.state.streamingText.isEmpty ? nil : session.state.streamingText
+    }
+
+    /// LIVE-GATE G4: CC-parity pinned todo widget — `WindowSurfaceView.windowContent` renders a
+    /// compact "what's left" list below the transcript whenever ANY task isn't done yet, mirroring
+    /// Claude Code's own pinned-todo panel. Empty (hides the whole section) once every task is
+    /// `.completed`, or when there are no tasks at all. The gate-4 batch-reset already living in
+    /// `SessionReducer`'s `taskUpdated` case clears a finished batch's tasks before the next run's
+    /// first task arrives, so a stale ALL-completed list from a prior run never lingers here either.
+    var pinnedTasks: [TaskItem] {
+        let tasks = session.state.tasks
+        return tasks.contains(where: { $0.status != "completed" }) ? tasks : []
+    }
+
     /// Task B hook (mirrors `OrbWindowController.exchangeIndex`): which historical exchange, if
     /// any, `visibleResponse` should read instead of the live stream / most recent reply. `nil`
     /// = live/most-recent. Wired by `GlassRootView`'s `.onChange(of: controller.exchangeIndex)`

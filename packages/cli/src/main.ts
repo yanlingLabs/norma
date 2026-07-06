@@ -1,10 +1,11 @@
 import { join, resolve } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { resolveNormaHome, KeychainSecretStore, startDaemon, TOKEN_NAMES } from "@norma/core";
-import { METHODS } from "@norma/protocol";
+import { METHODS, type Task } from "@norma/protocol";
 import { NormaClient } from "./client";
 import { applyEvent, isStalled, type WatchdogState } from "./watchdog";
 import { streamAction } from "./stream-state";
+import { renderTaskBlock, TASK_ICONS, trackLineStart, upsertTask } from "./task-block";
 import { installPlugin, removePluginDir, removePluginFromSettings, setPluginEnabled } from "./plugin-cli";
 import { isOtherChoice, parseQuestionAnswer } from "./questions";
 import { parsePlanResponse } from "./plan-response";
@@ -12,7 +13,6 @@ import { parsePlanResponse } from "./plan-response";
 const AQUA = "\x1b[38;2;53;214;232m";
 const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
-const TASK_ICONS: Record<string, string> = { pending: "☐", in_progress: "◐", completed: "☑" };
 
 async function readSecret(promptText: string): Promise<string> {
   process.stdout.write(promptText);
@@ -130,26 +130,63 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
   let exiting = false; // guard to ensure a single exit path wins, not a race between stall watchdog and endHeadlessTurn
   let streaming = false; // an assistant line is mid-stream on stdout (deltas printed, no newline yet)
 
+  // Pinned incomplete-task block (CC parity): TTY-only. `tasks` mirrors the session's current
+  // task list (upsert on task_updated — see task-block.ts for why a simple upsert is correct
+  // here). `atLineStart`/`pinnedLines` are the bookkeeping the erase/reprint dance needs:
+  // atLineStart tracks whether the last byte written to stdout was a newline (the ONLY safe
+  // moment to erase+redraw the block — never mid a streamed delta or a bg-task-output chunk,
+  // both of which can end without one); pinnedLines is how many trailing lines on screen
+  // currently belong to the block, so we know how far to cursor-up before clearing.
+  // Non-TTY (piped/-p) is untouched: eraseBlockIfPinned/repaintBlockIfSafe are no-ops there, so
+  // `emit()` degenerates to a plain process.stdout.write and task_updated keeps its exact
+  // existing one-line-per-update console output for headless consumers.
+  let tasks: Task[] = [];
+  let atLineStart = true;
+  let pinnedLines = 0;
+
+  function eraseBlockIfPinned(): void {
+    if (pinnedLines > 0) { process.stdout.write(`\x1b[${pinnedLines}A\x1b[0J`); pinnedLines = 0; }
+  }
+  function repaintBlockIfSafe(): void {
+    if (!process.stdout.isTTY || !atLineStart) return;
+    // Width passed per-repaint (not cached): terminal resizes between repaints pick up the new
+    // width; truncation keeps 1 logical line == 1 physical row so the erase count stays exact.
+    const lines = renderTaskBlock(tasks, process.stdout.columns);
+    if (lines.length === 0) return;
+    for (const l of lines) process.stdout.write(`${DIM}${l}${RESET}\n`);
+    pinnedLines = lines.length;
+  }
+  function refreshBlock(): void { eraseBlockIfPinned(); repaintBlockIfSafe(); }
+  // Every stdout write in this event loop funnels through here so the block is always erased
+  // before new content lands and (if we're at a safe fresh-line boundary afterwards) redrawn
+  // below it — this is what keeps it "pinned" without ever tearing a partial line.
+  function emit(text: string): void {
+    eraseBlockIfPinned();
+    process.stdout.write(text);
+    atLineStart = trackLineStart(atLineStart, text);
+    repaintBlockIfSafe();
+  }
+
   const c = await connect("cli-p", (e) => {
     const sa = streamAction(streaming, e as { type: string; threadId?: string });
     streaming = sa.streaming;
-    if (sa.action === "write_delta") { process.stdout.write(`${AQUA}${(e as { delta: string }).delta}${RESET}`); }
-    else if (sa.action === "close_line") process.stdout.write("\n");
+    if (sa.action === "write_delta") emit(`${AQUA}${(e as { delta: string }).delta}${RESET}`);
+    else if (sa.action === "close_line") emit("\n");
     applyEvent(wd, e, Date.now());
     if (e.type === "assistant_message") {
-      if (sa.action === "close_then_print_full") { process.stdout.write("\n"); console.log(`${AQUA}${e.text}${RESET}`); }
-      else if (sa.action === "print_full") console.log(`${AQUA}${e.text}${RESET}`);
-      else process.stdout.write("\n");
+      if (sa.action === "close_then_print_full") { emit("\n"); emit(`${AQUA}${e.text}${RESET}\n`); }
+      else if (sa.action === "print_full") emit(`${AQUA}${e.text}${RESET}\n`);
+      else emit("\n");
     }
-    else if (e.type === "tool_call") console.log(`${DIM}⚙ ${e.name} ${e.argsJson.slice(0, 120)}${RESET}`);
-    else if (e.type === "tool_result") console.log(`${DIM}  ↳ ${e.isError ? "ERROR: " : ""}${e.output.split("\n")[0]?.slice(0, 120) ?? ""}${RESET}`);
+    else if (e.type === "tool_call") emit(`${DIM}⚙ ${e.name} ${e.argsJson.slice(0, 120)}${RESET}\n`);
+    else if (e.type === "tool_result") emit(`${DIM}  ↳ ${e.isError ? "ERROR: " : ""}${e.output.split("\n")[0]?.slice(0, 120) ?? ""}${RESET}\n`);
     else if (e.type === "approval_requested") {
-      process.stdout.write(`approve ${e.toolName}? ${DIM}${e.summary}${RESET} [y/N] `);
+      emit(`approve ${e.toolName}? ${DIM}${e.summary}${RESET} [y/N] `);
       pending.push(e.callId);
-    } else if (e.type === "directory_added") console.log(`${DIM}+ dir ${e.path}${e.persisted ? " (remembered)" : ""}${RESET}`);
-    else if (e.type === "bg_task_started") console.log(`${DIM}▶ bg ${e.taskId} started: ${e.command.slice(0, 80)}${RESET}`);
-    else if (e.type === "bg_task_output") process.stdout.write(`${DIM}${e.chunk}${RESET}`);
-    else if (e.type === "bg_task_exited") console.log(`${DIM}■ bg ${e.taskId} exited (${e.killed ? "killed" : "exit " + e.exitCode})${RESET}`);
+    } else if (e.type === "directory_added") emit(`${DIM}+ dir ${e.path}${e.persisted ? " (remembered)" : ""}${RESET}\n`);
+    else if (e.type === "bg_task_started") emit(`${DIM}▶ bg ${e.taskId} started: ${e.command.slice(0, 80)}${RESET}\n`);
+    else if (e.type === "bg_task_output") emit(`${DIM}${e.chunk}${RESET}`);
+    else if (e.type === "bg_task_exited") emit(`${DIM}■ bg ${e.taskId} exited (${e.killed ? "killed" : "exit " + e.exitCode})${RESET}\n`);
     else if (e.type === "question_asked") {
       // No TTY → skip rendering entirely (do NOT block reading stdin); the QuestionBroker
       // times out server-side and the engine proceeds with its "best judgment" fallback.
@@ -157,17 +194,24 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
         void (async () => {
           const answers: Record<string, string> = {};
           for (const q of e.questions) {
-            console.log(`\n${AQUA}${q.header}${RESET} — ${q.question}`);
+            emit(`\n${AQUA}${q.header}${RESET} — ${q.question}\n`);
             q.options.forEach((o: { label: string; description?: string }, i: number) => {
-              console.log(`  ${i + 1}) ${o.label}${o.description ? ` ${DIM}${o.description}${RESET}` : ""}`);
+              emit(`  ${i + 1}) ${o.label}${o.description ? ` ${DIM}${o.description}${RESET}` : ""}\n`);
             });
-            console.log(`  ${q.options.length + 1}) Other (type your answer)`);
-            const input = await readLine(q.multiSelect ? "choose (comma-separated numbers or text): " : "choose (number or text): ");
+            emit(`  ${q.options.length + 1}) Other (type your answer)\n`);
+            // The prompt text is written via emit() (so the block's erase/reprint bookkeeping
+            // stays accurate) and readLine() itself is given "" — it still does its own raw,
+            // un-tracked stdout write for whatever text it's passed, which would desync
+            // atLineStart if we let it print the real prompt.
+            const promptText = q.multiSelect ? "choose (comma-separated numbers or text): " : "choose (number or text): ";
+            emit(promptText);
+            const input = await readLine("");
             if (isOtherChoice(input, q.options.length)) {
               // M1: choosing "Other" BY ITS MENU NUMBER isn't itself an answer — that digit is a
               // selection, not free text. Re-prompt for the real answer so the model never sees
               // the literal number as if the user had typed it as their response.
-              answers[q.question] = (await readLine("your answer: ")).trim();
+              emit("your answer: ");
+              answers[q.question] = (await readLine("")).trim();
             } else {
               answers[q.question] = parseQuestionAnswer(input, q.options.map((o: { label: string }) => o.label), q.multiSelect);
             }
@@ -180,28 +224,34 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
       // resolves the plan and the engine proceeds, same guard as question_asked above.
       if (process.stdin.isTTY) {
         void (async () => {
-          console.log(`\n${AQUA}Plan${RESET}\n${e.plan}\n`);
-          console.log(`  1) approve — I'll approve each edit\n  2) approve + auto-accept edits\n  3) reject (type: 3 <reason>)`);
-          const input = await readLine("choose (number or text): ");
+          emit(`\n${AQUA}Plan${RESET}\n${e.plan}\n\n`);
+          emit(`  1) approve — I'll approve each edit\n  2) approve + auto-accept edits\n  3) reject (type: 3 <reason>)\n`);
+          emit("choose (number or text): ");
+          const input = await readLine("");
           const r = parsePlanResponse(input);
           await c.planRespond({ sessionId, callId: e.callId, ...r });
         })();
       }
     } else if (e.type === "plan_resolved") {
-      console.log(`${DIM}${e.approved ? `plan approved${e.autoAccept ? " (auto-accept edits)" : ""}` : "plan rejected"}${RESET}`);
+      emit(`${DIM}${e.approved ? `plan approved${e.autoAccept ? " (auto-accept edits)" : ""}` : "plan rejected"}${RESET}\n`);
     } else if (e.type === "task_updated") {
-      console.log(`${DIM}${TASK_ICONS[e.task.status]} ${e.task.subject}${RESET}`);
+      tasks = upsertTask(tasks, e.task);
+      // TTY: the per-line print is replaced by the pinned block (upserted above); non-TTY
+      // (headless consumers parse this) keeps the exact original one-line-per-update output.
+      if (process.stdout.isTTY) refreshBlock();
+      else emit(`${DIM}${TASK_ICONS[e.task.status]} ${e.task.subject}${RESET}\n`);
     } else if (e.type === "worktree_entered") {
-      console.log(`${DIM}⛿ entered worktree ${e.name} (branch ${e.branch})${RESET}`);
+      emit(`${DIM}⛿ entered worktree ${e.name} (branch ${e.branch})${RESET}\n`);
     } else if (e.type === "worktree_exited") {
-      console.log(`${DIM}⟲ left worktree ${e.name}${e.removed ? " (removed)" : ""}${RESET}`);
+      emit(`${DIM}⟲ left worktree ${e.name}${e.removed ? " (removed)" : ""}${RESET}\n`);
     } else if (e.type === "thread_started") {
-      console.log(`${DIM}⌥ spawned ${e.agentType} subagent${RESET}`);
+      emit(`${DIM}⌥ spawned ${e.agentType} subagent${RESET}\n`);
     } else if (e.type === "thread_completed") {
-      console.log(`${DIM}✓ subagent done${e.stopReason !== "end_turn" ? ` (${e.stopReason})` : ""}${RESET}`);
+      emit(`${DIM}✓ subagent done${e.stopReason !== "end_turn" ? ` (${e.stopReason})` : ""}${RESET}\n`);
     } else if (e.type === "agent_error") {
       console.error(`agent error: ${e.message}`);
     } else if (e.type === "turn_completed") {
+      refreshBlock(); // safety net: reflects the final task state (and disappears if all done)
       void endHeadlessTurn(c, sessionId, wdTimer, e.stopReason === "end_turn" ? 0 : 1);
     }
   });
