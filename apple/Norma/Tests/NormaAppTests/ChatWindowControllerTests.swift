@@ -120,7 +120,7 @@ final class ChatWindowControllerTests: XCTestCase {
         c.close()
     }
 
-    /// Fix D (anim-fidelity restore): the grow is now spring-driven (`morphStep` at 140/18)
+    /// Fix D (anim-fidelity restore): the grow is now spring-driven (`morphStep` at 140/22 — gate r6)
     /// rather than a fixed 0.30s duration — settle-based, not duration-based. Polls until the
     /// panel's frame stops changing between ticks (the spring has settled and `frameAnimTick()`'s
     /// own guard snapped it exactly to `frameAnimTarget`), then asserts it landed on the expected
@@ -298,7 +298,7 @@ final class ChatWindowControllerTests: XCTestCase {
         XCTAssertLessThan(firedAt ?? 1, 1.0, "the orb handoff must precede the final settle (progress < 1)")
     }
 
-    /// The snapshot's corner radius ramps from the window's 16pt to a full circle (≈ half the
+    /// The snapshot's corner radius ramps from the window's corner radius (26pt — gate r6) to a full circle (≈ half the
     /// ~20pt orb-bubble frame) by settle — the "converges to something that looks like the orb"
     /// half of the choreography. Read via the melt seam captured on the last tick.
     func testShrinkCornerRadiusRampsToCircleAtSettle() async throws {

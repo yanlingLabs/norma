@@ -62,11 +62,14 @@ let chatWindowCollapsedSize = NSSize(width: 240, height: 140)
 
 /// Gate r4 (fully self-drawn window): the window is borderless for life, so the CONTENT owns its
 /// corners — `ChatWindowRootView` clips/fills a `RoundedRectangle` at this radius (the modern
-/// macOS-26 look), and AppKit's window shadow follows that tinted shape. 16pt reads as a normal
-/// contemporary window; tune here if the gate wants it rounder/squarer. Gate r5: also the START of
-/// the close-shrink's corner-radius ramp (the melting snapshot layer interpolates FROM this TO a
-/// full circle — see `ChatWindowController.applyShrinkMelt`).
-let chatWindowCornerRadius: CGFloat = 16
+/// macOS-26 look), and AppKit's window shadow follows that tinted shape. Gate r6 (live-gate
+/// screenshot comparison against a real macOS-26 window): 16pt read visibly squarer than the OS's
+/// own continuous corner — bumped to 26pt, which reads as genuinely rounder / on par with a real
+/// macOS-26 window; tune here if a future gate wants it rounder/squarer still. Gate r5: also the
+/// START of the close-shrink's corner-radius ramp (the melting snapshot layer interpolates FROM
+/// this TO a full circle — see `ChatWindowController.applyShrinkMelt`) — the ramp now starts from
+/// 26pt too, unchanged mechanically.
+let chatWindowCornerRadius: CGFloat = 26
 
 /// Gate r5 (window melts into the orb): the actual VISIBLE orb bubble diameter — the small fluid
 /// glass circle the collapsed orb really is on screen (`MorphModel.orbBubbleSize`, 20pt — the size

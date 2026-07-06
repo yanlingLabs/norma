@@ -50,7 +50,10 @@ struct ChatWindowRootView: View {
                     onMinimize: onRequestMinimize,
                     onZoom: onRequestZoom
                 )
-                .padding(.leading, 4) // 16pt content pad + 4 = ~20pt from the window's left edge
+                // Gate r6 (macOS-26 proportions, live-gate finding): 16pt content pad + 6 = ~22pt
+                // from the window's left edge — closer to a real macOS-26 window's traffic-light
+                // inset than the previous ~20pt (pad + 4).
+                .padding(.leading, 6)
 
                 Text(adapter.statusText)
                     .font(.system(size: 12, weight: .medium))
@@ -112,7 +115,8 @@ struct ChatWindowRootView: View {
 }
 
 /// Gate r4: the three self-drawn macOS-style traffic lights, replacing the removed native window
-/// buttons (the borderless window has none). Three 12pt circles, 8pt apart, each with a subtle
+/// buttons (the borderless window has none). Gate r6 (live-gate finding — real macOS-26 buttons
+/// read visibly bigger): three 14pt circles (was 12pt), 9pt apart (was 8pt), each with a subtle
 /// darker ring; hovering ANYWHERE over the group reveals the ×/−/+ glyphs (macOS behavior). Wired:
 /// red → close, yellow → minimize, green → zoom (see `ChatWindowRootView`).
 private struct MacTrafficLights: View {
@@ -128,7 +132,7 @@ private struct MacTrafficLights: View {
     private static let glyphColor = Color(red: 0.28, green: 0.14, blue: 0.0).opacity(0.55) // dark brown-ish
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 9) { // gate r6: 8 → 9, matched to the 12pt → 14pt circle bump
             light(color: Self.closeColor, glyph: "xmark", action: onClose)
             light(color: Self.minimizeColor, glyph: "minus", action: onMinimize)
             light(color: Self.zoomColor, glyph: "plus", action: onZoom)
@@ -143,11 +147,11 @@ private struct MacTrafficLights: View {
                 Circle().strokeBorder(Color.black.opacity(0.12), lineWidth: 0.5)
                 if hovering {
                     Image(systemName: glyph)
-                        .font(.system(size: 7.5, weight: .bold))
+                        .font(.system(size: 8.5, weight: .bold)) // gate r6: 7.5 → 8.5
                         .foregroundStyle(Self.glyphColor)
                 }
             }
-            .frame(width: 12, height: 12)
+            .frame(width: 14, height: 14) // gate r6: 12 → 14, real macOS-26 traffic-light size
             .contentShape(Circle())
         }
         .buttonStyle(.plain)
@@ -156,5 +160,7 @@ private struct MacTrafficLights: View {
 
 /// Gate r4: height of the self-drawn header band that holds the traffic lights + status text (the
 /// buttons sit vertically centered within it). Sized to the user's Safari-proportions ask without
-/// wasting the vertical space the old 52pt native-titlebar inset did.
-let chatWindowHeaderHeight: CGFloat = 28
+/// wasting the vertical space the old 52pt native-titlebar inset did. Gate r6: bumped 28 → 30 to
+/// give the bigger 14pt traffic lights (was 12pt) a touch more breathing room — 28pt started to
+/// feel tight once the buttons grew.
+let chatWindowHeaderHeight: CGFloat = 30

@@ -43,10 +43,12 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
     /// rapid-fire torture test with zero crashes where the animator approach failed on round 2.
     /// Fix D (anim-fidelity restore): the grow used to be a fixed-duration, smoothstep-eased
     /// interpolation (`growStartTime`/`growDuration`). Replaced with the codebase's own morph
-    /// spring (`morphStep`, `Orb/SpringStep.swift`) driving a plain 0→1 scalar, at 140/18 (ζ≈0.76
-    /// — a touch softer than the core orb↔field morph's own 140/22, landing a slightly larger
-    /// ~2-3% overshoot: the "organic settle" sweet spot for a window growing into place, vs. the
-    /// tighter liquid-merge bounce the small glass shape wants).
+    /// spring (`morphStep`, `Orb/SpringStep.swift`) driving a plain 0→1 scalar. Gate r6 (close-feel
+    /// live-gate finding): now at 140/22 — the SAME tuning as the core orb↔field morph's own
+    /// default (`morphStep`'s defaulted params, `OrbWindowController.morphTick()`'s call site,
+    /// which omits stiffness/damping) — rather than the previous 140/18 (ζ≈0.76), which read as a
+    /// touch too soft/floaty next to v1's morph language. Matching the core spring exactly makes
+    /// the window's grow/shrink feel like the SAME motion vocabulary as the orb↔field morph.
     /// Gate r3 (W1 — animated close): generalized to drive BOTH directions with the SAME spring —
     /// `growTimer`/`growStart`/`growTarget` etc. renamed `frameAnimTimer`/`frameAnimStart`/
     /// `frameAnimTarget` and a `frameAnimDirection` (`.grow`/`.shrink`) added so `frameAnimTick()`
@@ -104,7 +106,8 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
     /// (`installShrinkSnapshot()`), swap the panel's `contentView` to an `NSImageView` showing it
     /// (scaled independently on both axes), and animate THAT instead — buttery scaling with zero
     /// layout-collapse artifacts. Held here so `frameAnimTick()` can ramp its layer's `cornerRadius`
-    /// (16pt → a circle) each frame; nilled in `close()` (torn down with the panel).
+    /// (`chatWindowCornerRadius`, 26pt — gate r6 — → a circle) each frame; nilled in `close()`
+    /// (torn down with the panel).
     private var shrinkSnapshotView: NSImageView?
 
     /// Gate r5 one-shot latch: `onClose` (which re-summons the orb at the cursor) fires EXACTLY once
@@ -161,8 +164,10 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
             screenVisibleFrame: visible, defaultSize: chatWindowDefaultSize
         )
 
-        // Panel construction: v1 transplant (InteractionController.swift:849-877), with
-        // v2's orb collectionBehavior (adds .canJoinAllSpaces — proven above-fullscreen).
+        // Panel construction: v1 transplant (InteractionController.swift:849-877). Gate r6
+        // (v1 parity, live-gate finding): the collectionBehavior below deliberately does NOT
+        // include `.canJoinAllSpaces` — see that assignment's own doc for why the chat window and
+        // the orb panel differ here on purpose.
         //
         // Gate r4 (fully self-drawn window): the panel is BORDERLESS for its entire life —
         // `[.borderless, .nonactivatingPanel, .resizable]`, exactly v1's approach (v1 drew ALL its
@@ -201,7 +206,18 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         panel.hasShadow = true // borderless: AppKit's shadow follows the tinted RoundedRectangle content shape
         panel.isFloatingPanel = true
         panel.level = .screenSaver
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+        // Gate r6 (v1 parity, live-gate finding): NO `.canJoinAllSpaces` here — v1's detached
+        // chat panel (`InteractionController.swift:868`) deliberately stayed on the Space it was
+        // opened on; the ORB panel (`OrbWindowController.swift`) is the thing that follows the
+        // user everywhere and correctly keeps `.canJoinAllSpaces` (untouched by this fix). The
+        // chat window is furniture — it stays where you put it, on the Space you put it on, and
+        // simply isn't visible if you switch away. A 4-finger tap from ANY Space still closes it
+        // and returns the orb (`AppDelegate`'s `summonToggleAction` routes to `.closeWindow`
+        // whenever `chat?.isVisible == true`, regardless of which Space is active) — that routing
+        // is unaffected by this change and needs no `.canJoinAllSpaces` to work, since it's driven
+        // by the global tap/hotkey monitor, not by the window itself being on-screen. See also
+        // `closeAnimated()`'s `isOnActiveSpace` guard below, which this change makes reachable.
+        panel.collectionBehavior = [.stationary, .ignoresCycle, .fullScreenAuxiliary]
         panel.isMovableByWindowBackground = true // drag the glass body to move (no titlebar to grab)
         panel.acceptsMouseMovedEvents = true
         // Task-5 review catch: AppKit auto-hides key-capable panels when the app deactivates,
@@ -317,9 +333,25 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
     /// and the YELLOW minimize buttons route here (see `ChatWindowRootView`): the orb IS Norma's
     /// minimized state, so "dismiss" and "minimize" currently share this shrink-to-orb gesture; the
     /// semantics may diverge in a later phase. Esc during the shrink is a no-op (`isShrinking`).
+    ///
+    /// Gate r6 (v1 parity — window stays on its Space): now that the panel no longer carries
+    /// `.canJoinAllSpaces`, it can be closed from a Space OTHER than the one it's actually showing
+    /// on (e.g. the 4-finger tap / summon-toggle routing works from any Space). In that case the
+    /// melt would play entirely off-screen from the user's perspective AND `NSEvent.mouseLocation`
+    /// below would read a cursor position on the WRONG Space (the shrink target would be centered
+    /// on a point that has nothing to do with where the window visually is to the user, or where
+    /// the orb should reappear). Skip the animation entirely and tear down instantly instead — see
+    /// `panel.isOnActiveSpace` guard just below.
     func closeAnimated() {
         guard let panel else { return }
         guard !isShrinking else { return }
+        guard panel.isOnActiveSpace else {
+            // Gate r6: off-Space close — no visible melt to play and no valid cursor to target;
+            // same instant, idempotent teardown the red/yellow buttons would otherwise animate
+            // into. `close()` still fires `onClose` exactly once via the latch.
+            close()
+            return
+        }
         cancelFrameAnimation() // stop any in-flight GROW — state only, frame is left exactly where it was
         // Gate r5: freeze the live content to a bitmap and animate THAT down to the orb bubble — the
         // SwiftUI composer/header can't lay out at ~20pt without clipping/fighting. Snapshot happens
@@ -382,14 +414,14 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         let dt = now - lastFrameAnimTick
         lastFrameAnimTick = now
 
-        // Fix D (anim-fidelity restore): 140/18 (ζ≈0.76) — a touch softer than the core
-        // orb↔field morph's own 140/22, landing a slightly larger ~2-3% overshoot: the
-        // conservative "organic settle" sweet spot for a window growing into (or shrinking out
-        // of) place, as opposed to the tighter liquid-merge bounce the small glass shape wants.
-        // Does NOT touch `morphStep`'s own call site in `OrbWindowController.morphTick()` (that
-        // call omits stiffness/damping, so it keeps the default 140/22). Gate r3: the SAME spring
-        // now drives both `.grow` and `.shrink` — only the endpoints and the settle action differ.
-        let (p, v) = morphStep(progress: frameAnimProgress, velocity: frameAnimVelocity, target: 1, dt: dt, stiffness: 140, damping: 18)
+        // Gate r6 (close-feel live-gate finding): 140/22 — matches the core orb↔field morph's own
+        // default tuning exactly (v1's morph language), replacing the previous 140/18 (ζ≈0.76,
+        // a touch softer / more overshoot) that read as slightly too floaty next to it. Passed
+        // explicitly (rather than relying on `morphStep`'s defaults) so this call site stays
+        // self-documenting even though it now equals `OrbWindowController.morphTick()`'s own
+        // call (which omits stiffness/damping and keeps the 140/22 default). Gate r3: the SAME
+        // spring drives both `.grow` and `.shrink` — only the endpoints and the settle action differ.
+        let (p, v) = morphStep(progress: frameAnimProgress, velocity: frameAnimVelocity, target: 1, dt: dt, stiffness: 140, damping: 22)
         frameAnimProgress = p
         frameAnimVelocity = v
 
@@ -440,7 +472,7 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
     }
 
     /// Gate r5: the visual melt applied each shrink tick. Ramps the snapshot layer's `cornerRadius`
-    /// from `chatWindowCornerRadius` (16pt) up to half the CURRENT frame's smaller dimension — so it
+    /// from `chatWindowCornerRadius` (26pt — gate r6) up to half the CURRENT frame's smaller dimension — so it
     /// becomes a true circle as the frame converges on the ~20pt orb-bubble square — and dissolves
     /// the whole panel (content + shadow) via `alphaValue`: held at 1.0 until
     /// `chatWindowShrinkAlphaHoldProgress`, then eased to ~0 by settle. `masksToBounds` was set true
