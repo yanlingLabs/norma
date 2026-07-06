@@ -681,7 +681,11 @@ final class OrbWindowController: ObservableObject {
         morphVelocity = velocity
 
         let distance = abs(morphTarget - next)
-        guard distance < 0.001, abs(velocity) < 0.01 else { return }
+        // Fix A (anim-fidelity restore): v1's own settle epsilon (GlassFieldWindow.swift:1841)
+        // is 0.004/0.05, not 0.001/0.01 — the tighter v2 threshold made the spring visibly hang
+        // for several extra ticks near rest (imperceptible velocity, but not yet "there" by the
+        // old, stricter bar) instead of settling the instant it's perceptually done.
+        guard distance < 0.004, abs(velocity) < 0.05 else { return }
 
         morphModel.progress = morphTarget
         cancelMorphTimer()

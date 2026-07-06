@@ -41,13 +41,15 @@ final class MorphStepTests: XCTestCase {
     }
 
     func testMorphSettlesAtTargetPerBriefThresholds() {
-        // Brief's settle rule: |target - progress| < 0.001 && |velocity| < 0.01.
+        // Fix A (anim-fidelity restore): the settle rule is v1's own epsilon
+        // (GlassFieldWindow.swift:1841) — |target - progress| < 0.004 && |velocity| < 0.05 — not
+        // the tighter 0.001/0.01 v2 had drifted to (see `OrbWindowController.morphTick()`'s guard).
         var progress = 0.0
         var velocity = 0.0
         var settledStep: Int?
         for step in 0..<1000 {
             (progress, velocity) = morphStep(progress: progress, velocity: velocity, target: 1, dt: 1.0 / 60.0)
-            if abs(1 - progress) < 0.001, abs(velocity) < 0.01 {
+            if abs(1 - progress) < 0.004, abs(velocity) < 0.05 {
                 settledStep = step
                 break
             }

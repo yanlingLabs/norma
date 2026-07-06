@@ -169,6 +169,14 @@ struct NormaFieldView: View {
         // as "the empty glass shell still inflating" rather than as a
         // stretched-out pill with chrome visible at tiny sizes.
         let contentReveal = smoothstep(0.45, 0.74, morph.progress)
+        // Fix B (anim-fidelity restore, v1 GlassFieldView.swift:735-736 verbatim — the
+        // dashboard/chat bodies' "content focus-pull"): a soft blur + gentle scale-up on the
+        // composer's content layer, easing out as the morph finishes, so the content reads as
+        // pulling into sharp focus rather than just fading in flat. Ported onto the composer
+        // content group (v1's own composerBody never carried this, only `contentReveal`'s
+        // opacity fade — the fidelity investigation calls for porting the SAME formula here).
+        let contentBlur = CGFloat((1 - smoothstep(0.44, 1.0, morph.progress)) * 18)
+        let contentScale = 0.985 + CGFloat(smoothstep(0.40, 1.0, morph.progress)) * 0.015
         // Two distinct morph phases:
         // 1) 0.00...0.48: orb -> composer only.
         // 2) 0.50...1.00: top row splits out of composer.
@@ -272,6 +280,8 @@ struct NormaFieldView: View {
                 composerShape: composerShape,
                 navFinal: navFinal,
                 contentReveal: contentReveal,
+                contentBlur: contentBlur,
+                contentScale: contentScale,
                 glassSplitProgress: glassSplitProgress,
                 sideGlassReveal: sideGlassReveal,
                 sideGlassMaterialScale: sideGlassMaterialScale,
@@ -308,6 +318,8 @@ struct NormaFieldView: View {
         composerShape: CGRect,
         navFinal: CGRect,
         contentReveal: Double,
+        contentBlur: CGFloat,
+        contentScale: CGFloat,
         glassSplitProgress: Double,
         sideGlassReveal: Double,
         sideGlassMaterialScale: CGFloat,
@@ -509,6 +521,14 @@ struct NormaFieldView: View {
                         style: .continuous
                     )
                 )
+                // Fix B (anim-fidelity restore, v1 GlassFieldView.swift:781-782 verbatim): the
+                // content focus-pull — blurred/slightly-shrunk early in the morph, sharpening and
+                // scaling up to its true size as the shell finishes forming. Placed BEFORE
+                // `.position(...)`/`.opacity(...)`/`GlassForegroundLegibility` — same layering v1
+                // uses (content transform first, then place, then fade, then the legibility
+                // difference-blend wraps everything) — no `.drawingGroup()` (v1 LAW).
+                .scaleEffect(contentScale, anchor: .center)
+                .blur(radius: contentBlur)
                 .position(x: composerFinal.midX, y: composerFinal.midY)
                 .opacity(contentReveal)
                 .modifier(GlassForegroundLegibility())
