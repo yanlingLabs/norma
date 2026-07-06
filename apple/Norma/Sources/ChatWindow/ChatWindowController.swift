@@ -112,6 +112,12 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
             defer: false
         )
         panel.title = "Norma" // a11y/Dock — titleVisibility hides it from the (hidden) title bar text
+        // Gate r2: Safari-style chrome (traffic lights inset in a taller bar + the larger
+        // macOS 26 corner radius) comes from an empty unified toolbar — but a toolbar imposes
+        // AppKit's own chrome-height frame minimums, which would inflate the grow animation's
+        // tiny orb-sized start frame on the very first setFrame. So the panel is born
+        // toolbar-less for the grow and gains the toolbar when the grow SETTLES — see
+        // `attachChromeToolbar()`, called from `growTick`'s natural finish.
         panel.contentMinSize = NSSize(width: 340, height: 360) // native resize floor, matches the sanitizer's own
         panel.frameSanitizer = { [weak self] proposed, _ in
             // Gate fix (F1): bypass the SIZE floor while the grow animation is driving frames —
@@ -213,7 +219,20 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         panel.setFrame(frame, display: true)
         if t >= 1 {
             cancelGrowAnimation()
+            attachChromeToolbar()
         }
+    }
+
+    /// Gate r2 (deferred from panel construction — see the comment in `show(from:)`): the empty
+    /// unified toolbar that gives the settled window its Safari-style chrome. Attached only at
+    /// the grow's NATURAL finish — a close() mid-grow never needs chrome, and re-shows rebuild
+    /// the panel from scratch anyway.
+    private func attachChromeToolbar() {
+        guard let panel, panel.toolbar == nil else { return }
+        let toolbar = NSToolbar(identifier: "norma.chatwindow.toolbar")
+        toolbar.displayMode = .iconOnly
+        panel.toolbar = toolbar
+        panel.toolbarStyle = .unified
     }
 
     private func cancelGrowAnimation() {

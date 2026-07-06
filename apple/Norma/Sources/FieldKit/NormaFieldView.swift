@@ -541,10 +541,6 @@ struct NormaFieldView: View {
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(adapter.interactionNeeded ? Color(red: 1.0, green: 0.72, blue: 0.30) : .white)
                 .frame(width: chatButtonFinal.width, height: chatButtonFinal.height)
-                .background(
-                    Circle().stroke(.white.opacity(adapter.focusedElement == .expandChevron ? 0.9 : 0.0),
-                                    lineWidth: 1.5)
-                )
                 .contentShape(Circle())
                 .onTapGesture { adapter.onExpandToWindow() }
                 .opacity(sideContentReveal)
@@ -555,6 +551,20 @@ struct NormaFieldView: View {
                 .onChange(of: adapter.interactionNeeded, initial: true) { _, needed in chevronPulse = needed }
                 .position(x: chatButtonFinal.midX, y: chatButtonFinal.midY)
                 .modifier(GlassForegroundLegibility())
+
+            // Gate r2: the focus ring lives OUTSIDE the difference-blend scope so its Norma-blue
+            // hue stays TRUE instead of inverting against the wallpaper (white ring read as just
+            // another chrome stroke; selection needs its own stable color).
+            Circle()
+                .stroke(
+                    Color(red: 0.45, green: 0.75, blue: 1.0)
+                        .opacity(adapter.focusedElement == .expandChevron ? 0.95 : 0.0),
+                    lineWidth: 2.0
+                )
+                .frame(width: chatButtonFinal.width, height: chatButtonFinal.height)
+                .opacity(sideContentReveal)
+                .allowsHitTesting(false)
+                .position(x: chatButtonFinal.midX, y: chatButtonFinal.midY)
 
             if !navSegments.isEmpty {
                 NavigationPill(

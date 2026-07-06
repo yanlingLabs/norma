@@ -14,6 +14,8 @@ func chatWindowTint(darkMode: Bool) -> (white: Double, opacity: Double) {
 /// here and must not be imported.
 struct ChatWindowRootView: View {
     @ObservedObject var adapter: FieldStateAdapter
+    /// Closing is owned by the native red traffic light (ChatWindowController's
+    /// windowShouldClose); kept as a seam for keyboard/programmatic close paths.
     let onRequestClose: () -> Void
     @Environment(\.colorScheme) private var colorScheme
 
@@ -24,17 +26,13 @@ struct ChatWindowRootView: View {
 
     var body: some View {
         VStack(spacing: 10) {
+            // Gate r2: no in-content close button — the native red traffic light (F2) owns
+            // closing; a second gray ✕ read as leftover chrome.
             HStack {
                 Text(adapter.statusText)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button(action: onRequestClose) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
             }
 
             ScrollView {
@@ -95,7 +93,8 @@ struct ChatWindowRootView: View {
     }
 }
 
-/// Gate fix (F2): vertical space reserved at the top of the content so the status row/close
-/// button clear the native traffic-light buttons (`.fullSizeContentView` extends our content
-/// under them). Matches the minimal (toolbar-less) title-bar height on current macOS.
-private let chatWindowContentTopInset: CGFloat = 28
+/// Gate fix (F2, retuned r2): vertical space reserved at the top of the content so the status
+/// row clears the native traffic lights (`.fullSizeContentView` extends our content under
+/// them). r2 attached an empty unified toolbar (Safari-style chrome — see
+/// ChatWindowController), which makes the titlebar band ~52pt tall instead of 28.
+private let chatWindowContentTopInset: CGFloat = 52
