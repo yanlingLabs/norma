@@ -1,11 +1,19 @@
 import AppKit
 
 /// v1 transplant (AI pointer InteractionController.swift:1385-1425, `DetachedChatPanel`,
-/// byte-faithful except the class name): a borderless panel whose EVERY frame mutation is
-/// routed through `frameSanitizer`, so no code path (drag, animation, programmatic resize)
-/// can ever push the window off-screen. Unlike the orb's `KeyableNonActivatingPanel`
-/// (canBecomeKey gated on `acceptsKeyInput`), this panel is unconditionally keyable — the
-/// window only exists while the user is deliberately interacting with it.
+/// byte-faithful except the class name): a panel whose EVERY frame mutation is routed through
+/// `frameSanitizer`, so no code path (drag, animation, programmatic resize, NATIVE resize —
+/// gate fix F2 added `.resizable` to the styleMask) can ever push the window off-screen or
+/// below its minimum size. Unlike the orb's `KeyableNonActivatingPanel` (canBecomeKey gated on
+/// `acceptsKeyInput`), this panel is unconditionally keyable — the window only exists while the
+/// user is deliberately interacting with it.
+///
+/// Gate fix (F2): the styleMask (set by `ChatWindowController.show(from:)`) went from
+/// `[.borderless, .nonactivatingPanel]` to `[.titled, .closable, .miniaturizable, .resizable,
+/// .fullSizeContentView, .nonactivatingPanel]` — real system traffic-light buttons + native
+/// edge-resizing, while `.fullSizeContentView` keeps the SwiftUI content extending under the
+/// (hidden-title, transparent) title bar so the glass tint reads as one continuous surface. See
+/// that method's doc for why `.nonactivatingPanel` was kept.
 final class ChatWindowPanel: NSPanel {
     var frameSanitizer: ((NSRect, NSRect) -> NSRect)?
 

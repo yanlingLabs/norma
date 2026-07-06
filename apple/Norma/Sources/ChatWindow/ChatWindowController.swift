@@ -47,6 +47,18 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
     private var growStartTime: CFTimeInterval = 0
     private let growDuration: CFTimeInterval = 0.30
 
+    /// Gate fix (F1): true for the entire duration of the grow animation (the initial placement
+    /// AND every 60Hz tick that follows), false otherwise. `panel.frameSanitizer` (installed in
+    /// `show()`) reads this to bypass its normal 340×360 size floor while true — the grow's
+    /// source is now the COLLAPSED ORB's small panel frame (`OrbWindowController.
+    /// finishCollapse()`, ~240×140, sometimes smaller), which the floor would otherwise inflate
+    /// to 340×360 on the very FIRST `setFrame`, killing the "grows from a tiny circle" effect
+    /// this gate fix exists to restore. Position still gets clamped on-screen throughout (see
+    /// `clampedChatWindowPosition`) — only the size floor is bypassed. Set true right before the
+    /// grow's first `setFrame`, cleared in `cancelGrowAnimation()` (both the natural t>=1 finish
+    /// and `close()`'s mid-flight cancel), same lifecycle as `programmaticMove`.
+    private var isAnimatingGrow = false
+
     /// Spec §4: closing the window restores focus to the previously active app — the same
     /// snapshot/restore type the field uses (see OrbWindowController's `externalFocus`).
     private var externalFocus: ExternalFocusSnapshot?
@@ -73,14 +85,41 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
 
         // Panel construction: v1 transplant (InteractionController.swift:849-877), with
         // v2's orb collectionBehavior (adds .canJoinAllSpaces — proven above-fullscreen).
+        //
+        // Gate fix (F2 — real traffic lights + resizable): `.titled + .closable +
+        // .miniaturizable + .resizable + .fullSizeContentView` gives the window the three
+        // native system traffic-light buttons (native behavior/metrics, routed through OUR
+        // teardown for close — see `windowShouldClose(_:)` below) and native edge-resizing,
+        // while `.fullSizeContentView` still lets the SwiftUI content extend under the titlebar
+        // so the glass tint reads as one continuous surface (`ChatWindowRootView`'s background
+        // now bleeds to the window edge and relies on the SYSTEM window shape for corner
+        // rounding — no more manual `.clipShape`, see that file's doc). `.nonactivatingPanel` is
+        // KEPT alongside `.titled`: reasoned from AppKit docs (this combination is the standard
+        // technique behind e.g. Spotlight-style/inspector panels that show real chrome without
+        // stealing app activation) and empirically exercised by this file's own test suite
+        // (`ChatWindowControllerTests` constructs/orders-front/closes this exact panel
+        // repeatedly on a live WindowServer session with no crash/assertion) — if a future gate
+        // finds it misbehaving live, drop `.nonactivatingPanel` here and note that the window
+        // will then activate Norma on interaction (`ExternalFocusSnapshot` restore on close
+        // already handles giving focus back).
         let panel = ChatWindowPanel(
             contentRect: target,
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: [
+                .titled, .closable, .miniaturizable, .resizable, .fullSizeContentView,
+                .nonactivatingPanel,
+            ],
             backing: .buffered,
             defer: false
         )
-        panel.frameSanitizer = { proposed, _ in
-            clampedChatWindowFrame(proposed, screenVisibleFrame: visible)
+        panel.title = "Norma" // a11y/Dock — titleVisibility hides it from the (hidden) title bar text
+        panel.contentMinSize = NSSize(width: 340, height: 360) // native resize floor, matches the sanitizer's own
+        panel.frameSanitizer = { [weak self] proposed, _ in
+            // Gate fix (F1): bypass the SIZE floor while the grow animation is driving frames —
+            // see `isAnimatingGrow`'s doc. Position still gets clamped on-screen either way.
+            guard let self, !self.isAnimatingGrow else {
+                return clampedChatWindowPosition(proposed, screenVisibleFrame: visible)
+            }
+            return clampedChatWindowFrame(proposed, screenVisibleFrame: visible)
         }
         panel.backgroundColor = .clear
         panel.isOpaque = false
@@ -114,9 +153,19 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         // restored ITS snapshot, so "current" is the app the user was really in.
         externalFocus = ExternalFocusSnapshot.captureCurrent()
 
-        let startFrame = clampedChatWindowFrame(sourceFrame, screenVisibleFrame: visible)
+        // Gate fix (F1): `sourceFrame` is now the COLLAPSED orb's own small panel frame
+        // (`OrbWindowController.finishCollapse()`, ~240×140 — smaller than this window's own
+        // 340×360 floor in both dimensions), not the field's old expanded frame. Deliberately
+        // NOT pre-clamped through `clampedChatWindowFrame` here — that would inflate it to the
+        // floor before the grow animation even starts. `isAnimatingGrow` makes the panel's own
+        // `setFrame` override bypass that floor (position only, see `frameSanitizer` above) for
+        // this placement and every tick that follows; read `panel.frame` back afterward so
+        // `growStart` is the exact (position-clamped) frame actually on-screen at t=0, not the
+        // raw un-clamped proposal.
+        isAnimatingGrow = true
         programmaticMove = true
-        panel.setFrame(startFrame, display: false)
+        panel.setFrame(sourceFrame, display: false)
+        let startFrame = panel.frame
         panel.orderFrontRegardless()
         panel.makeKey()
         startGrowAnimation(from: startFrame, to: target)
@@ -171,6 +220,7 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         growTimer?.invalidate()
         growTimer = nil
         programmaticMove = false
+        isAnimatingGrow = false // gate fix (F1): re-arm the sanitizer's size floor for real user/system frame changes
     }
 
     // MARK: NSWindowDelegate
@@ -178,6 +228,26 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
     func windowDidMove(_ notification: Notification) {
         guard !programmaticMove, let frame = panel?.frame else { return }
         rememberedFrame = frame
+    }
+
+    /// Gate fix (F2 — resizable): native edge-resizing fires `windowDidResize`, not
+    /// `windowDidMove` — mirrors that method's exact programmatic-move guard so a resize driven
+    /// by the grow animation or `chatWindowTargetFrame` never pollutes `rememberedFrame`, only a
+    /// real user drag of a resize handle does.
+    func windowDidResize(_ notification: Notification) {
+        guard !programmaticMove, let frame = panel?.frame else { return }
+        rememberedFrame = frame
+    }
+
+    /// Gate fix (F2 — native traffic lights): the native red close button invokes this before
+    /// AppKit's own close sequence runs. Route it through OUR teardown (`close()` — which fires
+    /// `onClose` exactly once, restores focus, tears down the key monitor) and refuse AppKit's
+    /// own close (`return false`) since we already tore the window down ourselves; `close()` is
+    /// itself idempotent (guards on `panel` already being nil), so this can never double-fire
+    /// `onClose` even if something else raced a close in first.
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        close()
+        return false
     }
 
     /// Test seam for the drag-memory rule (unit tests can't synthesize a real user drag).

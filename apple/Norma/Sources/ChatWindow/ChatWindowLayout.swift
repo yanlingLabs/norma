@@ -15,6 +15,20 @@ func clampedChatWindowFrame(_ proposed: NSRect, screenVisibleFrame screen: NSRec
     return f
 }
 
+/// Gate fix (F1 — expand choreography): position-only counterpart of `clampedChatWindowFrame`,
+/// used for the chat window's grow-animation START/intermediate frames
+/// (`ChatWindowController.isAnimatingGrow`'s doc). The grow's source is now the collapsed orb's
+/// own small panel frame (~240×140), smaller than the 340×360 floor above in BOTH dimensions —
+/// running it through the full clamp would inflate it to the floor on the very first frame,
+/// defeating the "grows from a tiny circle" effect. This keeps only the on-screen-origin half of
+/// that clamp (same inset convention), leaving size untouched.
+func clampedChatWindowPosition(_ proposed: NSRect, screenVisibleFrame screen: NSRect) -> NSRect {
+    var f = proposed
+    f.origin.x = min(max(f.origin.x, screen.minX + 2), max(screen.minX + 2, screen.maxX - f.width - 2))
+    f.origin.y = min(max(f.origin.y, screen.minY + 2), max(screen.minY + 2, screen.maxY - f.height - 2))
+    return f
+}
+
 /// Spec §2 position rule: the FIRST expand of an app run grows to the default size centered
 /// on the field's frame; once the user has dragged the window, re-expands go to the
 /// remembered frame instead. Both clamped on-screen.

@@ -222,6 +222,10 @@ final class OrbWindowController: ObservableObject {
     func hide() {
         guard isVisible else { return }
         if surface == .field {
+            // Gate fix (F1): hiding outright is a stronger action than a pending field→window
+            // handoff — never let a stale `pendingWindowExpand` from an aborted handoff fire the
+            // window expansion this force-finish's `finishCollapse()` (below) is about to run.
+            pendingWindowExpand = false
             // Nobody will see the last bit of the collapse morph once the panel is ordered
             // out — snap it to settled rather than leaving an orphaned Timer + monitor + key
             // panel running behind a hidden window.
@@ -264,6 +268,13 @@ final class OrbWindowController: ObservableObject {
         // closure to go stale), so once the target is 1 the stale collapse-teardown can
         // never fire — it settles at 1 instead of 0.
         if surface == .field && morphTarget == 0 {
+            // Gate fix (F1): a re-summon mid-collapse cancels any pending field→window handoff
+            // armed by `enterWindowMode()` — the user reopened the field instead of letting it
+            // finish morphing into the orb, so that handoff must never fire once THIS retargeted
+            // morph later settles (belt: it settles at 1 now anyway, never hitting
+            // `morphTick()`'s `morphTarget == 0` gate — but a one-shot must never be left armed
+            // past the cycle it was meant for).
+            pendingWindowExpand = false
             startMorph(target: 1)
             // Finding-2 (belt): teardown never ran on this path, so the panel is still keyable and
             // still key and NO `restore()` fired this cycle — so unlike the cold path below there's
@@ -561,26 +572,43 @@ final class OrbWindowController: ObservableObject {
         }
     }
 
-    /// Phase 2d-i: field → window handoff. The field force-finishes its collapse via the
-    /// existing hide() path (monitors off, key relinquished, follower stopped — the exact
-    /// teardown the 2c gate hardened), the orb panel disappears (spec §2: the window IS
-    /// Norma until dismissed), and the chat window grows from where the field was.
+    /// Phase 2d-i: field → window handoff. Gate fix (F1 — expand choreography, live-gate
+    /// finding): the field first visibly MORPHS BACK into the orb (the ordinary
+    /// `collapseToOrb()` spring, same as any other collapse — no more instant force-finish via
+    /// `hide()`), and only once that morph SETTLES does the chat window actually start growing,
+    /// from the NOW-COLLAPSED orb's small frame (spec §2: the window IS Norma until dismissed).
     var onExpandToWindow: ((NSRect) -> Void)?
 
-    /// Legal only from `.field`. Ordering is load-bearing: capture `panel.frame` FIRST (before
-    /// anything moves it), THEN `hide()` — which force-finishes the in-flight collapse morph
-    /// synchronously (`finishCollapse()` resizes the panel back down AND sets `surface = .orb`)
-    /// and orders the panel out — THEN overwrite `surface` to `.window`, THEN fire
-    /// `onExpandToWindow?` with the frame captured before any of that teardown ran. Reordering
-    /// this drops either the source frame (if captured after `hide()` resizes the panel) or
-    /// leaves `surface` at the wrong value (if set before `hide()`, since `hide()`'s
-    /// `finishCollapse()` unconditionally stamps `.orb`).
+    /// One-shot latch (gate fix F1): armed by `enterWindowMode()` instead of driving the handoff
+    /// synchronously. The field must be SEEN to morph back into the orb before the chat window
+    /// appears, so `enterWindowMode()` merely arms this and starts the ordinary animated
+    /// `collapseToOrb()` — the actual handoff (capture the collapsed orb's frame, hide the orb
+    /// panel, flip `surface` to `.window`, fire `onExpandToWindow?`) happens inside
+    /// `finishCollapse()`, once the morph spring settles naturally, exactly like any other
+    /// collapse completion. `consumePendingWindowExpand()` is the one-shot consumer, same shape
+    /// as `consumeCollapseOnTurnStart()`/`consumeExpandForAnswerReveal()` above.
+    ///
+    /// Cleared (never fires stale — this codebase got burned by exactly that once already, see
+    /// `collapseOnTurnStart`'s doc) on any path that ends this collapse cycle for a DIFFERENT
+    /// reason: `expandToField()`'s mid-morph retarget (the user re-summoned the field, cancelling
+    /// the handoff) and `hide()`'s force-finish branch (hiding outright is a stronger action than
+    /// a pending window handoff).
+    private var pendingWindowExpand = false
+
+    @discardableResult
+    private func consumePendingWindowExpand() -> Bool {
+        defer { pendingWindowExpand = false }
+        return pendingWindowExpand
+    }
+
+    /// Legal only from `.field`. Gate fix (F1): no longer drives the handoff itself — arms
+    /// `pendingWindowExpand` and starts the ordinary animated `collapseToOrb()` so the field
+    /// visibly morphs back into the orb first. See `pendingWindowExpand`'s doc for the rest of
+    /// the handoff (which runs inside `finishCollapse()` once the morph settles).
     func enterWindowMode() {
         guard surface == .field else { return }
-        let sourceFrame = panel.frame
-        hide()               // force-finishes collapse → surface = .orb, panel ordered out
-        surface = .window
-        onExpandToWindow?(sourceFrame)
+        pendingWindowExpand = true
+        collapseToOrb()
     }
 
     /// Task 6 (FieldFocus): public alias for `enterWindowMode()` reachable from
@@ -702,6 +730,21 @@ final class OrbWindowController: ObservableObject {
         exchangeIndex = nil
 
         OrbDebug.log("collapseToOrb: complete")
+
+        // Gate fix (F1): second half of the field→window handoff `enterWindowMode()` armed —
+        // the panel is now sized/positioned to the COLLAPSED orb's frame (just set above, NOT
+        // the field's old expanded frame), so capture THAT as the chat window's grow-animation
+        // source. Tear the orb panel down exactly like `hide()` would (order out, stop the
+        // follower, mark not visible) WITHOUT recursing back into this same force-finish branch
+        // — calling `hide()` here would re-enter `finishCollapse()`.
+        if consumePendingWindowExpand() {
+            let orbFrame = panel.frame
+            follower.stop()
+            panel.orderOut(nil)
+            isVisible = false
+            surface = .window
+            onExpandToWindow?(orbFrame)
+        }
     }
 }
 

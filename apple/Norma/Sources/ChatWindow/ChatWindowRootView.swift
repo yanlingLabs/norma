@@ -70,12 +70,32 @@ struct ChatWindowRootView: View {
             )
             .frame(height: 88)
         }
-        .padding(16)
+        .padding(.horizontal, 16)
+        .padding(.bottom, 16)
+        // Gate fix (F2 — native traffic lights): reserve the native title-bar button row
+        // (`.fullSizeContentView` lets our content extend all the way up under it) so the
+        // status text/close button never sit underneath the real traffic lights.
+        .padding(.top, chatWindowContentTopInset)
         .background(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
+            // Gate fix (F2 — corner radius): the window is now `.titled` (real traffic lights +
+            // native resize, see `ChatWindowController.show(from:)`), so the SYSTEM draws the
+            // window's rounded-corner shape and clips our content to it automatically — a titled
+            // NSWindow's content view is clipped to the window's own shape. A second, manually
+            // rounded/clipped layer here would either show a mismatched double-rounded seam or a
+            // square glass corner poking past the system's round one, depending on which radius
+            // is bigger. Fill flush to the window edge with a plain rectangle instead, and let
+            // the system's own shape do ALL the rounding. `.ignoresSafeArea()` lets the tint
+            // bleed all the way up under the titlebar so the button row reads as part of the
+            // same glass surface (not a separate bar) — spec's Safari-screenshot reference.
+            Rectangle()
                 .fill(tint)
-                .glassEffect(in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .glassEffect(in: Rectangle())
+                .ignoresSafeArea()
         )
-        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
     }
 }
+
+/// Gate fix (F2): vertical space reserved at the top of the content so the status row/close
+/// button clear the native traffic-light buttons (`.fullSizeContentView` extends our content
+/// under them). Matches the minimal (toolbar-less) title-bar height on current macOS.
+private let chatWindowContentTopInset: CGFloat = 28
