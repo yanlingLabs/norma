@@ -28,6 +28,7 @@ enum FluidState: Equatable {
 final class FieldStateAdapter: ObservableObject {
     private let session: SessionModel
     private var cancellable: AnyCancellable?
+    private var cancellables = Set<AnyCancellable>()
 
     init(session: SessionModel) {
         self.session = session
@@ -38,6 +39,20 @@ final class FieldStateAdapter: ObservableObject {
         cancellable = session.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
+
+        // Cache the task-completion fill level from the event stream (when state changes),
+        // not from the getter's read-time side effect. This ensures that a fast
+        // taskUpdated→turnCompleted burst hitting the same render doesn't drop the final
+        // level (1.0) because the getter never ran between events.
+        session.$state
+            .sink { [weak self] newState in
+                guard let self else { return }
+                if newState.turnRunning {
+                    let c = newState.taskCounts
+                    self.lastWorkingLevel = c.total > 0 ? Double(c.done) / Double(c.total) : 0.5
+                }
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - v1's composer-display surface (Core/AppState.swift:160-171's `composerDisplayText`)
@@ -202,7 +217,6 @@ final class FieldStateAdapter: ObservableObject {
         guard s.turnRunning else { return .idle }
         let counts = s.taskCounts
         let level = counts.total > 0 ? Double(counts.done) / Double(counts.total) : 0.5
-        lastWorkingLevel = level
         return .working(level: level)
     }
 

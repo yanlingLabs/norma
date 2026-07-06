@@ -38,4 +38,21 @@ final class FluidStateTests: XCTestCase {
         a.hasUnread = true
         XCTAssertEqual(a.fluidState, .unread(level: 1.0))
     }
+    func testUnreadHoldsFinalLevelEvenWithoutInterveningReads() {
+        let session = SessionModel()
+        let a = FieldStateAdapter(session: session)
+        session.applyForTesting { s in
+            s.turnRunning = true
+            s.tasks = [TaskItem(id: "1", subject: "a", status: "completed"),
+                       TaskItem(id: "2", subject: "b", status: "in_progress")]
+        }
+        // NO fluidState read here — then the burst: all-complete + turn end in quick succession
+        session.applyForTesting { s in
+            s.tasks = [TaskItem(id: "1", subject: "a", status: "completed"),
+                       TaskItem(id: "2", subject: "b", status: "completed")]
+        }
+        session.applyForTesting { s in s.turnRunning = false }
+        a.hasUnread = true
+        XCTAssertEqual(a.fluidState, .unread(level: 1.0))
+    }
 }

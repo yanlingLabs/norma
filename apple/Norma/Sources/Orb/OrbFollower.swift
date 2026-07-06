@@ -149,12 +149,9 @@ final class OrbFollower {
         let (next, tier) = springStep(spring, target: targetOrigin(), dt: dt, config: config)
 
         // Task 2 (fluid orb acceleration tap): (velocity - lastVelocity) / dt, this tick's real
-        // dt — the same one just fed to `springStep` above. Floored at the same 1/240 the spring
-        // integration itself floors `dt` to (`SpringStep.swift`'s `springStep`), so an
-        // arbitrarily-small/zero raw `dt` (e.g. two ticks landing back-to-back) can't divide the
-        // velocity delta into a NaN/unbounded spike — `FluidSim` (Task 1) clamps whatever comes
-        // out of this regardless, this floor just keeps the input itself finite.
-        let accelDt = max(dt, 1.0 / 240.0)
+        // dt — the same one just fed to `springStep` above. Clamped to [1/240, config.dtClampMax]
+        // (the same range the spring integration uses), so both computations share a time base.
+        let accelDt = max(1.0 / 240.0, min(dt, config.dtClampMax))
         let v = next.velocity
         morphModel.fluidAcceleration = CGVector(dx: (v.x - lastVelocity.x) / accelDt, dy: (v.y - lastVelocity.y) / accelDt)
         lastVelocity = v
