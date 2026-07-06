@@ -1,7 +1,7 @@
 import AppKit
 
-/// Spec §2: default chat-window size.
-let chatWindowDefaultSize = NSSize(width: 560, height: 640)
+// NOTE (gate r7): `chatWindowDefaultSize` now lives in `FieldKit/WindowSurfaceGeometry.swift`
+// (ownership moved to the same-panel window surface; this whole file is deleted in the r7 pivot).
 
 /// v1 transplant, adapted (AI pointer InteractionController.swift:1263-1279,
 /// `clampedDetachedFrame`): min 340×360 (v1's floor), max = screen − 4, then origin
@@ -60,16 +60,7 @@ func chatWindowTargetFrame(
 /// If `collapsedWindowSize` ever changes, update this alongside it.
 let chatWindowCollapsedSize = NSSize(width: 240, height: 140)
 
-/// Gate r4 (fully self-drawn window): the window is borderless for life, so the CONTENT owns its
-/// corners — `ChatWindowRootView` clips/fills a `RoundedRectangle` at this radius (the modern
-/// macOS-26 look), and AppKit's window shadow follows that tinted shape. Gate r6 (live-gate
-/// screenshot comparison against a real macOS-26 window): 16pt read visibly squarer than the OS's
-/// own continuous corner — bumped to 26pt, which reads as genuinely rounder / on par with a real
-/// macOS-26 window; tune here if a future gate wants it rounder/squarer still. Gate r5: also the
-/// START of the close-shrink's corner-radius ramp (the melting snapshot layer interpolates FROM
-/// this TO a full circle — see `ChatWindowController.applyShrinkMelt`) — the ramp now starts from
-/// 26pt too, unchanged mechanically.
-let chatWindowCornerRadius: CGFloat = 26
+// NOTE (gate r7): `chatWindowCornerRadius` now lives in `FieldKit/WindowSurfaceGeometry.swift`.
 
 /// Gate r5 (window melts into the orb): the actual VISIBLE orb bubble diameter — the small fluid
 /// glass circle the collapsed orb really is on screen (`MorphModel.orbBubbleSize`, 20pt — the size
@@ -93,10 +84,7 @@ let chatWindowOrbHandoffProgress: Double = 0.7
 /// away (the "kill the vanish" half of the choreography).
 let chatWindowShrinkAlphaHoldProgress: Double = 0.6
 
-/// Gate r4 (custom green zoom button): how far `ChatWindowController.zoomToggle()` insets the
-/// screen's visible frame when zooming to fill — a small breathing gap so the zoomed window doesn't
-/// sit flush against the screen edges / menu bar.
-let chatWindowZoomInset: CGFloat = 8
+// NOTE (gate r7): `chatWindowZoomInset` now lives in `FieldKit/WindowSurfaceGeometry.swift`.
 
 /// Gate r3 (W1) / gate r5: the shrink's end-of-animation frame — a small orb-BUBBLE-sized SQUARE
 /// (`chatWindowOrbBubbleDiameter`, not the 240×140 collapsed PANEL any more — see that constant's

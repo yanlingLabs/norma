@@ -1,6 +1,16 @@
 import Foundation
 import CoreGraphics
 
+/// Gate r7 (same-panel window morph): which body `NormaFieldView` renders off `morph.progress` —
+/// the composer/field morph (`.field`, covering both the collapsed orb and the expanded field, one
+/// progress dimension) or the large window surface (`.window`). v1 carried the analogous
+/// `surface: GlassFieldSurface` (`composer`/`dashboard`/`chat`) on its own `MorphModel`; v2 splits
+/// the field↔window render choice onto this dedicated flag so the controller (`OrbWindowController`)
+/// can flip it at the same instants it drives the morph, without `NormaFieldView` importing the
+/// controller's own `Surface` enum. Set `.window` in `presentWindowSurface()`, back to `.field` in
+/// `finishWindowCollapse()`.
+enum MorphRenderSurface { case field, window }
+
 /// DIRECT TRANSPLANT of v1's `MorphModel` (TextField/GlassFieldWindow.swift:263-334), the
 /// spring-driven single source of truth for the orb → composer morph in v1. Every visual that
 /// participates in the morph reads off `progress` (0…1): the glass shape grows from a small
@@ -90,6 +100,20 @@ final class MorphModel: ObservableObject {
     /// (Space/screen changes). Rebuilding the glass subtree forces SwiftUI's
     /// native Liquid Glass backing view to reacquire refraction/shadow state.
     @Published var glassRefreshGeneration = 0
+
+    // MARK: - Gate r7: window surface (same-panel window morph)
+
+    /// Which body renders off `progress` — the field/composer morph or the large window surface.
+    /// See `MorphRenderSurface`'s doc.
+    @Published var renderSurface: MorphRenderSurface = .field
+    /// The window shell's FINAL (settled, progress=1) rect in window-LOCAL SwiftUI coords (y-down),
+    /// computed once by `presentWindowSurface()` via `windowSurfaceLayout`. `nil` while `.field`.
+    /// The window branch (`WindowSurfaceView`) and the mouse gate
+    /// (`OrbWindowController.updateWindowMouseGate`) both read this.
+    @Published var windowFinalRect: CGRect?
+    /// The orb end of the window morph in window-LOCAL SwiftUI coords — where the shell shrinks to
+    /// at progress 0 (the locked open anchor, mapped into the window frame). `nil` while `.field`.
+    @Published var windowOrbPoint: CGPoint?
 
     // MARK: - Task 2/3: fluid orb — MOVED OFF this model (task-3 fix wave)
 
