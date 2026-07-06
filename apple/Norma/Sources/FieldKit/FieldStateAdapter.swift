@@ -62,18 +62,21 @@ final class FieldStateAdapter: ObservableObject {
     /// free-form narration slots have no v2 equivalent.
     ///
     /// Wave 6 gate rework: `.thinking`/`.toolRunning` no longer read `OrbStatus.pillText` (it
-    /// returns nil for both now) — they compose `workingPillText(verb:hasActiveTask:done:total:)`
+    /// returns nil for both now) — they compose `workingVerbText(verb:)` + `workingCountText(...)`
     /// instead, so the collapsed pill shows the turn's CC-style whimsical verb ("Reticulating…")
-    /// rather than a static "thinking…"/tool name, with "☑ n/m" appended only while a task is
-    /// actually `.in_progress`. `.approvalNeeded`/`.disconnected` are checked FIRST and win
-    /// outright even mid-turn — they're the only two `OrbStatus` cases whose `pillText` is
-    /// non-nil, so this two-branch shape (status override, else working-verb composition) is
-    /// exhaustive without a `default`/fallback case.
+    /// rather than a static "thinking…"/tool name, with "☑ n/m" as a separate chip positioned left
+    /// of the orb. `.approvalNeeded`/`.disconnected` are checked FIRST and win outright even
+    /// mid-turn — they're the only two `OrbStatus` cases whose `pillText` is non-nil, so this
+    /// two-branch shape (status override, else working-verb composition) is exhaustive without a
+    /// `default`/fallback case.
     ///
     /// GATE-3 FIX (F3, preserved): only returns `""` when there is truly nothing to report
     /// (`status == .idle` and no turn running) — the collapsed-orb pill's reveal condition
     /// (`NormaFieldView`'s `hasStatusPill`) gates directly on "`statusText` non-empty," mirroring
     /// the pre-transplant `OrbView.pillText`'s contract (nil only for true idle).
+    ///
+    /// Gate polish: split into `verbText` (right of orb) and `countText` (left of orb) for
+    /// separate positioning — this property now re-composes them for backwards compatibility.
     var statusText: String {
         let s = session.state
         let text: String
@@ -96,6 +99,32 @@ final class FieldStateAdapter: ObservableObject {
     }
 
     private var lastLoggedStatusText: String?
+
+    /// Gate polish: the animated verb text for the right-side pill ("Reticulating…", "Noodling…").
+    /// Returns override status text for non-working states (.approvalNeeded, .disconnected),
+    /// or the bare working verb while a turn is running, or empty string for true idle.
+    var verbText: String {
+        let s = session.state
+        if let pillText = s.status.pillText {
+            return pillText // .approvalNeeded / .disconnected — override even mid-turn
+        } else if s.turnRunning {
+            return workingVerbText(verb: s.workingVerb)
+        } else {
+            return "" // true idle
+        }
+    }
+
+    /// Gate polish: the task-count chip text for the left-side chip ("☑ 1/4", "☑ 3/5").
+    /// Returns the count suffix only while a task is in_progress; otherwise empty string.
+    var countText: String {
+        let s = session.state
+        if s.turnRunning {
+            let counts = s.taskCounts
+            return workingCountText(hasActiveTask: s.hasActiveTask, done: counts.done, total: counts.total)
+        } else {
+            return ""
+        }
+    }
 
     /// Wave-7 gate item 2: true exactly when `statusText` is currently showing the CC-style
     /// working-verb composition (`workingPillText`) — i.e. the SAME branch of `statusText` above

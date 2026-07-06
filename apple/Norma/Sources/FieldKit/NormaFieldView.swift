@@ -185,16 +185,32 @@ struct NormaFieldView: View {
         // `+1` today and growth is always rightward; the general (direction-aware) form below
         // still pins correctly if that ever changes.
         let thinkingEdgeGap: CGFloat = morph.orbBubbleSize / 2 + 10
-        let thinkingNearEdgeX = collapsedCenter.x + thinkingDirection * thinkingEdgeGap
-        // `FieldThinkingPill` caps its own width at `.maxWidth` — sizing the (invisible)
-        // alignment box to that same cap and aligning the label to its near edge means short
-        // captions sit flush at the pinned anchor and long ones grow only toward the box's far
-        // edge, never back past the anchor.
-        let thinkingBoxCenter = CGPoint(
-            x: thinkingNearEdgeX + thinkingDirection * FieldThinkingPill.maxWidth / 2,
+
+        // Gate polish: split verb and count into separate chips on opposite sides of the orb.
+        // VERB (right side): pin the leading edge a fixed gap to the right of the orb center.
+        let verbNearEdgeX = collapsedCenter.x + thinkingDirection * thinkingEdgeGap
+        let verbBoxCenter = CGPoint(
+            x: verbNearEdgeX + thinkingDirection * FieldThinkingPill.maxWidth / 2,
             y: collapsedCenter.y
         )
-        let thinkingAlignment: Alignment = thinkingDirection > 0 ? .leading : .trailing
+        let verbAlignment: Alignment = thinkingDirection > 0 ? .leading : .trailing
+
+        // COUNT (left side): pin the trailing edge a fixed gap to the left of the orb center.
+        // For .topLeft corner (isLeft=true, thinkingDirection=+1), the count goes to the LEFT
+        // (negative direction), so we negate the direction for the left-side chip.
+        let countEdgeGap: CGFloat = morph.orbBubbleSize / 2 + 10
+        let countDirection: CGFloat = -thinkingDirection // opposite side
+        let countNearEdgeX = collapsedCenter.x + countDirection * countEdgeGap
+        let countBoxCenter = CGPoint(
+            x: countNearEdgeX + countDirection * FieldCountChip.maxWidth / 2,
+            y: collapsedCenter.y
+        )
+        let countAlignment: Alignment = countDirection > 0 ? .leading : .trailing
+
+        // For backwards compatibility in the tree-building code below
+        let thinkingNearEdgeX = verbNearEdgeX
+        let thinkingBoxCenter = verbBoxCenter
+        let thinkingAlignment = verbAlignment
         let navOrbRect = CGRect(
             x: navFinal.minX,
             y: navFinal.midY - morph.orbBubbleSize / 2,
@@ -223,6 +239,8 @@ struct NormaFieldView: View {
                 thinkingReveal: thinkingReveal,
                 thinkingBoxCenter: thinkingBoxCenter,
                 thinkingAlignment: thinkingAlignment,
+                countBoxCenter: countBoxCenter,
+                countAlignment: countAlignment,
                 navGlassRect: navGlassRect,
                 haloColor: haloColor
             )
@@ -255,6 +273,8 @@ struct NormaFieldView: View {
         thinkingReveal: Double,
         thinkingBoxCenter: CGPoint,
         thinkingAlignment: Alignment,
+        countBoxCenter: CGPoint,
+        countAlignment: Alignment,
         navGlassRect: CGRect,
         haloColor: Color
     ) -> some View {
@@ -442,6 +462,21 @@ struct NormaFieldView: View {
                 .allowsHitTesting(false)
             }
 
+            // Gate polish: task count chip on the LEFT (grows leftward from the orb)
+            if thinkingReveal > 0 && !adapter.countText.isEmpty {
+                Color.clear
+                    .frame(width: FieldCountChip.maxWidth, height: FieldCountChip.height)
+                    .overlay(alignment: countAlignment) {
+                        FieldCountChip(
+                            caption: adapter.countText,
+                            contentOpacity: thinkingReveal
+                        )
+                    }
+                    .position(x: countBoxCenter.x, y: countBoxCenter.y)
+                    .modifier(GlassForegroundLegibility())
+                    .allowsHitTesting(false)
+            }
+
             if thinkingReveal > 0 {
                 // GATE-4 FIX (item 1 + 3): an invisible box, sized to `FieldThinkingPill`'s own
                 // width cap and pinned at `thinkingBoxCenter`, with the label aligned to its
@@ -451,11 +486,13 @@ struct NormaFieldView: View {
                 // text (no glass/stroke chrome — item 3); legibility comes from
                 // `GlassForegroundLegibility`'s difference blend below, same as every other label
                 // in this file.
+                // Gate polish: now shows just the verb text (with animated spinner/sheen if working);
+                // the count chip is rendered separately to the left above.
                 Color.clear
                     .frame(width: FieldThinkingPill.maxWidth, height: FieldThinkingPill.height)
                     .overlay(alignment: thinkingAlignment) {
                         FieldThinkingPill(
-                            caption: adapter.statusText,
+                            caption: adapter.verbText,
                             contentOpacity: thinkingReveal,
                             animated: adapter.isWorkingVerb
                         )
@@ -1090,6 +1127,32 @@ private struct FieldThinkingPill: View {
         // somewhere in the middle of unused width.
         .frame(maxWidth: Self.maxWidth, alignment: .leading)
         .fixedSize(horizontal: true, vertical: true)
+    }
+}
+
+// MARK: - FieldCountChip (gate polish: task-count chip for the left side of the orb)
+
+/// The task-count chip positioned to the left of the collapsed orb ("☑ 1/4", "☑ 3/5", etc.).
+/// Bare text, no chrome, same legibility mechanism as `FieldThinkingPill`.
+private struct FieldCountChip: View {
+    /// Cap on the label's width before `lineLimit`/`truncationMode` kick in.
+    static let maxWidth: CGFloat = 80
+    /// Height of the alignment box. Keeps the chip vertically centered on the orb row.
+    static let height: CGFloat = 28
+
+    var caption: String = ""
+    var contentOpacity: Double = 1
+
+    var body: some View {
+        Text(caption)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .opacity(contentOpacity)
+            // Align to the trailing edge so the chip grows leftward (away from the orb).
+            .frame(maxWidth: Self.maxWidth, alignment: .trailing)
+            .fixedSize(horizontal: true, vertical: true)
     }
 }
 
