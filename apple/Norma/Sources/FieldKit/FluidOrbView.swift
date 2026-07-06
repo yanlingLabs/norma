@@ -60,6 +60,16 @@ struct FluidOrbView: View {
     /// out, and `FluidOrbSlot` keeps this view mounted for exactly that long (see its own doc).
     let state: FluidState
 
+    /// Interrupt-feedback gate polish: while true, the fluid renders `stoppedTint` regardless of
+    /// what `state`/`tint` would otherwise say — a 2s muted beat confirming the Esc-interrupt was
+    /// received (`FieldStateAdapter.showStoppedFlash`'s doc). Deliberately checked ONLY inside
+    /// `tint` below, never inside `lastTint`'s `.onChange(of: state)` tracker — that tracker keeps
+    /// following the REAL state the whole time, so the instant this flag clears (2s later, or on
+    /// the next `turn_started`), `tint` falls straight back to whatever `state` actually is
+    /// (holding-blue if tasks are still incomplete, amber if unread, or draining) with no stale
+    /// slate residue.
+    let isStoppedFlash: Bool
+
     /// Norma blue — the working tint (task-level fill while a turn is running). A literal,
     /// undistorted color: this view renders OUTSIDE `GlassForegroundLegibility`'s difference
     /// blend (see `NormaFieldView.composerMorphedContent`), so what's declared here is exactly
@@ -74,6 +84,11 @@ struct FluidOrbView: View {
     ///
     /// Finding-4: brightened from `(1.0, 0.72, 0.30)` (GATE-TUNING KNOB, see `workingTint`).
     private static let unreadTint = Color(red: 1.0, green: 0.80, blue: 0.35)
+
+    /// Interrupt-feedback gate polish: muted, desaturated slate — the "stopped" beat's tint,
+    /// deliberately unlike either working-blue or unread-amber so an Esc-interrupt reads as its
+    /// own distinct, quieter event rather than a variant of either normal state.
+    private static let stoppedTint = Color(red: 0.62, green: 0.66, blue: 0.72)
 
     /// Task-3 fix wave (review finding, "drain snaps amber → blue"): `FluidState.idle` carries no
     /// color of its own — without this, a dismissed-unread drain would snap the bubble from amber
@@ -145,7 +160,8 @@ struct FluidOrbView: View {
     }
 
     private var tint: Color {
-        Self.activeTint(for: state) ?? lastTint
+        if isStoppedFlash { return Self.stoppedTint }
+        return Self.activeTint(for: state) ?? lastTint
     }
 
     private func step(at now: Date) {
@@ -182,6 +198,12 @@ struct FluidOrbView: View {
 struct FluidOrbSlot: View {
     @ObservedObject var fluid: FluidModel
     let state: FluidState
+    /// Interrupt-feedback gate polish: threaded straight through to `FluidOrbView`'s tint override
+    /// — this slot's own mount/drain decision below is unchanged by it (still driven purely by
+    /// `state`/fill level, per this type's existing doc), since the flash is a TINT beat, not a
+    /// visibility one; the common case (Esc mid-turn with incomplete tasks) already holds the
+    /// fluid visible via `FluidState.working`, which is what actually carries the flash on screen.
+    let isStoppedFlash: Bool
 
     var body: some View {
         // `state != .idle`: an active turn or an unread reply — always show. The second clause
@@ -192,7 +214,7 @@ struct FluidOrbSlot: View {
         // tree entirely: no more ticks, no more `@Published` writes, truly quiescent (D9) until
         // the next `.working`/`.unread`.
         if state != .idle || fluid.sim.level > 0.01 {
-            FluidOrbView(fluid: fluid, state: state)
+            FluidOrbView(fluid: fluid, state: state, isStoppedFlash: isStoppedFlash)
         } else {
             EmptyView()
         }

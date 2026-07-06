@@ -169,7 +169,11 @@ struct NormaFieldView: View {
         // (`GlassFieldView.swift:273`: `if !appState.statusText.isEmpty { return
         // appState.statusText }`). Kept as `thinkingReveal` (not renamed) since it still drives
         // the SAME fade-in curve, now for "has a status pill" rather than strictly "is thinking."
-        let hasStatusPill = !adapter.statusText.isEmpty
+        // Interrupt-feedback gate polish: `showStoppedFlash` must reveal the pill even though the
+        // turn has already ended (`adapter.statusText` is `""` the instant `turn_completed`
+        // clears `turnRunning` — see its own doc) — otherwise the "⏹ stopped" caption below would
+        // never actually appear, since the box it lives in only renders while `thinkingReveal > 0`.
+        let hasStatusPill = !adapter.statusText.isEmpty || adapter.showStoppedFlash
         let thinkingReveal = hasStatusPill
             ? 1 - smoothstep(0.04, 0.22, morph.progress)
             : 0
@@ -340,7 +344,7 @@ struct NormaFieldView: View {
             // itself on progress too was considered and rejected — mount stays driven purely by
             // fluidState/level (`FluidOrbSlot`'s own doc) so drain-visibility doesn't depend on
             // which surface happens to be showing.
-            FluidOrbSlot(fluid: fluid, state: adapter.fluidState)
+            FluidOrbSlot(fluid: fluid, state: adapter.fluidState, isStoppedFlash: adapter.showStoppedFlash)
                 .frame(width: morph.orbBubbleSize, height: morph.orbBubbleSize)
                 .position(x: collapsedCenter.x, y: collapsedCenter.y)
                 .opacity(1 - smoothstep(0.0, 0.28, morph.progress))
@@ -488,13 +492,21 @@ struct NormaFieldView: View {
                 // in this file.
                 // Gate polish: now shows just the verb text (with animated spinner/sheen if working);
                 // the count chip is rendered separately to the left above.
+                //
+                // Interrupt-feedback gate polish: `showStoppedFlash` REPLACES the verb text with
+                // "⏹ stopped" for 2s after an Esc-interrupt — the verb is gone anyway by then
+                // (the turn already ended, so `adapter.verbText` reads `""`), so this is never
+                // fighting the normal verb display for the same slot, just filling the gap it
+                // leaves with an explicit confirmation instead of a silent blank. Plain,
+                // unanimated text (`animated: false`) — same convention as the other static
+                // override pills (disconnected/needs approval), not the working-verb sheen.
                 Color.clear
                     .frame(width: FieldThinkingPill.maxWidth, height: FieldThinkingPill.height)
                     .overlay(alignment: thinkingAlignment) {
                         FieldThinkingPill(
-                            caption: adapter.verbText,
+                            caption: adapter.showStoppedFlash ? "⏹ stopped" : adapter.verbText,
                             contentOpacity: thinkingReveal,
-                            animated: adapter.isWorkingVerb
+                            animated: adapter.showStoppedFlash ? false : adapter.isWorkingVerb
                         )
                     }
                     .position(x: thinkingBoxCenter.x, y: thinkingBoxCenter.y)

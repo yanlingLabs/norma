@@ -39,6 +39,14 @@ struct OrbSessionState: Equatable {
     /// (`agentError`) — since a queued steer never survives past the turn it was queued for.
     var queuedSteers: [String] = []
 
+    /// Interrupt-feedback gate polish: true exactly when the MOST RECENT `turn_completed(main)`
+    /// carried `stopReason == "aborted"` (an Esc-interrupt) — false for any other stop reason
+    /// ("end_turn", tool-limit, etc.) and cleared back to false the instant the NEXT turn starts.
+    /// This is pure reducer state (no timers, no view concerns) — `FieldStateAdapter` below is
+    /// what turns a false→true transition into a transient, self-clearing UI flash; the reducer
+    /// itself just tracks "was the last completed turn an interrupt," nothing more.
+    var lastTurnAborted: Bool = false
+
     /// CC-style whimsical working verb for the current turn (wave 6 gate item 1) — e.g.
     /// "Reticulating", "Noodling" (see `WorkingVerbs`). The REDUCER never sets this (it must stay
     /// pure, no randomness) — `SessionModel.apply` rolls it right after `reduce` on
@@ -83,6 +91,7 @@ enum SessionReducer {
             s.turnRunning = true
             s.status = .thinking
             s.streamingText = ""
+            s.lastTurnAborted = false // a fresh turn clears any prior interrupt flag
         case .toolCall(let v) where v.threadId == mainThread:
             if s.pendingApprovalIds.isEmpty { s.status = .toolRunning(name: v.name) }
         case .toolResult(let v) where v.threadId == mainThread:
@@ -118,6 +127,7 @@ enum SessionReducer {
             s.streamingText = ""
             s.status = .idle
             s.queuedSteers = [] // the turn absorbed whatever was queued for it
+            s.lastTurnAborted = (v.stopReason == "aborted") // Esc-interrupt feedback (gate polish)
         case .agentError(let v) where v.threadId == mainThread:
             s.turnRunning = false
             s.pendingApprovalIds = []

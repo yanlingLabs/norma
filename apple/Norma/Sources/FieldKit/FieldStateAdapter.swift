@@ -32,6 +32,7 @@ final class FieldStateAdapter: ObservableObject {
 
     init(session: SessionModel) {
         self.session = session
+        self.previousLastTurnAborted = session.state.lastTurnAborted
         // Republish the session's own changes as our own — `statusText`/`isThinking`/
         // `visibleResponse` below are computed (not `@Published`) so they always read `session`
         // live; this is what makes `@ObservedObject var adapter: FieldStateAdapter` in the view
@@ -51,8 +52,45 @@ final class FieldStateAdapter: ObservableObject {
                     let c = newState.taskCounts
                     self.lastWorkingLevel = c.total > 0 ? Double(c.done) / Double(c.total) : 0.5
                 }
+                // Interrupt-feedback gate polish: fire the transient "stopped" flash exactly on
+                // the false→true edge of the pure reducer's `lastTurnAborted` — never on a
+                // steady-state read (a re-render while it's already true must NOT restart the
+                // timer) and never on the true→false clear a fresh `turn_started` produces (that
+                // clear is silent by design; only the ABORT itself announces).
+                if newState.lastTurnAborted && !self.previousLastTurnAborted {
+                    self.triggerStoppedFlash()
+                }
+                self.previousLastTurnAborted = newState.lastTurnAborted
             }
             .store(in: &cancellables)
+    }
+
+    /// Edge-detection memory for the sink above — `OrbSessionState.lastTurnAborted`'s own last
+    /// observed value, NOT itself part of the pure reducer state (view-layer bookkeeping only).
+    private var previousLastTurnAborted: Bool
+
+    /// Interrupt-feedback gate polish: transient, view-layer-only signal that the turn just ended
+    /// via an Esc-interrupt (`OrbSessionState.lastTurnAborted` flipping false→true) — deliberately
+    /// NOT part of the pure reducer (`SessionReducer`/`OrbSessionState`): a self-clearing timer is
+    /// exactly the kind of impurity (wall-clock time, `DispatchQueue`) the reducer's contract
+    /// forbids (see `OrbSessionState.workingVerb`'s doc for the same rule applied to randomness).
+    /// `NormaFieldView`/`FluidOrbSlot` read this to swap in the "⏹ stopped" caption and a muted
+    /// fluid tint for 2 seconds, then fall back to their normal state-driven rendering.
+    @Published var showStoppedFlash: Bool = false
+
+    /// The pending auto-clear for `showStoppedFlash` — cancelled and replaced (not just
+    /// re-scheduled) on every re-trigger so a second interrupt within the 2s window restarts the
+    /// full 2s rather than letting the first timer clear the flash early out from under it.
+    private var stoppedFlashWorkItem: DispatchWorkItem?
+
+    private func triggerStoppedFlash() {
+        stoppedFlashWorkItem?.cancel()
+        showStoppedFlash = true
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.showStoppedFlash = false
+        }
+        stoppedFlashWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: workItem)
     }
 
     // MARK: - v1's composer-display surface (Core/AppState.swift:160-171's `composerDisplayText`)
