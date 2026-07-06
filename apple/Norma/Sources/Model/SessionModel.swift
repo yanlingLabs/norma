@@ -8,6 +8,22 @@ struct TaskItem: Equatable {
     var status: String
 }
 
+/// One line of "what happened during this exchange" — tools run, task transitions, subagents
+/// spawned/finished, worktree enters/exits, and interaction points (approvals/questions/plans).
+/// Captured per-exchange by `SessionReducer.reduce` (2d-ii-a task 1) so the transcript can show
+/// a turn's activity without re-deriving it from the flat event log; tasks 3/4 render these.
+struct ActivityItem: Equatable {
+    enum Kind: Equatable {
+        case tool(name: String)
+        case task(subject: String, status: String)
+        case subagent(agentType: String)
+        case subagentDone
+        case worktree(entered: Bool, detail: String)
+        case interaction(String)
+    }
+    var kind: Kind
+}
+
 /// A user prompt paired with its reply — the field's inline-response shell (2c wave 2 task 3)
 /// reads `exchanges.last` instead of the flat `lastReply` string so it can tell "no reply yet"
 /// (empty `reply`) apart from "no exchange at all" (empty array), and so a later wave can render
@@ -15,6 +31,14 @@ struct TaskItem: Equatable {
 struct Exchange: Equatable {
     var prompt: String
     var reply: String
+    /// What happened while this exchange's turn ran (2d-ii-a task 1) — appended via
+    /// `SessionReducer.appendActivity` (main-transcript events only; adjacent dupes collapse;
+    /// capped at 200 drop-oldest). Defaulted so existing `Exchange(prompt:reply:)` call
+    /// sites and equality-based tests are untouched.
+    var activity: [ActivityItem] = []
+    /// True when this exchange's turn ended with `stopReason == "aborted"` (Esc-interrupt) —
+    /// the per-exchange sibling of the state-level `lastTurnAborted` flash flag.
+    var aborted: Bool = false
 }
 
 struct OrbSessionState: Equatable {
@@ -94,17 +118,21 @@ enum SessionReducer {
             s.lastTurnAborted = false // a fresh turn clears any prior interrupt flag
         case .toolCall(let v) where v.threadId == mainThread:
             if s.pendingApprovalIds.isEmpty { s.status = .toolRunning(name: v.name) }
+            appendActivity(.tool(name: v.name), to: &s)
         case .toolResult(let v) where v.threadId == mainThread:
             if s.pendingApprovalIds.isEmpty { s.status = .thinking }
         case .approvalRequested(let v) where v.threadId == mainThread:
             s.pendingApprovalIds.insert(v.callId)
             s.status = .approvalNeeded(count: s.pendingApprovalIds.count)
+            appendActivity(.interaction(v.summary), to: &s)
         case .questionAsked(let v) where v.threadId == mainThread:
             s.pendingApprovalIds.insert(v.callId)
             s.status = .approvalNeeded(count: s.pendingApprovalIds.count)
+            appendActivity(.interaction(v.questions.first?.question ?? "question"), to: &s)
         case .planPresented(let v) where v.threadId == mainThread:
             s.pendingApprovalIds.insert(v.callId)
             s.status = .approvalNeeded(count: s.pendingApprovalIds.count)
+            appendActivity(.interaction("plan presented"), to: &s)
         case .approvalResolved(let v):
             s = resolvePending(s, callId: v.callId)
         case .questionResolved(let v):
@@ -128,6 +156,11 @@ enum SessionReducer {
             s.status = .idle
             s.queuedSteers = [] // the turn absorbed whatever was queued for it
             s.lastTurnAborted = (v.stopReason == "aborted") // Esc-interrupt feedback (gate polish)
+            if v.stopReason == "aborted", !s.exchanges.isEmpty {
+                // Per-exchange record of the interrupt (2d-ii-a task 1) — unlike the transient
+                // lastTurnAborted flash above, this stays on the exchange for the transcript.
+                s.exchanges[s.exchanges.count - 1].aborted = true
+            }
         case .agentError(let v) where v.threadId == mainThread:
             s.turnRunning = false
             s.pendingApprovalIds = []
@@ -138,6 +171,11 @@ enum SessionReducer {
                 s.exchanges[last].reply = "⚠︎ \(v.message)"
             }
         case .taskUpdated(let v): // any thread — tasks are session-wide
+            // 2d-ii-a task 1: remember the PRE-upsert status so activity capture below can
+            // append only when this event actually transitioned the task (nil = brand-new
+            // task, which counts as a change). The helper's adjacent-dupe collapse is a
+            // second net, not the primary dedupe.
+            let previousStatus = s.tasks.first(where: { $0.id == v.task.id })?.status
             if let i = s.tasks.firstIndex(where: { $0.id == v.task.id }) {
                 s.tasks[i].subject = v.task.subject
                 s.tasks[i].status = v.task.status
@@ -176,10 +214,39 @@ enum SessionReducer {
                 }
                 s.tasks.append(TaskItem(id: v.task.id, subject: v.task.subject, status: v.task.status))
             }
+            // Transcript activity is MAIN-thread only (child-thread task churn still upserts
+            // above — tasks are session-wide — but must not pollute the main transcript).
+            if v.threadId == mainThread, previousStatus != v.task.status {
+                appendActivity(.task(subject: v.task.subject, status: v.task.status), to: &s)
+            }
+        case .worktreeEntered(let v) where v.threadId == mainThread:
+            appendActivity(.worktree(entered: true, detail: v.branch), to: &s)
+        case .worktreeExited(let v) where v.threadId == mainThread:
+            appendActivity(.worktree(entered: false, detail: v.name), to: &s)
+        case .threadStarted(let v):
+            // Subagent lifecycle events carry CHILD threadIds by nature, so a main-thread guard
+            // would drop all of them — yet they ARE main-transcript-relevant ("spawned an agent").
+            // Guard on turnRunning instead: only capture while the main turn is actually going.
+            if s.turnRunning { appendActivity(.subagent(agentType: v.agentType), to: &s) }
+        case .threadCompleted:
+            if s.turnRunning { appendActivity(.subagentDone, to: &s) }
         default:
-            break // messages/deltas/bg/worktree/checkpoint/harness events don't move the orb in 2b
+            break // messages/deltas/bg/checkpoint/harness + child-thread events don't move state
         }
         return s
+    }
+
+    /// Appends to the exchange currently being built. Transcript capture is MAIN-thread only
+    /// and defensive: no open exchange → drop. Adjacent duplicates collapse. Capped at 200
+    /// (drop-oldest) so a marathon turn can't balloon memory (spec §1).
+    private static func appendActivity(_ kind: ActivityItem.Kind, to state: inout OrbSessionState) {
+        guard !state.exchanges.isEmpty else { return }
+        let last = state.exchanges.count - 1
+        if state.exchanges[last].activity.last?.kind == kind { return }
+        state.exchanges[last].activity.append(ActivityItem(kind: kind))
+        if state.exchanges[last].activity.count > 200 {
+            state.exchanges[last].activity.removeFirst(state.exchanges[last].activity.count - 200)
+        }
     }
 
     static func reduceConnection(_ state: OrbSessionState, _ conn: ConnectionState) -> OrbSessionState {
