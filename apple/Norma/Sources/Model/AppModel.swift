@@ -59,9 +59,14 @@ final class AppModel: ObservableObject {
     }
 
     /// Field summon path: a session to talk to, creating one if none is focused.
+    ///
+    /// Orb-created sessions run approvalPolicy "auto": the orb has no approval UI until 2d,
+    /// so there's nowhere to surface an "ask" prompt. The daemon's reviewer still gates
+    /// dangerous bash regardless of policy — auto ≠ unguarded. Sessions the orb merely
+    /// FOLLOWS (created elsewhere, e.g. the CLI) keep their creator's policy, unchanged.
     func ensureFocusedSession() async -> String? {
         if let sid = focusedSessionId { return sid }
-        guard let created = try? await client.createSession(scope: "global", cwd: NSHomeDirectory()) else { return nil }
+        guard let created = try? await client.createSession(scope: "global", cwd: NSHomeDirectory(), approvalPolicy: "auto") else { return nil }
         // The daemon broadcasts session_created BEFORE the RPC response returns; the pump may
         // have already refocused us onto the new session. Idempotent skip — never double-attach.
         if focusedSessionId == created.sessionId { return focusedSessionId }

@@ -127,6 +127,9 @@ final class AppModelTests: XCTestCase {
         await waitUntilSent(t, 3)
         let create = lineJSON(t.sent[2])
         XCTAssertEqual(create["method"] as? String, "session.create")
+        // Orb-created sessions run auto-approval: no approval UI exists in the orb until 2d.
+        let createParams = create["params"] as? [String: Any]
+        XCTAssertEqual(createParams?["approvalPolicy"] as? String, "auto")
         // REAL daemon wire order: broadcast BEFORE the RPC response.
         t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"session_created","seq":1,"sessionId":"s_new","ts":0,"scope":"global"}}"#)
         t.feed(#"{"jsonrpc":"2.0","id":\#(create["id"] as! Int),"result":{"sessionId":"s_new","trusted":true}}"#)

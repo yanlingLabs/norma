@@ -56,6 +56,11 @@ final class OrbWindowController: ObservableObject {
     /// public surface into its collaborator's internals.
     var morphProgressForTesting: Double { morphModel.progress }
 
+    /// Test-only counter (gate fix — Esc-interrupt live-gate finding): `MorphTimerReentrancyTests`
+    /// asserts this stays at 1 after a stale/duplicate `morphTick()` fires post-settle — see
+    /// `morphTick()`'s re-entry guard doc for the bug this locks in against.
+    private(set) var finishCollapseCallCountForTesting = 0
+
     /// Wired in Task 6: the controller exposes callbacks, it does NOT import AppModel.
     /// Returns send success — GlassRootView's submit() gates the draft clear on this so a
     /// failed/disconnected send never loses the composed text (spec §6).
@@ -276,9 +281,23 @@ final class OrbWindowController: ObservableObject {
         startMorph(target: 1)
 
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
-            guard let self, event.window === panel else { return event }
+            guard let self else { return event }
+            guard event.window === panel else {
+                // Diagnostic (debug-gated, same convention as the scroll monitor's NON-PANEL
+                // log): distinguishes "event never reached this monitor as panel-directed" from
+                // "reached it but the Esc branch itself didn't fire" — proves/disproves a
+                // synthesized-or-real Esc arriving with no window binding or a stale key window
+                // after a re-summon (gate-fix repro session's culprit (b)).
+                if event.keyCode == 53 {
+                    OrbDebug.log("key monitor: Esc REJECTED window=\(event.window.map { String(describing: type(of: $0)) } ?? "nil") num=\(event.windowNumber) panelNum=\(panel.windowNumber) keyWindow=\(NSApp.keyWindow.map { String(describing: type(of: $0)) } ?? "nil")")
+                }
+                return event
+            }
             if event.keyCode == 53 { // Esc
-                if self.onEsc?() == true { return nil } // consumed as interrupt
+                let running = self.session.state.turnRunning
+                let consumed = self.onEsc?() == true
+                OrbDebug.log("key monitor: Esc panel-matched turnRunning=\(running) onEsc-consumed=\(consumed)")
+                if consumed { return nil } // consumed as interrupt
                 self.collapseToOrb()
                 return nil
             }
@@ -484,7 +503,25 @@ final class OrbWindowController: ObservableObject {
         morphVelocity = 0
     }
 
-    private func morphTick() {
+    /// Internal (not `private`) purely so `MorphTimerReentrancyTests` can drive a stale tick
+    /// directly — see the re-entry guard's doc just below for why that's needed.
+    func morphTick() {
+        // Re-entry guard (gate fix — Esc-interrupt live-gate finding): `startMorph()` schedules
+        // this via `Timer.scheduledTimer` whose closure hops through `Task { @MainActor in
+        // self?.morphTick() }` rather than running synchronously. Under main-actor contention
+        // (reproduced live during the gate's repro session: rapid, overlapping summon/collapse
+        // triggers backed up the main actor enough that SEVEN queued `Task` closures all ran in
+        // a burst once it freed up) MULTIPLE Task closures can queue up before any of them runs.
+        // Each one independently re-checks the settle condition below and — with no guard here —
+        // redundantly re-ran the ENTIRE settle-and-teardown branch, including `finishCollapse()`
+        // seven times over for a single collapse (confirmed via `OrbDebug` — see the gate
+        // report). `cancelMorphTimer()` sets `morphTimer = nil` the FIRST time this settles, so
+        // any later/duplicate tick now bails out here instead of redundantly re-running
+        // teardown — cheap insurance against this class of stale-callback bug even though this
+        // session's repro of the reported Esc failure itself did not reproduce through this path
+        // (see the gate report's "what did and didn't reproduce" section).
+        guard morphTimer != nil else { return }
+
         let now = CACurrentMediaTime()
         let dt = now - lastMorphTick
         lastMorphTick = now
@@ -516,6 +553,7 @@ final class OrbWindowController: ObservableObject {
     /// keeping the SAME physical anchor point the field was just occupying (`currentGlassAnchor()`
     /// reads the panel's CURRENT — still big — frame) so the shrink doesn't jump.
     private func finishCollapse() {
+        finishCollapseCallCountForTesting += 1
         if let keyMonitor {
             NSEvent.removeMonitor(keyMonitor)
             self.keyMonitor = nil

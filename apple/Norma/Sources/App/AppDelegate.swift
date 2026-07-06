@@ -56,6 +56,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return ok
         }
         orb.onEsc = { [weak self] in
+            let running = self?.appModel?.session.state.turnRunning
+            OrbDebug.log("AppDelegate.onEsc: fired appModel=\(self?.appModel != nil ? "present" : "nil") turnRunning=\(String(describing: running))")
             guard let self, self.appModel?.session.state.turnRunning == true else { return false }
             Task { await self.appModel?.interruptTurn() }
             return true
