@@ -78,6 +78,23 @@ final class OrbWindowController: ObservableObject {
     /// session, so tests that assert on it must tolerate a headless host where it stays false.
     var panelIsKeyForTesting: Bool { panel.isKeyWindow }
 
+    /// Test-only read-through (gate r8): the panel's live AppKit frame — lets a test observe the
+    /// window-collapse cursor-ride (`rideWindowCollapseToCursor()`) actually moving the panel,
+    /// without exposing the panel itself past this seam.
+    var panelFrameForTesting: CGRect { panel.frame }
+
+    /// Test-only read-through (gate r8): the CURRENT glass anchor, reusing the exact private helper
+    /// `finishCollapse()`/`expandToField()` already read off the live panel frame (composer corner
+    /// mapped through whichever size the panel is actually sized to right now) — lets a test assert
+    /// where the settled orb (or field) anchor actually landed after a collapse.
+    var currentGlassAnchorForTesting: CGPoint { currentGlassAnchor() }
+
+    /// Test-only override (gate r8): `rideWindowCollapseToCursor()` uses this INSTEAD of
+    /// `follower.rawGlassAnchor()` when set. `OrbFollower`'s cursor tracker reads the real OS mouse
+    /// position, which a test can't deterministically move (no CGEvent-warp seam in this suite) —
+    /// `nil` (the production default) leaves the live-cursor path unaffected.
+    var glassAnchorOverrideForTesting: CGPoint?
+
     /// Test-only seam: `surface` is `private(set)` because production callers only ever move it via
     /// `expandToField()`/`collapseToOrb()`/`enterWindowMode()`/`collapseWindowToOrb()`'s own guarded
     /// transitions — but a test may need to plant a surface directly to exercise a method in
@@ -653,6 +670,18 @@ final class OrbWindowController: ObservableObject {
     /// near-fullscreen content size; toggles back to `chatWindowDefaultSize`. Reset on collapse.
     private(set) var windowZoomed = false
 
+    /// Gate r8: the CONTENT size held fixed for the duration of a window collapse, captured by
+    /// `collapseWindowToOrb()` from whatever `windowFinalRect` was open with (so a ZOOMED window
+    /// collapses at its zoomed size, never silently resetting to `chatWindowDefaultSize`).
+    /// `rideWindowCollapseToCursor()` re-lays-out every tick at this fixed content size — only the
+    /// ANCHOR (and therefore the panel frame/orb point) moves.
+    private var windowCollapseContentSize = chatWindowDefaultSize
+
+    /// Gate r8: the screen locked in for the whole collapse ride (v1 parity — `lockLargeSurface`
+    /// never re-resolves which screen to use mid-flight, even if the cursor wanders onto another
+    /// display during the collapse). `nil` outside of an in-flight window collapse.
+    private var windowCollapseLockedScreen: CGRect?
+
     /// Gate r7 (ARCHITECTURE PIVOT): present the large window surface on the SAME panel — v1's
     /// `presentLargeSurface` (GlassFieldWindow.swift:829-883), simplified for v2's single centered
     /// surface. Called from `morphTick()` the instant the field's reverse-morph crosses progress
@@ -713,10 +742,53 @@ final class OrbWindowController: ObservableObject {
     /// tap all route here. v1 parity: the large surface ALWAYS returns to the orb, never back to the
     /// field. Reverse-morphs the shell back down to the orb bubble (SAME 140/22 spring);
     /// `finishWindowCollapse()` does the teardown once it settles.
+    ///
+    /// Gate r8: also arms the cursor-ride (`rideWindowCollapseToCursor()`, driven from `morphTick()`
+    /// every tick this collapse is in flight) by capturing what stays FIXED for the whole ride — the
+    /// content size (so a zoomed window collapses at its zoomed size) and the screen the window
+    /// opened on (v1 `lockLargeSurface` parity — never re-resolved mid-flight).
     func collapseWindowToOrb() {
         guard surface == .window else { return }
+        windowCollapseContentSize = morphModel.windowFinalRect?.size ?? chatWindowDefaultSize
+        windowCollapseLockedScreen = visibleScreenFrame(containing: currentWindowScreenAnchor())
         startMorph(target: 0)
         OrbDebug.log("collapseWindowToOrb: morphTarget=0")
+    }
+
+    /// Gate r8 (v1 follow-collapse parity — `trackStep`'s `isCollapsing` branch for `.dashboard`/
+    /// `.chat`, GlassFieldWindow.swift:1909-1925, mapped in
+    /// `.superpowers/sdd/v1-largesurface-map.md` §5): each collapse tick, recompute the
+    /// window-surface layout at the LIVE cursor (fenced to the screen locked in by
+    /// `collapseWindowToOrb()`) instead of leaving the shell converging on the stale open anchor.
+    /// `windowSurfaceLayout`'s content frame is centered on the LOCKED screen independent of
+    /// `anchor` — so the content never visibly slides mid-collapse; only the orb-bubble end of the
+    /// morph (`windowOrbPoint`) and the enclosing panel frame chase the cursor, which is what makes
+    /// the tail of the shrink (once `morphedWindowSurfaceRect`'s travel band starts blending away
+    /// from `finalRect`) read as "already following" instead of a stationary melt. Snapped every
+    /// tick, not sprung — v1's own semantics here (`originPos = layout.windowFrame.origin; velocity
+    /// = .zero`) — via a direct `panel.setFrame` rather than through `OrbFollower` (whose own
+    /// tracking spring stays paused throughout window mode, `windowStationary` — see that
+    /// property's doc for why the two mechanisms never fight over the panel frame).
+    private func rideWindowCollapseToCursor() {
+        guard let screen = windowCollapseLockedScreen else { return }
+        let raw = glassAnchorOverrideForTesting ?? follower.rawGlassAnchor()
+        let anchor = fenceAnchorForWindowCollapse(
+            raw,
+            orbBubbleSize: morphModel.orbBubbleSize,
+            haloPadding: morphModel.haloPadding,
+            visibleFrame: screen
+        )
+        let layout = windowSurfaceLayout(
+            anchor: anchor,
+            contentSize: windowCollapseContentSize,
+            haloPadding: morphModel.haloPadding,
+            orbBubbleSize: morphModel.orbBubbleSize,
+            screenFrame: screen
+        )
+        morphModel.windowFinalRect = layout.finalRect
+        morphModel.windowOrbPoint = layout.orbPoint
+        panel.setFrame(layout.windowFrame, display: false)
+        morphModel.activeWindowSize = layout.windowFrame.size
     }
 
     /// Gate r7 (green traffic light): toggle the window between `chatWindowDefaultSize` and a
@@ -902,6 +974,13 @@ final class OrbWindowController: ObservableObject {
             return
         }
 
+        // Gate r8: the window's OWN collapse (v1 follow-collapse parity) — ride the panel toward
+        // the live cursor every tick this reverse-morph is in flight, see
+        // `rideWindowCollapseToCursor()`'s doc.
+        if surface == .window, morphTarget == 0 {
+            rideWindowCollapseToCursor()
+        }
+
         morphModel.progress = next
         morphVelocity = velocity
 
@@ -933,11 +1012,13 @@ final class OrbWindowController: ObservableObject {
     /// to a user drag), flip back to `.orb`/`.field` render, and RESUME the follower from the locked
     /// orb origin so it springs smoothly toward the cursor (rather than teleporting).
     ///
-    /// CONSCIOUS SIMPLIFICATION (noted for the gate): the window is stationary throughout its
-    /// collapse (no cursor-riding, unlike v1's dashboard which recomputed the layout each tick), so
-    /// the shell melts to the orb at the LOCKED open anchor and the follower then springs the orb to
-    /// the cursor. Seamless when the cursor is near the open spot (the common case: Esc / clicking a
-    /// traffic light); a small spring-glide otherwise.
+    /// Gate r8 (fixes the r7 conscious simplification of the same name): the window is no longer
+    /// stationary DURING its collapse — `rideWindowCollapseToCursor()` (called from `morphTick()`
+    /// every tick this collapse is in flight) already converged the shell's orb end on the live
+    /// cursor, so `currentWindowScreenAnchor()` below reads off the RIDDEN frame — i.e. it already
+    /// equals (close to) the live cursor position, not the stale locked-open anchor. The follower
+    /// then only has the tiny remaining `baseOffset` gap left to close, so it reads as a seamless
+    /// continuation rather than a spring-glide from wherever the window happened to open.
     private func finishWindowCollapse() {
         if let keyMonitor {
             NSEvent.removeMonitor(keyMonitor)
@@ -966,6 +1047,7 @@ final class OrbWindowController: ObservableObject {
         morphModel.renderSurface = .field
         morphModel.progress = 0
         windowZoomed = false
+        windowCollapseLockedScreen = nil // gate r8: scope the ride's locked screen to one collapse span
 
         surface = .orb
         externalFocus?.restore()

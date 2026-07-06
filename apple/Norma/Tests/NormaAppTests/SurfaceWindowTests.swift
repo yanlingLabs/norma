@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import Norma
 
@@ -152,6 +153,90 @@ final class SurfaceWindowTests: XCTestCase {
 
         controller.zoomToggleWindow()
         XCTAssertFalse(controller.windowZoomed, "second press restores")
+
+        controller.hide()
+    }
+
+    /// Gate r8 (v1 follow-collapse parity): DURING a window collapse, the panel already rides
+    /// toward the live cursor each tick — it must NOT stay frozen at the locked open anchor until
+    /// settle (that was the r7 "stationary collapse" conscious simplification this fixes). Drives
+    /// the collapse with `glassAnchorOverrideForTesting` set (the real cursor tracker reads the live
+    /// OS mouse position, which this suite can't deterministically move) and samples the panel
+    /// MID-collapse (surface still `.window`, progress not yet settled) to assert it has already
+    /// converged toward the overridden anchor.
+    func testWindowCollapseRidesTowardChangedCursorMidCollapse() async throws {
+        let controller = OrbWindowController(session: SessionModel())
+        controller.show()
+        controller.expandToField()
+        try await pollUntil(timeout: 5.0) { controller.morphProgressForTesting > 0.9 }
+        controller.enterWindowMode()
+        try await pollUntil(timeout: 5.0) { controller.surface == .window && controller.isMorphIdleForTesting }
+
+        let screen = try XCTUnwrap(NSScreen.main).visibleFrame
+        let openFrame = controller.panelFrameForTesting
+        let target = CGPoint(x: screen.midX + 250, y: screen.midY - 120)
+        controller.glassAnchorOverrideForTesting = target
+
+        controller.collapseWindowToOrb()
+        try await pollUntil(timeout: 5.0) { controller.morphProgressForTesting < 0.9 }
+        XCTAssertEqual(controller.surface, .window, "still mid-collapse, not settled yet")
+        XCTAssertNotEqual(
+            controller.panelFrameForTesting.origin, openFrame.origin,
+            "the ride must already be moving the panel toward the cursor mid-collapse, not waiting for settle"
+        )
+
+        let orbPoint = try XCTUnwrap(controller.morphModel.windowOrbPoint, "must stay live mid-collapse")
+        let frame = controller.panelFrameForTesting
+        let midAnchor = CGPoint(x: frame.minX + orbPoint.x, y: frame.maxY - orbPoint.y)
+        let expected = fenceAnchorForWindowCollapse(
+            target, orbBubbleSize: controller.morphModel.orbBubbleSize,
+            haloPadding: controller.morphModel.haloPadding, visibleFrame: screen
+        )
+        XCTAssertEqual(midAnchor.x, expected.x, accuracy: 1.0, "the shell's orb end must already be converging on the cursor mid-collapse")
+        XCTAssertEqual(midAnchor.y, expected.y, accuracy: 1.0)
+
+        try await pollUntil(timeout: 5.0) { controller.surface == .orb }
+        controller.hide()
+    }
+
+    /// Gate r8 regression: once the collapse SETTLES, the orb lands at (near) wherever the ride
+    /// converged to — NOT the stale locked-open anchor the r7 "stationary collapse" simplification
+    /// used to melt to before the follower sprang it the rest of the way. `currentGlassAnchorForTesting`
+    /// reads the settled orb's own composer-corner anchor (mapped through `collapsedWindowSize`).
+    func testWindowCollapseSettlesAtRiddenAnchorNotStaleOpenAnchor() async throws {
+        let controller = OrbWindowController(session: SessionModel())
+        controller.show()
+        controller.expandToField()
+        try await pollUntil(timeout: 5.0) { controller.morphProgressForTesting > 0.9 }
+        controller.enterWindowMode()
+        try await pollUntil(timeout: 5.0) { controller.surface == .window && controller.isMorphIdleForTesting }
+
+        let screen = try XCTUnwrap(NSScreen.main).visibleFrame
+        let openFrame = controller.panelFrameForTesting
+        let openOrbPoint = try XCTUnwrap(controller.morphModel.windowOrbPoint)
+        let openAnchor = CGPoint(x: openFrame.minX + openOrbPoint.x, y: openFrame.maxY - openOrbPoint.y)
+
+        let target = CGPoint(x: screen.midX + 220, y: screen.midY + 90)
+        XCTAssertGreaterThan(
+            hypot(target.x - openAnchor.x, target.y - openAnchor.y), 50,
+            "the test target must actually differ from the open anchor for this regression to mean anything"
+        )
+        controller.glassAnchorOverrideForTesting = target
+
+        controller.collapseWindowToOrb()
+        try await pollUntil(timeout: 5.0) { controller.surface == .orb }
+
+        let settledAnchor = controller.currentGlassAnchorForTesting
+        let expected = fenceAnchorForWindowCollapse(
+            target, orbBubbleSize: controller.morphModel.orbBubbleSize,
+            haloPadding: controller.morphModel.haloPadding, visibleFrame: screen
+        )
+        XCTAssertEqual(settledAnchor.x, expected.x, accuracy: 2.0, "the settled orb must land where the ride converged, not the stale open anchor")
+        XCTAssertEqual(settledAnchor.y, expected.y, accuracy: 2.0)
+        XCTAssertGreaterThan(
+            hypot(settledAnchor.x - openAnchor.x, settledAnchor.y - openAnchor.y), 50,
+            "must have actually moved away from the stale open anchor, not melted in place"
+        )
 
         controller.hide()
     }

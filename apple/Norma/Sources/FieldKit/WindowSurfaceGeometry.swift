@@ -158,3 +158,30 @@ func roundedRectContains(_ rect: CGRect, radius: CGFloat, point: CGPoint) -> Boo
         hypot(point.x - center.x, point.y - center.y) <= r
     }
 }
+
+// MARK: - Gate r8: window-collapse cursor-ride (v1 `trackStep`'s `isCollapsing` branch for
+// `.dashboard`/`.chat`, GlassFieldWindow.swift:1909-1925 — mapped in
+// `.superpowers/sdd/v1-largesurface-map.md` §5)
+
+/// Screen-edge clamp for the window-collapse anchor — keeps the shrinking shell's orb-bubble end
+/// (padded by its own halo margin, the SAME margin `windowSurfaceLayout`'s orb-bubble union already
+/// reserves: `orbBubbleSize/2 + haloPadding`) fully within `visibleFrame` as it chases the live
+/// cursor each tick, so a cursor dragged to a screen edge mid-collapse can't push the shrinking
+/// bubble off-screen. Distinct from `fenceAnchorForTopLeftCorner` (FieldCorner.swift) — that one
+/// fences a `.topLeft`-corner composer/field frame against ITS OWN origin-mapping geometry; this is
+/// a plain center-anchor clamp matching the window surface's centered-content geometry, where the
+/// anchor itself is the point being fenced (not an origin derived from it).
+func fenceAnchorForWindowCollapse(
+    _ anchor: CGPoint,
+    orbBubbleSize: CGFloat,
+    haloPadding: CGFloat,
+    visibleFrame: CGRect
+) -> CGPoint {
+    let margin = orbBubbleSize / 2 + haloPadding
+    let bounds = visibleFrame.insetBy(dx: margin, dy: margin)
+    guard bounds.width > 0, bounds.height > 0 else { return anchor }
+    return CGPoint(
+        x: Swift.min(Swift.max(anchor.x, bounds.minX), bounds.maxX),
+        y: Swift.min(Swift.max(anchor.y, bounds.minY), bounds.maxY)
+    )
+}

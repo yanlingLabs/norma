@@ -64,11 +64,21 @@ final class OrbFollower {
     var isCollapsing = false
 
     /// Gate r7 (same-panel window morph): while the window surface is open the panel is a large,
-    /// LOCKED frame — the follower must NOT spring it toward the cursor (the window is stationary,
-    /// spec §5). Distinct from `stop()`: the display link stays alive (paused) and the spring/cursor
-    /// state is preserved, so `OrbWindowController.finishWindowCollapse()` can resume tracking from a
-    /// snapped origin (the orb springs smoothly from the locked open anchor to the cursor rather than
-    /// teleporting). Set true by `presentWindowSurface()`, back to false by `finishWindowCollapse()`.
+    /// LOCKED frame — THIS follower must NOT spring it toward the cursor (its own tracking spring is
+    /// scoped to the small orb/field frame's `FieldCorner` geometry, a different shape entirely).
+    /// Distinct from `stop()`: the display link stays alive (paused) and the spring/cursor state is
+    /// preserved, so `OrbWindowController.finishWindowCollapse()` can resume tracking from a snapped
+    /// origin once the collapse settles. Set true by `presentWindowSurface()`, back to false by
+    /// `finishWindowCollapse()`.
+    ///
+    /// Gate r8: this does NOT mean the panel is motionless throughout — while COLLAPSING (`surface
+    /// == .window`, morph target 0), `OrbWindowController.morphTick()` rides the panel origin toward
+    /// the live cursor itself, each tick, via a SEPARATE path (`rideWindowCollapseToCursor()`,
+    /// `panel.setFrame` directly) that bypasses this follower entirely — reusing `rawGlassAnchor()`
+    /// below for the same cursor-anchor convention, but none of this follower's own spring/fence
+    /// math (wrong geometry for the window's centered-content layout). `windowStationary` staying
+    /// true for that whole span is exactly what's wanted: THIS follower's link must stay paused so
+    /// the two mechanisms never fight over the same panel frame.
     var windowStationary = false {
         didSet {
             guard windowStationary != oldValue else { return }
@@ -78,6 +88,18 @@ final class OrbFollower {
                 wake()
             }
         }
+    }
+
+    /// Gate r8: the raw (un-fenced) glass-anchor target this follower's own tracking spring chases
+    /// — cursor + `baseOffset`, or the sticky magnetic target if one is set (the same precedence
+    /// `targetOrigin()` below uses, factored out so it's reachable without also pulling in that
+    /// method's `FieldCorner`/fence mapping, which is scoped to the small orb/field frame's own
+    /// geometry). Exposed (not `private`) so `OrbWindowController`'s window-collapse cursor-ride
+    /// (gate r8, `rideWindowCollapseToCursor()`) can converge on the SAME anchor convention the
+    /// follower resumes tracking from at settle (`finishWindowCollapse()` wakes this follower right
+    /// after) — no offset mismatch at the handoff.
+    func rawGlassAnchor() -> CGPoint {
+        magneticTarget ?? CGPoint(x: cursorLocation.x + baseOffset.x, y: cursorLocation.y + baseOffset.y)
     }
 
     var onCursorLocationChange: ((CGPoint) -> Void)?

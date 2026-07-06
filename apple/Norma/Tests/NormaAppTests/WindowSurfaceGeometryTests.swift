@@ -155,4 +155,57 @@ final class WindowSurfaceGeometryTests: XCTestCase {
         // a point on the straight edge (mid-top) is in
         XCTAssertTrue(roundedRectContains(rect, radius: radius, point: CGPoint(x: 50, y: 1)))
     }
+
+    // MARK: - Gate r8: window-collapse cursor-ride
+
+    /// As the anchor moves tick-to-tick (mid-collapse, tracking the live cursor), the CONTENT stays
+    /// put in screen space — `windowSurfaceLayout`'s content frame is centered on `screenFrame`
+    /// independent of `anchor` — only the enclosing `windowFrame`'s origin and the local `orbPoint`
+    /// shift to keep the shrinking bubble converging on the new anchor. This is the property that
+    /// makes the ride read as "the bubble chases the cursor" rather than "the whole window slides".
+    func testContentStaysPutAsAnchorMovesMidCollapse() {
+        let anchorA = CGPoint(x: 300, y: 300)
+        let anchorB = CGPoint(x: 1200, y: 700)
+        let a = layout(anchor: anchorA)
+        let b = layout(anchor: anchorB)
+        let contentScreenA = CGPoint(x: a.windowFrame.minX + a.finalRect.minX, y: a.windowFrame.maxY - a.finalRect.maxY)
+        let contentScreenB = CGPoint(x: b.windowFrame.minX + b.finalRect.minX, y: b.windowFrame.maxY - b.finalRect.maxY)
+        XCTAssertEqual(contentScreenA.x, contentScreenB.x, accuracy: 0.5)
+        XCTAssertEqual(contentScreenA.y, contentScreenB.y, accuracy: 0.5)
+        // ...while the orb point DOES move, all the way to the new anchor, each time.
+        let orbScreenB = CGPoint(x: b.windowFrame.minX + b.orbPoint.x, y: b.windowFrame.maxY - b.orbPoint.y)
+        XCTAssertEqual(orbScreenB.x, anchorB.x, accuracy: 0.5)
+        XCTAssertEqual(orbScreenB.y, anchorB.y, accuracy: 0.5)
+    }
+
+    /// `fenceAnchorForWindowCollapse` keeps the (padded) orb bubble fully inside `visibleFrame`: an
+    /// anchor beyond the edge clamps to the fenced bound; one already inside passes through
+    /// unchanged.
+    func testFenceAnchorForWindowCollapseClampsToScreen() {
+        let visible = CGRect(x: 0, y: 0, width: 1512, height: 944)
+        let margin = bubble / 2 + halo
+        let farRight = CGPoint(x: 5000, y: 500)
+        let fenced = fenceAnchorForWindowCollapse(
+            farRight, orbBubbleSize: bubble, haloPadding: halo, visibleFrame: visible
+        )
+        XCTAssertEqual(fenced.x, visible.maxX - margin, accuracy: 0.001)
+        XCTAssertEqual(fenced.y, 500)
+
+        let inside = CGPoint(x: 700, y: 400)
+        let unclamped = fenceAnchorForWindowCollapse(
+            inside, orbBubbleSize: bubble, haloPadding: halo, visibleFrame: visible
+        )
+        XCTAssertEqual(unclamped, inside)
+    }
+
+    /// Below the top-left edge too — both axes clamp independently.
+    func testFenceAnchorForWindowCollapseClampsTopLeft() {
+        let visible = CGRect(x: 0, y: 0, width: 1512, height: 944)
+        let margin = bubble / 2 + halo
+        let fenced = fenceAnchorForWindowCollapse(
+            CGPoint(x: -500, y: -500), orbBubbleSize: bubble, haloPadding: halo, visibleFrame: visible
+        )
+        XCTAssertEqual(fenced.x, visible.minX + margin, accuracy: 0.001)
+        XCTAssertEqual(fenced.y, visible.minY + margin, accuracy: 0.001)
+    }
 }
