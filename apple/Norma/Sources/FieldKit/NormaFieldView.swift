@@ -22,12 +22,23 @@ import AppKit
 /// (`ImageChipGlassRow`/`ImageChipMorphStrokeRow`/`ImageChipMorphFocusGlowRow`/
 /// `ImageChipMorphContentRow` and their shared state — `renderedImageChips`, `composerImages`,
 /// `reconcileRenderedImageChips`, etc. — plus the `screenshotOffset` slot `composerFinalRect`
-/// used to reserve for them); the chat-button/expand affordance next to the nav pill
-/// (`chatButtonFinalRect`, `TopRowIconButton`/`TopRowIconFocusGlow`, since chat is cut);
-/// battery/fan/permissions (`permissions`/`batteryLimiterController`/`fanController`/
-/// `privilegedHelperClient` were `GlassFieldWindowController` dependencies, never read inside
-/// composerBody itself, so there was nothing here to delete beyond not carrying them forward);
-/// tear-out/detach and the chat sidebar.
+/// used to reserve for them); battery/fan/permissions (`permissions`/`batteryLimiterController`/
+/// `fanController`/`privilegedHelperClient` were `GlassFieldWindowController` dependencies, never
+/// read inside composerBody itself, so there was nothing here to delete beyond not carrying them
+/// forward); tear-out/detach and the chat sidebar.
+///
+/// GATE r1 FIX (F3): the chat/expand button next to the nav pill was originally cut above (task A
+/// assumed "chat" — the detached chat window surface — meant the whole affordance was dead), then
+/// re-added task B without it (a corner-overlay chevron on the composer shell itself, see
+/// `composerOrResponseContent`'s neighboring overlay below prior to this fix). Live-gate finding
+/// F3: the button belongs in the TOP ROW next to the nav pill, exactly where v1 drew it
+/// (`chatButtonFinalRect`, `TopRowIconButton`/`TopRowIconFocusGlow`, GlassFieldView.swift:1058-
+/// 1066/1759-1774/1742-1755) — "chat" there was never the sidebar, it was this same expand-to-
+/// window affordance. Restored verbatim as v1 had it: `chatButtonFinalRect(navFinal:)` (free
+/// function below, extracted — see its own doc — for pure-geometry testability), a 34×34 circular
+/// glass surface (`NativeGlassCapsuleSurface`, id "chat-button") immediately left of the nav pill,
+/// same reveal timing as the nav pill (`sideGlassReveal`/`sideContentReveal`), same
+/// `TopRowIconButton` icon/focus-ring look. The corner-overlay chevron this replaces is gone.
 ///
 /// FOCUS COORDINATOR: v1's field panel is permanently mouse-inert (`ignoresMouseEvents = true`),
 /// so `FieldFocusCoordinator` exists there to let arrow keys/Enter drive every button via a
@@ -86,13 +97,15 @@ struct NormaFieldView: View {
 
     @State private var composerContentHeight: CGFloat = 22
 
-    /// Task 7: drives the expand chevron's amber pulse. `.onChange(of: adapter.interactionNeeded)`
+    /// Task 7: drives the expand button's amber pulse. `.onChange(of: adapter.interactionNeeded)`
     /// below mirrors `interactionNeeded` onto this local `@State`; the `.animation(value:
-    /// chevronPulse)` modifier (scoped to the chevron's own `overlay` closure — v1 LAW: never on
-    /// an outer/ancestor view) fires a `.repeatForever(autoreverses: true)` opacity animation on
-    /// that single false→true transition, which then keeps autoreversing forever with no further
-    /// state churn needed — same local-animation-state convention as `WorkingSpinnerGlyph`/
-    /// `SheenText` elsewhere in this file.
+    /// chevronPulse)` modifier (scoped to the button's own view chain in `composerMorphedContent`
+    /// — GATE r1 FIX F3: relocated from the composer's corner overlay to the top-row button, same
+    /// scoping rule either way — v1 LAW: never on an outer/ancestor view) fires a
+    /// `.repeatForever(autoreverses: true)` opacity animation on that single false→true
+    /// transition, which then keeps autoreversing forever with no further state churn needed —
+    /// same local-animation-state convention as `WorkingSpinnerGlyph`/`SheenText` elsewhere in
+    /// this file.
     @State private var chevronPulse = false
 
     /// v1 default halo tint (`appState.visualCustomization.haloNSColor`'s factory default) —
@@ -235,6 +248,22 @@ struct NormaFieldView: View {
             to: navFinal,
             progress: glassSplitProgress
         )
+        // GATE r1 FIX (F3): restored top-row expand button geometry — v1's
+        // `chatButtonFinalRect(navFinal:)` (GlassFieldView.swift:1058-1066), a square button sized
+        // to the nav pill's own height, sitting `interPillGap` to its left. Extracted as a free
+        // function (see its own doc) rather than an instance method so it's directly testable.
+        let chatButtonFinal = chatButtonFinalRect(navFinal: navFinal, interPillGap: morph.interPillGap)
+        let chatButtonOrbRect = CGRect(
+            x: chatButtonFinal.midX - morph.orbBubbleSize / 2,
+            y: chatButtonFinal.midY - morph.orbBubbleSize / 2,
+            width: morph.orbBubbleSize,
+            height: morph.orbBubbleSize
+        )
+        let chatButtonGlassRect = interpolatedRect(
+            from: chatButtonOrbRect,
+            to: chatButtonFinal,
+            progress: glassSplitProgress
+        )
 
         ZStack {
             composerMorphedContent(
@@ -255,6 +284,8 @@ struct NormaFieldView: View {
                 countBoxCenter: countBoxCenter,
                 countAlignment: countAlignment,
                 navGlassRect: navGlassRect,
+                chatButtonFinal: chatButtonFinal,
+                chatButtonGlassRect: chatButtonGlassRect,
                 haloColor: haloColor
             )
         }
@@ -289,6 +320,8 @@ struct NormaFieldView: View {
         countBoxCenter: CGPoint,
         countAlignment: Alignment,
         navGlassRect: CGRect,
+        chatButtonFinal: CGRect,
+        chatButtonGlassRect: CGRect,
         haloColor: Color
     ) -> some View {
         ZStack {
@@ -317,6 +350,21 @@ struct NormaFieldView: View {
                         .position(x: navGlassRect.midX, y: navGlassRect.midY)
                         .allowsHitTesting(false)
                     }
+
+                    // GATE r1 FIX (F3): the expand/chat button's own glass surface — NOT gated on
+                    // `!navSegments.isEmpty` (unlike "top-row" above): the button is an
+                    // independent top-row affordance, not a nav segment, so it renders even while
+                    // `navSegments` is empty (see that property's own doc). Reuses
+                    // `NativeGlassCapsuleSurface` exactly as v1 did for "chat-button" — a Capsule
+                    // with equal width/height renders as a circle (corner radius = min(w,h)/2).
+                    NativeGlassCapsuleSurface(
+                        id: "chat-button",
+                        namespace: glassNamespace,
+                        width: chatButtonGlassRect.width * sideGlassMaterialScale,
+                        height: chatButtonGlassRect.height * sideGlassMaterialScale
+                    )
+                    .position(x: chatButtonGlassRect.midX, y: chatButtonGlassRect.midY)
+                    .allowsHitTesting(false)
 
                     // GATE-4 FIX (item 3): the status label used to have a matching glass-only
                     // "ghost" layer in here (invisible text, `drawsGlass: true`) purely so its
@@ -373,6 +421,19 @@ struct NormaFieldView: View {
                     .strokeBorder(Color.white.opacity(0.5), lineWidth: 1)
                     .frame(width: navGlassRect.width, height: navGlassRect.height)
                     .position(x: navGlassRect.midX, y: navGlassRect.midY)
+                    .opacity(sideGlassReveal)
+                    .modifier(GlassForegroundLegibility())
+                    .allowsHitTesting(false)
+            }
+
+            // GATE r1 FIX (F3): chat-button stroke, mirroring v1's Circle stroke
+            // (GlassFieldView.swift:577-585) — not gated on `!navSegments.isEmpty` for the same
+            // reason the glass fill above isn't.
+            if rendersSideGlass {
+                Circle()
+                    .strokeBorder(Color.white.opacity(0.5), lineWidth: 1)
+                    .frame(width: chatButtonGlassRect.width, height: chatButtonGlassRect.height)
+                    .position(x: chatButtonGlassRect.midX, y: chatButtonGlassRect.midY)
                     .opacity(sideGlassReveal)
                     .modifier(GlassForegroundLegibility())
                     .allowsHitTesting(false)
@@ -455,56 +516,45 @@ struct NormaFieldView: View {
             // interactive text view / buttons and v2's field is NOT mouse-inert while expanded
             // (see the file header's FOCUS COORDINATOR note), so it must stay hit-testable.
 
-            // Task 6 (FieldFocus) — 2d-i expand chevron: keyboard-first (spec §3 — the
-            // difference blend breaks reliable hit-testing at this small a target; click is
-            // best-effort). Positioned top-trailing within the shell using the SAME shared
-            // insets `composerContent`/`inlineResponse` already share (`contentHorizontalPadding`/
-            // `contentVerticalPadding`), gated on `contentReveal` exactly like the shell content
-            // it sits on top of (`composerOrResponseContent` above) rather than a hard `if`, so it
-            // fades in/out in lockstep with the rest of the composer chrome through the morph.
-            // The Color.clear backing box is deliberately `.allowsHitTesting(false)` — only the
-            // chevron's own small `Circle` contentShape should intercept clicks; this box merely
-            // sizes/positions the overlay to `composerFinal` without stealing clicks meant for the
-            // composer text view underneath.
-            Color.clear
-                .frame(width: composerFinal.width, height: composerFinal.height)
-                .allowsHitTesting(false)
-                .overlay(alignment: .topTrailing) {
-                    // Task 7: amber pulse while the daemon needs a human (`adapter.
-                    // interactionNeeded`) — composes with (never replaces) the existing focus
-                    // ring below. v1 LAW: the `repeatForever` `.animation` is scoped to THIS
-                    // overlay closure alone, value-keyed on the local `chevronPulse` `@State`,
-                    // never hoisted onto an outer/ancestor view.
-                    Image(systemName: "arrow.up.left.and.arrow.down.right")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(adapter.interactionNeeded ? Color(red: 1.0, green: 0.72, blue: 0.30) : .white)
-                        .frame(width: 22, height: 22)
-                        .background(
-                            Circle().stroke(.white.opacity(adapter.focusedElement == .expandChevron ? 0.9 : 0.0),
-                                            lineWidth: 1.5)
-                        )
-                        .contentShape(Circle())
-                        .onTapGesture { adapter.onExpandToWindow() }
-                        .opacity(Double(contentReveal))
-                        .opacity(chevronPulse ? 1.0 : 0.45)
-                        .animation(adapter.interactionNeeded
-                            ? .easeInOut(duration: 0.5).repeatForever(autoreverses: true)
-                            : .default, value: chevronPulse)
-                        .onChange(of: adapter.interactionNeeded, initial: true) { _, needed in chevronPulse = needed }
-                        // 36 (not `contentHorizontalPadding`'s 12) so this chevron's trailing
-                        // 22pt tap target clears `revealDraftButton`'s top-trailing slot
-                        // (HStack `.padding(6)` inside `inlineResponse`'s `.topTrailing` ZStack,
-                        // spanning [right-28, right-6]) — chevron now spans [right-58, right-36],
-                        // an 8pt gap short of the button, same fixed position in both composer
-                        // and reply states (review: was a 16pt/22pt overlap that stole taps).
-                        .padding(.horizontal, 36)
-                        .padding(.vertical, Self.contentVerticalPadding)
-                }
-                .position(x: composerFinal.midX, y: composerFinal.midY)
-                .modifier(GlassForegroundLegibility())
-
             // v1's NavigationFocusGlow (keyboard-focus ring on nav pill segments) is cut here —
             // same reason as ComposerSideFocusGlowLayer above.
+
+            // GATE r1 FIX (F3): expand/chat button, restored to the TOP ROW exactly where v1 drew
+            // it (`TopRowIconButton`, GlassFieldView.swift:1759-1774), immediately left of the nav
+            // pill at `chatButtonFinal` — this REPLACES the corner-overlay chevron that used to
+            // live here, pinned to `composerFinal`'s top-trailing corner (deleted; that overlay
+            // also overlapped `historyPositionText`/`revealDraftButton` while browsing history —
+            // a recorded minor this restore resolves as a side effect). Reveal timing now matches
+            // the nav pill's own icon layer exactly (`sideContentReveal`, not the old `contentReveal`
+            // gate — that one was tied to the composer/response content fading in beneath the
+            // corner overlay; this button lives in the top row alongside the nav pill instead, so
+            // it fades with THAT row's content, same as `NavigationPill` above).
+            //
+            // Task 6 (FieldFocus) / Task 7 (interaction-needed pulse) seams are unchanged, only
+            // relocated: keyboard-first focus ring (`adapter.focusedElement == .expandChevron` —
+            // spec §3, the difference blend breaks reliable hit-testing at this small a target, so
+            // click stays best-effort via `.onTapGesture`) and the amber `chevronPulse` pulse while
+            // `adapter.interactionNeeded` (v1 LAW: the `repeatForever` `.animation` stays scoped to
+            // THIS view alone, value-keyed on the local `chevronPulse` `@State`, never hoisted onto
+            // an outer/ancestor view).
+            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(adapter.interactionNeeded ? Color(red: 1.0, green: 0.72, blue: 0.30) : .white)
+                .frame(width: chatButtonFinal.width, height: chatButtonFinal.height)
+                .background(
+                    Circle().stroke(.white.opacity(adapter.focusedElement == .expandChevron ? 0.9 : 0.0),
+                                    lineWidth: 1.5)
+                )
+                .contentShape(Circle())
+                .onTapGesture { adapter.onExpandToWindow() }
+                .opacity(sideContentReveal)
+                .opacity(chevronPulse ? 1.0 : 0.45)
+                .animation(adapter.interactionNeeded
+                    ? .easeInOut(duration: 0.5).repeatForever(autoreverses: true)
+                    : .default, value: chevronPulse)
+                .onChange(of: adapter.interactionNeeded, initial: true) { _, needed in chevronPulse = needed }
+                .position(x: chatButtonFinal.midX, y: chatButtonFinal.midY)
+                .modifier(GlassForegroundLegibility())
 
             if !navSegments.isEmpty {
                 NavigationPill(
@@ -1001,6 +1051,40 @@ struct NormaFieldView: View {
         let t = min(1, max(0, (shorter - 48) / 60))
         return circleRadius * (1 - t) + pillRadius * t
     }
+}
+
+// MARK: - Chat/expand button geometry (GATE r1 FIX F3)
+
+/// v1's `chatButtonFinalRect(navFinal:)` (GlassFieldView.swift:1058-1066), verbatim math: a
+/// square button sized to the nav pill's own height, sitting `interPillGap` to its left at the
+/// same y. `navPillFinalRect(in:composerFinal:)` (`NormaFieldView`, private above) already
+/// reserves this exact gap on its `corner.isLeft` branch (`composerFinal.minX + height +
+/// interPillGap`) — that's what v1 did too (GlassFieldView.swift:1051-1052) — so on that branch
+/// this rect lands flush with `composerFinal`'s own left edge, still fully inside the window. On
+/// the `!corner.isLeft` branch `navPillFinalRect` doesn't reserve the gap (its nav pill hugs
+/// `composerFinal.maxX` directly), but with the default `MorphModel` constants the nav pill's own
+/// width cap (`min(navPillMaxWidth, composerFinal.width - 40)` = 300, short of the composer's
+/// 360pt width by 60pt) leaves 60pt of slack between the nav pill's leading edge and
+/// `composerFinal.minX` — comfortably more than this button's `size + gap` (34 + 8 = 42pt) — see
+/// `ChatButtonGeometryTests`, so the button still lands inside `composerFinal` — and therefore
+/// inside the window — on both corner variants. `morph.corner` is pinned at `.topLeft` forever
+/// (`isLeft` always true) per `MorphModel.corner`'s own doc, so only the first branch is live
+/// today; this stays correct for the dormant branch too, matching v1's own single, corner-agnostic
+/// formula (no explicit `isLeft` check inside `chatButtonFinalRect` itself, there or here — the
+/// corner-awareness is entirely inherited from whichever `navFinal` the caller passes in).
+///
+/// Extracted as a free, top-level function (rather than a private `NormaFieldView` method, unlike
+/// `navPillFinalRect`) so it's directly unit-testable without constructing a full
+/// `NormaFieldView`/`FieldStateAdapter`/`FluidModel` — same convention as `fenceAnchorForTopLeftCorner`
+/// (`FieldKit/FieldCorner.swift`) and `followerTargetOrigin` (`Orb/OrbFollower.swift`).
+func chatButtonFinalRect(navFinal: CGRect, interPillGap: CGFloat) -> CGRect {
+    let size = navFinal.height
+    return CGRect(
+        x: navFinal.minX - interPillGap - size,
+        y: navFinal.minY,
+        width: size,
+        height: size
+    )
 }
 
 // MARK: - GlassForegroundLegibility (v1 GlassFieldView.swift:1285-1291, verbatim)
