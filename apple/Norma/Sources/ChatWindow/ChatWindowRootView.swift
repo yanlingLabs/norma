@@ -1,10 +1,8 @@
 import SwiftUI
 
-/// Spec §1: the window is glass but TINTED near-opaque (white in Light, grey in Dark) so it
-/// reads as a solid normal window. Pure so the exact values are pinned by tests.
-func chatWindowTint(darkMode: Bool) -> (white: Double, opacity: Double) {
-    darkMode ? (white: 0.16, opacity: 0.94) : (white: 0.97, opacity: 0.94)
-}
+// NOTE (gate r7): `chatWindowTint`, `MacTrafficLights`, and `chatWindowHeaderHeight` now live in
+// `FieldKit/WindowSurfaceView.swift` / `WindowSurfaceGeometry.swift` (ownership moved to the
+// same-panel window surface; this whole file is deleted in the r7 pivot).
 
 /// Task 4 content: field content, bigger (spec decision) — status header, the current
 /// prompt/reply, and the shared composer. This is a NEW, simple layout — NOT a `NormaFieldView`
@@ -114,53 +112,5 @@ struct ChatWindowRootView: View {
     }
 }
 
-/// Gate r4: the three self-drawn macOS-style traffic lights, replacing the removed native window
-/// buttons (the borderless window has none). Gate r6 (live-gate finding — real macOS-26 buttons
-/// read visibly bigger): three 14pt circles (was 12pt), 9pt apart (was 8pt), each with a subtle
-/// darker ring; hovering ANYWHERE over the group reveals the ×/−/+ glyphs (macOS behavior). Wired:
-/// red → close, yellow → minimize, green → zoom (see `ChatWindowRootView`).
-private struct MacTrafficLights: View {
-    let onClose: () -> Void
-    let onMinimize: () -> Void
-    let onZoom: () -> Void
-    @State private var hovering = false
-
-    // Standard macOS traffic-light fills.
-    private static let closeColor = Color(red: 1.0, green: 0.373, blue: 0.341)    // #FF5F57
-    private static let minimizeColor = Color(red: 0.996, green: 0.737, blue: 0.176) // #FEBC2E
-    private static let zoomColor = Color(red: 0.157, green: 0.784, blue: 0.251)   // #28C840
-    private static let glyphColor = Color(red: 0.28, green: 0.14, blue: 0.0).opacity(0.55) // dark brown-ish
-
-    var body: some View {
-        HStack(spacing: 9) { // gate r6: 8 → 9, matched to the 12pt → 14pt circle bump
-            light(color: Self.closeColor, glyph: "xmark", action: onClose)
-            light(color: Self.minimizeColor, glyph: "minus", action: onMinimize)
-            light(color: Self.zoomColor, glyph: "plus", action: onZoom)
-        }
-        .onHover { hovering = $0 }
-    }
-
-    private func light(color: Color, glyph: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            ZStack {
-                Circle().fill(color)
-                Circle().strokeBorder(Color.black.opacity(0.12), lineWidth: 0.5)
-                if hovering {
-                    Image(systemName: glyph)
-                        .font(.system(size: 8.5, weight: .bold)) // gate r6: 7.5 → 8.5
-                        .foregroundStyle(Self.glyphColor)
-                }
-            }
-            .frame(width: 14, height: 14) // gate r6: 12 → 14, real macOS-26 traffic-light size
-            .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-/// Gate r4: height of the self-drawn header band that holds the traffic lights + status text (the
-/// buttons sit vertically centered within it). Sized to the user's Safari-proportions ask without
-/// wasting the vertical space the old 52pt native-titlebar inset did. Gate r6: bumped 28 → 30 to
-/// give the bigger 14pt traffic lights (was 12pt) a touch more breathing room — 28pt started to
-/// feel tight once the buttons grew.
-let chatWindowHeaderHeight: CGFloat = 30
+// NOTE (gate r7): `MacTrafficLights` + `chatWindowHeaderHeight` moved to
+// `FieldKit/WindowSurfaceView.swift`.

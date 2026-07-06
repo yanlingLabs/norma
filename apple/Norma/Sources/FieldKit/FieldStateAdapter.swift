@@ -361,6 +361,15 @@ final class FieldStateAdapter: ObservableObject {
     /// Wired by GlassRootView → OrbWindowController.requestExpandToWindow().
     var onExpandToWindow: () -> Void = {}
 
+    // MARK: - Gate r7: window-surface controls (same-panel window morph)
+
+    /// Wired by GlassRootView → `OrbWindowController.collapseWindowToOrb()`. The window's red/yellow
+    /// traffic lights, Esc, and the 4-finger tap all route here — the window always collapses back
+    /// to the ORB (v1 parity: the large surface never returns to the field).
+    var onWindowClose: () -> Void = {}
+    /// Wired by GlassRootView → `OrbWindowController.zoomToggleWindow()`. The green traffic light.
+    var onWindowZoom: () -> Void = {}
+
     // MARK: - Task 7: interaction-needed pulses
 
     /// Spec §3: the daemon needs a human — a pending approval, question, or plan (the reducer

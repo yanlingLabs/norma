@@ -115,7 +115,24 @@ struct NormaFieldView: View {
 
     var body: some View {
         GeometryReader { geo in
-            composerBody(in: geo.size)
+            // Gate r7 (same-panel window morph): the field/composer body and the large window
+            // surface are two body branches off the SAME `morph.progress`, chosen by
+            // `morph.renderSurface` (v1 routed `dashboardBody`/`chatBody`/`composerBody` off its own
+            // `morph.surface` the same way). The controller flips `renderSurface` at the same
+            // instants it drives the morph — `.window` in `presentWindowSurface()`, `.field` in
+            // `finishWindowCollapse()`.
+            switch morph.renderSurface {
+            case .field:
+                composerBody(in: geo.size)
+            case .window:
+                WindowSurfaceView(
+                    adapter: adapter, morph: morph, fluid: fluid,
+                    namespace: glassNamespace, windowSize: geo.size,
+                    onClose: { adapter.onWindowClose() },
+                    onMinimize: { adapter.onWindowClose() },
+                    onZoom: { adapter.onWindowZoom() }
+                )
+            }
         }
         // GATE-3 FIX (F1, root cause #2): was `morph.windowSize` (the fixed 480×440 EXPANDED
         // size) unconditionally — see `MorphModel.activeWindowSize`'s doc for why that silently
