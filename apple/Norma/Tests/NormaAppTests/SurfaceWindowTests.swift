@@ -173,17 +173,19 @@ final class SurfaceWindowTests: XCTestCase {
         try await pollUntil(timeout: 5.0) { controller.surface == .window && controller.isMorphIdleForTesting }
 
         let screen = try XCTUnwrap(NSScreen.main).visibleFrame
-        let openFrame = controller.panelFrameForTesting
         let target = CGPoint(x: screen.midX + 250, y: screen.midY - 120)
         controller.glassAnchorOverrideForTesting = target
 
         controller.collapseWindowToOrb()
         try await pollUntil(timeout: 5.0) { controller.morphProgressForTesting < 0.9 }
         XCTAssertEqual(controller.surface, .window, "still mid-collapse, not settled yet")
-        XCTAssertNotEqual(
-            controller.panelFrameForTesting.origin, openFrame.origin,
-            "the ride must already be moving the panel toward the cursor mid-collapse, not waiting for settle"
-        )
+        // FINAL-REVIEW FIX: deliberately NO panel-frame-origin assertion here. For an anchor
+        // INTERIOR to the padded content frame, `windowFrame = paddedContentFrame.union(orbFrame)`
+        // is the content frame both before and after the ride — the panel origin legitimately
+        // never moves. The ride's real contract is that the SHELL's orb anchor (`windowOrbPoint`
+        // resolved against the frame) converges on the fenced cursor mid-collapse, asserted below
+        // against the deterministic override. (The removed assertion was also machine-dependent:
+        // the open anchor derives from the live mouse position at present time.)
 
         let orbPoint = try XCTUnwrap(controller.morphModel.windowOrbPoint, "must stay live mid-collapse")
         let frame = controller.panelFrameForTesting
