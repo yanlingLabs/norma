@@ -677,6 +677,24 @@ final class OrbWindowController: ObservableObject {
             target: morphTarget,
             dt: dt
         )
+
+        // Fix C (anim-fidelity restore, v1 early-fire parity — GlassFieldWindow.swift:1827-1839's
+        // `morphCompletionProgressThreshold`): when collapsing WITH a field→window handoff armed
+        // (`pendingWindowExpand`), fire the handoff the INSTANT progress crosses 0.15 on the way
+        // down to 0, rather than waiting for the full settle below. This lets the chat window
+        // start growing from the collapsing orb's current position while the orb's own last
+        // sliver of collapse finishes underneath it, instead of visibly pausing at full settle
+        // before the window ever appears. One-shot: `beginWindowHandoffOverlapped()` consumes
+        // `pendingWindowExpand`, so this condition is false on every subsequent tick even though
+        // `next <= 0.15` stays true all the way down to 0 — the LATCH is the guard, not the
+        // progress comparison.
+        if morphTarget == 0, pendingWindowExpand, next <= 0.15 {
+            morphModel.progress = next
+            morphVelocity = velocity
+            beginWindowHandoffOverlapped()
+            return // morph timer keeps running — orb finishes collapsing beneath the growing window
+        }
+
         morphModel.progress = next
         morphVelocity = velocity
 
@@ -693,6 +711,38 @@ final class OrbWindowController: ObservableObject {
         if morphTarget == 0 {
             finishCollapse()
         }
+    }
+
+    /// Fix C (anim-fidelity restore, v1 early-fire parity): the actual handoff, fired from
+    /// `morphTick()` the instant a collapsing morph (with `pendingWindowExpand` armed) crosses
+    /// progress ≤ 0.15. Consumes the one-shot latch, then computes the SAME collapsed-frame
+    /// projection `finishCollapse()`'s own down-resize will land on (current glass anchor +
+    /// `collapsedWindowSize`) — the panel's OWN AppKit frame is deliberately left alone here: it's
+    /// still sized to `windowSize` throughout the whole morph (only the SwiftUI content shrinks
+    /// internally as `progress` falls — see the type doc's ARCHITECTURE NOTE), and a real resize
+    /// this early, before the content has visually finished shrinking, would clip the still-mid-
+    /// collapse composer geometry against a too-small container. This is therefore a "mid-shrink"
+    /// PROJECTION of where the orb is about to finish, not a literal read of `panel.frame` — the
+    /// tracking spring (Fix F, snapped directly to the cursor-driven target while collapsing) keeps
+    /// adjusting the real anchor for the remaining ~0.15 of progress, so the true final position
+    /// can drift a hair from this estimate, imperceptibly at 60Hz. `surface` flips to `.window`
+    /// here (the window is now the surface of record) and `onExpandToWindow?` fires with the
+    /// projected frame — the orb panel itself is NOT torn down yet; it keeps visibly finishing its
+    /// collapse (the morph timer keeps running) underneath the growing chat window, and
+    /// `finishCollapse()` below performs the real teardown once that collapse naturally settles.
+    private func beginWindowHandoffOverlapped() {
+        guard consumePendingWindowExpand() else { return }
+        let anchor = currentGlassAnchor()
+        let origin = morphModel.corner.windowOrigin(
+            glassAnchor: anchor,
+            morph: morphModel,
+            windowSize: morphModel.collapsedWindowSize,
+            surface: .composer
+        )
+        let orbFrame = NSRect(origin: origin, size: morphModel.collapsedWindowSize)
+        surface = .window
+        onExpandToWindow?(orbFrame)
+        OrbDebug.log("collapseToOrb: overlapped handoff fired at progress=\(morphModel.progress)")
     }
 
     /// The collapse-completion teardown, shared by the morph settling naturally (`morphTick()`)
@@ -730,17 +780,32 @@ final class OrbWindowController: ObservableObject {
 
         externalFocus?.restore()
         externalFocus = nil
-        surface = .orb
         exchangeIndex = nil
 
         OrbDebug.log("collapseToOrb: complete")
 
-        // Gate fix (F1): second half of the field→window handoff `enterWindowMode()` armed —
-        // the panel is now sized/positioned to the COLLAPSED orb's frame (just set above, NOT
-        // the field's old expanded frame), so capture THAT as the chat window's grow-animation
-        // source. Tear the orb panel down exactly like `hide()` would (order out, stop the
-        // follower, mark not visible) WITHOUT recursing back into this same force-finish branch
-        // — calling `hide()` here would re-enter `finishCollapse()`.
+        // Fix C (handoff overlap): if `beginWindowHandoffOverlapped()` already fired early (at the
+        // ≤0.15 crossing in `morphTick()` — the common case whenever a handoff was armed),
+        // `surface` is ALREADY `.window` by the time this natural settle runs. This settle must
+        // NOT stomp `.window` back to `.orb` (the window, not the orb, is now the surface of
+        // record) — but it must still tear the (now hidden-behind-the-chat-window) orb panel down
+        // exactly like any other handoff completion: order out, stop the follower, mark not
+        // visible (reusing the same hide-pieces the pre-overlap implementation used), WITHOUT
+        // re-firing `onExpandToWindow` (the one-shot already fired).
+        if surface == .window {
+            follower.stop()
+            panel.orderOut(nil)
+            isVisible = false
+            return
+        }
+
+        surface = .orb
+
+        // Belt: `pendingWindowExpand` should already be consumed (false) on every reachable path
+        // here — progress always crosses ≤0.15, and therefore `beginWindowHandoffOverlapped()`,
+        // before it can settle within the 0.004 epsilon above (0.15 > 0.004). Kept as a fallback
+        // so a latch that somehow survived to full settle still fires the handoff (with the NOW-
+        // final collapsed frame, freshly resized above) instead of silently stranding the caller.
         if consumePendingWindowExpand() {
             let orbFrame = panel.frame
             follower.stop()

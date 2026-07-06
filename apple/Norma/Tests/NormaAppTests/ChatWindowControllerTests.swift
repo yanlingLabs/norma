@@ -80,6 +80,39 @@ final class ChatWindowControllerTests: XCTestCase {
         c.close()
     }
 
+    /// Fix D (anim-fidelity restore): the grow is now spring-driven (`morphStep` at 140/18)
+    /// rather than a fixed 0.30s duration — settle-based, not duration-based. Polls until the
+    /// panel's frame stops changing between ticks (the spring has settled and `growTick()`'s own
+    /// guard snapped it exactly to `growTarget`), then asserts it landed on the expected target
+    /// size (mirrors `ChatWindowLayoutTests.testFirstExpandCentersDefaultSizeOnSource`'s own
+    /// expectation for a fresh controller with no remembered frame) — proving the settle guard
+    /// actually fires and the spring neither runs forever nor stops short of the real target.
+    func testGrowSettlesToTargetFrame() async throws {
+        let c = makeController()
+        let source = NSRect(x: 400, y: 400, width: 240, height: 44)
+        c.show(from: source)
+
+        var lastSize: NSSize = .zero
+        var stableTicks = 0
+        let deadline = Date().addingTimeInterval(3.0)
+        while stableTicks < 3, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            let size = c.panel?.frame.size ?? .zero
+            if size == lastSize {
+                stableTicks += 1
+            } else {
+                stableTicks = 0
+                lastSize = size
+            }
+        }
+
+        XCTAssertEqual(
+            c.panel?.frame.size, chatWindowDefaultSize,
+            "the settled grow must land exactly on the target size, not merely close to it"
+        )
+        c.close()
+    }
+
     /// Gate fix (F2): the native red close button (`windowShouldClose`) must route through our
     /// own teardown exactly once — never double-firing `onClose` even if something else raced a
     /// close in first (`close()` is idempotent).

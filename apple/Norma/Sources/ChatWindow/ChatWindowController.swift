@@ -41,11 +41,20 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
     /// `interpolatedRect` pure helpers (`Orb/MorphGeometry.swift`) for the same duration/easing
     /// feel, sidesteps AppKit's implicit-animation state entirely, and survived an 8-round
     /// rapid-fire torture test with zero crashes where the animator approach failed on round 2.
+    /// Fix D (anim-fidelity restore): the grow used to be a fixed-duration, smoothstep-eased
+    /// interpolation (`growStartTime`/`growDuration`). Replaced with the codebase's own morph
+    /// spring (`morphStep`, `Orb/SpringStep.swift`) driving a plain 0→1 scalar, at 140/18 (ζ≈0.76
+    /// — a touch softer than the core orb↔field morph's own 140/22, landing a slightly larger
+    /// ~2-3% overshoot: the "organic settle" sweet spot for a window growing into place, vs. the
+    /// tighter liquid-merge bounce the small glass shape wants). `growStart`/`growTarget` (the
+    /// endpoints) and `growTimer` (the 60Hz driver — see that property's own doc for why a manual
+    /// Timer, not `.animator()`) are unchanged.
     private var growTimer: Timer?
     private var growStart: NSRect = .zero
     private var growTarget: NSRect = .zero
-    private var growStartTime: CFTimeInterval = 0
-    private let growDuration: CFTimeInterval = 0.30
+    private var growProgress: Double = 0
+    private var growVelocity: Double = 0
+    private var lastGrowTick: CFTimeInterval = 0
 
     /// Gate fix (F1): true for the entire duration of the grow animation (the initial placement
     /// AND every 60Hz tick that follows), false otherwise. `panel.frameSanitizer` (installed in
@@ -203,7 +212,9 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
     private func startGrowAnimation(from start: NSRect, to end: NSRect) {
         growStart = start
         growTarget = end
-        growStartTime = CACurrentMediaTime()
+        growProgress = 0
+        growVelocity = 0
+        lastGrowTick = CACurrentMediaTime()
         growTimer?.invalidate()
         growTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.growTick() }
@@ -212,12 +223,36 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
 
     private func growTick() {
         guard let panel, growTimer != nil else { return }
-        let elapsed = CACurrentMediaTime() - growStartTime
-        let t = max(0, min(1, elapsed / growDuration))
-        let eased = smoothstep(0, 1, t)
-        let frame = interpolatedRect(from: growStart, to: growTarget, progress: eased)
+        let now = CACurrentMediaTime()
+        // Real dt (last-tick timestamp), same clamp range as the core morph — `morphStep` itself
+        // clamps to [1/240, 1/20] internally, this is just the raw measurement.
+        let dt = now - lastGrowTick
+        lastGrowTick = now
+
+        // Fix D (anim-fidelity restore): 140/18 (ζ≈0.76) — a touch softer than the core
+        // orb↔field morph's own 140/22, landing a slightly larger ~2-3% overshoot: the
+        // conservative "organic settle" sweet spot for a window growing into place, as opposed to
+        // the tighter liquid-merge bounce the small glass shape wants. Does NOT touch
+        // `morphStep`'s own call site in `OrbWindowController.morphTick()` (that call omits
+        // stiffness/damping, so it keeps the default 140/22).
+        let (p, v) = morphStep(progress: growProgress, velocity: growVelocity, target: 1, dt: dt, stiffness: 140, damping: 18)
+        growProgress = p
+        growVelocity = v
+
+        // Deliberately NOT clamping `p` below 1 — the slight overshoot past 1 IS the organic
+        // settle. NOTE: the shared `interpolatedRect` (Orb/MorphGeometry.swift) clamps its own
+        // `progress` to [0, 1] internally (matching v1's own identically-clamped helper) — every
+        // OTHER caller always feeds it an already-`smoothstep`-bounded value, so that clamp has
+        // never been exercised, but it would silently swallow this grow's overshoot outright. A
+        // local, unclamped lerp keeps that shared utility's existing contract untouched for its
+        // other callers while actually letting this grow's overshoot extrapolate past
+        // `growTarget`, as intended.
+        let frame = unclampedInterpolatedRect(from: growStart, to: growTarget, progress: p)
         panel.setFrame(frame, display: true)
-        if t >= 1 {
+
+        // Settle guard — same epsilon as the core morph (Fix A).
+        if abs(1 - p) < 0.004, abs(v) < 0.05 {
+            panel.setFrame(growTarget, display: true)
             cancelGrowAnimation()
             attachChromeToolbar()
         }
@@ -273,4 +308,19 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
     func noteUserMovedWindowForTesting(to frame: NSRect) {
         rememberedFrame = frame
     }
+}
+
+/// Fix D support: the same linear rect lerp as `interpolatedRect` (`Orb/MorphGeometry.swift`),
+/// minus that helper's own `progress` clamp to `[0, 1]` — see `growTick()`'s doc for why the
+/// grow's spring-driven overshoot (`progress` briefly > 1) needs an UNclamped lerp to actually
+/// extrapolate the frame past `growTarget`, while every other caller of the shared, clamped
+/// helper is unaffected.
+private func unclampedInterpolatedRect(from start: CGRect, to end: CGRect, progress: Double) -> CGRect {
+    let t = CGFloat(progress)
+    return CGRect(
+        x: start.minX + (end.minX - start.minX) * t,
+        y: start.minY + (end.minY - start.minY) * t,
+        width: start.width + (end.width - start.width) * t,
+        height: start.height + (end.height - start.height) * t
+    )
 }

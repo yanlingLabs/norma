@@ -76,14 +76,23 @@ func springStep(_ state: SpringState, target: CGPoint, dt rawDt: TimeInterval, c
 
 /// Pure morph-progress spring step (v1 GlassFieldWindow.swift:1811-1822): the same semi-
 /// implicit Euler integration as `springStep`, over a scalar 0…1 progress instead of a
-/// CGPoint. Stiffness 140 / damping 22 — deliberately underdamped so an expand overshoots
-/// progress slightly above 1 (the "liquid merge" bounce is the point, not a bug). The dt
-/// clamp is v1's own [1/240, 1/20] — wider on the top end than the position spring's
-/// [1/240, 1/30]; verbatim, not a typo.
-func morphStep(progress: Double, velocity: Double, target: Double, dt rawDt: TimeInterval) -> (progress: Double, velocity: Double) {
+/// CGPoint. Default stiffness 140 / damping 22 (the core orb↔field morph's own tuning,
+/// deliberately underdamped so an expand overshoots progress slightly above 1 — the "liquid
+/// merge" bounce is the point, not a bug) — kept as defaulted parameters, NOT hardcoded, so
+/// `ChatWindowController`'s window-grow animation (Fix D, anim-fidelity restore) can drive the
+/// SAME integrator at its own tuning (140/18, ζ≈0.76 — a slightly softer, ~2-3%-overshoot
+/// "organic settle") without touching this call site's own 140/22 (`OrbWindowController.
+/// morphTick()`, which relies on the default). The dt clamp is v1's own [1/240, 1/20] — wider
+/// on the top end than the position spring's [1/240, 1/30]; verbatim, not a typo.
+func morphStep(
+    progress: Double,
+    velocity: Double,
+    target: Double,
+    dt rawDt: TimeInterval,
+    stiffness: Double = 140.0,
+    damping: Double = 22.0
+) -> (progress: Double, velocity: Double) {
     let dt = max(1.0 / 240.0, min(rawDt, 1.0 / 20.0))
-    let stiffness = 140.0
-    let damping = 22.0
 
     let accel = stiffness * (target - progress) - damping * velocity
     let nextVelocity = velocity + accel * dt
