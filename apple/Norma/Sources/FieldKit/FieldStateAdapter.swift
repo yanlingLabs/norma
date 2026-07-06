@@ -210,6 +210,17 @@ final class FieldStateAdapter: ObservableObject {
         return session.state.lastReply
     }
 
+    /// 2d-ii-a: the full transcript for the WINDOW's scrollback. The field keeps its single
+    /// pinned pair (`visibleResponse`/`displayedPrompt` honor `exchangeIndex`); the window
+    /// ignores exchangeIndex entirely — scrollback replaces swipe-history there (spec §3).
+    var transcript: [Exchange] { session.state.exchanges }
+
+    /// Live partial reply for the window's streaming row — deliberately NOT `visibleResponse`
+    /// (that one is exchangeIndex-pinned for the field).
+    var liveStreamingText: String? {
+        session.state.streamingText.isEmpty ? nil : session.state.streamingText
+    }
+
     /// Task B hook (mirrors `OrbWindowController.exchangeIndex`): which historical exchange, if
     /// any, `visibleResponse` should read instead of the live stream / most recent reply. `nil`
     /// = live/most-recent. Wired by `GlassRootView`'s `.onChange(of: controller.exchangeIndex)`

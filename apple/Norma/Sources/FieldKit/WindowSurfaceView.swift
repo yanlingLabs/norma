@@ -138,26 +138,8 @@ struct WindowSurfaceView: View {
             }
             .frame(height: chatWindowHeaderHeight)
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    if let prompt = adapter.displayedPrompt {
-                        Text(prompt)
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    if let position = adapter.historyPositionText {
-                        Text(position).font(.system(size: 11)).foregroundStyle(.tertiary)
-                    }
-                    Text(adapter.visibleResponse ?? "")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.primary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .padding(.vertical, 4)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            TranscriptView(adapter: adapter, tint: Color(red: 0.45, green: 0.75, blue: 1.0))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             if let queued = adapter.queuedText {
                 Text(queued).font(.system(size: 11)).foregroundStyle(.tertiary)
