@@ -94,7 +94,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     Haptics.gestureRecognized()
                     guard let orb else { return }
                     switch summonToggleAction(surface: orb.surface, windowVisible: chat?.isVisible == true) {
-                    case .closeWindow: chat?.close()
+                    // Gate r3 (W1): animated close (spring-shrink to the cursor) — matches the
+                    // Esc/traffic-light close paths in `ChatWindowController`.
+                    case .closeWindow: chat?.closeAnimated()
                     case .toggleField: orb.toggleField()
                     }
                 }

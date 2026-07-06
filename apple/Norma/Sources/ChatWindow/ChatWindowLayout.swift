@@ -15,13 +15,14 @@ func clampedChatWindowFrame(_ proposed: NSRect, screenVisibleFrame screen: NSRec
     return f
 }
 
-/// Gate fix (F1 — expand choreography): position-only counterpart of `clampedChatWindowFrame`,
-/// used for the chat window's grow-animation START/intermediate frames
-/// (`ChatWindowController.isAnimatingGrow`'s doc). The grow's source is now the collapsed orb's
-/// own small panel frame (~240×140), smaller than the 340×360 floor above in BOTH dimensions —
-/// running it through the full clamp would inflate it to the floor on the very first frame,
-/// defeating the "grows from a tiny circle" effect. This keeps only the on-screen-origin half of
-/// that clamp (same inset convention), leaving size untouched.
+/// Gate fix (F1 — expand choreography), generalized by gate r3 (W1) to the shrink too: position-
+/// only counterpart of `clampedChatWindowFrame`, used for the chat window's grow/shrink-animation
+/// START/intermediate frames (`ChatWindowController.isAnimatingFrame`'s doc). The grow's source
+/// (and the shrink's target) is the collapsed orb's own small size (~240×140,
+/// `chatWindowCollapsedSize` below), smaller than the 340×360 floor above in BOTH dimensions —
+/// running it through the full clamp would inflate it to the floor, defeating the "grows from /
+/// shrinks to a tiny circle" effect. This keeps only the on-screen-origin half of that clamp
+/// (same inset convention), leaving size untouched.
 func clampedChatWindowPosition(_ proposed: NSRect, screenVisibleFrame screen: NSRect) -> NSRect {
     var f = proposed
     f.origin.x = min(max(f.origin.x, screen.minX + 2), max(screen.minX + 2, screen.maxX - f.width - 2))
@@ -48,4 +49,30 @@ func chatWindowTargetFrame(
         height: defaultSize.height
     )
     return clampedChatWindowFrame(centered, screenVisibleFrame: screenVisibleFrame)
+}
+
+/// Gate r3 (W1 — animated close): size the close-shrink spring targets. Mirrors
+/// `MorphModel.collapsedWindowSize` (`FieldKit/MorphModel.swift`, 240×140 — the same size the
+/// orb panel itself is born/settled at, `OrbWindowController.init`/`finishCollapse()`) rather
+/// than importing it: `ChatWindowController` has no reference to a live `MorphModel` instance
+/// (owned by `OrbWindowController`/shared via `FieldStateAdapter`, neither reachable from here
+/// without new coupling this gate fix doesn't need) — a plain mirrored constant is simplest.
+/// If `collapsedWindowSize` ever changes, update this alongside it.
+let chatWindowCollapsedSize = NSSize(width: 240, height: 140)
+
+/// Gate r3 (W1): the shrink's end-of-animation frame — orb-sized, centered on `point` (the
+/// cursor: `OrbWindowController.exitWindowMode()`'s `show()` re-summons the orb exactly there
+/// once `ChatWindowController.closeAnimated()`'s teardown runs). Position-only clamp
+/// (`clampedChatWindowPosition`) — deliberately NOT `clampedChatWindowFrame`'s full clamp, which
+/// would inflate this back up to the 340×360 floor and defeat the "shrinks to a tiny orb" effect,
+/// same reasoning as the grow's own `isAnimatingFrame` sanitizer bypass.
+func chatWindowShrinkTargetFrame(centeredOn point: NSPoint, screenVisibleFrame: NSRect) -> NSRect {
+    let size = chatWindowCollapsedSize
+    let proposed = NSRect(
+        x: point.x - size.width / 2,
+        y: point.y - size.height / 2,
+        width: size.width,
+        height: size.height
+    )
+    return clampedChatWindowPosition(proposed, screenVisibleFrame: screenVisibleFrame)
 }

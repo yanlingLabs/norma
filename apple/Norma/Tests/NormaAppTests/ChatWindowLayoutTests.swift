@@ -57,4 +57,24 @@ final class ChatWindowLayoutTests: XCTestCase {
         XCTAssertLessThanOrEqual(t.maxX, screen.maxX - 2)
         XCTAssertLessThanOrEqual(t.maxY, screen.maxY - 2)
     }
+
+    /// Gate r3 (W1 — animated close): the shrink's target is orb-sized (`chatWindowCollapsedSize`,
+    /// mirroring `MorphModel.collapsedWindowSize`) and centered on the cursor point, position-only
+    /// clamped (size is deliberately NOT floored to the 340×360 minimum — an orb IS meant to be
+    /// smaller than that).
+    func testShrinkTargetIsOrbSizedAndCenteredOnCursor() {
+        let cursor = NSPoint(x: 700, y: 500)
+        let f = chatWindowShrinkTargetFrame(centeredOn: cursor, screenVisibleFrame: screen)
+        XCTAssertEqual(f.size, chatWindowCollapsedSize)
+        XCTAssertEqual(f.midX, cursor.x, accuracy: 0.5)
+        XCTAssertEqual(f.midY, cursor.y, accuracy: 0.5)
+    }
+
+    func testShrinkTargetNearEdgeStaysOnScreen() {
+        let cursor = NSPoint(x: 5, y: 5) // bottom-left corner
+        let f = chatWindowShrinkTargetFrame(centeredOn: cursor, screenVisibleFrame: screen)
+        XCTAssertEqual(f.size, chatWindowCollapsedSize, "position clamp must never touch size")
+        XCTAssertGreaterThanOrEqual(f.minX, screen.minX + 2)
+        XCTAssertGreaterThanOrEqual(f.minY, screen.minY + 2)
+    }
 }
