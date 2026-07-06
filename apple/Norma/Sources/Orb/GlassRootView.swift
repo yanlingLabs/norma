@@ -19,21 +19,11 @@ struct GlassRootView: View {
     /// (see `FluidModel`'s doc, `FieldKit/FluidOrbView.swift`). Held only to pass down to
     /// `NormaFieldView`, which itself only passes it further down to `FluidOrbSlot`.
     let fluidModel: FluidModel
-    @StateObject private var adapter: FieldStateAdapter
+    // NOTE: owned by `OrbWindowController.fieldAdapter` (Task 2d-i.2), not here — the chat
+    // window shares this same instance for drafts/replies/focus. Injected as `@ObservedObject`,
+    // so the memberwise init suffices (no custom init needed).
+    @ObservedObject var adapter: FieldStateAdapter
     private let draftCache = DraftCache()
-
-    init(session: SessionModel, controller: OrbWindowController, morphModel: MorphModel, fluidModel: FluidModel) {
-        self.session = session
-        self.controller = controller
-        self.morphModel = morphModel
-        self.fluidModel = fluidModel
-        _adapter = StateObject(wrappedValue: FieldStateAdapter(session: session))
-        // NOTE: do NOT touch `adapter` here. Accessing a @StateObject's wrappedValue inside
-        // init mutates a pre-installation THROWAWAY instance — the installed adapter keeps the
-        // default no-op closures (live-gate bug: typing worked, Enter silently did nothing).
-        // Wiring lives in body via wireCallbacks(); the closures are plain vars (not
-        // @Published), so per-render reassignment is idempotent and publishes nothing.
-    }
 
     /// Idempotent callback wiring onto the INSTALLED adapter (see init NOTE).
     private func wireCallbacks() {

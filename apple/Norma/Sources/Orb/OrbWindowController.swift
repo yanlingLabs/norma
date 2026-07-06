@@ -142,6 +142,11 @@ final class OrbWindowController: ObservableObject {
         return expandForAnswerReveal
     }
 
+    /// Task 2d-i.2: the ONE FieldStateAdapter both surfaces (field + chat window) observe.
+    /// Owned here — not by GlassRootView — so the chat window shares drafts, replies, and
+    /// focus state with the field for free.
+    let fieldAdapter: FieldStateAdapter
+
     private let session: SessionModel
     private let swipeRecognizer = TrackpadHorizontalSwipeRecognizer()
     private var keyMonitor: Any?
@@ -157,6 +162,7 @@ final class OrbWindowController: ObservableObject {
 
     init(session: SessionModel) {
         self.session = session
+        self.fieldAdapter = FieldStateAdapter(session: session)
         let morph = MorphModel()
         self.morphModel = morph
         self.follower = OrbFollower(morphModel: morph, fluidModel: fluidModel)
@@ -193,7 +199,10 @@ final class OrbWindowController: ObservableObject {
         // `NormaFieldView` (FieldKit), which owns its own `GlassEffectContainer` and renders the
         // whole orb↔field morph off `morphModel.progress`.
         panel.contentView = NSHostingView(
-            rootView: GlassRootView(session: session, controller: self, morphModel: morph, fluidModel: fluidModel)
+            rootView: GlassRootView(
+                session: session, controller: self, morphModel: morph,
+                fluidModel: fluidModel, adapter: fieldAdapter
+            )
         )
     }
 
