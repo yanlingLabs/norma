@@ -26,7 +26,66 @@ final class FluidModel: ObservableObject {
     /// Deliberately NOT `@Published`: `FluidOrbView.step` is the sole reader, and it already reads
     /// `sim` fresh every tick of its own — there is no view left to invalidate by publishing this
     /// too, only wasted Combine traffic on every follower tick (up to 120/s).
-    var acceleration: CGVector = .zero
+    ///
+    /// Final-review Important-2 (D9 settled-tick freeze, unpause path (b)): this `didSet` is the
+    /// ONE exception to "nobody publishes off this" — while `FluidOrbView`'s tick is paused
+    /// (`isPausedForTick == true`, set by the view itself, see `FluidOrbView.body`), a fresh kick
+    /// above `fluidPauseAccelThreshold` needs to wake the (non-ticking) view back up somehow, and
+    /// the view can't poll a non-`@Published` var while paused (nothing re-invokes it). `wasExcited`
+    /// edge-detects so this only trips `excitationPulse` on the calm→excited transition, never on
+    /// every one of the up to 120 ticks/sec a sustained motion burst spans — preserving the whole
+    /// point of `acceleration` being unpublished (avoiding 120Hz `@Published` traffic) for the
+    /// overwhelmingly common case (tick NOT paused, i.e. actively animating already).
+    var acceleration: CGVector = .zero {
+        didSet {
+            guard isPausedForTick else { wasExcited = false; return }
+            let magnitude = hypot(acceleration.dx, acceleration.dy)
+            let excited = magnitude > fluidPauseAccelThreshold
+            if excited && !wasExcited {
+                excitationPulse += 1
+            }
+            wasExcited = excited
+        }
+    }
+
+    /// Mirrors whether `FluidOrbView`'s `TimelineView` tick is currently paused — written by the
+    /// view itself (`.onChange(of: paused)`) every time its local `@State paused` flips. Plain
+    /// ivar, not `@Published`: nothing needs to react to this changing on its own, it only gates
+    /// whether `acceleration`'s `didSet` above is worth doing any work at all.
+    var isPausedForTick: Bool = false
+
+    /// Edge-detection memory for `acceleration`'s `didSet` — see its doc.
+    private var wasExcited = false
+
+    /// Final-review Important-2 (D9 settled-tick freeze, unpause path (b)): a trip wire, not a
+    /// value — `FluidOrbView` (already `@ObservedObject`-observing this model for `sim`) reacts to
+    /// this incrementing by clearing its own `paused` state. An `Int` counter (not a `Bool`
+    /// toggle) so two rapid pulses can never coalesce into a single `onChange` firing (SwiftUI's
+    /// `.onChange` only fires on an actual value change; a `Bool` flipped true→false→true within
+    /// one render pass could in principle collapse to a no-op diff, an `Int` that only ever
+    /// increments cannot).
+    @Published var excitationPulse: Int = 0
+}
+
+/// Final-review Important-2 (D9 settled-tick freeze): acceleration magnitude (pt/s²) below which
+/// the cursor counts as "calm" for the pause/unpause decision — shared by `shouldPauseFluidTick`
+/// and `FluidModel.acceleration`'s `didSet` so the two can never disagree about what "calm" means.
+/// Well below the ~600-5000 magnitudes `FluidSimTests` uses to excite waves/tilt, so a genuinely
+/// still cursor pauses while a slow deliberate drift still counts as motion.
+let fluidPauseAccelThreshold: Double = 5.0
+
+/// PURE extraction (final-review Important-2/D9 fix) of the settled-tick-freeze decision — no
+/// SwiftUI `@State`, no view lifecycle, so the logic has direct unit coverage
+/// (`FluidTickPauseTests`). Pausing requires ALL of: the fluid is currently HOLDING work between
+/// turns (`isHeld` — never true for `.unread`'s synthetic breathing or an actively-`turnRunning`
+/// working fill, both of which must keep animating regardless of how calm/settled they look, see
+/// `FieldStateAdapter.isHoldingWork`'s doc), the sim has actually settled to `targetLevel`
+/// (`FluidSim.isSettled`), and the cursor is calm (`accelMagnitude` below `threshold` — a moving
+/// cursor's tilt/wave excitation would un-settle the sim again on the very next real step, so
+/// pausing while still excited would visibly freeze a moving bubble mid-motion).
+func shouldPauseFluidTick(sim: FluidSim, targetLevel: Double, isHeld: Bool, accelMagnitude: Double, threshold: Double = fluidPauseAccelThreshold) -> Bool {
+    guard isHeld, accelMagnitude < threshold else { return false }
+    return sim.isSettled(targetLevel: targetLevel)
 }
 
 /// Task 3 (fluid orb): the liquid rendered inside the orb bubble — a `Canvas`-drawn fill whose
@@ -64,11 +123,28 @@ struct FluidOrbView: View {
     /// what `state`/`tint` would otherwise say — a 2s muted beat confirming the Esc-interrupt was
     /// received (`FieldStateAdapter.showStoppedFlash`'s doc). Deliberately checked ONLY inside
     /// `tint` below, never inside `lastTint`'s `.onChange(of: state)` tracker — that tracker keeps
-    /// following the REAL state the whole time, so the instant this flag clears (2s later, or on
-    /// the next `turn_started`), `tint` falls straight back to whatever `state` actually is
-    /// (holding-blue if tasks are still incomplete, amber if unread, or draining) with no stale
-    /// slate residue.
+    /// following the REAL state the whole time, so the instant this flag clears — 2s later, OR on
+    /// the next `turn_started` (final-review fix: `FieldStateAdapter`'s `session.$state` sink now
+    /// force-clears `showStoppedFlash` the moment `turnRunning` flips true, so an Esc-then-resubmit
+    /// within the 2s window can't leave this flag stuck true over a live, working orb) — `tint`
+    /// falls straight back to whatever `state` actually is (holding-blue if tasks are still
+    /// incomplete, amber if unread, or draining) with no stale slate residue.
     let isStoppedFlash: Bool
+
+    /// Final-review Important-2 (D9 settled-tick freeze): true when the fluid is holding its
+    /// level between turns (`FieldStateAdapter.isHoldingWork`'s doc) — the ONLY state `paused`
+    /// below is ever allowed to go true for; `.unread`'s synthetic breathing and an actively-
+    /// `turnRunning` working fill must always keep ticking regardless of how calm/settled they
+    /// momentarily look, so `shouldPauseFluidTick` gates on this first.
+    let isHeld: Bool
+
+    /// Final-review Important-2 (D9 settled-tick freeze): true once the held sim has settled AND
+    /// the cursor is calm — while true, `TimelineView` below stops scheduling frames entirely
+    /// (`paused:` binding), which is what actually stops the redraw-forever violation (merely
+    /// deciding NOT to call `step` would still cost a `Canvas` re-render every frame; pausing the
+    /// schedule itself costs zero). See `shouldPauseFluidTick` (set from `step(at:)`) for the
+    /// pause decision, and `body`'s `.onChange` handlers below for every unpause path.
+    @State private var paused = false
 
     /// Norma blue — the working tint (task-level fill while a turn is running). A literal,
     /// undistorted color: this view renders OUTSIDE `GlassForegroundLegibility`'s difference
@@ -106,7 +182,7 @@ struct FluidOrbView: View {
     @State private var lastTick: Date?
 
     var body: some View {
-        TimelineView(.animation) { timeline in
+        TimelineView(.animation(minimumInterval: nil, paused: paused)) { timeline in
             Canvas { ctx, size in
                 let sim = fluid.sim
                 let r = min(size.width, size.height) / 2
@@ -144,6 +220,27 @@ struct FluidOrbView: View {
             if let active = Self.activeTint(for: newState) {
                 lastTint = active
             }
+        }
+        // Final-review Important-2, UNPAUSE path (a): `state` changing means the slot re-rendered
+        // on an adapter publish — e.g. a task finished (level target moved), the turn resumed
+        // (`isHeld` about to flip false), or the reply became unread. Any of those invalidates
+        // whatever settled/calm reading justified the current pause, so unconditionally clear it
+        // and let `step` re-earn the pause on its own next tick if it's still warranted.
+        .onChange(of: state) { _, _ in
+            paused = false
+        }
+        // UNPAUSE path (b), half 1: mirror `paused` onto the model so its `acceleration.didSet`
+        // (the other half, in `FluidModel`) knows whether tripping `excitationPulse` is even
+        // worth doing right now.
+        .onChange(of: paused) { _, newValue in
+            fluid.isPausedForTick = newValue
+        }
+        // UNPAUSE path (b), half 2: a fresh kick while paused trips `excitationPulse` (see
+        // `FluidModel.acceleration`'s `didSet`) — clear `paused` in response so the next real
+        // frame resumes ticking. `fluid` is already `@ObservedObject`, so this `@Published`
+        // increment is the only thing that can wake a paused view without polling.
+        .onChange(of: fluid.excitationPulse) { _, _ in
+            paused = false
         }
         .clipShape(Circle())
         .allowsHitTesting(false)
@@ -187,6 +284,16 @@ struct FluidOrbView: View {
         }
         fluid.sim = fluid.sim.step(dt: dt, acceleration: acceleration, targetLevel: target)
         OrbDebug.log("FluidOrbView.step dt=\(String(format: "%.4f", dt)) level=\(String(format: "%.3f", fluid.sim.level)) target=\(String(format: "%.2f", target))")
+
+        // Final-review Important-2 (D9 settled-tick freeze): decide AFTER this tick's step, using
+        // the fresh sim state it just produced — `fluid.acceleration` (the raw tracking-spring
+        // tap, not the `.unread` branch's synthetic wobble local var above) is the same signal
+        // `FluidModel.acceleration`'s `didSet` watches for the unpause kick, so pause/unpause agree
+        // on what "calm" means.
+        let accelMagnitude = hypot(fluid.acceleration.dx, fluid.acceleration.dy)
+        if shouldPauseFluidTick(sim: fluid.sim, targetLevel: target, isHeld: isHeld, accelMagnitude: accelMagnitude) {
+            paused = true
+        }
     }
 }
 
@@ -204,6 +311,13 @@ struct FluidOrbSlot: View {
     /// visibility one; the common case (Esc mid-turn with incomplete tasks) already holds the
     /// fluid visible via `FluidState.working`, which is what actually carries the flash on screen.
     let isStoppedFlash: Bool
+    /// Final-review Important-2: threaded straight through to `FluidOrbView`'s settled-tick pause
+    /// decision — true when the fluid is holding its level between turns
+    /// (`FieldStateAdapter.isHoldingWork`'s doc). This slot's own mount/drain decision below is
+    /// unchanged by it (still driven purely by `state`/fill level) — held-work is itself an
+    /// always-`state != .idle` case, so it was already keeping this view mounted; this flag only
+    /// affects whether the mounted view's tick is allowed to freeze once settled.
+    let isHeld: Bool
 
     var body: some View {
         // `state != .idle`: an active turn or an unread reply — always show. The second clause
@@ -214,7 +328,7 @@ struct FluidOrbSlot: View {
         // tree entirely: no more ticks, no more `@Published` writes, truly quiescent (D9) until
         // the next `.working`/`.unread`.
         if state != .idle || fluid.sim.level > 0.01 {
-            FluidOrbView(fluid: fluid, state: state, isStoppedFlash: isStoppedFlash)
+            FluidOrbView(fluid: fluid, state: state, isStoppedFlash: isStoppedFlash, isHeld: isHeld)
         } else {
             EmptyView()
         }

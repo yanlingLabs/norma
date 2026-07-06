@@ -51,6 +51,21 @@ final class FieldStateAdapter: ObservableObject {
                 if newState.turnRunning {
                     let c = newState.taskCounts
                     self.lastWorkingLevel = c.total > 0 ? Double(c.done) / Double(c.total) : 0.5
+                    // Final-review fix (IMPORTANT-1): a turn_started-driven turnRunning=true must
+                    // clear any still-pending stopped-flash immediately — without this, Esc'ing a
+                    // turn then resubmitting within the 2s auto-clear window renders "⏹ stopped" +
+                    // the slate flash tint OVER a live, working orb (false status: the new turn is
+                    // actually running, but the UI still reports the old one as stopped). Cancel
+                    // the pending auto-clear `DispatchWorkItem` too (not just the flag) so it can't
+                    // fire later and redundantly re-clear an already-false flag. Guarded on
+                    // `showStoppedFlash` currently being true so a turn that never flashed doesn't
+                    // take a spurious `@Published` publish on every single state event while
+                    // running (this sink fires on every task/turn event, not just turn_started).
+                    self.stoppedFlashWorkItem?.cancel()
+                    self.stoppedFlashWorkItem = nil
+                    if self.showStoppedFlash {
+                        self.showStoppedFlash = false
+                    }
                 }
                 // Interrupt-feedback gate polish: fire the transient "stopped" flash exactly on
                 // the false→true edge of the pure reducer's `lastTurnAborted` — never on a
@@ -265,12 +280,13 @@ final class FieldStateAdapter: ObservableObject {
     /// holds once `hasUnread` flips true (the task/turn that produced the reply may already be
     /// gone by then: `turnCompleted` clears `turnRunning` before the wave-3 calm-check even marks
     /// the orb unread, see `OrbFollower.isCursorCalm`/`GlassRootView`'s turn-completion handler).
-    /// Updated at READ time inside `fluidState` (simpler than mirroring a `hasUnread` setter
-    /// observer, and just as correct: every `hasUnread` flip is preceded by at least one
-    /// `.working` read while the turn was running, since `NormaFieldView`/`GlassRootView` poll
-    /// `fluidState` continuously while mounted). Defaults to 0.5 — the same "no signal yet" level
-    /// `taskLevel` itself falls back to — so an (unexercised in practice) unread-before-any-work
-    /// edge case still renders a sane mid-fill bubble instead of an arbitrary stale value.
+    /// Updated inside the `session.$state` sink (`init` above) on every state change while
+    /// `turnRunning`, NOT at `fluidState`'s read time — this ensures a fast taskUpdated→
+    /// turnCompleted burst hitting the same render doesn't drop the final level (1.0) because the
+    /// getter never ran between events (see the sink's own doc). Defaults to 0.5 — the same "no
+    /// signal yet" level `taskLevel` itself falls back to — so an (unexercised in practice)
+    /// unread-before-any-work edge case still renders a sane mid-fill bubble instead of an
+    /// arbitrary stale value.
     private var lastWorkingLevel: Double = 0.5
 
     /// Derived, not stored: `hasUnread` wins outright (the reply is waiting, regardless of
@@ -302,6 +318,23 @@ final class FieldStateAdapter: ObservableObject {
             return .working(level: level)
         }
         return .idle
+    }
+
+    /// Final-review Important-2 (D9 settled-tick freeze): true exactly in `fluidState`'s
+    /// "hold" branch above — the fluid is rendering `.working(level)` because tasks remain
+    /// incomplete, NOT because a turn is actively advancing it. Threaded down to
+    /// `FluidOrbSlot`/`FluidOrbView` so the tick loop knows it's safe to freeze once the sim
+    /// settles (a held bubble's target level isn't moving) — MUST be false while `turnRunning`
+    /// (the task-completion fill is actively changing then, see `fluidState`'s own `.working`
+    /// branch) and MUST be false for `.unread`/`.idle` (the synthetic breathing and drain
+    /// animations both need to keep ticking; see `FluidOrbView.step`'s `.unread` wobble and the
+    /// `.idle` drain-to-zero target). Computed, not stored — same convention as `fluidState`
+    /// itself, always reflects a live read of `session.state`.
+    var isHoldingWork: Bool {
+        guard !hasUnread else { return false }
+        let s = session.state
+        let counts = s.taskCounts
+        return !s.turnRunning && counts.total > 0 && counts.done < counts.total
     }
 
     // MARK: - Callbacks (task B wires real behavior)

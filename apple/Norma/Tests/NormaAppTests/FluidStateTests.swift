@@ -84,4 +84,37 @@ final class FluidStateTests: XCTestCase {
         a.hasUnread = true
         XCTAssertEqual(a.fluidState, .unread(level: 1.0))
     }
+
+    // MARK: - Final-review Important-2 (D9 settled-tick freeze): `isHoldingWork`
+
+    func testIsHoldingWorkTrueOnlyWhenTurnEndedWithIncompleteTasks() {
+        let session = SessionModel()
+        let a = FieldStateAdapter(session: session)
+        session.applyForTesting { s in
+            s.turnRunning = true
+            s.tasks = [TaskItem(id: "1", subject: "a", status: "completed"),
+                       TaskItem(id: "2", subject: "b", status: "in_progress")]
+        }
+        XCTAssertFalse(a.isHoldingWork, "must be false while the turn is actively running")
+        session.applyForTesting { s in s.turnRunning = false }
+        XCTAssertTrue(a.isHoldingWork, "must be true once the turn ends with work remaining")
+    }
+
+    func testIsHoldingWorkFalseWhenUnread() {
+        let session = SessionModel()
+        let a = FieldStateAdapter(session: session)
+        session.applyForTesting { s in
+            s.turnRunning = true
+            s.tasks = [TaskItem(id: "1", subject: "a", status: "in_progress")]
+        }
+        session.applyForTesting { s in s.turnRunning = false }
+        XCTAssertTrue(a.isHoldingWork)
+        a.hasUnread = true
+        XCTAssertFalse(a.isHoldingWork, "unread must win outright — its own synthetic breathing must never freeze")
+    }
+
+    func testIsHoldingWorkFalseWhenTrulyIdle() {
+        let a = FieldStateAdapter(session: SessionModel())
+        XCTAssertFalse(a.isHoldingWork)
+    }
 }

@@ -107,4 +107,26 @@ struct FluidSim: Equatable {
     private static func clamp(_ value: Double, min minVal: Double, max maxVal: Double) -> Double {
         return max(minVal, min(value, maxVal))
     }
+
+    /// Final-review Important-2 (D9 settled-tick freeze): true once the sim has visually stopped
+    /// moving toward `targetLevel` — no wave excitation, no tilt (or tilt spring motion), and the
+    /// level has converged close enough that continuing to redraw would be indistinguishable from
+    /// holding still. PURE — a plain read of this struct's own fields, no wall-clock/view state.
+    ///
+    /// Tolerances are tuned against `kLevelLerpRate`'s own asymptote: `level` only ever lerps a
+    /// fraction of the remaining distance toward `targetLevel` each step (`step(dt:)`'s last line),
+    /// so it geometrically approaches but never exactly equals the target — `0.002` is generous
+    /// enough that real convergence still trips this (see `FluidSimTests` settle timing) while
+    /// staying tight enough that a genuine in-flight drain/fill (which starts at 0.5-1.0 magnitude
+    /// away from target) reads as NOT settled for the vast majority of its travel, not just its
+    /// final few percent. `waveAmplitude`/`tilt`/`tiltVelocity` thresholds are similarly generous
+    /// versus their own decay/spring dynamics (`kWaveDecay`, `kTiltStiffness`/`kTiltDamping`) —
+    /// see `FluidSimTests.testSettlesFromMotion`/`testNeverSettlesWhileExcited` for the numbers
+    /// this was tuned against.
+    func isSettled(targetLevel: Double) -> Bool {
+        waveAmplitude < 0.001
+            && abs(tilt) < 0.005
+            && abs(tiltVelocity) < 0.01
+            && abs(level - targetLevel) < 0.002
+    }
 }

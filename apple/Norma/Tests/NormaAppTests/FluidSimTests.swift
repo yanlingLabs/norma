@@ -42,4 +42,35 @@ final class FluidSimTests: XCTestCase {
         for _ in 0..<600 { s = s.step(dt: 1.0/60.0, acceleration: CGVector(dx: 5000, dy: 0), targetLevel: 0.5) }
         XCTAssertLessThanOrEqual(abs(s.tilt), 0.5 + 1e-9) // never past kMaxTilt, even mid-overshoot regime
     }
+
+    // MARK: - Final-review Important-2 (D9 settled-tick freeze): `isSettled(targetLevel:)`
+
+    func testSettlesFromMotionOnceCalm() {
+        var s = FluidSim.rest
+        for _ in 0..<30 { s = s.step(dt: 1.0/60.0, acceleration: CGVector(dx: 800, dy: 0), targetLevel: 0.5) }
+        XCTAssertFalse(s.isSettled(targetLevel: 0.5), "excited motion must never read as settled")
+        for _ in 0..<600 { s = s.step(dt: 1.0/60.0, acceleration: .zero, targetLevel: 0.5) }
+        XCTAssertTrue(s.isSettled(targetLevel: 0.5), "calm + converged tilt/wave/level must read as settled")
+    }
+
+    func testNeverSettlesUnderSustainedExcitement() {
+        var s = FluidSim.rest
+        for _ in 0..<600 { s = s.step(dt: 1.0/60.0, acceleration: CGVector(dx: 600, dy: 300), targetLevel: 0.5) }
+        XCTAssertFalse(s.isSettled(targetLevel: 0.5), "sustained motion (real drag/fill in flight) must never read as settled")
+    }
+
+    func testDrainToNewTargetEventuallySettles() {
+        var s = FluidSim.rest
+        for _ in 0..<300 { s = s.step(dt: 1.0/60.0, acceleration: .zero, targetLevel: 1.0) } // fill to 1.0 first
+        XCTAssertTrue(s.isSettled(targetLevel: 1.0))
+        for _ in 0..<600 { s = s.step(dt: 1.0/60.0, acceleration: .zero, targetLevel: 0.0) } // calm drain to 0
+        XCTAssertTrue(s.isSettled(targetLevel: 0.0), "a calm drain must settle at its NEW target, not stay stuck reading the old one")
+    }
+
+    func testNotSettledMidwayThroughADrain() {
+        var s = FluidSim.rest
+        for _ in 0..<300 { s = s.step(dt: 1.0/60.0, acceleration: .zero, targetLevel: 1.0) }
+        s = s.step(dt: 1.0/60.0, acceleration: .zero, targetLevel: 0.0) // one step into the drain
+        XCTAssertFalse(s.isSettled(targetLevel: 0.0), "must not report settled while still most of the way from the target — no early freeze")
+    }
 }

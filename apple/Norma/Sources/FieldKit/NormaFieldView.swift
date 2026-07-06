@@ -344,7 +344,7 @@ struct NormaFieldView: View {
             // itself on progress too was considered and rejected — mount stays driven purely by
             // fluidState/level (`FluidOrbSlot`'s own doc) so drain-visibility doesn't depend on
             // which surface happens to be showing.
-            FluidOrbSlot(fluid: fluid, state: adapter.fluidState, isStoppedFlash: adapter.showStoppedFlash)
+            FluidOrbSlot(fluid: fluid, state: adapter.fluidState, isStoppedFlash: adapter.showStoppedFlash, isHeld: adapter.isHoldingWork)
                 .frame(width: morph.orbBubbleSize, height: morph.orbBubbleSize)
                 .position(x: collapsedCenter.x, y: collapsedCenter.y)
                 .opacity(1 - smoothstep(0.0, 0.28, morph.progress))
