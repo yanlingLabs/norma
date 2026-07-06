@@ -285,7 +285,7 @@ enum SessionReducer {
         case "task_create", "task_update":
             guard let subject = obj["subject"] as? String, !subject.isEmpty else { return nil }
             return subject
-        case "read", "write", "edit", "glob", "grep":
+        case "read", "write", "edit", "glob", "grep", "ls":
             if let path = obj["file_path"] as? String, !path.isEmpty { return path }
             if let path = obj["path"] as? String, !path.isEmpty { return path }
             if let pattern = obj["pattern"] as? String, !pattern.isEmpty { return pattern }
