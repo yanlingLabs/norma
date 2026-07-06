@@ -141,6 +141,10 @@ struct WindowSurfaceView: View {
             TranscriptView(adapter: adapter, tint: Color(red: 0.45, green: 0.75, blue: 1.0))
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
+            if !adapter.pinnedTasks.isEmpty {
+                pinnedTasksSection(adapter.pinnedTasks)
+            }
+
             if let queued = adapter.queuedText {
                 Text(queued).font(.system(size: 11)).foregroundStyle(.tertiary)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -156,6 +160,41 @@ struct WindowSurfaceView: View {
         .padding(.horizontal, 16)
         .padding(.top, 14)
         .padding(.bottom, 16)
+    }
+
+    /// LIVE-GATE G4: the compact "what's left" list — up to 5 rows of `☐`/`◐`/`☑` + subject, with
+    /// a "+N more" tail when there are more than 5. Hidden entirely when `adapter.pinnedTasks` is
+    /// empty (the caller in `windowContent` already gates on that), so this is pure rendering, no
+    /// further emptiness logic here.
+    @ViewBuilder
+    private func pinnedTasksSection(_ tasks: [TaskItem]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Divider().opacity(0.5)
+            ForEach(Array(tasks.prefix(5).enumerated()), id: \.offset) { _, task in
+                HStack(spacing: 6) {
+                    Text(pinnedTaskGlyph(task.status))
+                    Text(task.subject)
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(task.status == "in_progress" ? .secondary : .tertiary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            }
+            if tasks.count > 5 {
+                Text("+\(tasks.count - 5) more")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func pinnedTaskGlyph(_ status: String) -> String {
+        switch status {
+        case "in_progress": return "◐"
+        case "completed": return "☑"
+        default: return "☐" // pending, or any unrecognized status
+        }
     }
 }
 

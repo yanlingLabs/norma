@@ -14,7 +14,14 @@ struct TaskItem: Equatable {
 /// a turn's activity without re-deriving it from the flat event log; tasks 3/4 render these.
 struct ActivityItem: Equatable {
     enum Kind: Equatable {
-        case tool(name: String)
+        /// `detail` (LIVE-GATE G3) is a short, tool-specific hint extracted from the tool call's
+        /// `argsJson` by `SessionReducer.extractToolDetail` — the bash command's first line, a
+        /// task subject, or a file path/pattern, depending on `name`. `nil` for tools with no
+        /// recognized detail field, or when `argsJson` fails to parse (defensive: malformed/
+        /// missing JSON never throws, it just yields no detail). Consumed by the transcript's
+        /// grouped tool rows (`groupActivity`/`toolGroupLabel` in ChatContent) for the expandable
+        /// per-call detail lines — never by `activityGlyphAndLabel`'s single-item fallback path.
+        case tool(name: String, detail: String?)
         case task(subject: String, status: String)
         case subagent(agentType: String)
         case subagentDone
@@ -118,7 +125,7 @@ enum SessionReducer {
             s.lastTurnAborted = false // a fresh turn clears any prior interrupt flag
         case .toolCall(let v) where v.threadId == mainThread:
             if s.pendingApprovalIds.isEmpty { s.status = .toolRunning(name: v.name) }
-            appendActivity(.tool(name: v.name), to: &s)
+            appendActivity(.tool(name: v.name, detail: extractToolDetail(name: v.name, argsJson: v.argsJson)), to: &s)
         case .toolResult(let v) where v.threadId == mainThread:
             if s.pendingApprovalIds.isEmpty { s.status = .thinking }
         case .approvalRequested(let v) where v.threadId == mainThread:
@@ -237,15 +244,54 @@ enum SessionReducer {
     }
 
     /// Appends to the exchange currently being built. Transcript capture is MAIN-thread only
-    /// and defensive: no open exchange → drop. Adjacent duplicates collapse. Capped at 200
-    /// (drop-oldest) so a marathon turn can't balloon memory (spec §1).
+    /// and defensive: no open exchange → drop. Adjacent duplicates collapse — EXCEPT `.tool`
+    /// (LIVE-GATE G3): every tool call is now its own item, even back-to-back calls to the same
+    /// tool, so the transcript can show an accurate per-call count/detail list (grouping into
+    /// "Ran N shell commands" etc. is the VIEW's job, `groupActivity` in ChatContent, not the
+    /// reducer's). Capped at 200 (drop-oldest) so a marathon turn can't balloon memory (spec §1).
     private static func appendActivity(_ kind: ActivityItem.Kind, to state: inout OrbSessionState) {
         guard !state.exchanges.isEmpty else { return }
         let last = state.exchanges.count - 1
-        if state.exchanges[last].activity.last?.kind == kind { return }
+        if case .tool = kind {
+            // no adjacent-dupe collapse — see doc comment above.
+        } else if state.exchanges[last].activity.last?.kind == kind {
+            return
+        }
         state.exchanges[last].activity.append(ActivityItem(kind: kind))
         if state.exchanges[last].activity.count > 200 {
             state.exchanges[last].activity.removeFirst(state.exchanges[last].activity.count - 200)
+        }
+    }
+
+    /// LIVE-GATE G3: a short, tool-specific hint pulled from the tool call's raw `argsJson` —
+    /// pure JSON parsing, no throwing (malformed/missing JSON, or a field of the wrong type,
+    /// all fall through to `nil`; this must never crash the reducer). `bash` → the command's
+    /// first line, clipped to 100 chars (long heredocs/scripts stay one line). `task_create`/
+    /// `task_update` → the task's `subject`. `read`/`write`/`edit`/`glob`/`grep` → whichever of
+    /// `file_path`/`path`/`pattern` is present (different tools use different field names for
+    /// "the thing this call touched"). Anything else → `nil` — not every tool has a useful
+    /// one-line summary, and that's fine, the group just renders with no detail lines.
+    private static func extractToolDetail(name: String, argsJson: String) -> String? {
+        guard let data = argsJson.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        switch name {
+        case "bash":
+            guard let command = obj["command"] as? String, !command.isEmpty else { return nil }
+            let firstLine = command.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+                .first.map(String.init) ?? command
+            return String(firstLine.prefix(100))
+        case "task_create", "task_update":
+            guard let subject = obj["subject"] as? String, !subject.isEmpty else { return nil }
+            return subject
+        case "read", "write", "edit", "glob", "grep":
+            if let path = obj["file_path"] as? String, !path.isEmpty { return path }
+            if let path = obj["path"] as? String, !path.isEmpty { return path }
+            if let pattern = obj["pattern"] as? String, !pattern.isEmpty { return pattern }
+            return nil
+        default:
+            return nil
         }
     }
 

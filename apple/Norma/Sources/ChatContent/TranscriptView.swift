@@ -18,8 +18,12 @@ struct TranscriptView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
                     ForEach(Array(adapter.transcript.enumerated()), id: \.offset) { index, exchange in
-                        exchangeRows(exchange, isLast: index == adapter.transcript.count - 1)
-                            .id(index)
+                        TranscriptExchangeRow(
+                            exchange: exchange,
+                            streamingText: index == adapter.transcript.count - 1 ? adapter.liveStreamingText : nil,
+                            tint: tint
+                        )
+                        .id(index)
                     }
                 }
                 .padding(.vertical, 4)
@@ -61,26 +65,6 @@ struct TranscriptView: View {
         .padding(8)
     }
 
-    @ViewBuilder
-    private func exchangeRows(_ exchange: Exchange, isLast: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if !exchange.prompt.isEmpty {
-                TranscriptUserBubble(text: exchange.prompt, tint: tint)
-            }
-            ForEach(Array(exchange.activity.enumerated()), id: \.offset) { _, item in
-                TranscriptActivityRow(item: item)
-            }
-            // v1's synthetic-trailing-stream mechanism: while streaming, the LAST exchange
-            // renders the growing partial as its reply.
-            if isLast, let streaming = adapter.liveStreamingText {
-                TranscriptAssistantMessage(text: streaming, isStreaming: true)
-            } else if !exchange.reply.isEmpty {
-                TranscriptAssistantMessage(text: exchange.reply, isStreaming: false)
-            }
-            if exchange.aborted { TranscriptStoppedRow() }
-        }
-    }
-
     private func follow(_ proxy: ScrollViewProxy) {
         if shouldAutoscroll(nearBottom: nearBottom, contentGrew: true) {
             scrollToBottom(proxy)
@@ -93,5 +77,55 @@ struct TranscriptView: View {
         let last = adapter.transcript.count - 1
         guard last >= 0 else { return }
         withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(last, anchor: .bottom) }
+    }
+}
+
+/// One exchange's rows — prompt bubble, GROUPED activity (LIVE-GATE G3: `groupActivity` merges
+/// consecutive same-name tool calls, skips `.task` entirely), reply/streaming, stopped flag. A
+/// dedicated `View` (not a `@ViewBuilder` func on `TranscriptView`) because it owns its own
+/// expansion `@State` — which group indices are expanded — scoped per-exchange-row and reset on
+/// view recycle (fine: expansion is a transient reading aid, not persisted state).
+private struct TranscriptExchangeRow: View {
+    let exchange: Exchange
+    /// Non-nil only for the LAST exchange while a reply is actively streaming (v1's synthetic
+    /// trailing-stream mechanism) — `TranscriptView.body` computes this per-index so this view
+    /// stays a pure function of its own inputs.
+    let streamingText: String?
+    let tint: Color
+
+    @State private var expandedGroups: Set<Int> = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if !exchange.prompt.isEmpty {
+                TranscriptUserBubble(text: exchange.prompt, tint: tint)
+            }
+            ForEach(Array(groupActivity(exchange.activity).enumerated()), id: \.offset) { index, group in
+                switch group {
+                case .tools(let name, let count, let details):
+                    TranscriptToolGroupRow(
+                        name: name, count: count, details: details,
+                        isExpanded: expandedGroups.contains(index),
+                        toggle: { toggle(index) }
+                    )
+                case .single(let item):
+                    TranscriptActivityRow(item: item)
+                }
+            }
+            if let streamingText {
+                TranscriptAssistantMessage(text: streamingText, isStreaming: true)
+            } else if !exchange.reply.isEmpty {
+                TranscriptAssistantMessage(text: exchange.reply, isStreaming: false)
+            }
+            if exchange.aborted { TranscriptStoppedRow() }
+        }
+    }
+
+    private func toggle(_ index: Int) {
+        if expandedGroups.contains(index) {
+            expandedGroups.remove(index)
+        } else {
+            expandedGroups.insert(index)
+        }
     }
 }

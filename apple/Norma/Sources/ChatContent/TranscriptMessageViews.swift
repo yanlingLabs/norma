@@ -10,7 +10,11 @@ import SwiftUI
 /// No `.drawingGroup()` (v1 LAW) and no `repeatForever` animation anywhere below — this content
 /// renders under the morph's scale/blur/opacity bands.
 
-/// The user's own message — right-aligned tinted bubble, donor `ChatMessageBubble`'s `isUser` branch.
+/// The user's own message — right-aligned bubble, donor `ChatMessageBubble`'s `isUser` branch.
+/// LIVE-GATE G1: the surface itself is now a plain `.ultraThinMaterial` (matches the rest of the
+/// window chrome) instead of a tinted fill/border — `tint` is kept in the signature (callers
+/// unchanged) and still forwarded to `TranscriptFormattedMessageText` for inline markdown accents
+/// (bullets/quote rule/headings), it's just no longer used to paint the bubble surface.
 struct TranscriptUserBubble: View {
     let text: String
     let tint: Color
@@ -31,22 +35,11 @@ struct TranscriptUserBubble: View {
 
     private var content: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("You")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
-
             TranscriptFormattedMessageText(text: displayText, tint: tint, fillsAvailableWidth: false)
                 .foregroundStyle(.primary)
         }
         .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(tint.opacity(0.12))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .strokeBorder(tint.opacity(0.55), lineWidth: 0.5)
-        )
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 }
 
@@ -66,10 +59,6 @@ struct TranscriptAssistantMessage: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             VStack(alignment: .leading, spacing: 6) {
-                Text("Norma")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.secondary)
-
                 TranscriptFormattedMessageText(text: displayText, tint: .accentColor, fillsAvailableWidth: true)
                     .foregroundStyle(.primary)
             }
@@ -357,11 +346,14 @@ private func transcriptCopyForeground(isHovering: Bool, didCopy: Bool) -> Color 
 
 /// Pure glyph/label mapper for one `ActivityItem` — no view/environment dependency so it's
 /// directly unit-testable (`ActivityRowTests`). Kept exhaustive over `ActivityItem.Kind` so a
-/// future case is a compile error here, not a silent blank row.
+/// future case is a compile error here, not a silent blank row. In practice `.tool` items never
+/// reach this mapper anymore (LIVE-GATE G3): `groupActivity` always folds them into `.tools`
+/// groups rendered by `TranscriptToolGroupRow`, never `.single` — this branch stays only for
+/// exhaustiveness/defensiveness and direct unit testing.
 func activityGlyphAndLabel(_ item: ActivityItem) -> (glyph: String, label: String) {
     switch item.kind {
-    case .tool(let name):
-        return ("⚙", name)
+    case .tool(let name, let detail):
+        return ("⚙", detail.map { "\(name): \($0)" } ?? name)
     case .task(let subject, let status):
         return (taskGlyph(for: status), subject)
     case .subagent(let agentType):
@@ -414,5 +406,128 @@ struct TranscriptStoppedRow: View {
         .foregroundStyle(.tertiary)
         .lineLimit(1)
         .truncationMode(.middle)
+    }
+}
+
+// MARK: - Grouped tool lines (LIVE-GATE G3)
+
+/// One row's worth of rendered activity, AFTER grouping consecutive same-name tool calls — the
+/// transcript renders `[ActivityGroup]` (via `groupActivity` below), never the raw
+/// `[ActivityItem]` directly, so a 30-call bash loop reads as one "Ran 30 shell commands" line
+/// instead of 30 separate rows.
+enum ActivityGroup: Equatable {
+    case tools(name: String, count: Int, details: [String])
+    case single(ActivityItem)
+}
+
+/// Pure grouping logic — no view/environment dependency, directly unit-testable. Consecutive
+/// `.tool` items with the SAME name merge into one `.tools` group (its `details` array collects
+/// only the non-nil `detail` strings, in order — a group can have fewer details than `count` when
+/// some calls had no extractable detail). `.task` items are SKIPPED ENTIRELY here, deliberately:
+/// live task state now lives in the pinned incomplete-tasks section (LIVE-GATE G4,
+/// `FieldStateAdapter.pinnedTasks`), and the task_create/task_update TOOL CALLS themselves already
+/// read as "Created N tasks"/"Updated N tasks" via their own `.tool` activity — showing the same
+/// transition a third time (raw task-status line) would be redundant clutter. Every other kind
+/// (subagent/subagentDone/worktree/interaction) passes through unchanged as `.single` AND breaks
+/// any tool run in progress — a bash call after an interaction starts a fresh group rather than
+/// merging across it, so the grouping reflects the actual chronological interleaving.
+func groupActivity(_ items: [ActivityItem]) -> [ActivityGroup] {
+    var groups: [ActivityGroup] = []
+    for item in items {
+        switch item.kind {
+        case .task:
+            continue // deliberate — see doc comment above
+        case .tool(let name, let detail):
+            if case .tools(let lastName, let count, var details) = groups.last, lastName == name {
+                if let detail { details.append(detail) }
+                groups[groups.count - 1] = .tools(name: name, count: count + 1, details: details)
+            } else {
+                groups.append(.tools(name: name, count: 1, details: detail.map { [$0] } ?? []))
+            }
+        default:
+            groups.append(.single(item))
+        }
+    }
+    return groups
+}
+
+/// Pure label composer for a `.tools` group — natural verbs, singular/plural, matching the
+/// brief's exact vocabulary. Any tool name not explicitly listed (future tools, `mcp__*` server
+/// tools, etc.) falls back to "Used a tool"/"Used N tools" rather than a blank or raw tool name.
+func toolGroupLabel(name: String, count: Int) -> String {
+    switch name {
+    case "bash":
+        return count == 1 ? "Ran a shell command" : "Ran \(count) shell commands"
+    case "task_create":
+        return count == 1 ? "Created a task" : "Created \(count) tasks"
+    case "task_update":
+        return count == 1 ? "Updated a task" : "Updated \(count) tasks"
+    case "task_list":
+        return "Checked tasks"
+    case "read":
+        return count == 1 ? "Read a file" : "Read \(count) files"
+    case "write":
+        return count == 1 ? "Wrote a file" : "Wrote \(count) files"
+    case "edit":
+        return count == 1 ? "Made an edit" : "Made \(count) edits"
+    case "glob", "grep":
+        return count == 1 ? "Searched" : "Searched \(count) times"
+    case "ToolSearch":
+        return count == 1 ? "Loaded a tool" : "Loaded \(count) tools"
+    case "Skill":
+        return count == 1 ? "Loaded a skill" : "Loaded \(count) skills"
+    case "ask_user":
+        return count == 1 ? "Asked a question" : "Asked \(count) questions"
+    case "exit_plan_mode":
+        return count == 1 ? "Presented a plan" : "Presented \(count) plans"
+    case "request_directory":
+        return count == 1 ? "Requested a directory" : "Requested \(count) directories"
+    default:
+        return count == 1 ? "Used a tool" : "Used \(count) tools"
+    }
+}
+
+/// A grouped run of consecutive same-name tool calls — renders the natural-language label at the
+/// same 11pt `.tertiary` style as `TranscriptActivityRow`, with a `chevron.right` that rotates 90°
+/// when expanded to reveal each call's own detail line (tool name + detail, monospaced, indented,
+/// single-line middle-truncated). Expansion is driven entirely by the parent (per-exchange local
+/// `@State`, see `TranscriptView`'s exchange row) — this view is stateless itself.
+struct TranscriptToolGroupRow: View {
+    let name: String
+    let count: Int
+    let details: [String]
+    let isExpanded: Bool
+    let toggle: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Button(action: toggle) {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .frame(width: 10)
+                    Text(toolGroupLabel(name: name, count: count))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 11))
+            .foregroundStyle(.tertiary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+
+            if isExpanded {
+                ForEach(Array(details.enumerated()), id: \.offset) { _, detail in
+                    Text("\(name) \(detail)")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .padding(.leading, 16)
+                }
+            }
+        }
+        .animation(.easeOut(duration: 0.15), value: isExpanded)
     }
 }
