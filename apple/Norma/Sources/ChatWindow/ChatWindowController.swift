@@ -74,29 +74,57 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
     /// Gate fix (F1), generalized by gate r3 (W1) to cover the shrink too: true for the entire
     /// duration of EITHER frame animation (grow or shrink — the initial placement AND every 60Hz
     /// tick that follows), false otherwise. `panel.frameSanitizer` (installed in `show()`) reads
-    /// this to bypass its normal 340×360 size floor while true — the grow's source (and the
-    /// shrink's TARGET) is the COLLAPSED ORB's small panel size (`chatWindowCollapsedSize`,
-    /// mirroring `OrbWindowController.finishCollapse()`'s ~240×140), which the floor would
-    /// otherwise inflate to 340×360, killing the "grows from / shrinks to a tiny circle" effect
-    /// both this fix and W1 exist to restore. Position still gets clamped on-screen throughout
+    /// this to bypass its normal 340×360 size floor while true — the grow's source is the COLLAPSED
+    /// ORB's small panel size (`chatWindowCollapsedSize`, ~240×140), and the shrink's TARGET is the
+    /// even smaller visible orb BUBBLE (`chatWindowOrbBubbleDiameter`, ~20×20 — gate r5), both of
+    /// which the floor would otherwise inflate to 340×360, killing the "grows from / melts into a
+    /// tiny circle" effect this fix and W1/r5 exist to restore. Position still gets clamped on-screen throughout
     /// (see `clampedChatWindowPosition`) — only the size floor is bypassed. Set true right before
     /// each animation's first frame, cleared in `cancelFrameAnimation()` (both directions' natural
     /// t>=1 finish and `close()`'s mid-flight cancel), same lifecycle as `programmaticMove`.
     private var isAnimatingFrame = false
 
-    /// Gate r4 regression seam (window shrink stall fix): the true on-screen frame the close-shrink
-    /// actually REACHED at settle, captured right before teardown. Tests assert this landed at orb
-    /// size (`chatWindowCollapsedSize`, ~240×140) — proving the shrink reaches its target instead of
-    /// stalling. With the window now borderless for life (no titled/toolbar chrome minimum to clamp
-    /// the small frames — the class of bug the r4-draft chrome-strip existed to work around) this
-    /// passes trivially; it stays as a permanent guard against any future chrome/minimum regression.
-    /// nil until a shrink has settled.
+    /// Gate r4 regression seam (window shrink stall fix), gate r5: the true on-screen frame the
+    /// close-shrink actually REACHED at settle, captured right before teardown. Tests assert this
+    /// landed at the visible orb-BUBBLE size (`chatWindowOrbBubbleDiameter`, ~20×20 — gate r5 shrinks
+    /// to the bubble, not the 240×140 panel) — proving the shrink reaches its target instead of
+    /// stalling at a chrome minimum (the r4 defect) or at the big-square panel (the r5 defect). With
+    /// the window borderless for life there is no chrome minimum; this stays as a permanent guard
+    /// against any future chrome/minimum/target regression. nil until a shrink has settled.
     private(set) var lastShrinkSettledFrameForTesting: NSRect?
 
     /// Gate r4 (custom green zoom button): the frame to restore to when the manual zoom toggle is
     /// pressed a second time. nil = not currently zoomed. Kept separate from `rememberedFrame`
     /// (drag memory) on purpose — a zoom is a transient toggle, not a new remembered home.
     private var preZoomFrame: NSRect?
+
+    /// Gate r5 (window melts into the orb): during the close-shrink the live SwiftUI content
+    /// (`ChatWindowRootView` — an 88pt composer, header band, paddings) CANNOT lay out at ~20pt and
+    /// would fight/clip ugly. So at `closeAnimated()` start we render the hosting view to a bitmap
+    /// (`installShrinkSnapshot()`), swap the panel's `contentView` to an `NSImageView` showing it
+    /// (scaled independently on both axes), and animate THAT instead — buttery scaling with zero
+    /// layout-collapse artifacts. Held here so `frameAnimTick()` can ramp its layer's `cornerRadius`
+    /// (16pt → a circle) each frame; nilled in `close()` (torn down with the panel).
+    private var shrinkSnapshotView: NSImageView?
+
+    /// Gate r5 one-shot latch: `onClose` (which re-summons the orb at the cursor) fires EXACTLY once
+    /// per show — EARLY, when the shrink crosses `chatWindowOrbHandoffProgress` (~0.7), so the orb
+    /// rematerializes WHILE the last of the dissolving circle melts over it. The final settle and
+    /// any racing `close()` must NOT re-fire it. Reset in `show()`.
+    private var onCloseFired = false
+
+    /// Gate r5 test seam: the shrink `progress` at the tick `onClose` fired the early orb handoff
+    /// (nil until it fires, and only set on the shrink's 0.7 crossing — NOT on a synchronous
+    /// `close()`). Tests assert this landed in [0.7, 1.0) — i.e. BEFORE the final settle.
+    private(set) var onCloseFiredAtProgressForTesting: Double?
+
+    /// Gate r5 test seam: the shrink snapshot layer's `cornerRadius` at the most recent melt tick.
+    /// Tests assert it ramps to ≈ `chatWindowOrbBubbleDiameter / 2` (a circle) by settle.
+    private(set) var lastShrinkCornerRadiusForTesting: CGFloat = 0
+
+    /// Gate r5 test seam: true once `closeAnimated()`'s content snapshot has replaced the live
+    /// SwiftUI hosting view — i.e. the melt is animating a bitmap, not the collapsing composer.
+    var isShowingShrinkSnapshotForTesting: Bool { panel?.contentView is NSImageView }
 
     /// Spec §4: closing the window restores focus to the previously active app — the same
     /// snapshot/restore type the field uses (see OrbWindowController's `externalFocus`).
@@ -122,6 +150,10 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
     /// path is not expected to be hit by the real UI regardless.
     func show(from sourceFrame: NSRect) {
         guard panel == nil else { return }
+        // Gate r5: fresh show → re-arm the one-shot orb-handoff latch and its test seams.
+        onCloseFired = false
+        onCloseFiredAtProgressForTesting = nil
+        lastShrinkCornerRadiusForTesting = 0
         let screen = NSScreen.screens.first { $0.frame.intersects(sourceFrame) } ?? NSScreen.main
         let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
         let target = chatWindowTargetFrame(
@@ -247,8 +279,22 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         panel.delegate = nil
         panel.orderOut(nil)
         self.panel = nil
+        shrinkSnapshotView = nil // gate r5: melt bitmap dies with the panel
         externalFocus?.restore()
         externalFocus = nil
+        // Gate r5: `onClose` may already have fired at the ~0.7 orb-handoff crossing (the normal
+        // animated path); the settle-driven `close()`, or any racing instant `close()`, must not
+        // re-fire it — the latch keeps it exactly-once-per-show. A synchronous `close()` that beats
+        // the shrink to 0.7 (e.g. `close()` racing `closeAnimated()`) fires it here for the first time.
+        fireOnCloseOnce()
+    }
+
+    /// Gate r5: fire `onClose` at most once per show (the one-shot orb-handoff latch). Called both
+    /// EARLY from `frameAnimTick()` when the shrink crosses `chatWindowOrbHandoffProgress`, and from
+    /// `close()`'s teardown — whichever reaches it first wins; the other is a no-op.
+    private func fireOnCloseOnce() {
+        guard !onCloseFired else { return }
+        onCloseFired = true
         onClose?()
     }
 
@@ -275,6 +321,12 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         guard let panel else { return }
         guard !isShrinking else { return }
         cancelFrameAnimation() // stop any in-flight GROW — state only, frame is left exactly where it was
+        // Gate r5: freeze the live content to a bitmap and animate THAT down to the orb bubble — the
+        // SwiftUI composer/header can't lay out at ~20pt without clipping/fighting. Snapshot happens
+        // here, so mid-GROW retarget captures whatever is currently rendered (the content is live
+        // during the grow). Graceful: if the snapshot can't be taken, the live view is animated
+        // instead (may clip at the bottom, but never crashes).
+        installShrinkSnapshot()
         let shrinkFrom = panel.frame
         let cursor = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { $0.frame.contains(cursor) } ?? NSScreen.main
@@ -352,22 +404,89 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         let frame = unclampedInterpolatedRect(from: frameAnimStart, to: frameAnimTarget, progress: p)
         panel.setFrame(frame, display: true)
 
+        let direction = frameAnimDirection
+
+        // Gate r5 — the melt. Only the shrink leg: ramp the snapshot's corner radius toward a circle
+        // and dissolve the panel's alpha, then hand off to the orb EARLY so it rematerializes under
+        // the last of the fade (see `applyShrinkMelt` and `chatWindowOrbHandoffProgress`).
+        if direction == .shrink {
+            applyShrinkMelt(progress: p, frameSize: frame.size, panel: panel)
+            if !onCloseFired, p >= chatWindowOrbHandoffProgress {
+                onCloseFiredAtProgressForTesting = p
+                fireOnCloseOnce() // orb returns at the cursor; the last ~30% of the circle melts over it
+            }
+        }
+
         // Settle guard — same epsilon as the core morph (Fix A).
         if abs(1 - p) < 0.004, abs(v) < 0.05 {
             panel.setFrame(frameAnimTarget, display: true)
-            let direction = frameAnimDirection
             if direction == .shrink {
-                // Gate r4 regression seam: the real on-screen frame the shrink REACHED, captured
-                // before teardown nils the panel — tests assert this is orb-sized (~240×140).
+                // Gate r5: snap the final melt state too, so the last on-screen frame is the orb
+                // circle at ~0 alpha (no opaque square left to blink away) before teardown.
+                applyShrinkMelt(progress: 1, frameSize: frameAnimTarget.size, panel: panel)
+                // Gate r4 regression seam, gate r5: the real on-screen frame the shrink REACHED,
+                // captured before teardown nils the panel — now orb-BUBBLE-sized (~20×20), not the
+                // 240×140 panel.
                 lastShrinkSettledFrameForTesting = panel.frame
             }
             cancelFrameAnimation()
-            // Gate r3 (W1): the shrink's whole point is to lead into teardown — run the exact
-            // same instant, idempotent `close()` now that the panel has visibly settled at the
-            // cursor. The grow has nothing further to do (the window is self-drawn borderless — no
-            // chrome to attach or fade in).
+            // Gate r3 (W1) / gate r5: the shrink's whole point is to lead into teardown — run the
+            // same instant, idempotent `close()` now that the circle has settled and dissolved.
+            // `onClose` already fired at the 0.7 handoff, so this teardown does orderOut + panel=nil
+            // + externalFocus restore WITHOUT re-firing it (the latch). The grow has nothing further
+            // to do (self-drawn borderless — no chrome to attach or fade in).
             if direction == .shrink { close() }
         }
+    }
+
+    /// Gate r5: the visual melt applied each shrink tick. Ramps the snapshot layer's `cornerRadius`
+    /// from `chatWindowCornerRadius` (16pt) up to half the CURRENT frame's smaller dimension — so it
+    /// becomes a true circle as the frame converges on the ~20pt orb-bubble square — and dissolves
+    /// the whole panel (content + shadow) via `alphaValue`: held at 1.0 until
+    /// `chatWindowShrinkAlphaHoldProgress`, then eased to ~0 by settle. `masksToBounds` was set true
+    /// at snapshot install so the corner radius actually clips.
+    private func applyShrinkMelt(progress p: Double, frameSize: NSSize, panel: ChatWindowPanel) {
+        let clamped = min(max(p, 0), 1)
+        let minHalf = min(frameSize.width, frameSize.height) / 2
+        let eased = smoothstep(0, 1, clamped)
+        let ramped = chatWindowCornerRadius + (minHalf - chatWindowCornerRadius) * CGFloat(eased)
+        let radius = max(0, min(ramped, minHalf)) // never exceed a circle for the current size
+        shrinkSnapshotView?.layer?.cornerRadius = radius
+        lastShrinkCornerRadiusForTesting = radius
+
+        if clamped <= chatWindowShrinkAlphaHoldProgress {
+            panel.alphaValue = 1.0
+        } else {
+            let a = (clamped - chatWindowShrinkAlphaHoldProgress) / (1.0 - chatWindowShrinkAlphaHoldProgress)
+            panel.alphaValue = max(0, 1.0 - a)
+        }
+    }
+
+    /// Gate r5: freeze the live SwiftUI content to a bitmap and swap it in as an `NSImageView`, so
+    /// the shrink animates a scalable image instead of collapsing the real composer/header layout.
+    /// `.scaleAxesIndependently` lets the near-square orb frame squish the content without letterbox
+    /// gaps; `wantsLayer`/`masksToBounds` give `applyShrinkMelt` a layer whose `cornerRadius` clips
+    /// to a circle. No-op (leaves the live view in place, animated as-is) if the content has no
+    /// drawable bounds or the bitmap can't be cached — never fatal.
+    private func installShrinkSnapshot() {
+        guard let panel, let content = panel.contentView else { return }
+        let bounds = content.bounds
+        guard bounds.width > 1, bounds.height > 1,
+              let rep = content.bitmapImageRepForCachingDisplay(in: bounds) else { return }
+        content.cacheDisplay(in: bounds, to: rep)
+        let image = NSImage(size: bounds.size)
+        image.addRepresentation(rep)
+
+        let imageView = NSImageView(frame: bounds)
+        imageView.image = image
+        imageView.imageScaling = .scaleAxesIndependently
+        imageView.imageAlignment = .alignCenter
+        imageView.wantsLayer = true
+        imageView.layer?.masksToBounds = true
+        imageView.layer?.cornerRadius = chatWindowCornerRadius
+        imageView.autoresizingMask = [.width, .height]
+        panel.contentView = imageView
+        shrinkSnapshotView = imageView
     }
 
     private func cancelFrameAnimation() {

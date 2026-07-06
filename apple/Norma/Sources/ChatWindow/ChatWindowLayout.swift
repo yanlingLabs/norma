@@ -63,26 +63,53 @@ let chatWindowCollapsedSize = NSSize(width: 240, height: 140)
 /// Gate r4 (fully self-drawn window): the window is borderless for life, so the CONTENT owns its
 /// corners — `ChatWindowRootView` clips/fills a `RoundedRectangle` at this radius (the modern
 /// macOS-26 look), and AppKit's window shadow follows that tinted shape. 16pt reads as a normal
-/// contemporary window; tune here if the gate wants it rounder/squarer.
+/// contemporary window; tune here if the gate wants it rounder/squarer. Gate r5: also the START of
+/// the close-shrink's corner-radius ramp (the melting snapshot layer interpolates FROM this TO a
+/// full circle — see `ChatWindowController.applyShrinkMelt`).
 let chatWindowCornerRadius: CGFloat = 16
+
+/// Gate r5 (window melts into the orb): the actual VISIBLE orb bubble diameter — the small fluid
+/// glass circle the collapsed orb really is on screen (`MorphModel.orbBubbleSize`, 20pt — the size
+/// `FluidOrbSlot` is `.frame(width:height:)`'d to in `NormaFieldView`). This is what the close-shrink
+/// now targets, NOT the collapsed orb PANEL (`chatWindowCollapsedSize`, 240×140). That panel is
+/// mostly halo/tracking margin around a ~20pt bubble; shrinking the window to the 240×140 slab read
+/// as "a big square" that then blinked away (the r5 defect). Shrinking to the bubble instead, with
+/// the corner-radius ramp turning it into a circle, makes the window converge to something that
+/// LOOKS like the orb. Mirrored (not imported) for the same reason `chatWindowCollapsedSize` is —
+/// this controller can't reach a live `MorphModel`; keep in lockstep with `orbBubbleSize`.
+let chatWindowOrbBubbleDiameter: CGFloat = 20
+
+/// Gate r5: the shrink progress at which the orb's return is fired (`onClose` → the orb
+/// rematerializes at the cursor). Deliberately BEFORE settle (1.0) so the last ~30% of the
+/// shrinking, dissolving circle overlaps the freshly-shown orb — the handoff reads as the window
+/// melting into it rather than a square blinking out.
+let chatWindowOrbHandoffProgress: Double = 0.7
+
+/// Gate r5: the shrink progress until which the melting content stays fully opaque; past it the
+/// panel alpha eases to ~0, reaching 0 exactly at settle so there is no opaque frame left to blink
+/// away (the "kill the vanish" half of the choreography).
+let chatWindowShrinkAlphaHoldProgress: Double = 0.6
 
 /// Gate r4 (custom green zoom button): how far `ChatWindowController.zoomToggle()` insets the
 /// screen's visible frame when zooming to fill — a small breathing gap so the zoomed window doesn't
 /// sit flush against the screen edges / menu bar.
 let chatWindowZoomInset: CGFloat = 8
 
-/// Gate r3 (W1): the shrink's end-of-animation frame — orb-sized, centered on `point` (the
-/// cursor: `OrbWindowController.exitWindowMode()`'s `show()` re-summons the orb exactly there
-/// once `ChatWindowController.closeAnimated()`'s teardown runs). Position-only clamp
-/// (`clampedChatWindowPosition`) — deliberately NOT `clampedChatWindowFrame`'s full clamp, which
-/// would inflate this back up to the 340×360 floor and defeat the "shrinks to a tiny orb" effect.
+/// Gate r3 (W1) / gate r5: the shrink's end-of-animation frame — a small orb-BUBBLE-sized SQUARE
+/// (`chatWindowOrbBubbleDiameter`, not the 240×140 collapsed PANEL any more — see that constant's
+/// doc for why the panel read as "a big square"), centered on `point` (the cursor:
+/// `OrbWindowController.exitWindowMode()`'s `show()` re-summons the orb exactly there once
+/// `ChatWindowController.closeAnimated()`'s teardown runs). A square end frame + the corner-radius
+/// ramp (`applyShrinkMelt`) makes the window settle as a circle the size of the orb bubble.
+/// Position-only clamp (`clampedChatWindowPosition`) — deliberately NOT `clampedChatWindowFrame`'s
+/// full clamp, which would inflate this back up to the 340×360 floor and defeat the melt entirely.
 func chatWindowShrinkTargetFrame(centeredOn point: NSPoint, screenVisibleFrame: NSRect) -> NSRect {
-    let size = chatWindowCollapsedSize
+    let d = chatWindowOrbBubbleDiameter
     let proposed = NSRect(
-        x: point.x - size.width / 2,
-        y: point.y - size.height / 2,
-        width: size.width,
-        height: size.height
+        x: point.x - d / 2,
+        y: point.y - d / 2,
+        width: d,
+        height: d
     )
     return clampedChatWindowPosition(proposed, screenVisibleFrame: screenVisibleFrame)
 }

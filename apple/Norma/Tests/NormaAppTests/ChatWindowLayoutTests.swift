@@ -58,22 +58,25 @@ final class ChatWindowLayoutTests: XCTestCase {
         XCTAssertLessThanOrEqual(t.maxY, screen.maxY - 2)
     }
 
-    /// Gate r3 (W1 — animated close): the shrink's target is orb-sized (`chatWindowCollapsedSize`,
-    /// mirroring `MorphModel.collapsedWindowSize`) and centered on the cursor point, position-only
-    /// clamped (size is deliberately NOT floored to the 340×360 minimum — an orb IS meant to be
-    /// smaller than that).
-    func testShrinkTargetIsOrbSizedAndCenteredOnCursor() {
+    /// Gate r5 (window melts into the orb): the shrink's target is now the VISIBLE orb BUBBLE — a
+    /// small square (`chatWindowOrbBubbleDiameter`, mirroring `MorphModel.orbBubbleSize`, 20pt), NOT
+    /// the 240×140 collapsed PANEL (`chatWindowCollapsedSize`) that read as "a big square" then
+    /// blinked away. Centered on the cursor point, position-only clamped (size is deliberately NOT
+    /// floored to the 340×360 minimum — the orb bubble IS meant to be tiny).
+    func testShrinkTargetIsOrbBubbleSizedAndCenteredOnCursor() {
         let cursor = NSPoint(x: 700, y: 500)
         let f = chatWindowShrinkTargetFrame(centeredOn: cursor, screenVisibleFrame: screen)
-        XCTAssertEqual(f.size, chatWindowCollapsedSize)
+        XCTAssertEqual(f.size, NSSize(width: chatWindowOrbBubbleDiameter, height: chatWindowOrbBubbleDiameter))
+        XCTAssertLessThan(f.size.width, chatWindowCollapsedSize.width, "gate r5: the target is the tiny bubble, not the 240×140 panel")
         XCTAssertEqual(f.midX, cursor.x, accuracy: 0.5)
         XCTAssertEqual(f.midY, cursor.y, accuracy: 0.5)
     }
 
     func testShrinkTargetNearEdgeStaysOnScreen() {
-        let cursor = NSPoint(x: 5, y: 5) // bottom-left corner
+        let cursor = NSPoint(x: 1, y: 1) // bottom-left corner
         let f = chatWindowShrinkTargetFrame(centeredOn: cursor, screenVisibleFrame: screen)
-        XCTAssertEqual(f.size, chatWindowCollapsedSize, "position clamp must never touch size")
+        XCTAssertEqual(f.size, NSSize(width: chatWindowOrbBubbleDiameter, height: chatWindowOrbBubbleDiameter),
+                       "position clamp must never touch size")
         XCTAssertGreaterThanOrEqual(f.minX, screen.minX + 2)
         XCTAssertGreaterThanOrEqual(f.minY, screen.minY + 2)
     }

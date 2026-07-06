@@ -236,13 +236,12 @@ final class ChatWindowControllerTests: XCTestCase {
         c.close()
     }
 
-    /// THE regression test for the stall (hypothesis 1): the close-shrink must actually REACH the
-    /// orb-sized target (~240×140) — the original defect was it freezing at AppKit's titled/toolbar
-    /// chrome minimum (~40×220, the big rounded square the user saw). With the window borderless for
-    /// life there is no chrome minimum, so it lands exactly on target. Captured via
-    /// `lastShrinkSettledFrameForTesting` — the true on-screen frame the spring settled on right
-    /// before teardown.
-    func testShrinkReachesOrbSizedTargetBeforeClose() async throws {
+    /// Gate r5 (window melts into the orb): the close-shrink must reach the VISIBLE orb-BUBBLE-sized
+    /// square (`chatWindowOrbBubbleDiameter`, ~20×20) — NOT the 240×140 collapsed PANEL it used to
+    /// target (the r5 defect: shrinking to a 240×140 opaque tinted slab read as "a big square" that
+    /// then blinked away). Captured via `lastShrinkSettledFrameForTesting` — the true on-screen frame
+    /// the spring settled on right before teardown.
+    func testShrinkReachesOrbBubbleSizedTargetBeforeClose() async throws {
         let c = makeController()
         c.show(from: NSRect(x: 400, y: 400, width: 240, height: 44))
         try await waitUntilFrameStable(c)
@@ -252,10 +251,66 @@ final class ChatWindowControllerTests: XCTestCase {
 
         let settled = c.lastShrinkSettledFrameForTesting
         XCTAssertNotNil(settled, "the shrink must have settled and recorded its final on-screen frame")
-        XCTAssertEqual(settled?.size.width ?? 0, chatWindowCollapsedSize.width, accuracy: 2,
-                       "the shrink reaches orb WIDTH — no chrome minimum")
-        XCTAssertEqual(settled?.size.height ?? 0, chatWindowCollapsedSize.height, accuracy: 2,
-                       "the shrink reaches orb HEIGHT — borderless has no chrome minimum; before the pivot AppKit floored this at ~220 and the close stalled")
+        XCTAssertEqual(settled?.size.width ?? 0, chatWindowOrbBubbleDiameter, accuracy: 2,
+                       "the shrink reaches the orb BUBBLE width (~20), not the 240×140 panel")
+        XCTAssertEqual(settled?.size.height ?? 0, chatWindowOrbBubbleDiameter, accuracy: 2,
+                       "the shrink reaches the orb BUBBLE height (~20) — a small circle, not a big square")
+    }
+
+    // MARK: Gate r5 — window melts into the orb (snapshot scaling, radius→circle ramp, early orb handoff)
+
+    /// The moment the shrink starts, the live SwiftUI composer/header is replaced by a bitmap
+    /// snapshot (`NSImageView`) that scales cleanly to ~20pt — the real layout can't lay out that
+    /// small without clipping/fighting. Asserted synchronously right after `closeAnimated()`, since
+    /// the swap happens synchronously at shrink start (before any 60Hz tick).
+    func testCloseAnimatedSwapsLiveContentForSnapshot() async throws {
+        let c = makeController()
+        c.show(from: NSRect(x: 400, y: 400, width: 240, height: 44))
+        try await waitUntilFrameStable(c)
+        XCTAssertFalse(c.isShowingShrinkSnapshotForTesting, "live SwiftUI content while settled")
+
+        c.closeAnimated()
+        XCTAssertTrue(c.isShowingShrinkSnapshotForTesting,
+                      "the shrink animates a snapshot bitmap, not the collapsing live composer")
+
+        try await waitUntilClosed(c)
+        XCTAssertFalse(c.isVisible)
+    }
+
+    /// The orb's return (`onClose`) fires EARLY — when the shrink crosses ~0.7 — NOT at the final
+    /// settle, so the orb rematerializes while the last of the dissolving circle melts over it.
+    /// `onCloseFiredAtProgressForTesting` records the shrink progress at that fire; it must land in
+    /// [handoff, 1.0), i.e. strictly before settle.
+    func testOnCloseFiresAtOverlapThresholdBeforeSettle() async throws {
+        let c = makeController()
+        var fired = 0
+        c.onClose = { fired += 1 }
+        c.show(from: NSRect(x: 400, y: 400, width: 240, height: 44))
+        try await waitUntilFrameStable(c)
+
+        c.closeAnimated()
+        try await waitUntilClosed(c)
+
+        XCTAssertEqual(fired, 1, "onClose fires exactly once")
+        let firedAt = c.onCloseFiredAtProgressForTesting
+        XCTAssertNotNil(firedAt, "onClose fired from the shrink's early handoff crossing, not a synchronous close")
+        XCTAssertGreaterThanOrEqual(firedAt ?? 0, chatWindowOrbHandoffProgress)
+        XCTAssertLessThan(firedAt ?? 1, 1.0, "the orb handoff must precede the final settle (progress < 1)")
+    }
+
+    /// The snapshot's corner radius ramps from the window's 16pt to a full circle (≈ half the
+    /// ~20pt orb-bubble frame) by settle — the "converges to something that looks like the orb"
+    /// half of the choreography. Read via the melt seam captured on the last tick.
+    func testShrinkCornerRadiusRampsToCircleAtSettle() async throws {
+        let c = makeController()
+        c.show(from: NSRect(x: 400, y: 400, width: 240, height: 44))
+        try await waitUntilFrameStable(c)
+
+        c.closeAnimated()
+        try await waitUntilClosed(c)
+
+        XCTAssertEqual(c.lastShrinkCornerRadiusForTesting, chatWindowOrbBubbleDiameter / 2, accuracy: 1.5,
+                       "by settle the corner radius is ≈ half the orb-bubble size — a circle")
     }
 
     /// The custom GREEN traffic light drives `zoomToggle()` (a borderless window has no native
