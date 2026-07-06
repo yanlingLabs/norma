@@ -472,7 +472,13 @@ struct NormaFieldView: View {
                         .contentShape(Circle())
                         .onTapGesture { adapter.onExpandToWindow() }
                         .opacity(Double(contentReveal))
-                        .padding(.horizontal, Self.contentHorizontalPadding)
+                        // 36 (not `contentHorizontalPadding`'s 12) so this chevron's trailing
+                        // 22pt tap target clears `revealDraftButton`'s top-trailing slot
+                        // (HStack `.padding(6)` inside `inlineResponse`'s `.topTrailing` ZStack,
+                        // spanning [right-28, right-6]) — chevron now spans [right-58, right-36],
+                        // an 8pt gap short of the button, same fixed position in both composer
+                        // and reply states (review: was a 16pt/22pt overlap that stole taps).
+                        .padding(.horizontal, 36)
                         .padding(.vertical, Self.contentVerticalPadding)
                 }
                 .position(x: composerFinal.midX, y: composerFinal.midY)
@@ -624,7 +630,11 @@ struct NormaFieldView: View {
                     if r.activatesExpand { adapter.onExpandToWindow() }
                     return r.consumed
                 },
-                onTypingRefocus: { adapter.focusedElement = .composer }
+                onTypingRefocus: {
+                    // Guard against a redundant @Published fire on every keystroke when focus
+                    // is already `.composer` (the common case while typing).
+                    if adapter.focusedElement != .composer { adapter.focusedElement = .composer }
+                }
             )
             .overlay(alignment: .topLeading) {
                 if adapter.composerDraft.isEmpty {
