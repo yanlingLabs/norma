@@ -121,11 +121,15 @@ final class ActivityGroupingTests: XCTestCase {
         XCTAssertEqual(toolGroupFragment(name: "request_directory", count: 2), "requested 2 directories")
     }
 
-    func testToolGroupFragmentGlobRelabeledToListedGrepStaysSearched() {
-        // r1b: `glob` relabels from "searched" to "listed a/N directories" — Norma has no `ls`
-        // tool, `glob` is the lister. `grep` keeps "searched".
-        XCTAssertEqual(toolGroupFragment(name: "glob", count: 1), "listed a directory")
-        XCTAssertEqual(toolGroupFragment(name: "glob", count: 2), "listed 2 directories")
+    func testToolGroupFragmentLsGetsListedGlobRevertsToSearchedGrepStaysSearched() {
+        // Post-r1b: now that Norma has a native `ls` tool, `ls` gets "listed a/N directories" —
+        // the label r1b had temporarily borrowed for `glob` as a stand-in. `glob` REVERTS to its
+        // pre-r1b "searched"/"searched N times" (same fragment as `grep` — both are pattern
+        // searches, not directory listings).
+        XCTAssertEqual(toolGroupFragment(name: "ls", count: 1), "listed a directory")
+        XCTAssertEqual(toolGroupFragment(name: "ls", count: 2), "listed 2 directories")
+        XCTAssertEqual(toolGroupFragment(name: "glob", count: 1), "searched")
+        XCTAssertEqual(toolGroupFragment(name: "glob", count: 2), "searched 2 times")
         XCTAssertEqual(toolGroupFragment(name: "grep", count: 1), "searched")
         XCTAssertEqual(toolGroupFragment(name: "grep", count: 3), "searched 3 times")
     }
@@ -141,8 +145,9 @@ final class ActivityGroupingTests: XCTestCase {
     func testToolGroupLabelCapitalizesTheFragment() {
         XCTAssertEqual(toolGroupLabel(name: "bash", count: 1), "Ran a shell command")
         XCTAssertEqual(toolGroupLabel(name: "bash", count: 3), "Ran 3 shell commands")
-        XCTAssertEqual(toolGroupLabel(name: "glob", count: 1), "Listed a directory")
-        XCTAssertEqual(toolGroupLabel(name: "glob", count: 3), "Listed 3 directories")
+        XCTAssertEqual(toolGroupLabel(name: "ls", count: 1), "Listed a directory")
+        XCTAssertEqual(toolGroupLabel(name: "ls", count: 3), "Listed 3 directories")
+        XCTAssertEqual(toolGroupLabel(name: "glob", count: 1), "Searched")
         XCTAssertEqual(toolGroupLabel(name: "grep", count: 1), "Searched")
         XCTAssertEqual(toolGroupLabel(name: "mcp__foo__bar", count: 1), "Used a tool")
     }
@@ -159,9 +164,10 @@ final class ActivityGroupingTests: XCTestCase {
         // CC screenshot said "Read 4 files, listed 1 directory, ran 8 shell commands" — but Norma's
         // own singular convention (matching every other verb: "a file" not "1 file") renders a
         // count of exactly 1 as "a directory", so the count-1 fragment here is "listed a directory".
+        // Uses `ls` (not `glob`, which reverted to "searched" once `ls` shipped as its own tool).
         let entries = [
             ToolRunEntry(name: "read", count: 4, details: []),
-            ToolRunEntry(name: "glob", count: 1, details: []),
+            ToolRunEntry(name: "ls", count: 1, details: []),
             ToolRunEntry(name: "bash", count: 8, details: []),
         ]
         XCTAssertEqual(toolRunSentence(entries), "Read 4 files, listed a directory, ran 8 shell commands")
@@ -170,7 +176,7 @@ final class ActivityGroupingTests: XCTestCase {
     func testSentenceWithMultipleDirectoriesUsesTheCountedForm() {
         let entries = [
             ToolRunEntry(name: "read", count: 4, details: []),
-            ToolRunEntry(name: "glob", count: 2, details: []),
+            ToolRunEntry(name: "ls", count: 2, details: []),
             ToolRunEntry(name: "bash", count: 8, details: []),
         ]
         XCTAssertEqual(toolRunSentence(entries), "Read 4 files, listed 2 directories, ran 8 shell commands")

@@ -474,13 +474,15 @@ func groupActivity(_ items: [ActivityItem]) -> [ActivityGroup] {
 }
 
 /// Pure lowercase fragment for one `ToolRunEntry` — the sentence-building unit consumed by
-/// `toolRunSentence`. Natural verbs, singular/plural, matching the brief's exact vocabulary. r1b:
-/// `glob` relabels from "searched" to "listed a directory"/"listed N directories" (Norma has no
-/// `ls` tool — `glob` is the lister); `grep` keeps "searched". Any tool name not explicitly listed
-/// (future tools, `mcp__*` server tools, etc.) falls back to "used a tool"/"used N tools" rather
-/// than a blank or raw tool name. None of these fragments are proper-noun-ish — keep it that way,
-/// since `toolRunSentence` only capitalizes the FIRST fragment of a sentence and lowercases the
-/// rest verbatim.
+/// `toolRunSentence`. Natural verbs, singular/plural, matching the brief's exact vocabulary.
+/// `ls` (the native directory-listing tool, added after r1b) gets "listed a directory"/"listed N
+/// directories" — the label r1b had temporarily borrowed for `glob` as a stand-in while Norma had
+/// no dedicated lister. Now that `ls` exists, `glob` REVERTS to its pre-r1b "searched"/"searched N
+/// times" (same fragment as `grep` — both are pattern searches, not directory listings). Any tool
+/// name not explicitly listed (future tools, `mcp__*` server tools, etc.) falls back to "used a
+/// tool"/"used N tools" rather than a blank or raw tool name. None of these fragments are
+/// proper-noun-ish — keep it that way, since `toolRunSentence` only capitalizes the FIRST fragment
+/// of a sentence and lowercases the rest verbatim.
 func toolGroupFragment(name: String, count: Int) -> String {
     switch name {
     case "bash":
@@ -497,8 +499,10 @@ func toolGroupFragment(name: String, count: Int) -> String {
         return count == 1 ? "wrote a file" : "wrote \(count) files"
     case "edit":
         return count == 1 ? "made an edit" : "made \(count) edits"
-    case "glob":
+    case "ls":
         return count == 1 ? "listed a directory" : "listed \(count) directories"
+    case "glob":
+        return count == 1 ? "searched" : "searched \(count) times"
     case "grep":
         return count == 1 ? "searched" : "searched \(count) times"
     case "ToolSearch":
