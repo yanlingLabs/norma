@@ -30,23 +30,35 @@ struct TranscriptView: View {
                 nearBottom = isNear
                 if isNear { showLatestPill = false }
             }
-            .onChange(of: adapter.transcript.count) { _, _ in follow(proxy) }
-            .onChange(of: adapter.liveStreamingText) { _, _ in follow(proxy) }
+            // Task-4 review fix: onChange fires on ANY change — including the count DROPPING to
+            // zero on session refocus (SessionModel.reset() swaps exchanges wholesale). Only a
+            // genuine growth may follow/raise the pill; a reset must do neither.
+            .onChange(of: adapter.transcript.count) { old, new in
+                if new > old { follow(proxy) }
+            }
+            .onChange(of: adapter.liveStreamingText) { old, new in
+                if (new?.count ?? 0) > (old?.count ?? 0) { follow(proxy) }
+            }
             .overlay(alignment: .bottomTrailing) {
-                if showLatestPill {
-                    Button {
-                        scrollToBottom(proxy)
-                    } label: {
-                        Label("latest", systemImage: "arrow.down")
-                            .font(.system(size: 11, weight: .medium))
-                            .padding(.horizontal, 10).padding(.vertical, 5)
-                            .background(Capsule().fill(.thinMaterial))
-                    }
-                    .buttonStyle(.plain)
-                    .padding(8)
-                }
+                if showLatestPill { latestPill(proxy) }
             }
         }
+    }
+
+    /// Extracted from `body` (Task-4 review, minor): the chained ScrollViewReader expression sat
+    /// at SourceKit's type-check complexity cliff — keep `body` shallow so future edits don't
+    /// tip it over.
+    private func latestPill(_ proxy: ScrollViewProxy) -> some View {
+        Button {
+            scrollToBottom(proxy)
+        } label: {
+            Label("latest", systemImage: "arrow.down")
+                .font(.system(size: 11, weight: .medium))
+                .padding(.horizontal, 10).padding(.vertical, 5)
+                .background(Capsule().fill(.thinMaterial))
+        }
+        .buttonStyle(.plain)
+        .padding(8)
     }
 
     @ViewBuilder

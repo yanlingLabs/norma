@@ -27,5 +27,17 @@ final class TranscriptAutoscrollTests: XCTestCase {
 
         XCTAssertEqual(adapter.transcript.count, 1)
         XCTAssertEqual(adapter.liveStreamingText, "partial…")
+
+        // Task-4 review fix: discriminate liveStreamingText from visibleResponse — a regression
+        // aliasing one to the other (the exact bug the doc comment warns against) must FAIL here.
+        // After the turn finalizes, streamingText clears but a stored reply exists:
+        // visibleResponse falls through to the reply while liveStreamingText must be nil.
+        session.applyForTesting { s in
+            s.streamingText = ""
+            s.turnRunning = false
+            s.exchanges = [Exchange(prompt: "hi", reply: "final answer")]
+        }
+        XCTAssertNil(adapter.liveStreamingText, "no live stream after finalization")
+        XCTAssertEqual(adapter.visibleResponse, "final answer", "visibleResponse falls through to the stored reply — the two accessors must diverge here")
     }
 }
