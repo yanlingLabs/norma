@@ -208,16 +208,33 @@ final class FieldStateAdapter: ObservableObject {
 
     /// Derived, not stored: `hasUnread` wins outright (the reply is waiting, regardless of
     /// whether a new turn has already started since); otherwise `turnRunning` renders the current
-    /// task-completion fill; otherwise there is nothing to show at all.
+    /// task-completion fill; otherwise — Finding-3 — the fluid HOLDS its level while any task is
+    /// still incomplete (the WORK isn't done even though this turn ended), and only drains to
+    /// `.idle` once every task is complete (or there were never any tasks).
+    ///
+    /// Finding-3 (gate 2): the fluid represents Norma's WORK, not just the current turn. A turn
+    /// finishing with an incomplete task list (the agent paused between turns, or is waiting to be
+    /// told to continue) used to drain the liquid to empty, reading as "all done" when it isn't.
+    /// Now it holds `.working(level)` at the task-completion fill instead. Implementation choice
+    /// (per the directive's "implementer's choice"): reuse `.working` rather than add a
+    /// `.pausedWork` case — the fluid sim's slosh already decays naturally once the cursor (and so
+    /// the tracking-spring acceleration feeding `FluidSim`) calms, so a held-but-idle bubble reads
+    /// as "paused/settled" on its own, without a distinct dimmed case. Unread still wins above.
     var fluidState: FluidState {
         if hasUnread {
             return .unread(level: lastWorkingLevel)
         }
         let s = session.state
-        guard s.turnRunning else { return .idle }
         let counts = s.taskCounts
         let level = counts.total > 0 ? Double(counts.done) / Double(counts.total) : 0.5
-        return .working(level: level)
+        if s.turnRunning {
+            return .working(level: level)
+        }
+        // Turn ended: hold the fill while work remains (any task not yet completed); else drain.
+        if counts.total > 0 && counts.done < counts.total {
+            return .working(level: level)
+        }
+        return .idle
     }
 
     // MARK: - Callbacks (task B wires real behavior)

@@ -64,10 +64,16 @@ struct FluidOrbView: View {
     /// undistorted color: this view renders OUTSIDE `GlassForegroundLegibility`'s difference
     /// blend (see `NormaFieldView.composerMorphedContent`), so what's declared here is exactly
     /// what's drawn.
-    private static let workingTint = Color(red: 0.35, green: 0.62, blue: 1.0)
+    ///
+    /// Finding-4 (gate 2, "brighter fluid"): bumped noticeably more luminous from
+    /// `(0.35, 0.62, 1.0)`. GATE-TUNING KNOB — this + `unreadTint` + the fill-gradient opacities
+    /// in `body` are the four constants to nudge if the liquid reads too bright/too dim on device.
+    private static let workingTint = Color(red: 0.45, green: 0.75, blue: 1.0)
     /// Warm amber — the unread tint (a finished reply is waiting, unseen). Replaces wave-3's
     /// unread-blink overlay pulse; the amber fluid itself IS the unread signal now.
-    private static let unreadTint = Color(red: 1.0, green: 0.72, blue: 0.30)
+    ///
+    /// Finding-4: brightened from `(1.0, 0.72, 0.30)` (GATE-TUNING KNOB, see `workingTint`).
+    private static let unreadTint = Color(red: 1.0, green: 0.80, blue: 0.35)
 
     /// Task-3 fix wave (review finding, "drain snaps amber → blue"): `FluidState.idle` carries no
     /// color of its own — without this, a dismissed-unread drain would snap the bubble from amber
@@ -103,8 +109,10 @@ struct FluidOrbView: View {
                 }
                 path.addLine(to: CGPoint(x: size.width, y: size.height))
                 path.closeSubpath()
+                // Finding-4 (gate 2): raised fill opacities from 0.85/0.55 for a more luminous,
+                // less washed-out liquid (GATE-TUNING KNOB — see `workingTint`'s doc).
                 ctx.fill(path, with: .linearGradient(
-                    Gradient(colors: [tint.opacity(0.85), tint.opacity(0.55)]),
+                    Gradient(colors: [tint.opacity(0.95), tint.opacity(0.7)]),
                     startPoint: CGPoint(x: size.width / 2, y: surfaceY),
                     endPoint: CGPoint(x: size.width / 2, y: size.height)
                 ))

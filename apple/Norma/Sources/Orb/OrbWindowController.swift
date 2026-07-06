@@ -61,6 +61,17 @@ final class OrbWindowController: ObservableObject {
     /// `morphTick()`'s re-entry guard doc for the bug this locks in against.
     private(set) var finishCollapseCallCountForTesting = 0
 
+    /// Test-only counter (Finding-2, gate 2): every synchronous `makePanelKeyWinningLateActivation`
+    /// pass increments this — a re-summon must re-assert key focus, so a test drives
+    /// expand→collapse→re-expand and asserts this went UP on the second expand (see that method's
+    /// doc for the key-window race it defends against).
+    private(set) var keyAssertionCountForTesting = 0
+
+    /// Test-only read-through — lets a test observe whether the panel actually became the key
+    /// window after a summon (the Finding-2 smoking gun). Key status depends on a live WindowServer
+    /// session, so tests that assert on it must tolerate a headless host where it stays false.
+    var panelIsKeyForTesting: Bool { panel.isKeyWindow }
+
     /// Wired in Task 6: the controller exposes callbacks, it does NOT import AppModel.
     /// Returns send success — GlassRootView's submit() gates the draft clear on this so a
     /// failed/disconnected send never loses the composed text (spec §6).
@@ -239,6 +250,17 @@ final class OrbWindowController: ObservableObject {
         // never fire — it settles at 1 instead of 0.
         if surface == .field && morphTarget == 0 {
             startMorph(target: 1)
+            // Finding-2 (belt): teardown never ran on this path, so the panel is still keyable and
+            // still key and NO `restore()` fired this cycle — so unlike the cold path below there's
+            // no live race to beat here. Re-assert only DEFERRED (next runloop tick), purely to
+            // catch an EARLIER collapse cycle's `restore()` activation that might still be in
+            // flight. Deliberately NOT synchronous: this retarget sequence feeds a timing-sensitive
+            // 60Hz morph spring (see `MorphTimerReentrancyTests`), and a synchronous
+            // `orderFrontRegardless()`/`makeKey()` inline here perturbs that spring's settle timing.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.surface == .field, !self.panel.isKeyWindow else { return }
+                self.makePanelKeyWinningLateActivation()
+            }
             OrbDebug.log("expandToField: retarget mid-collapse re-summon, morphTarget=1")
             return
         }
@@ -276,32 +298,42 @@ final class OrbWindowController: ObservableObject {
         externalFocus = ExternalFocusSnapshot.captureCurrent()
         panel.acceptsKeyInput = true
         panel.ignoresMouseEvents = false
-        panel.makeKey()
         surface = .field
+        // Finding-2 fix (gate 2): make the panel key AND keep it key against a late external-app
+        // reactivation — see `makePanelKeyWinningLateActivation`'s doc. `surface = .field` is set
+        // FIRST so the belt in the key monitor (and the retry's `surface == .field` guard) sees the
+        // right surface immediately.
+        makePanelKeyWinningLateActivation()
         startMorph(target: 1)
 
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             guard let self else { return event }
-            guard event.window === panel else {
-                // Diagnostic (debug-gated, same convention as the scroll monitor's NON-PANEL
-                // log): distinguishes "event never reached this monitor as panel-directed" from
-                // "reached it but the Esc branch itself didn't fire" — proves/disproves a
-                // synthesized-or-real Esc arriving with no window binding or a stale key window
-                // after a re-summon (gate-fix repro session's culprit (b)).
-                if event.keyCode == 53 {
-                    OrbDebug.log("key monitor: Esc REJECTED window=\(event.window.map { String(describing: type(of: $0)) } ?? "nil") num=\(event.windowNumber) panelNum=\(panel.windowNumber) keyWindow=\(NSApp.keyWindow.map { String(describing: type(of: $0)) } ?? "nil")")
-                }
+            // Finding-2 belt (gate 2, wave-9 parity): a LOCAL monitor only ever sees OUR app's own
+            // events, and this accessory app has exactly ONE window a keyDown could be meant for
+            // while the field is open — the field panel. So route Esc on the SURFACE, not on
+            // `event.window === panel`: a re-summon key race can leave the keyDown bound to a
+            // stale/nil window (exactly what wave-9 found for synthesized scrolls), and the old
+            // window-identity guard then silently dropped a perfectly good Esc. `escMonitorAction`
+            // is the pure, table-tested decision (window identity is deliberately not one of its
+            // inputs). NOTE the residual case this belt canNOT cover: if the panel isn't key AND
+            // our app isn't active at all, no local monitor fires — that path is closed by
+            // `makePanelKeyWinningLateActivation()` making the panel key on every summon.
+            let running = self.session.state.turnRunning
+            switch escMonitorAction(
+                keyCode: event.keyCode,
+                surface: self.surface,
+                escConsumed: { self.onEsc?() == true }
+            ) {
+            case .passThrough:
                 return event
-            }
-            if event.keyCode == 53 { // Esc
-                let running = self.session.state.turnRunning
-                let consumed = self.onEsc?() == true
-                OrbDebug.log("key monitor: Esc panel-matched turnRunning=\(running) onEsc-consumed=\(consumed)")
-                if consumed { return nil } // consumed as interrupt
+            case .interrupt:
+                OrbDebug.log("key monitor: Esc → interrupt isPanel=\(event.window === panel) panelKey=\(panel.isKeyWindow) turnRunning=\(running)")
+                return nil
+            case .collapse:
+                OrbDebug.log("key monitor: Esc → collapse isPanel=\(event.window === panel) panelKey=\(panel.isKeyWindow) turnRunning=\(running)")
                 self.collapseToOrb()
                 return nil
             }
-            return event
         }
 
         // Wave 2c task 4: same lifecycle as the Esc monitor above — installed only while
@@ -370,6 +402,36 @@ final class OrbWindowController: ObservableObject {
         }
 
         OrbDebug.log("expandToField: morphTarget=1")
+    }
+
+    /// Finding-2 fix (gate 2 — "Esc from the field is dead after a re-summon"). ROOT CAUSE: after an
+    /// auto-collapse, `finishCollapse()` calls `externalFocus?.restore()` →
+    /// `NSRunningApplication.activate()` on the app that was frontmost before we summoned. The
+    /// WindowServer processes that activation ASYNCHRONOUSLY. A fast re-summon's `panel.makeKey()`
+    /// can therefore run and win momentarily, only for the in-flight external activation to LAND a
+    /// beat later and steal system key focus back. The panel is then no longer the key window,
+    /// physical keyDowns (incl. Esc) route to the external app, and our LOCAL key monitor — which
+    /// only ever sees OUR app's own events — never fires at all (no belt can recover an event that
+    /// never arrives; that's why the wave-9-style window-agnostic belt in the monitor is necessary
+    /// but not SUFFICIENT — this is the sufficient half).
+    ///
+    /// FIX: assert key now, then RE-ASSERT on the next runloop tick(s). By the next tick the late
+    /// external activation has already landed, so our re-`makeKey()` is the last word and wins.
+    /// `orderFrontRegardless()` + `makeKey()` (deliberately NOT `NSApp.activate(ignoringOtherApps:)`
+    /// — v1's avoided nuclear option; a `.nonactivatingPanel` can hold key focus without activating
+    /// the whole app, Spotlight-style). Bounded retries, and each retry bails the instant the panel
+    /// is already key or the surface has left `.field`, so it can never spin.
+    private func makePanelKeyWinningLateActivation(retriesLeft: Int = 3) {
+        keyAssertionCountForTesting += 1
+        panel.orderFrontRegardless()
+        panel.makeKey()
+        let isKey = panel.isKeyWindow
+        OrbDebug.log("makePanelKey: panelKey=\(isKey) retriesLeft=\(retriesLeft)")
+        guard !isKey, retriesLeft > 0 else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.surface == .field, !self.panel.isKeyWindow else { return }
+            self.makePanelKeyWinningLateActivation(retriesLeft: retriesLeft - 1)
+        }
     }
 
     /// The physical screen point where the composer's chosen corner (`morphModel.corner`,
@@ -586,4 +648,28 @@ final class OrbWindowController: ObservableObject {
 
         OrbDebug.log("collapseToOrb: complete")
     }
+}
+
+/// Finding-2 (gate 2): what the field key monitor should do with a keyDown, extracted pure so it's
+/// table-tested (`EscInterruptTests`).
+enum EscMonitorAction: Equatable { case passThrough, interrupt, collapse }
+
+/// Esc (keyCode 53) while the field is open is ALWAYS the field's — interrupt a running turn
+/// (whatever `escConsumed` reports, i.e. `onEsc()`), else collapse the field. Every other key, and
+/// any key while the surface is the collapsed orb, passes through untouched.
+///
+/// Window identity is deliberately NOT an input: a local monitor only sees OUR app's events, this
+/// accessory app has a single window, and a re-summon key race can leave the keyDown bound to a
+/// stale/nil window — so routing on the SURFACE (not `event.window === panel`) is what makes the
+/// Esc survive the race (same window-agnostic acceptance wave-9 landed for synthesized scrolls).
+///
+/// `escConsumed` is a closure, not a `Bool`, so `onEsc()`'s interrupt side effect fires ONLY after
+/// the keyCode/surface guard passes — never on unrelated keydowns.
+func escMonitorAction(
+    keyCode: UInt16,
+    surface: OrbWindowController.Surface,
+    escConsumed: () -> Bool
+) -> EscMonitorAction {
+    guard keyCode == 53, surface == .field else { return .passThrough }
+    return escConsumed() ? .interrupt : .collapse
 }
