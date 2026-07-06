@@ -1,12 +1,41 @@
 import SwiftUI
 
+/// Task-3 fix wave (review finding, "full-body re-render per tick"): the fluid's own physics state
+/// used to live on the SHARED `MorphModel` (`morph.fluid` + `morph.fluidAcceleration`), observed
+/// by both this view AND `NormaFieldView` (the whole field body — glass geometry, composer/
+/// response content, nav pill…). Since the sim advances on every render tick (~120/s while a turn
+/// is active), every one of those `@Published` writes re-ran `NormaFieldView`'s entire body too —
+/// a full-body re-render for a change nothing but this bubble needed to see, and a direct
+/// violation of this file's own local-animation-state convention (cf. `WorkingSpinnerGlyph`/
+/// `SheenText` in `NormaFieldView.swift`, which each scope their own animation state to
+/// themselves, never an ancestor). `FluidModel` is a dedicated, narrowly-scoped `ObservableObject`
+/// for exactly this state; the only things that ever observe it are `FluidOrbSlot` and
+/// `FluidOrbView` below — `NormaFieldView` holds a plain, non-`@ObservedObject` reference just to
+/// pass one down (see that file's mount site, and its own new progress-fade comment).
+@MainActor
+final class FluidModel: ObservableObject {
+    /// The fluid orb's own physics state (`Orb/FluidSim.swift`, Task 1) — the render tick (Task 3,
+    /// `FluidOrbView.step`) owns advancing this every frame via
+    /// `.step(dt:acceleration:targetLevel:)` and reads it back out for the bubble's tilt/wave/level
+    /// rendering. Lives here (rather than on the view) so it survives across `FluidOrbView`
+    /// remounts, the same reason `MorphModel.progress` etc. live on a model rather than a view.
+    @Published var sim: FluidSim = .rest
+    /// `OrbFollower`'s per-tick tracking-spring acceleration tap ((velocity − lastVelocity) / dt,
+    /// see `OrbFollower.tick()`) — the lateral/vertical "kick" the fluid sim's tilt/wave terms
+    /// react to. Written every display-link tick regardless of which surface is showing.
+    /// Deliberately NOT `@Published`: `FluidOrbView.step` is the sole reader, and it already reads
+    /// `sim` fresh every tick of its own — there is no view left to invalidate by publishing this
+    /// too, only wasted Combine traffic on every follower tick (up to 120/s).
+    var acceleration: CGVector = .zero
+}
+
 /// Task 3 (fluid orb): the liquid rendered inside the orb bubble — a `Canvas`-drawn fill whose
 /// surface tilts with cursor motion and ripples with excitement (`Orb/FluidSim.swift`, Task 1's
 /// pure physics), tinted `workingTint` while the agent is working and `unreadTint` while a
-/// finished reply sits unread. Mounted ONLY while fluid is visible
-/// (`NormaFieldView`'s `adapter.fluidState != .idle || morph.fluid.level > 0.01`) — this view's
-/// own `TimelineView` tick stops entirely the instant it unmounts (D9: idle = zero draw cost;
-/// this is what replaces the always-animating breathing/glow halo view, deleted this task).
+/// finished reply sits unread. Mounted ONLY while the fluid is visible — `FluidOrbSlot` below is
+/// the sole owner of that decision — so this view's own `TimelineView` tick stops entirely the
+/// instant it unmounts (D9: idle = zero draw cost; this is what replaces the always-animating
+/// breathing/glow halo view, deleted this task).
 ///
 /// TICK MECHANISM (per the task-3 brief's open question — two candidates were on the table):
 /// (a) read `timeline.date` directly inside the `Canvas` drawing closure and step the sim there,
@@ -24,11 +53,11 @@ import SwiftUI
 /// ~60/s while `.working`, and the view stops ticking entirely once unmounted (confirmed via the
 /// same log going silent).
 struct FluidOrbView: View {
-    @ObservedObject var morph: MorphModel
-    /// Almost always `.working`/`.unread` — `NormaFieldView` keeps this view mounted for one
-    /// beat after the state itself goes idle (draining `targetLevel` to 0) rather than switching
-    /// to passing `.idle` here; `step(at:)` below still handles `.idle` defensively (target 0)
-    /// since `FluidState` is a plain value the caller could in principle pass either way.
+    @ObservedObject var fluid: FluidModel
+    /// The turn/unread/idle state driving this tick. `.idle` is passed here on EVERY drain (a turn
+    /// finishing, or an unread reply getting cleared) — not a rare defensive corner case: `step
+    /// (at:)` below feeds it `targetLevel: 0` for as long as the bubble takes to visibly empty
+    /// out, and `FluidOrbSlot` keeps this view mounted for exactly that long (see its own doc).
     let state: FluidState
 
     /// Norma blue — the working tint (task-level fill while a turn is running). A literal,
@@ -39,6 +68,13 @@ struct FluidOrbView: View {
     /// Warm amber — the unread tint (a finished reply is waiting, unseen). Replaces wave-3's
     /// unread-blink overlay pulse; the amber fluid itself IS the unread signal now.
     private static let unreadTint = Color(red: 1.0, green: 0.72, blue: 0.30)
+
+    /// Task-3 fix wave (review finding, "drain snaps amber → blue"): `FluidState.idle` carries no
+    /// color of its own — without this, a dismissed-unread drain would snap the bubble from amber
+    /// straight to the (semantically meaningless, for a drain) working blue for its entire
+    /// fade-out. Kept current by the `onChange` in `body` below whenever `state` reports an active
+    /// (non-`.idle`) tint; the `.idle` branch of `tint` reuses whatever this last held.
+    @State private var lastTint: Color = workingTint
 
     /// Wall-clock time of the previous tick — `step(at:)` advances by REAL elapsed time between
     /// ticks (not an assumed 1/60 frame rate), so the on-screen liquid tracks the display's
@@ -51,8 +87,7 @@ struct FluidOrbView: View {
     var body: some View {
         TimelineView(.animation) { timeline in
             Canvas { ctx, size in
-                let sim = morph.fluid
-                guard sim.level > 0.005 else { return }
+                let sim = fluid.sim
                 let r = min(size.width, size.height) / 2
                 var path = Path()
                 // Surface line across the bubble, in bubble coordinates.
@@ -78,15 +113,31 @@ struct FluidOrbView: View {
                 step(at: newDate)
             }
         }
+        // Task-3 fix wave: keeps `lastTint` current, including for the very first frame
+        // (`initial: true`) so a fresh mount that happens to start on `.unread` (rather than
+        // `.working`) doesn't fall back to the wrong default if it drains to `.idle` before ever
+        // observing a "change".
+        .onChange(of: state, initial: true) { _, newState in
+            if let active = Self.activeTint(for: newState) {
+                lastTint = active
+            }
+        }
         .clipShape(Circle())
         .allowsHitTesting(false)
     }
 
-    private var tint: Color {
+    /// The tint for an active (non-`.idle`) state; `nil` for `.idle`, which carries no color of
+    /// its own — see `lastTint`'s doc.
+    private static func activeTint(for state: FluidState) -> Color? {
         switch state {
-        case .unread: return Self.unreadTint
-        default: return Self.workingTint
+        case .working: return workingTint
+        case .unread: return unreadTint
+        case .idle: return nil
         }
+    }
+
+    private var tint: Color {
+        Self.activeTint(for: state) ?? lastTint
     }
 
     private func step(at now: Date) {
@@ -94,7 +145,7 @@ struct FluidOrbView: View {
         lastTick = now
 
         let target: Double
-        var acceleration = morph.fluidAcceleration
+        var acceleration = fluid.acceleration
         switch state {
         case .working(let level):
             target = max(0.15, level) // never invisible while working
@@ -110,7 +161,32 @@ struct FluidOrbView: View {
         case .idle:
             target = 0 // draining — see `state`'s doc
         }
-        morph.fluid = morph.fluid.step(dt: dt, acceleration: acceleration, targetLevel: target)
-        OrbDebug.log("FluidOrbView.step dt=\(String(format: "%.4f", dt)) level=\(String(format: "%.3f", morph.fluid.level)) target=\(String(format: "%.2f", target))")
+        fluid.sim = fluid.sim.step(dt: dt, acceleration: acceleration, targetLevel: target)
+        OrbDebug.log("FluidOrbView.step dt=\(String(format: "%.4f", dt)) level=\(String(format: "%.3f", fluid.sim.level)) target=\(String(format: "%.2f", target))")
+    }
+}
+
+/// Task-3 fix wave: the ONLY thing that observes `FluidModel` other than `FluidOrbView` itself.
+/// `NormaFieldView` mounts this unconditionally (see its call site) and never touches `FluidModel`
+/// at all — re-renders of THIS view are driven by `fluid.sim` changing (the ~120Hz tick, while
+/// active) and stay fully scoped to this leaf; `NormaFieldView`'s own body never re-runs because
+/// of them, which is the whole point of this split (see `FluidModel`'s doc above).
+struct FluidOrbSlot: View {
+    @ObservedObject var fluid: FluidModel
+    let state: FluidState
+
+    var body: some View {
+        // `state != .idle`: an active turn or an unread reply — always show. The second clause
+        // keeps the drain itself VISIBLE after `state` has already gone `.idle` (`FluidOrbView`
+        // keeps ticking `targetLevel: 0` — see its doc) instead of hard-cutting to invisible the
+        // instant the turn/unread state clears. Once the drain settles under 0.01 this renders
+        // `EmptyView()`, which removes `FluidOrbView` — and with it its `TimelineView` — from the
+        // tree entirely: no more ticks, no more `@Published` writes, truly quiescent (D9) until
+        // the next `.working`/`.unread`.
+        if state != .idle || fluid.sim.level > 0.01 {
+            FluidOrbView(fluid: fluid, state: state)
+        } else {
+            EmptyView()
+        }
     }
 }

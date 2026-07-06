@@ -74,6 +74,14 @@ import AppKit
 struct NormaFieldView: View {
     @ObservedObject var adapter: FieldStateAdapter
     @ObservedObject var morph: MorphModel
+    /// Task-3 fix wave (review finding, "full-body re-render per tick"): deliberately NOT
+    /// `@ObservedObject` — see `FluidModel`'s doc (`FluidOrbView.swift`) for why this view must
+    /// never subscribe to the fluid's own publisher (that publisher fires at the sim's ~120Hz
+    /// tick rate, and this view's `body` — the whole field's glass geometry, composer/response
+    /// content, nav pill — is exactly what the fix wave stops from re-running on every one of
+    /// those writes). Held only to hand down to `FluidOrbSlot`, the sole observer, at the mount
+    /// site in `composerMorphedContent` below.
+    let fluid: FluidModel
     @Namespace private var glassNamespace
 
     @State private var composerContentHeight: CGFloat = 22
@@ -82,18 +90,6 @@ struct NormaFieldView: View {
     /// there is no visualCustomization system in v2 yet, so this is a fixed placeholder; a later
     /// wave that adds user customization should rebind this to a real setting.
     private let haloColor = Color.blue
-
-    /// Task 3 mounting rule for `FluidOrbView`: true while there's fluid state to show
-    /// (`.working`/`.unread`), OR — the second clause — while the sim still holds residual fill
-    /// from a JUST-finished `.working`/`.unread` spell that's draining back toward empty
-    /// (`FluidOrbView.step` feeds `targetLevel: 0` once `adapter.fluidState` reports `.idle`).
-    /// Without that second clause the view would hard-cut to invisible the instant the state
-    /// flips idle, rather than visibly draining; D9 (idle = zero draw cost) still holds once the
-    /// drain settles under 0.01, at which point this — and therefore the whole `TimelineView`
-    /// tick — unmounts.
-    private var showsFluid: Bool {
-        adapter.fluidState != .idle || morph.fluid.level > 0.01
-    }
 
     var body: some View {
         GeometryReader { geo in
@@ -303,15 +299,31 @@ struct NormaFieldView: View {
             // translucent glass material above, but below the stroke/foreground layers just
             // below (both wrapped in `GlassForegroundLegibility`'s difference blend, which would
             // invert the fluid's literal blue/amber tint if it were applied here too). Replaces
-            // the wave-3 unread blink outright (`showsFluid`'s doc) — the amber fluid IS the
+            // the wave-3 unread blink outright (`FluidOrbSlot`'s doc) — the amber fluid IS the
             // unread signal now. Sized/positioned to the collapsed orb bubble exactly (not
             // `composerShape`, which grows through the morph) and hard-clipped to a circle by
             // `FluidOrbView` itself.
-            if showsFluid {
-                FluidOrbView(morph: morph, state: adapter.fluidState)
-                    .frame(width: morph.orbBubbleSize, height: morph.orbBubbleSize)
-                    .position(x: collapsedCenter.x, y: collapsedCenter.y)
-            }
+            //
+            // Task-3 fix wave: mounted UNCONDITIONALLY — `FluidOrbSlot` (observing `FluidModel`,
+            // never this view) owns the visible/empty decision internally, so `NormaFieldView`
+            // never needs to react to the fluid's own state to decide whether to include it in
+            // the tree at all (see `FluidModel`'s doc).
+            //
+            // Task-3 fix wave (review finding, "no progress fade"): the fluid is an ORB-state
+            // visual — the deleted BreathingHalo faded via this exact
+            // `1 - smoothstep(0.0, 0.28, progress)` curve as the field expanded; without it the
+            // fluid would sit visible at the expanded panel's center with no fade at all. Reads
+            // `morph.progress`, which this view already observes, so this adds no new
+            // invalidation source. The slot's `TimelineView` still ticks while the field is
+            // expanded (opacity 0 doesn't unmount it) — acceptable: D9 (idle = zero draw cost)
+            // concerns true idle (state == .idle AND drained), not "field open." Gating the MOUNT
+            // itself on progress too was considered and rejected — mount stays driven purely by
+            // fluidState/level (`FluidOrbSlot`'s own doc) so drain-visibility doesn't depend on
+            // which surface happens to be showing.
+            FluidOrbSlot(fluid: fluid, state: adapter.fluidState)
+                .frame(width: morph.orbBubbleSize, height: morph.orbBubbleSize)
+                .position(x: collapsedCenter.x, y: collapsedCenter.y)
+                .opacity(1 - smoothstep(0.0, 0.28, morph.progress))
 
             RoundedRectangle(
                 cornerRadius: morphedCornerRadius(for: composerShape),

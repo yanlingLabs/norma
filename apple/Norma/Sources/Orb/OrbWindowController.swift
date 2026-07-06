@@ -37,6 +37,12 @@ final class OrbWindowController: ObservableObject {
 
     let follower: OrbFollower
     let morphModel: MorphModel
+    /// Task-3 fix wave: the fluid orb's own dedicated model (split off `MorphModel` — see
+    /// `FluidModel`'s doc, `FieldKit/FluidOrbView.swift`), created alongside `morphModel` and
+    /// passed down the same path (`GlassRootView` → `NormaFieldView` → `FluidOrbSlot`).
+    /// `OrbFollower` also holds this reference to write its per-tick acceleration tap directly
+    /// onto it instead of onto `morphModel`.
+    let fluidModel = FluidModel()
     private let panel: KeyableNonActivatingPanel
     private(set) var isVisible = false
     /// Derived, not driven directly by callers: `.field` the instant an expand STARTS,
@@ -137,7 +143,7 @@ final class OrbWindowController: ObservableObject {
         self.session = session
         let morph = MorphModel()
         self.morphModel = morph
-        self.follower = OrbFollower(morphModel: morph)
+        self.follower = OrbFollower(morphModel: morph, fluidModel: fluidModel)
 
         // v1 PointerOverlayWindow configuration, verbatim, except the panel now starts sized to
         // the COLLAPSED geometry (task B: the panel resizes between `collapsedWindowSize` and
@@ -171,7 +177,7 @@ final class OrbWindowController: ObservableObject {
         // `NormaFieldView` (FieldKit), which owns its own `GlassEffectContainer` and renders the
         // whole orb↔field morph off `morphModel.progress`.
         panel.contentView = NSHostingView(
-            rootView: GlassRootView(session: session, controller: self, morphModel: morph)
+            rootView: GlassRootView(session: session, controller: self, morphModel: morph, fluidModel: fluidModel)
         )
     }
 
