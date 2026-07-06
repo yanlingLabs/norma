@@ -15,6 +15,10 @@ struct TranscriptUserBubble: View {
     let text: String
     let tint: Color
 
+    private var displayText: String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     var body: some View {
         HStack(alignment: .bottom) {
             Spacer(minLength: 90)
@@ -31,7 +35,7 @@ struct TranscriptUserBubble: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.secondary)
 
-            TranscriptFormattedMessageText(text: text, tint: tint, fillsAvailableWidth: false)
+            TranscriptFormattedMessageText(text: displayText, tint: tint, fillsAvailableWidth: false)
                 .foregroundStyle(.primary)
         }
         .padding(14)
