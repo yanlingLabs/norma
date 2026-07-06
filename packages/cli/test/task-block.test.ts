@@ -70,3 +70,25 @@ describe("trackLineStart (safe-repaint-point rule)", () => {
     expect(trackLineStart(false, "")).toBe(false);
   });
 });
+
+describe("renderTaskBlock width truncation (final-review fix: erase math needs 1 logical line == 1 physical row)", () => {
+  const long = { id: "1", subject: "a".repeat(200), status: "pending" } as any;
+
+  test("a subject longer than the terminal truncates to columns-2 with an ellipsis (never wraps)", () => {
+    const lines = renderTaskBlock([long], 80);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.length).toBe(78); // columns - 2, ellipsis included
+    expect(lines[0]!.endsWith("…")).toBe(true);
+  });
+
+  test("short subjects pass through untouched at any width", () => {
+    const short = { id: "2", subject: "ship it", status: "pending" } as any;
+    expect(renderTaskBlock([short], 80)).toEqual([`${TASK_ICONS.pending} ship it`]);
+  });
+
+  test("undefined or tiny columns fall back to no truncation (pre-fix behavior)", () => {
+    expect(renderTaskBlock([long])[0]!.length).toBeGreaterThan(100);
+    expect(renderTaskBlock([long], 0)[0]!.length).toBeGreaterThan(100);
+    expect(renderTaskBlock([long], 2)[0]!.length).toBeGreaterThan(100);
+  });
+});

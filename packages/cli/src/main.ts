@@ -149,7 +149,9 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
   }
   function repaintBlockIfSafe(): void {
     if (!process.stdout.isTTY || !atLineStart) return;
-    const lines = renderTaskBlock(tasks);
+    // Width passed per-repaint (not cached): terminal resizes between repaints pick up the new
+    // width; truncation keeps 1 logical line == 1 physical row so the erase count stays exact.
+    const lines = renderTaskBlock(tasks, process.stdout.columns);
     if (lines.length === 0) return;
     for (const l of lines) process.stdout.write(`${DIM}${l}${RESET}\n`);
     pinnedLines = lines.length;
