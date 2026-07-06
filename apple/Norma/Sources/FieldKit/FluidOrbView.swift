@@ -229,6 +229,15 @@ struct FluidOrbView: View {
         .onChange(of: state) { _, _ in
             paused = false
         }
+        // UNPAUSE path (c), re-review hardening: path (a) only fires on a state VALUE change, but
+        // a resubmit with identical task counts re-derives the same `.working(level)` — `isHeld`
+        // flips false with no `state` diff and no cursor motion for path (b), leaving `paused`
+        // true during a running turn. Invisible today (a settled `.working` sim renders
+        // identically frozen or ticking) but violates `paused`'s held-only invariant; clear it
+        // whenever the hold ends.
+        .onChange(of: isHeld) { _, held in
+            if !held { paused = false }
+        }
         // UNPAUSE path (b), half 1: mirror `paused` onto the model so its `acceleration.didSet`
         // (the other half, in `FluidModel`) knows whether tripping `excitationPulse` is even
         // worth doing right now.
