@@ -31,6 +31,11 @@ struct GlassRootView: View {
         adapter.onClearMessage = { [adapter] in adapter.composerDraft = "" }
         adapter.onCollapse = { [controller] in controller.collapseToOrb() }
         adapter.onExpandToWindow = { [controller] in controller.requestExpandToWindow() }
+        // Gate r7 (same-panel window morph): the window's traffic lights / zoom route back to the
+        // controller — red+yellow collapse to the orb, green toggles zoom. Esc + the 4-finger tap
+        // use `collapseWindowToOrb()` directly (key monitor / AppDelegate summon router).
+        adapter.onWindowClose = { [controller] in controller.collapseWindowToOrb() }
+        adapter.onWindowZoom = { [controller] in controller.zoomToggleWindow() }
         // Wave-5 gate item 4: the composer-hop seam — `OrbWindowController.handleAcceptedSwipe`
         // needs to read/write `adapter.showingDraft` but can't reach the adapter directly (see
         // `OrbWindowController.isShowingDraft`'s doc).
@@ -91,15 +96,12 @@ struct GlassRootView: View {
                         adapter.showingDraft = true
                     }
                 case .window:
-                    // Phase 2d-i: `enterWindowMode()` routes through `hide()` internally, which
-                    // sets `surface = .orb` synchronously BEFORE the controller overwrites it
-                    // again to `.window` (see that method's ordering doc) — but both mutations
-                    // land in the same synchronous call, before SwiftUI's next view-update pass
-                    // ever observes the intermediate value, so this `onChange` only ever fires
-                    // `.field` → `.window` directly, never routing through the `.orb` case above.
-                    // That's exactly right: the chat window (`ChatWindowRootView`) renders off
-                    // this SAME `adapter`, so the in-progress draft must survive the handoff
-                    // untouched, not get stashed-and-cleared like a real collapse-to-orb.
+                    // Gate r7 (same-panel window morph): `presentWindowSurface()` flips
+                    // `.field` → `.window` on the SAME panel — the window branch (`WindowSurfaceView`)
+                    // renders off this SAME `adapter`, so the in-progress draft must survive the
+                    // handoff untouched, not get stashed-and-cleared like a real collapse-to-orb
+                    // (that happens on the `.orb` case when the window later collapses back). Nothing
+                    // to reset here.
                     break
                 }
             }

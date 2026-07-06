@@ -63,6 +63,23 @@ final class OrbFollower {
     /// unconditionally, v1's own bypass of the freeze).
     var isCollapsing = false
 
+    /// Gate r7 (same-panel window morph): while the window surface is open the panel is a large,
+    /// LOCKED frame — the follower must NOT spring it toward the cursor (the window is stationary,
+    /// spec §5). Distinct from `stop()`: the display link stays alive (paused) and the spring/cursor
+    /// state is preserved, so `OrbWindowController.finishWindowCollapse()` can resume tracking from a
+    /// snapped origin (the orb springs smoothly from the locked open anchor to the cursor rather than
+    /// teleporting). Set true by `presentWindowSurface()`, back to false by `finishWindowCollapse()`.
+    var windowStationary = false {
+        didSet {
+            guard windowStationary != oldValue else { return }
+            if windowStationary {
+                link?.isPaused = true
+            } else {
+                wake()
+            }
+        }
+    }
+
     var onCursorLocationChange: ((CGPoint) -> Void)?
     /// Renamed from wave 1's `onOrbCenterChange`: the published value is now the panel's
     /// window origin, not an orb center.
@@ -159,6 +176,9 @@ final class OrbFollower {
     }
 
     @objc private func tick() {
+        // Gate r7: the window surface is stationary — the link is paused while `windowStationary`,
+        // so this normally won't fire at all; belt against a stray tick moving the locked frame.
+        if windowStationary { return }
         let now = CACurrentMediaTime()
         let dt = now - lastUpdate
         lastUpdate = now
@@ -215,6 +235,9 @@ final class OrbFollower {
     }
 
     private func wake() {
+        // Gate r7: cursor samples keep arriving while the window is open — never let them un-pause
+        // the link and start moving the locked window frame.
+        guard !windowStationary else { return }
         guard let link else { return }
         if link.isPaused {
             lastUpdate = CACurrentMediaTime() // don't integrate the paused gap

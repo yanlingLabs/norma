@@ -8,7 +8,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var menuBar: MenuBarController?
     private(set) var appModel: AppModel?
     private(set) var orbController: OrbWindowController?
-    private(set) var chatController: ChatWindowController?
     private var stickiness: StickinessEngine?
     private var startTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
@@ -50,12 +49,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let orb = OrbWindowController(session: model.session)
         orbController = orb
 
-        // Task 5: the second controller, sharing the field's own `fieldAdapter` (Task 2d-i.2)
-        // so drafts/replies/focus stay in sync across the two surfaces for free.
-        let chat = ChatWindowController(session: model.session, adapter: orb.fieldAdapter)
-        chatController = chat
-        orb.onExpandToWindow = { [weak chat] frame in chat?.show(from: frame) }
-        chat.onClose = { [weak orb] in orb?.exitWindowMode() }
+        // Gate r7 (ARCHITECTURE PIVOT): the window is now a THIRD morph target of the orb panel
+        // itself (`OrbWindowController.presentWindowSurface()`), not a separate `ChatWindowController`
+        // panel — the whole `ChatWindow/*` layer is deleted. Expand-to-window is driven entirely
+        // inside the controller (chevron → `requestExpandToWindow()`), so there is no cross-controller
+        // `onExpandToWindow`/`onClose` wiring left to do.
 
         orb.onSubmit = { [weak self] text in
             guard let model = self?.appModel else { return false }
@@ -70,7 +68,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { await self.appModel?.interruptTurn() }
             return true
         }
-        chat.onEsc = orb.onEsc // identical interrupt semantics (wire AFTER orb.onEsc is assigned)
 
         let sticky = StickinessEngine(onTarget: { [weak orb] target in
             orb?.follower.setMagneticTarget(target)
@@ -90,13 +87,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             HotkeyTrigger.shared.start()
 
             TriggerHub.shared.didTrigger
-                .sink { [weak orb, weak chat] in
+                .sink { [weak orb] in
                     Haptics.gestureRecognized()
                     guard let orb else { return }
-                    switch summonToggleAction(surface: orb.surface, windowVisible: chat?.isVisible == true) {
-                    // Gate r3 (W1): animated close (spring-shrink to the cursor) — matches the
-                    // Esc/traffic-light close paths in `ChatWindowController`.
-                    case .closeWindow: chat?.closeAnimated()
+                    // Gate r7: the window surface is the SAME panel now, so window-open == orb visible
+                    // with `surface == .window`. A 4-finger tap while the window is open collapses it
+                    // back to the orb (the SAME 140/22 spring the morph uses); otherwise toggle field.
+                    switch summonToggleAction(surface: orb.surface, windowVisible: orb.isVisible) {
+                    case .closeWindow: orb.collapseWindowToOrb()
                     case .toggleField: orb.toggleField()
                     }
                 }

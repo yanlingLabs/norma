@@ -56,6 +56,12 @@ final class OrbWindowController: ObservableObject {
     /// public surface into its collaborator's internals.
     var morphProgressForTesting: Double { morphModel.progress }
 
+    /// Test-only: true once the morph spring has settled (no timer running) — the reliable "the
+    /// morph is done" signal a progress read can't give (the spring can overshoot past the target
+    /// before the settle epsilon fires). Gate r7's `zoomToggleWindow()` no-ops mid-morph, so its
+    /// test waits on this.
+    var isMorphIdleForTesting: Bool { morphTimer == nil }
+
     /// Test-only counter (gate fix — Esc-interrupt live-gate finding): `MorphTimerReentrancyTests`
     /// asserts this stays at 1 after a stale/duplicate `morphTick()` fires post-settle — see
     /// `morphTick()`'s re-entry guard doc for the bug this locks in against.
@@ -72,10 +78,10 @@ final class OrbWindowController: ObservableObject {
     /// session, so tests that assert on it must tolerate a headless host where it stays false.
     var panelIsKeyForTesting: Bool { panel.isKeyWindow }
 
-    /// Test-only seam: `surface` is `private(set)` because production callers only ever move it
-    /// via `expandToField()`/`collapseToOrb()`/`enterWindowMode()`/`exitWindowMode()`'s own
-    /// guarded transitions — but `SurfaceWindowTests` needs to plant `.window` directly to test
-    /// `exitWindowMode()` in isolation, without first driving a real field→window handoff.
+    /// Test-only seam: `surface` is `private(set)` because production callers only ever move it via
+    /// `expandToField()`/`collapseToOrb()`/`enterWindowMode()`/`collapseWindowToOrb()`'s own guarded
+    /// transitions — but a test may need to plant a surface directly to exercise a method in
+    /// isolation without first driving the whole handoff.
     func setSurfaceForTesting(_ s: Surface) { surface = s }
 
     /// Wired in Task 6: the controller exposes callbacks, it does NOT import AppModel.
@@ -233,6 +239,14 @@ final class OrbWindowController: ObservableObject {
             morphModel.progress = 0
             morphVelocity = 0
             finishCollapse()
+        } else if surface == .window {
+            // Gate r7: hiding while the window is open — snap-finish the window's collapse to the
+            // orb (same teardown the morph settle runs) rather than orphaning its monitors + mouse
+            // gate behind a hidden panel.
+            cancelMorphTimer()
+            morphModel.progress = 0
+            morphVelocity = 0
+            finishWindowCollapse()
         }
         isVisible = false
         follower.stop()
@@ -336,29 +350,46 @@ final class OrbWindowController: ObservableObject {
             guard let self else { return event }
             // Finding-2 belt (gate 2, wave-9 parity): a LOCAL monitor only ever sees OUR app's own
             // events, and this accessory app has exactly ONE window a keyDown could be meant for
-            // while the field is open — the field panel. So route Esc on the SURFACE, not on
+            // while the field/window is open — this panel. So route Esc on the SURFACE, not on
             // `event.window === panel`: a re-summon key race can leave the keyDown bound to a
             // stale/nil window (exactly what wave-9 found for synthesized scrolls), and the old
-            // window-identity guard then silently dropped a perfectly good Esc. `escMonitorAction`
-            // is the pure, table-tested decision (window identity is deliberately not one of its
-            // inputs). NOTE the residual case this belt canNOT cover: if the panel isn't key AND
-            // our app isn't active at all, no local monitor fires — that path is closed by
-            // `makePanelKeyWinningLateActivation()` making the panel key on every summon.
+            // window-identity guard then silently dropped a perfectly good Esc. The routing
+            // functions are pure/table-tested (window identity is deliberately not an input).
+            //
+            // Gate r7: the SAME monitor now serves the window surface too — `finishCollapse()` never
+            // ran on the field→window handoff, so this monitor is still installed; it reads
+            // `self.surface` live and dispatches to `windowEscAction` while `.window`.
             let running = self.session.state.turnRunning
-            switch escMonitorAction(
-                keyCode: event.keyCode,
-                surface: self.surface,
-                escConsumed: { self.onEsc?() == true }
-            ) {
-            case .passThrough:
+            switch self.surface {
+            case .field:
+                switch escMonitorAction(
+                    keyCode: event.keyCode, surface: .field,
+                    escConsumed: { self.onEsc?() == true }
+                ) {
+                case .passThrough:
+                    return event
+                case .interrupt:
+                    OrbDebug.log("key monitor: field Esc → interrupt panelKey=\(panel.isKeyWindow) turnRunning=\(running)")
+                    return nil
+                case .collapse:
+                    OrbDebug.log("key monitor: field Esc → collapse panelKey=\(panel.isKeyWindow) turnRunning=\(running)")
+                    self.collapseToOrb()
+                    return nil
+                }
+            case .window:
+                switch windowEscAction(keyCode: event.keyCode, escConsumed: { self.onEsc?() == true }) {
+                case .interrupt?:
+                    OrbDebug.log("key monitor: window Esc → interrupt turnRunning=\(running)")
+                    return nil
+                case .close?:
+                    OrbDebug.log("key monitor: window Esc → collapse turnRunning=\(running)")
+                    self.collapseWindowToOrb()
+                    return nil
+                case nil:
+                    return event
+                }
+            case .orb:
                 return event
-            case .interrupt:
-                OrbDebug.log("key monitor: Esc → interrupt isPanel=\(event.window === panel) panelKey=\(panel.isKeyWindow) turnRunning=\(running)")
-                return nil
-            case .collapse:
-                OrbDebug.log("key monitor: Esc → collapse isPanel=\(event.window === panel) panelKey=\(panel.isKeyWindow) turnRunning=\(running)")
-                self.collapseToOrb()
-                return nil
             }
         }
 
@@ -369,6 +400,11 @@ final class OrbWindowController: ObservableObject {
         swipeRecognizer.reset()
         scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel]) { [weak self] event in
             guard let self else { return event }
+            // Gate r7: this monitor's swipe/response-scroll interception is FIELD-only. In window
+            // mode the surface is opaque with a real `ScrollView` that hit-tests natively (no
+            // difference blend to break it — the whole reason the window escapes the field's
+            // regime), so scrolls must pass straight through untouched.
+            guard self.surface == .field else { return event }
             // Real trackpad events arrive bound to the panel (`event.window === panel` — proven
             // live in wave 8: 80 consecutive real samples). Synthesized scroll events
             // (accessibility/automation tooling, and this project's own CGEvent verification
@@ -572,21 +608,14 @@ final class OrbWindowController: ObservableObject {
         }
     }
 
-    /// Phase 2d-i: field → window handoff. Gate fix (F1 — expand choreography, live-gate
-    /// finding): the field first visibly MORPHS BACK into the orb (the ordinary
-    /// `collapseToOrb()` spring, same as any other collapse — no more instant force-finish via
-    /// `hide()`), and only once that morph SETTLES does the chat window actually start growing,
-    /// from the NOW-COLLAPSED orb's small frame (spec §2: the window IS Norma until dismissed).
-    var onExpandToWindow: ((NSRect) -> Void)?
-
-    /// One-shot latch (gate fix F1): armed by `enterWindowMode()` instead of driving the handoff
-    /// synchronously. The field must be SEEN to morph back into the orb before the chat window
-    /// appears, so `enterWindowMode()` merely arms this and starts the ordinary animated
-    /// `collapseToOrb()` — the actual handoff (capture the collapsed orb's frame, hide the orb
-    /// panel, flip `surface` to `.window`, fire `onExpandToWindow?`) happens inside
-    /// `finishCollapse()`, once the morph spring settles naturally, exactly like any other
-    /// collapse completion. `consumePendingWindowExpand()` is the one-shot consumer, same shape
-    /// as `consumeCollapseOnTurnStart()`/`consumeExpandForAnswerReveal()` above.
+    /// One-shot latch (gate fix F1, gate r7): armed by `enterWindowMode()` instead of driving the
+    /// handoff synchronously. The field must be SEEN to morph back into the orb before the window
+    /// grows out of it, so `enterWindowMode()` merely arms this and starts the ordinary animated
+    /// `collapseToOrb()` — the actual handoff (`presentWindowSurface()`: lock the screen, compute
+    /// the layout, set the big window frame, flip to `.window`, start a fresh 0→1 morph on the SAME
+    /// panel) fires from `morphTick()` the instant the reverse-morph crosses progress ≤0.08 (v1's
+    /// `morphCompletionProgressThreshold`). `consumePendingWindowExpand()` is the one-shot consumer,
+    /// same shape as `consumeCollapseOnTurnStart()`/`consumeExpandForAnswerReveal()` above.
     ///
     /// Cleared (never fires stale — this codebase got burned by exactly that once already, see
     /// `collapseOnTurnStart`'s doc) on any path that ends this collapse cycle for a DIFFERENT
@@ -620,13 +649,182 @@ final class OrbWindowController: ObservableObject {
         enterWindowMode()
     }
 
-    /// Legal only from `.window`. Restores the orb: `surface = .orb` first (so the chat window's
-    /// `onClose` → this call leaves no window in between where `surface` is stale), then `show()`
-    /// re-summons the orb panel at the cursor and restarts the follower.
-    func exitWindowMode() {
+    /// Gate r7 test seam: the window is zoomed (green traffic light) — instant re-present at a
+    /// near-fullscreen content size; toggles back to `chatWindowDefaultSize`. Reset on collapse.
+    private(set) var windowZoomed = false
+
+    /// Gate r7 (ARCHITECTURE PIVOT): present the large window surface on the SAME panel — v1's
+    /// `presentLargeSurface` (GlassFieldWindow.swift:829-883), simplified for v2's single centered
+    /// surface. Called from `morphTick()` the instant the field's reverse-morph crosses progress
+    /// ≤0.08, so the composer is seen morphing back toward the orb before the window grows out of
+    /// it. Locks the screen, computes the layout, sets the big window frame UP-FRONT, updates
+    /// `activeWindowSize`, switches to fixed-Space behavior (no `.canJoinAllSpaces` — the window
+    /// stays on its Space, v1 parity), flips to `.window`, and starts a FRESH 0→1 morph (SAME
+    /// 140/22 spring, same `morphTick`).
+    private func presentWindowSurface() {
+        guard consumePendingWindowExpand() else { return }
+        cancelMorphTimer() // the field's reverse-morph is done; take over with a fresh window morph
+
+        // The orb's current screen position — `finishCollapse()` never ran (we cancelled the field
+        // collapse mid-way), so the panel is still the FIELD frame and `currentGlassAnchor()` reads
+        // its orb anchor, which the collapse's cursor-riding put at ~the cursor.
+        let anchor = currentGlassAnchor()
+        let screen = visibleScreenFrame(containing: anchor)
+        let layout = windowSurfaceLayout(
+            anchor: anchor,
+            contentSize: chatWindowDefaultSize,
+            haloPadding: morphModel.haloPadding,
+            orbBubbleSize: morphModel.orbBubbleSize,
+            screenFrame: screen
+        )
+        morphModel.windowFinalRect = layout.finalRect
+        morphModel.windowOrbPoint = layout.orbPoint
+        windowZoomed = false
+
+        // Stationary (spec §5): pause the follower so it never springs the locked window frame.
+        follower.windowStationary = true
+
+        // Fixed-Space behavior — the window stays on the Space it opened on (v1 parity:
+        // `fixedSpacePanelCollectionBehavior`, no `.canJoinAllSpaces`).
+        panel.collectionBehavior = [.stationary, .ignoresCycle, .fullScreenAuxiliary]
+        panel.setFrame(layout.windowFrame, display: false)
+        // Keep NSHostingView's own auto-resize in lockstep (see `MorphModel.activeWindowSize`).
+        morphModel.activeWindowSize = layout.windowFrame.size
+
+        // Window-mode input: keyable + hit-testable (gated by the mouse gate) + draggable by the
+        // glass body (spec §5 — only in window mode; false everywhere else).
+        panel.acceptsKeyInput = true
+        panel.ignoresMouseEvents = false
+        panel.isMovableByWindowBackground = true
+        panel.orderFrontRegardless()
+        panel.makeKey()
+
+        surface = .window
+        morphModel.renderSurface = .window
+        morphModel.progress = 0
+        morphVelocity = 0
+
+        startWindowMouseGate()
+        startMorph(target: 1)
+        OrbDebug.log("presentWindowSurface: anchor=\(anchor) windowFrame=\(layout.windowFrame)")
+    }
+
+    /// Gate r7: window → orb collapse — Esc (idle), the red/yellow traffic lights, and the 4-finger
+    /// tap all route here. v1 parity: the large surface ALWAYS returns to the orb, never back to the
+    /// field. Reverse-morphs the shell back down to the orb bubble (SAME 140/22 spring);
+    /// `finishWindowCollapse()` does the teardown once it settles.
+    func collapseWindowToOrb() {
         guard surface == .window else { return }
-        surface = .orb
-        show()               // orb reappears at the cursor; follower restarts
+        startMorph(target: 0)
+        OrbDebug.log("collapseWindowToOrb: morphTarget=0")
+    }
+
+    /// Gate r7 (green traffic light): toggle the window between `chatWindowDefaultSize` and a
+    /// near-fullscreen content size. SHIPPED SIMPLE (noted for the gate): an INSTANT re-present of
+    /// the layout at the same anchor — progress stays 1 (no re-morph), so the shell + content just
+    /// resize in place. Deliberately NOT `.animator()`/`NSAnimationContext` for the frame (verified
+    /// SIGBUS class in this codebase); a spring-animated zoom is possible future polish. No-op while
+    /// a morph is in flight (`morphTimer != nil`).
+    func zoomToggleWindow() {
+        guard surface == .window, morphTimer == nil else { return }
+        let anchor = currentWindowScreenAnchor()
+        let screen = visibleScreenFrame(containing: anchor)
+        let content: CGSize
+        if windowZoomed {
+            content = chatWindowDefaultSize
+            windowZoomed = false
+        } else {
+            let inset = morphModel.haloPadding + chatWindowZoomInset
+            content = CGSize(
+                width: max(chatWindowDefaultSize.width, screen.width - 2 * inset),
+                height: max(chatWindowDefaultSize.height, screen.height - 2 * inset)
+            )
+            windowZoomed = true
+        }
+        let layout = windowSurfaceLayout(
+            anchor: anchor, contentSize: content,
+            haloPadding: morphModel.haloPadding, orbBubbleSize: morphModel.orbBubbleSize,
+            screenFrame: screen
+        )
+        morphModel.windowFinalRect = layout.finalRect
+        morphModel.windowOrbPoint = layout.orbPoint
+        panel.setFrame(layout.windowFrame, display: true)
+        morphModel.activeWindowSize = layout.windowFrame.size
+        OrbDebug.log("zoomToggleWindow: zoomed=\(windowZoomed) content=\(content)")
+    }
+
+    /// The orb end of the window shell mapped to screen coords, read off the panel's CURRENT frame
+    /// (robust to a user drag — the window may have moved from where it opened).
+    private func currentWindowScreenAnchor() -> CGPoint {
+        let frame = panel.frame
+        let orbPoint = morphModel.windowOrbPoint ?? CGPoint(x: frame.width / 2, y: frame.height / 2)
+        return CGPoint(x: frame.minX + orbPoint.x, y: frame.maxY - orbPoint.y)
+    }
+
+    private func visibleScreenFrame(containing point: CGPoint) -> NSRect {
+        (NSScreen.screens.first { $0.frame.contains(point) }?.visibleFrame)
+            ?? NSScreen.main?.visibleFrame
+            ?? NSScreen.main?.frame
+            ?? .zero
+    }
+
+    // MARK: Window-surface mouse gating (gate r7 — transplant of v1 `largeSurfaceMouseGate`/
+    // `largeSurfaceHitTest`, GlassFieldWindow.swift:1158-1219/1248-1290)
+
+    private var windowMouseGateTimer: Timer?
+
+    private func startWindowMouseGate() {
+        guard windowMouseGateTimer == nil else { return }
+        panel.acceptsMouseMovedEvents = true
+        updateWindowMouseGate()
+        windowMouseGateTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.updateWindowMouseGate() }
+        }
+    }
+
+    private func stopWindowMouseGate() {
+        windowMouseGateTimer?.invalidate()
+        windowMouseGateTimer = nil
+    }
+
+    /// The panel now spans content + halo, so a click on the transparent halo margin must pass
+    /// THROUGH. 60Hz: hit-test the current morphed shell rect and toggle `panel.ignoresMouseEvents`.
+    private func updateWindowMouseGate() {
+        guard surface == .window, isVisible,
+              let finalRect = morphModel.windowFinalRect,
+              let orbPoint = morphModel.windowOrbPoint else { return }
+        let frame = panel.frame
+        let screenPoint = NSEvent.mouseLocation
+        let localPoint = CGPoint(x: screenPoint.x - frame.minX, y: frame.maxY - screenPoint.y)
+        let accepts = windowSurfaceHitTest(
+            point: localPoint, windowSize: frame.size,
+            finalRect: finalRect, orbPoint: orbPoint,
+            progress: morphModel.progress, orbBubbleSize: morphModel.orbBubbleSize
+        )
+        setWindowMouseAcceptance(accepts)
+    }
+
+    /// v1 parity: only mutate on a CHANGE, and synthesize a mouse-moved on each toggle so hover/
+    /// tracking doesn't stick when the pointer crosses the shell↔halo boundary.
+    private func setWindowMouseAcceptance(_ accepts: Bool) {
+        let wasAccepting = !panel.ignoresMouseEvents
+        guard wasAccepting != accepts else { return }
+        if wasAccepting, !accepts { synthesizeWindowMouseMoved() }
+        panel.ignoresMouseEvents = !accepts
+        panel.acceptsMouseMovedEvents = true
+        if !wasAccepting, accepts { synthesizeWindowMouseMoved() }
+    }
+
+    private func synthesizeWindowMouseMoved() {
+        let screenPoint = NSEvent.mouseLocation
+        guard panel.frame.contains(screenPoint) else { return }
+        let locationInWindow = CGPoint(x: screenPoint.x - panel.frame.minX, y: screenPoint.y - panel.frame.minY)
+        guard let event = NSEvent.mouseEvent(
+            with: .mouseMoved, location: locationInWindow,
+            modifierFlags: NSEvent.modifierFlags, timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: panel.windowNumber, context: nil, eventNumber: 0, clickCount: 0, pressure: 0
+        ) else { return }
+        panel.sendEvent(event)
     }
 
     // MARK: Morph spring
@@ -689,21 +887,19 @@ final class OrbWindowController: ObservableObject {
             dt: dt
         )
 
-        // Fix C (anim-fidelity restore, v1 early-fire parity — GlassFieldWindow.swift:1827-1839's
-        // `morphCompletionProgressThreshold`): when collapsing WITH a field→window handoff armed
-        // (`pendingWindowExpand`), fire the handoff the INSTANT progress crosses 0.15 on the way
-        // down to 0, rather than waiting for the full settle below. This lets the chat window
-        // start growing from the collapsing orb's current position while the orb's own last
-        // sliver of collapse finishes underneath it, instead of visibly pausing at full settle
-        // before the window ever appears. One-shot: `beginWindowHandoffOverlapped()` consumes
-        // `pendingWindowExpand`, so this condition is false on every subsequent tick even though
-        // `next <= 0.15` stays true all the way down to 0 — the LATCH is the guard, not the
-        // progress comparison.
-        if morphTarget == 0, pendingWindowExpand, next <= 0.15 {
+        // Gate r7 (v1 early-fire parity — `morphCompletionProgressThreshold`, GlassFieldWindow.swift:
+        // 822): when the field is reverse-morphing toward the orb WITH a window handoff armed
+        // (`pendingWindowExpand`), present the window surface the INSTANT progress crosses ≤0.08 on
+        // the way to 0 — the composer is seen morphing back to the orb, then the window grows out of
+        // it (`presentWindowSurface()` starts a fresh 0→1 morph on the SAME panel). One-shot:
+        // `presentWindowSurface()` consumes `pendingWindowExpand` AND cancels this morph timer, so
+        // this branch can never re-fire. `surface == .field` is a belt — the latch is only ever
+        // armed while `.field`.
+        if surface == .field, morphTarget == 0, pendingWindowExpand, next <= 0.08 {
             morphModel.progress = next
             morphVelocity = velocity
-            beginWindowHandoffOverlapped()
-            return // morph timer keeps running — orb finishes collapsing beneath the growing window
+            presentWindowSurface() // consumes the latch, cancels this morph, starts the window's 0→1
+            return
         }
 
         morphModel.progress = next
@@ -720,40 +916,67 @@ final class OrbWindowController: ObservableObject {
         cancelMorphTimer()
 
         if morphTarget == 0 {
-            finishCollapse()
+            // Gate r7: the window's own collapse settles here too — route it to its own teardown.
+            if surface == .window {
+                finishWindowCollapse()
+            } else {
+                finishCollapse()
+            }
         }
     }
 
-    /// Fix C (anim-fidelity restore, v1 early-fire parity): the actual handoff, fired from
-    /// `morphTick()` the instant a collapsing morph (with `pendingWindowExpand` armed) crosses
-    /// progress ≤ 0.15. Consumes the one-shot latch, then computes the SAME collapsed-frame
-    /// projection `finishCollapse()`'s own down-resize will land on (current glass anchor +
-    /// `collapsedWindowSize`) — the panel's OWN AppKit frame is deliberately left alone here: it's
-    /// still sized to `windowSize` throughout the whole morph (only the SwiftUI content shrinks
-    /// internally as `progress` falls — see the type doc's ARCHITECTURE NOTE), and a real resize
-    /// this early, before the content has visually finished shrinking, would clip the still-mid-
-    /// collapse composer geometry against a too-small container. This is therefore a "mid-shrink"
-    /// PROJECTION of where the orb is about to finish, not a literal read of `panel.frame` — the
-    /// tracking spring (Fix F, snapped directly to the cursor-driven target while collapsing) keeps
-    /// adjusting the real anchor for the remaining ~0.15 of progress, so the true final position
-    /// can drift a hair from this estimate, imperceptibly at 60Hz. `surface` flips to `.window`
-    /// here (the window is now the surface of record) and `onExpandToWindow?` fires with the
-    /// projected frame — the orb panel itself is NOT torn down yet; it keeps visibly finishing its
-    /// collapse (the morph timer keeps running) underneath the growing chat window, and
-    /// `finishCollapse()` below performs the real teardown once that collapse naturally settles.
-    private func beginWindowHandoffOverlapped() {
-        guard consumePendingWindowExpand() else { return }
-        let anchor = currentGlassAnchor()
+    /// Gate r7: the window → orb teardown, run once the window's collapse morph settles at 0
+    /// (`morphTick()`) or a `hide()` force-finish. v1 `settleCollapsedOrb` (GlassFieldWindow.swift:
+    /// 1493-1525) parity, adapted: tear down the window monitors + mouse gate, restore GLOBAL
+    /// (follow-everywhere) Space behavior, resize the panel back DOWN to `collapsedWindowSize` at
+    /// the orb's CURRENT screen anchor (read off the live panel frame + `windowOrbPoint` — robust
+    /// to a user drag), flip back to `.orb`/`.field` render, and RESUME the follower from the locked
+    /// orb origin so it springs smoothly toward the cursor (rather than teleporting).
+    ///
+    /// CONSCIOUS SIMPLIFICATION (noted for the gate): the window is stationary throughout its
+    /// collapse (no cursor-riding, unlike v1's dashboard which recomputed the layout each tick), so
+    /// the shell melts to the orb at the LOCKED open anchor and the follower then springs the orb to
+    /// the cursor. Seamless when the cursor is near the open spot (the common case: Esc / clicking a
+    /// traffic light); a small spring-glide otherwise.
+    private func finishWindowCollapse() {
+        if let keyMonitor {
+            NSEvent.removeMonitor(keyMonitor)
+            self.keyMonitor = nil
+        }
+        if let scrollMonitor {
+            NSEvent.removeMonitor(scrollMonitor)
+            self.scrollMonitor = nil
+        }
+        stopWindowMouseGate()
+        panel.acceptsKeyInput = false
+        panel.ignoresMouseEvents = true
+        panel.isMovableByWindowBackground = false
+        // Restore global (follow-everywhere) Space behavior — the orb follows the cursor again.
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+
+        let anchor = currentWindowScreenAnchor()
         let origin = morphModel.corner.windowOrigin(
-            glassAnchor: anchor,
-            morph: morphModel,
-            windowSize: morphModel.collapsedWindowSize,
-            surface: .composer
+            glassAnchor: anchor, morph: morphModel,
+            windowSize: morphModel.collapsedWindowSize, surface: .composer
         )
-        let orbFrame = NSRect(origin: origin, size: morphModel.collapsedWindowSize)
-        surface = .window
-        onExpandToWindow?(orbFrame)
-        OrbDebug.log("collapseToOrb: overlapped handoff fired at progress=\(morphModel.progress)")
+        panel.setFrame(NSRect(origin: origin, size: morphModel.collapsedWindowSize), display: false)
+        morphModel.activeWindowSize = morphModel.collapsedWindowSize
+        morphModel.windowFinalRect = nil
+        morphModel.windowOrbPoint = nil
+        morphModel.renderSurface = .field
+        morphModel.progress = 0
+        windowZoomed = false
+
+        surface = .orb
+        externalFocus?.restore()
+        externalFocus = nil
+        exchangeIndex = nil
+
+        follower.isExpanded = false
+        follower.isCollapsing = false
+        follower.snapWindowOrigin(to: origin) // pin the spring at the locked orb origin (no publish)
+        follower.windowStationary = false      // wake → springs from here toward the cursor
+        OrbDebug.log("window collapse: complete")
     }
 
     /// The collapse-completion teardown, shared by the morph settling naturally (`morphTick()`)
@@ -800,35 +1023,14 @@ final class OrbWindowController: ObservableObject {
 
         OrbDebug.log("collapseToOrb: complete")
 
-        // Fix C (handoff overlap): if `beginWindowHandoffOverlapped()` already fired early (at the
-        // ≤0.15 crossing in `morphTick()` — the common case whenever a handoff was armed),
-        // `surface` is ALREADY `.window` by the time this natural settle runs. This settle must
-        // NOT stomp `.window` back to `.orb` (the window, not the orb, is now the surface of
-        // record) — but it must still tear the (now hidden-behind-the-chat-window) orb panel down
-        // exactly like any other handoff completion: order out, stop the follower, mark not
-        // visible (reusing the same hide-pieces the pre-overlap implementation used), WITHOUT
-        // re-firing `onExpandToWindow` (the one-shot already fired).
-        if surface == .window {
-            follower.stop()
-            panel.orderOut(nil)
-            isVisible = false
-            return
-        }
-
         surface = .orb
 
-        // Belt: `pendingWindowExpand` should already be consumed (false) on every reachable path
-        // here — progress always crosses ≤0.15, and therefore `beginWindowHandoffOverlapped()`,
-        // before it can settle within the 0.004 epsilon above (0.15 > 0.004). Kept as a fallback
-        // so a latch that somehow survived to full settle still fires the handoff (with the NOW-
-        // final collapsed frame, freshly resized above) instead of silently stranding the caller.
-        if consumePendingWindowExpand() {
-            let orbFrame = panel.frame
-            follower.stop()
-            panel.orderOut(nil)
-            isVisible = false
-            surface = .window
-            onExpandToWindow?(orbFrame)
+        // Belt (gate r7): a pending field→window handoff should always have already fired at the
+        // ≤0.08 crossing in `morphTick()` (0.08 > the 0.004 settle epsilon, so it can never slip
+        // through to a full settle) — but if one somehow survives to here, present the window
+        // surface now (from the freshly-collapsed orb frame) instead of stranding the request.
+        if pendingWindowExpand {
+            presentWindowSurface()
         }
     }
 }
@@ -857,11 +1059,23 @@ func escMonitorAction(
     return escConsumed() ? .interrupt : .collapse
 }
 
-/// 4-finger tap / hotkey routing (spec §4): while the chat window is open the tap closes
-/// it; otherwise the existing field toggle. `windowVisible` is the belt against a stale
+/// 4-finger tap / hotkey routing (spec §4): while the window surface is open the tap collapses it
+/// back to the orb; otherwise the existing field toggle. `windowVisible` is the belt against a stale
 /// `.window` surface with no live panel — never wedge the summon path.
 enum SummonToggleAction: Equatable { case toggleField, closeWindow }
 
 func summonToggleAction(surface: OrbWindowController.Surface, windowVisible: Bool) -> SummonToggleAction {
     (surface == .window && windowVisible) ? .closeWindow : .toggleField
+}
+
+/// Gate r7 (moved from the deleted `ChatWindowController`): Esc routing for the window surface —
+/// interrupt a running turn (window STAYS open so you can watch the stopped feedback), otherwise
+/// collapse back to the orb. Pure for tests (`WindowEscActionTests`). Distinct from the field's
+/// `escMonitorAction` only in name/semantics documentation; the window's key monitor branch uses
+/// this so the two surfaces' Esc contracts stay independently testable.
+enum WindowEscAction: Equatable { case interrupt, close }
+
+func windowEscAction(keyCode: UInt16, escConsumed: () -> Bool) -> WindowEscAction? {
+    guard keyCode == 53 else { return nil }
+    return escConsumed() ? .interrupt : .close
 }
