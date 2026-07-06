@@ -583,6 +583,15 @@ final class OrbWindowController: ObservableObject {
         onExpandToWindow?(sourceFrame)
     }
 
+    /// Task 6 (FieldFocus): public alias for `enterWindowMode()` reachable from
+    /// `FieldStateAdapter.onExpandToWindow` — the field's Enter-on-chevron path and the (best-
+    /// effort click) chevron overlay both call this indirectly via the adapter, never
+    /// `enterWindowMode()` directly (the adapter has no reference to the controller's window-mode
+    /// internals beyond this seam).
+    func requestExpandToWindow() {
+        enterWindowMode()
+    }
+
     /// Legal only from `.window`. Restores the orb: `surface = .orb` first (so the chat window's
     /// `onClose` → this call leaves no window in between where `surface` is stale), then `show()`
     /// re-summons the orb panel at the cursor and restarts the follower.

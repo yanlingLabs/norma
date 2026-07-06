@@ -38,6 +38,16 @@ struct ComposerTextView: NSViewRepresentable {
     /// requires. Defaults `false` so the field's own call-site (`NormaFieldView.swift`) is
     /// byte-identical / zero behavior change; only the window opts in.
     var usesAdaptiveColors: Bool = false
+    /// Task 6 (FieldFocus): virtual-focus keyboard chain, consulted first by
+    /// `CommandTextView.doCommand(by:)` on ↑/↓/Enter — returning `true` means consumed (the
+    /// pre-existing Enter/Shift+Enter contract does NOT run). Defaults `nil` so the chat window's
+    /// call-site (`ChatWindowRootView`) is untouched — that surface has real mouse/key focus, no
+    /// virtual focus concept in 2d-i (see `FieldFocus.swift`'s header).
+    var onFocusKey: ((FieldFocusKey, _ caretAtFirstLine: Bool, _ caretAtLastLine: Bool) -> Bool)?
+    /// Task 6 (FieldFocus): fired on every inserted character so typing while the chevron is
+    /// virtually focused snaps focus back to the composer. Defaults `nil` for the same reason as
+    /// `onFocusKey` above.
+    var onTypingRefocus: (() -> Void)?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -74,6 +84,8 @@ struct ComposerTextView: NSViewRepresentable {
         textView.insertionPointColor = .controlAccentColor
         textView.string = text
         textView.onSubmit = onSubmit
+        textView.onFocusKey = onFocusKey
+        textView.onTypingRefocus = onTypingRefocus
 
         let scrollView = NSScrollView()
         scrollView.hasVerticalScroller = false
@@ -95,6 +107,8 @@ struct ComposerTextView: NSViewRepresentable {
         guard let textView = nsView.documentView as? CommandTextView else { return }
         context.coordinator.parent = self
         textView.onSubmit = onSubmit
+        textView.onFocusKey = onFocusKey
+        textView.onTypingRefocus = onTypingRefocus
         if textView.string != text {
             textView.string = text
         }
@@ -149,12 +163,30 @@ struct ComposerTextView: NSViewRepresentable {
 /// v1 port of `CommandTextView` (TextField/ComposerTextView.swift:333-437), stripped to just
 /// the Enter/Shift+Enter `doCommand(by:)` override — the paste-image interception and
 /// selection-change reporting are gone with the image/caret-navigation surface above.
+///
+/// Task 6 (FieldFocus) adds the virtual-focus keyboard chain on top: `onFocusKey` gets first
+/// look at ↑/↓/Enter (see `FieldFocus.swift`'s header for why this is virtual, never a real
+/// firstResponder change) — only when it returns `false`/`nil` (unconsumed) does the pre-existing
+/// Enter/Shift+Enter contract below run, verbatim. `onTypingRefocus` fires on every inserted
+/// character so typing while the chevron is virtually focused snaps focus back to the composer
+/// before the character lands (`NormaFieldView`'s wiring sets `adapter.focusedElement = .composer`).
 final class CommandTextView: NSTextView {
     var onSubmit: (() -> Void)?
+    var onFocusKey: ((FieldFocusKey, _ caretAtFirstLine: Bool, _ caretAtLastLine: Bool) -> Bool)?
+    var onTypingRefocus: (() -> Void)?
 
     override func doCommand(by selector: Selector) {
+        let first = caretAtFirstLine(of: string, caretLocation: selectedRange().location)
+        let last = caretAtLastLine(of: string, caretLocation: NSMaxRange(selectedRange()))
         switch selector {
+        case #selector(NSResponder.moveUp(_:)):
+            if onFocusKey?(.up, first, last) == true { return }
+            super.doCommand(by: selector)
+        case #selector(NSResponder.moveDown(_:)):
+            if onFocusKey?(.down, first, last) == true { return }
+            super.doCommand(by: selector)
         case #selector(insertNewline(_:)):
+            if onFocusKey?(.enter, first, last) == true { return }
             if NSApp.currentEvent?.modifierFlags.contains(.shift) == true {
                 super.doCommand(by: selector)
             } else {
@@ -163,5 +195,10 @@ final class CommandTextView: NSTextView {
         default:
             super.doCommand(by: selector)
         }
+    }
+
+    override func insertText(_ insertString: Any, replacementRange: NSRange) {
+        onTypingRefocus?()
+        super.insertText(insertString, replacementRange: replacementRange)
     }
 }

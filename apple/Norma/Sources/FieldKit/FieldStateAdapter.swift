@@ -351,4 +351,13 @@ final class FieldStateAdapter: ObservableObject {
     /// Esc, which `OrbWindowController`'s key monitor already calls directly) — kept wired for
     /// parity/future use, same status as task A's unwired reset-icon slot.
     var onCollapse: () -> Void = {}
+
+    // MARK: - Task 6: FieldFocus (virtual keyboard focus — see FieldFocus.swift's header)
+
+    /// 2d-i keyboard focus (virtual — the composer text view keeps firstResponder; see
+    /// FieldFocus.swift). Reset to .composer on every surface change.
+    @Published var focusedElement: FieldFocusElement = .composer
+
+    /// Wired by GlassRootView → OrbWindowController.requestExpandToWindow().
+    var onExpandToWindow: () -> Void = {}
 }

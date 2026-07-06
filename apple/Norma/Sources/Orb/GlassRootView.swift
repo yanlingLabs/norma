@@ -30,6 +30,7 @@ struct GlassRootView: View {
         adapter.onSubmit = { [self] text in submit(text) }
         adapter.onClearMessage = { [adapter] in adapter.composerDraft = "" }
         adapter.onCollapse = { [controller] in controller.collapseToOrb() }
+        adapter.onExpandToWindow = { [controller] in controller.requestExpandToWindow() }
         // Wave-5 gate item 4: the composer-hop seam — `OrbWindowController.handleAcceptedSwipe`
         // needs to read/write `adapter.showingDraft` but can't reach the adapter directly (see
         // `OrbWindowController.isShowingDraft`'s doc).
@@ -45,7 +46,14 @@ struct GlassRootView: View {
                 case .orb:
                     draftCache.stash(adapter.composerDraft)
                     adapter.composerDraft = ""
+                    // Task 6 (FieldFocus): virtual focus never survives a surface change — a
+                    // collapse must not leave the chevron (or any future 2d-iii element) latched
+                    // focused for the NEXT summon.
+                    adapter.focusedElement = .composer
                 case .field:
+                    // Task 6 (FieldFocus): every fresh summon starts on the composer — same
+                    // "focus never survives a surface change" rule as the `.orb` case above.
+                    adapter.focusedElement = .composer
                     // Wave-9 gate fix: every fresh expand starts the reply scrolled to its top —
                     // matches v1 (a freshly re-morphed composer never remembered a stale scroll
                     // position either) and avoids a jarring mid-reply reopen if the content

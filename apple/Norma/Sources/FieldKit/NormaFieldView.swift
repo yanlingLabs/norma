@@ -446,6 +446,38 @@ struct NormaFieldView: View {
             // interactive text view / buttons and v2's field is NOT mouse-inert while expanded
             // (see the file header's FOCUS COORDINATOR note), so it must stay hit-testable.
 
+            // Task 6 (FieldFocus) — 2d-i expand chevron: keyboard-first (spec §3 — the
+            // difference blend breaks reliable hit-testing at this small a target; click is
+            // best-effort). Positioned top-trailing within the shell using the SAME shared
+            // insets `composerContent`/`inlineResponse` already share (`contentHorizontalPadding`/
+            // `contentVerticalPadding`), gated on `contentReveal` exactly like the shell content
+            // it sits on top of (`composerOrResponseContent` above) rather than a hard `if`, so it
+            // fades in/out in lockstep with the rest of the composer chrome through the morph.
+            // The Color.clear backing box is deliberately `.allowsHitTesting(false)` — only the
+            // chevron's own small `Circle` contentShape should intercept clicks; this box merely
+            // sizes/positions the overlay to `composerFinal` without stealing clicks meant for the
+            // composer text view underneath.
+            Color.clear
+                .frame(width: composerFinal.width, height: composerFinal.height)
+                .allowsHitTesting(false)
+                .overlay(alignment: .topTrailing) {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 22, height: 22)
+                        .background(
+                            Circle().stroke(.white.opacity(adapter.focusedElement == .expandChevron ? 0.9 : 0.0),
+                                            lineWidth: 1.5)
+                        )
+                        .contentShape(Circle())
+                        .onTapGesture { adapter.onExpandToWindow() }
+                        .opacity(Double(contentReveal))
+                        .padding(.horizontal, Self.contentHorizontalPadding)
+                        .padding(.vertical, Self.contentVerticalPadding)
+                }
+                .position(x: composerFinal.midX, y: composerFinal.midY)
+                .modifier(GlassForegroundLegibility())
+
             // v1's NavigationFocusGlow (keyboard-focus ring on nav pill segments) is cut here —
             // same reason as ComposerSideFocusGlowLayer above.
 
@@ -584,7 +616,15 @@ struct NormaFieldView: View {
             ComposerTextView(
                 text: adapter.draftBinding,
                 onSubmit: { adapter.onSubmit(adapter.composerDraft) },
-                onContentHeightChange: { height in composerContentHeight = height }
+                onContentHeightChange: { height in composerContentHeight = height },
+                onFocusKey: { key, first, last in
+                    let r = resolveFieldFocusKey(current: adapter.focusedElement, key: key,
+                                                 caretAtFirstLine: first, caretAtLastLine: last)
+                    adapter.focusedElement = r.element
+                    if r.activatesExpand { adapter.onExpandToWindow() }
+                    return r.consumed
+                },
+                onTypingRefocus: { adapter.focusedElement = .composer }
             )
             .overlay(alignment: .topLeading) {
                 if adapter.composerDraft.isEmpty {
