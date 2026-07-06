@@ -409,28 +409,42 @@ struct TranscriptStoppedRow: View {
     }
 }
 
-// MARK: - Grouped tool lines (LIVE-GATE G3)
+// MARK: - Grouped tool lines (LIVE-GATE G3 / r1b)
 
-/// One row's worth of rendered activity, AFTER grouping consecutive same-name tool calls — the
-/// transcript renders `[ActivityGroup]` (via `groupActivity` below), never the raw
-/// `[ActivityItem]` directly, so a 30-call bash loop reads as one "Ran 30 shell commands" line
-/// instead of 30 separate rows.
+/// One same-name stretch of tool calls inside a `.toolRun` — a run can mix DIFFERENT tool names
+/// back-to-back (r1b, CC parity: "Read 4 files, listed 1 directory, ran 8 shell commands") so a
+/// run is an ordered array of these, one per same-name stretch, `count`/`details` aggregated the
+/// same way r1's single-name `.tools` group was.
+struct ToolRunEntry: Equatable {
+    let name: String
+    let count: Int
+    let details: [String]
+}
+
+/// One row's worth of rendered activity, AFTER grouping — the transcript renders `[ActivityGroup]`
+/// (via `groupActivity` below), never the raw `[ActivityItem]` directly. r1b: an UNBROKEN run of
+/// tool calls collapses into ONE `.toolRun` group regardless of how many different tool names
+/// appear in it, so e.g. "read, read, glob, bash×8" reads as one comma-joined sentence row instead
+/// of three separate lines.
 enum ActivityGroup: Equatable {
-    case tools(name: String, count: Int, details: [String])
+    case toolRun([ToolRunEntry])
     case single(ActivityItem)
 }
 
-/// Pure grouping logic — no view/environment dependency, directly unit-testable. Consecutive
-/// `.tool` items with the SAME name merge into one `.tools` group (its `details` array collects
-/// only the non-nil `detail` strings, in order — a group can have fewer details than `count` when
-/// some calls had no extractable detail). `.task` items are SKIPPED ENTIRELY here, deliberately:
-/// live task state now lives in the pinned incomplete-tasks section (LIVE-GATE G4,
-/// `FieldStateAdapter.pinnedTasks`), and the task_create/task_update TOOL CALLS themselves already
-/// read as "Created N tasks"/"Updated N tasks" via their own `.tool` activity — showing the same
-/// transition a third time (raw task-status line) would be redundant clutter. Every other kind
-/// (subagent/subagentDone/worktree/interaction) passes through unchanged as `.single` AND breaks
-/// any tool run in progress — a bash call after an interaction starts a fresh group rather than
-/// merging across it, so the grouping reflects the actual chronological interleaving.
+/// Pure grouping logic — no view/environment dependency, directly unit-testable. Every `.tool`
+/// item, regardless of name, extends the CURRENT run (starting a new `.toolRun` group only if the
+/// previous item wasn't a tool at all); within that run, consecutive `.tool` items with the SAME
+/// name still merge into one `ToolRunEntry` (its `details` array collects only the non-nil
+/// `detail` strings, in order — an entry can have fewer details than `count` when some calls had
+/// no extractable detail), but a name change starts a new entry inside the same run rather than a
+/// new group. `.task` items are SKIPPED ENTIRELY here, deliberately: live task state now lives in
+/// the pinned incomplete-tasks section (LIVE-GATE G4, `FieldStateAdapter.pinnedTasks`), and the
+/// task_create/task_update TOOL CALLS themselves already read as "Created N tasks"/"Updated N
+/// tasks" via their own `.tool` activity — showing the same transition a third time (raw
+/// task-status line) would be redundant clutter. Every other kind (subagent/subagentDone/worktree/
+/// interaction) passes through unchanged as `.single` AND breaks any tool run in progress — a bash
+/// call after an interaction starts a fresh run rather than merging across it, so the grouping
+/// reflects the actual chronological interleaving.
 func groupActivity(_ items: [ActivityItem]) -> [ActivityGroup] {
     var groups: [ActivityGroup] = []
     for item in items {
@@ -438,11 +452,19 @@ func groupActivity(_ items: [ActivityItem]) -> [ActivityGroup] {
         case .task:
             continue // deliberate — see doc comment above
         case .tool(let name, let detail):
-            if case .tools(let lastName, let count, var details) = groups.last, lastName == name {
-                if let detail { details.append(detail) }
-                groups[groups.count - 1] = .tools(name: name, count: count + 1, details: details)
+            if case .toolRun(var entries) = groups.last {
+                if let last = entries.last, last.name == name {
+                    entries[entries.count - 1] = ToolRunEntry(
+                        name: name,
+                        count: last.count + 1,
+                        details: detail.map { last.details + [$0] } ?? last.details
+                    )
+                } else {
+                    entries.append(ToolRunEntry(name: name, count: 1, details: detail.map { [$0] } ?? []))
+                }
+                groups[groups.count - 1] = .toolRun(entries)
             } else {
-                groups.append(.tools(name: name, count: 1, details: detail.map { [$0] } ?? []))
+                groups.append(.toolRun([ToolRunEntry(name: name, count: 1, details: detail.map { [$0] } ?? [])]))
             }
         default:
             groups.append(.single(item))
@@ -451,51 +473,81 @@ func groupActivity(_ items: [ActivityItem]) -> [ActivityGroup] {
     return groups
 }
 
-/// Pure label composer for a `.tools` group — natural verbs, singular/plural, matching the
-/// brief's exact vocabulary. Any tool name not explicitly listed (future tools, `mcp__*` server
-/// tools, etc.) falls back to "Used a tool"/"Used N tools" rather than a blank or raw tool name.
-func toolGroupLabel(name: String, count: Int) -> String {
+/// Pure lowercase fragment for one `ToolRunEntry` — the sentence-building unit consumed by
+/// `toolRunSentence`. Natural verbs, singular/plural, matching the brief's exact vocabulary. r1b:
+/// `glob` relabels from "searched" to "listed a directory"/"listed N directories" (Norma has no
+/// `ls` tool — `glob` is the lister); `grep` keeps "searched". Any tool name not explicitly listed
+/// (future tools, `mcp__*` server tools, etc.) falls back to "used a tool"/"used N tools" rather
+/// than a blank or raw tool name. None of these fragments are proper-noun-ish — keep it that way,
+/// since `toolRunSentence` only capitalizes the FIRST fragment of a sentence and lowercases the
+/// rest verbatim.
+func toolGroupFragment(name: String, count: Int) -> String {
     switch name {
     case "bash":
-        return count == 1 ? "Ran a shell command" : "Ran \(count) shell commands"
+        return count == 1 ? "ran a shell command" : "ran \(count) shell commands"
     case "task_create":
-        return count == 1 ? "Created a task" : "Created \(count) tasks"
+        return count == 1 ? "created a task" : "created \(count) tasks"
     case "task_update":
-        return count == 1 ? "Updated a task" : "Updated \(count) tasks"
+        return count == 1 ? "updated a task" : "updated \(count) tasks"
     case "task_list":
-        return "Checked tasks"
+        return "checked tasks"
     case "read":
-        return count == 1 ? "Read a file" : "Read \(count) files"
+        return count == 1 ? "read a file" : "read \(count) files"
     case "write":
-        return count == 1 ? "Wrote a file" : "Wrote \(count) files"
+        return count == 1 ? "wrote a file" : "wrote \(count) files"
     case "edit":
-        return count == 1 ? "Made an edit" : "Made \(count) edits"
-    case "glob", "grep":
-        return count == 1 ? "Searched" : "Searched \(count) times"
+        return count == 1 ? "made an edit" : "made \(count) edits"
+    case "glob":
+        return count == 1 ? "listed a directory" : "listed \(count) directories"
+    case "grep":
+        return count == 1 ? "searched" : "searched \(count) times"
     case "ToolSearch":
-        return count == 1 ? "Loaded a tool" : "Loaded \(count) tools"
+        return count == 1 ? "loaded a tool" : "loaded \(count) tools"
     case "Skill":
-        return count == 1 ? "Loaded a skill" : "Loaded \(count) skills"
+        return count == 1 ? "loaded a skill" : "loaded \(count) skills"
     case "ask_user":
-        return count == 1 ? "Asked a question" : "Asked \(count) questions"
+        return count == 1 ? "asked a question" : "asked \(count) questions"
     case "exit_plan_mode":
-        return count == 1 ? "Presented a plan" : "Presented \(count) plans"
+        return count == 1 ? "presented a plan" : "presented \(count) plans"
     case "request_directory":
-        return count == 1 ? "Requested a directory" : "Requested \(count) directories"
+        return count == 1 ? "requested a directory" : "requested \(count) directories"
     default:
-        return count == 1 ? "Used a tool" : "Used \(count) tools"
+        return count == 1 ? "used a tool" : "used \(count) tools"
     }
 }
 
-/// A grouped run of consecutive same-name tool calls — renders the natural-language label at the
-/// same 11pt `.tertiary` style as `TranscriptActivityRow`, with a `chevron.right` that rotates 90°
-/// when expanded to reveal each call's own detail line (tool name + detail, monospaced, indented,
-/// single-line middle-truncated). Expansion is driven entirely by the parent (per-exchange local
-/// `@State`, see `TranscriptView`'s exchange row) — this view is stateless itself.
+/// Capitalized single-fragment label — delegates to `toolGroupFragment`, capitalizing the first
+/// letter. Kept for direct callers wanting one tool's label standalone; `toolRunSentence` also
+/// collapses to exactly this output when a run has only one entry (r1 parity: a single-tool run
+/// still reads as the plain "Ran 3 shell commands" it always did).
+func toolGroupLabel(name: String, count: Int) -> String {
+    capitalizingFirstLetter(toolGroupFragment(name: name, count: count))
+}
+
+private func capitalizingFirstLetter(_ s: String) -> String {
+    guard let first = s.first else { return s }
+    return first.uppercased() + s.dropFirst()
+}
+
+/// Builds the ONE comma-joined sentence for an unbroken tool run (LIVE-GATE G3 / r1b, CC parity:
+/// "Read 4 files, listed 1 directory, ran 8 shell commands") — per-entry fragments in run order,
+/// first fragment capitalized, every subsequent fragment lowercase. A single-entry run collapses
+/// to exactly `toolGroupLabel`'s output.
+func toolRunSentence(_ entries: [ToolRunEntry]) -> String {
+    let fragments = entries.map { toolGroupFragment(name: $0.name, count: $0.count) }
+    guard let first = fragments.first else { return "" }
+    return ([capitalizingFirstLetter(first)] + fragments.dropFirst()).joined(separator: ", ")
+}
+
+/// A grouped, UNBROKEN run of tool calls — renders as ONE comma-joined sentence (`toolRunSentence`)
+/// at the same 11pt `.tertiary` style as `TranscriptActivityRow`, with a SINGLE `chevron.right`
+/// that rotates 90° when expanded to reveal every call's own detail line across the WHOLE run, in
+/// order (tool name + detail, monospaced, indented, single-line middle-truncated) — one chevron
+/// per sentence row, not one per tool name. Expansion is driven entirely by the parent
+/// (per-exchange local `@State`, keyed by run index — see `TranscriptView`'s exchange row) — this
+/// view is stateless itself.
 struct TranscriptToolGroupRow: View {
-    let name: String
-    let count: Int
-    let details: [String]
+    let entries: [ToolRunEntry]
     let isExpanded: Bool
     let toggle: () -> Void
 
@@ -507,7 +559,7 @@ struct TranscriptToolGroupRow: View {
                         .font(.system(size: 9, weight: .semibold))
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                         .frame(width: 10)
-                    Text(toolGroupLabel(name: name, count: count))
+                    Text(toolRunSentence(entries))
                 }
                 .contentShape(Rectangle())
             }
@@ -518,8 +570,8 @@ struct TranscriptToolGroupRow: View {
             .truncationMode(.middle)
 
             if isExpanded {
-                ForEach(Array(details.enumerated()), id: \.offset) { _, detail in
-                    Text("\(name) \(detail)")
+                ForEach(Array(detailLines.enumerated()), id: \.offset) { _, line in
+                    Text(line)
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
@@ -529,5 +581,11 @@ struct TranscriptToolGroupRow: View {
             }
         }
         .animation(.easeOut(duration: 0.15), value: isExpanded)
+    }
+
+    /// Every detail line across the WHOLE run, in call order — flattens each entry's own
+    /// (already call-ordered) `details`, entries themselves already in run order.
+    private var detailLines: [String] {
+        entries.flatMap { entry in entry.details.map { "\(entry.name) \($0)" } }
     }
 }

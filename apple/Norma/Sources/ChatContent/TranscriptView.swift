@@ -80,8 +80,9 @@ struct TranscriptView: View {
     }
 }
 
-/// One exchange's rows — prompt bubble, GROUPED activity (LIVE-GATE G3: `groupActivity` merges
-/// consecutive same-name tool calls, skips `.task` entirely), reply/streaming, stopped flag. A
+/// One exchange's rows — prompt bubble, GROUPED activity (LIVE-GATE G3 / r1b: `groupActivity`
+/// folds any UNBROKEN run of tool calls — even across different tool names — into one `.toolRun`
+/// sentence row, skips `.task` entirely), reply/streaming, stopped flag. A
 /// dedicated `View` (not a `@ViewBuilder` func on `TranscriptView`) because it owns its own
 /// expansion `@State` — which group indices are expanded — scoped per-exchange-row and reset on
 /// view recycle (fine: expansion is a transient reading aid, not persisted state).
@@ -102,9 +103,9 @@ private struct TranscriptExchangeRow: View {
             }
             ForEach(Array(groupActivity(exchange.activity).enumerated()), id: \.offset) { index, group in
                 switch group {
-                case .tools(let name, let count, let details):
+                case .toolRun(let entries):
                     TranscriptToolGroupRow(
-                        name: name, count: count, details: details,
+                        entries: entries,
                         isExpanded: expandedGroups.contains(index),
                         toggle: { toggle(index) }
                     )
