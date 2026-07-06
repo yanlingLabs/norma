@@ -33,7 +33,7 @@ private final class KeyableNonActivatingPanel: NSPanel {
 /// size the panel is ACTUALLY sized to right now.
 @MainActor
 final class OrbWindowController: ObservableObject {
-    enum Surface { case orb, field }
+    enum Surface { case orb, field, window }
 
     let follower: OrbFollower
     let morphModel: MorphModel
@@ -71,6 +71,12 @@ final class OrbWindowController: ObservableObject {
     /// window after a summon (the Finding-2 smoking gun). Key status depends on a live WindowServer
     /// session, so tests that assert on it must tolerate a headless host where it stays false.
     var panelIsKeyForTesting: Bool { panel.isKeyWindow }
+
+    /// Test-only seam: `surface` is `private(set)` because production callers only ever move it
+    /// via `expandToField()`/`collapseToOrb()`/`enterWindowMode()`/`exitWindowMode()`'s own
+    /// guarded transitions — but `SurfaceWindowTests` needs to plant `.window` directly to test
+    /// `exitWindowMode()` in isolation, without first driving a real field→window handoff.
+    func setSurfaceForTesting(_ s: Surface) { surface = s }
 
     /// Wired in Task 6: the controller exposes callbacks, it does NOT import AppModel.
     /// Returns send success — GlassRootView's submit() gates the draft clear on this so a
@@ -555,6 +561,37 @@ final class OrbWindowController: ObservableObject {
         }
     }
 
+    /// Phase 2d-i: field → window handoff. The field force-finishes its collapse via the
+    /// existing hide() path (monitors off, key relinquished, follower stopped — the exact
+    /// teardown the 2c gate hardened), the orb panel disappears (spec §2: the window IS
+    /// Norma until dismissed), and the chat window grows from where the field was.
+    var onExpandToWindow: ((NSRect) -> Void)?
+
+    /// Legal only from `.field`. Ordering is load-bearing: capture `panel.frame` FIRST (before
+    /// anything moves it), THEN `hide()` — which force-finishes the in-flight collapse morph
+    /// synchronously (`finishCollapse()` resizes the panel back down AND sets `surface = .orb`)
+    /// and orders the panel out — THEN overwrite `surface` to `.window`, THEN fire
+    /// `onExpandToWindow?` with the frame captured before any of that teardown ran. Reordering
+    /// this drops either the source frame (if captured after `hide()` resizes the panel) or
+    /// leaves `surface` at the wrong value (if set before `hide()`, since `hide()`'s
+    /// `finishCollapse()` unconditionally stamps `.orb`).
+    func enterWindowMode() {
+        guard surface == .field else { return }
+        let sourceFrame = panel.frame
+        hide()               // force-finishes collapse → surface = .orb, panel ordered out
+        surface = .window
+        onExpandToWindow?(sourceFrame)
+    }
+
+    /// Legal only from `.window`. Restores the orb: `surface = .orb` first (so the chat window's
+    /// `onClose` → this call leaves no window in between where `surface` is stale), then `show()`
+    /// re-summons the orb panel at the cursor and restarts the follower.
+    func exitWindowMode() {
+        guard surface == .window else { return }
+        surface = .orb
+        show()               // orb reappears at the cursor; follower restarts
+    }
+
     // MARK: Morph spring
 
     private func startMorph(target: Double) {
@@ -681,4 +718,13 @@ func escMonitorAction(
 ) -> EscMonitorAction {
     guard keyCode == 53, surface == .field else { return .passThrough }
     return escConsumed() ? .interrupt : .collapse
+}
+
+/// 4-finger tap / hotkey routing (spec §4): while the chat window is open the tap closes
+/// it; otherwise the existing field toggle. `windowVisible` is the belt against a stale
+/// `.window` surface with no live panel — never wedge the summon path.
+enum SummonToggleAction: Equatable { case toggleField, closeWindow }
+
+func summonToggleAction(surface: OrbWindowController.Surface, windowVisible: Bool) -> SummonToggleAction {
+    (surface == .window && windowVisible) ? .closeWindow : .toggleField
 }

@@ -82,6 +82,17 @@ struct GlassRootView: View {
                     ) {
                         adapter.showingDraft = true
                     }
+                case .window:
+                    // Phase 2d-i: `enterWindowMode()` routes through `hide()` internally, which
+                    // sets `surface = .orb` synchronously BEFORE the controller overwrites it
+                    // again to `.window` (see that method's ordering doc) — but both mutations
+                    // land in the same synchronous call, before SwiftUI's next view-update pass
+                    // ever observes the intermediate value, so this `onChange` only ever fires
+                    // `.field` → `.window` directly, never routing through the `.orb` case above.
+                    // That's exactly right: the chat window (`ChatWindowRootView`) renders off
+                    // this SAME `adapter`, so the in-progress draft must survive the handoff
+                    // untouched, not get stashed-and-cleared like a real collapse-to-orb.
+                    break
                 }
             }
             .onChange(of: controller.exchangeIndex) { _, newValue in
