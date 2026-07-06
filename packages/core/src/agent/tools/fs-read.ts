@@ -1,8 +1,10 @@
 import { z } from "zod";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
 import { resolveWithinAny } from "../paths";
 import type { ToolRegistry } from "./registry";
+
+const LS_MAX_ENTRIES = 1000;
 
 // Bun's Glob.scan ignores `cwd` for absolute patterns and yields absolute
 // paths directly — join()-ing those onto `root` would silently fabricate a
@@ -19,6 +21,42 @@ export function registerReadTools(r: ToolRegistry): void {
     args: z.object({ path: z.string().min(1) }),
     run({ path }, { roots }) {
       return readFileSync(resolveWithinAny(roots, path), "utf8");
+    },
+  });
+
+  r.register({
+    name: "ls",
+    description:
+      "Lists files and directories in a given path (non-recursive, one level deep). `path` must be an absolute path, not a relative path. Optionally pass `ignore`, an array of glob patterns matched against entry names to exclude from the listing. Prefer `glob` or `grep` when you already know what you're looking for and want a targeted search rather than a full directory listing.",
+    args: z.object({ path: z.string().min(1), ignore: z.array(z.string()).optional() }),
+    run({ path, ignore }, { roots }) {
+      if (!isAbsolute(path)) throw new Error(`path must be absolute: ${path}`);
+      const target = resolveWithinAny(roots, path);
+      let st;
+      try {
+        st = statSync(target);
+      } catch {
+        throw new Error(`path does not exist: ${path}`);
+      }
+      if (!st.isDirectory()) throw new Error(`path is not a directory: ${path}`);
+
+      const patterns = (ignore ?? []).map((p: string) => new Bun.Glob(p));
+      const dirs: string[] = [];
+      const files: string[] = [];
+      for (const entry of readdirSync(target, { withFileTypes: true })) {
+        if (patterns.some((g: InstanceType<typeof Bun.Glob>) => g.match(entry.name))) continue;
+        if (entry.isDirectory()) dirs.push(entry.name + "/");
+        else files.push(entry.name);
+      }
+      dirs.sort();
+      files.sort();
+      const all = [...dirs, ...files];
+      const shown = all.slice(0, LS_MAX_ENTRIES);
+      let out = shown.join("\n");
+      if (all.length > LS_MAX_ENTRIES) {
+        out += (shown.length ? "\n" : "") + `… (+${all.length - LS_MAX_ENTRIES} more truncated)`;
+      }
+      return out;
     },
   });
 

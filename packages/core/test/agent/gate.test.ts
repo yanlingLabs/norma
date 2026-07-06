@@ -5,7 +5,7 @@ describe("PermissionGate v1", () => {
   const gate = new PermissionGate();
 
   test("read-only tools are allowed under both policies", () => {
-    for (const name of ["read", "glob", "grep"]) {
+    for (const name of ["read", "glob", "grep", "ls"]) {
       expect(gate.evaluate(name, "ask")).toBe("allow");
       expect(gate.evaluate(name, "auto")).toBe("allow");
     }
@@ -82,7 +82,7 @@ describe("PermissionGate v1", () => {
 
   test("plan matrix: read-only + exit_plan_mode + ask_user + task_* allow; write/edit/bash/bash_kill/mcp deny; unclassified deny", () => {
     const g = new PermissionGate();
-    for (const t of ["read", "glob", "grep", "Skill", "ToolSearch", "ask_user", "task_create", "task_list", "exit_plan_mode", "request_directory"]) {
+    for (const t of ["read", "glob", "grep", "ls", "Skill", "ToolSearch", "ask_user", "task_create", "task_list", "exit_plan_mode", "request_directory"]) {
       expect(g.evaluate(t, "plan")).toBe("allow");
     }
     for (const t of ["write", "edit", "bash", "bash_kill", "mcp__x__y", "frobnicate"]) {
