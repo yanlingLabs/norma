@@ -10,7 +10,7 @@ struct FluidSim: Equatable {
     /// Tuned for ~20-60pt bubble; suggested starting point 0.0006.
     private static let kAccelTilt: Double = 0.0006
     /// Maximum tilt magnitude (radians). Suggested starting point 0.5.
-    private static let maxTilt: Double = 0.5
+    private static let kMaxTilt: Double = 0.5
     /// Coefficient for acceleration magnitude to wave amplitude excitation.
     /// Suggested starting point 0.0012.
     private static let kAccelWave: Double = 0.0012
@@ -35,13 +35,13 @@ struct FluidSim: Equatable {
     /// Maximum surface offset magnitude (clamped).
     private static let kSurfaceMaxOffset: Double = 0.45
     /// Minimum dt (1/240 Hz).
-    private static let dtMin: TimeInterval = 1.0 / 240.0
+    private static let kDtMin: TimeInterval = 1.0 / 240.0
     /// Maximum dt (1/20 Hz).
-    private static let dtMax: TimeInterval = 1.0 / 20.0
+    private static let kDtMax: TimeInterval = 1.0 / 20.0
     /// Tilt spring stiffness.
-    private static let tiltStiffness: Double = 60.0
+    private static let kTiltStiffness: Double = 60.0
     /// Tilt spring damping.
-    private static let tiltDamping: Double = 10.0
+    private static let kTiltDamping: Double = 10.0
 
     /// Current fill level (0…1).
     var level: Double
@@ -65,14 +65,16 @@ struct FluidSim: Equatable {
     /// - Returns: New FluidSim state.
     func step(dt rawDt: TimeInterval, acceleration: CGVector, targetLevel: Double) -> FluidSim {
         var next = self
-        let dt = max(Self.dtMin, min(rawDt, Self.dtMax))
+        let dt = max(Self.kDtMin, min(rawDt, Self.kDtMax))
 
-        // Tilt spring toward -clamp(acceleration.dx * kAccelTilt, ±maxTilt).
-        let tiltTarget = -Self.clamp(acceleration.dx * Self.kAccelTilt, min: -Self.maxTilt, max: Self.maxTilt)
+        // Tilt spring toward -clamp(acceleration.dx * kAccelTilt, ±kMaxTilt).
+        let tiltTarget = -Self.clamp(acceleration.dx * Self.kAccelTilt, min: -Self.kMaxTilt, max: Self.kMaxTilt)
         let tiltError = tiltTarget - next.tilt
-        let tiltAccel = Self.tiltStiffness * tiltError - Self.tiltDamping * next.tiltVelocity
+        let tiltAccel = Self.kTiltStiffness * tiltError - Self.kTiltDamping * next.tiltVelocity
         next.tiltVelocity += tiltAccel * dt
         next.tilt += next.tiltVelocity * dt
+        // hard bound — the underdamped spring overshoots the clamped target; tan(tilt) in surfaceOffset must stay well off its asymptote regardless of tuning.
+        next.tilt = min(max(next.tilt, -Self.kMaxTilt), Self.kMaxTilt)
 
         // Wave amplitude: excited by acceleration magnitude, decays exponentially.
         let accelMagnitude = sqrt(acceleration.dx * acceleration.dx + acceleration.dy * acceleration.dy)

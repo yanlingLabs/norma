@@ -37,4 +37,9 @@ final class FluidSimTests: XCTestCase {
         s = s.step(dt: 5.0, acceleration: .zero, targetLevel: 1.0) // huge dt must not explode/teleport
         XCTAssertLessThan(s.level, 0.2)
     }
+    func testTiltHardBoundUnderSustainedMotion() {
+        var s = FluidSim.rest
+        for _ in 0..<600 { s = s.step(dt: 1.0/60.0, acceleration: CGVector(dx: 5000, dy: 0), targetLevel: 0.5) }
+        XCTAssertLessThanOrEqual(abs(s.tilt), 0.5 + 1e-9) // never past kMaxTilt, even mid-overshoot regime
+    }
 }
