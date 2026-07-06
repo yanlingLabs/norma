@@ -32,6 +32,12 @@ struct ComposerTextView: NSViewRepresentable {
     @Binding var text: String
     var onSubmit: () -> Void
     var onContentHeightChange: (CGFloat) -> Void = { _ in }
+    /// Task 4 (`ChatWindowRootView`): that window is an opaque, normally-colored surface — NOT
+    /// under the field's difference-blend LAW (see `textColor`'s doc above) — so its composer
+    /// needs real adaptive text/insertion colors instead of the hardcoded `.white` the field
+    /// requires. Defaults `false` so the field's own call-site (`NormaFieldView.swift`) is
+    /// byte-identical / zero behavior change; only the window opts in.
+    var usesAdaptiveColors: Bool = false
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -50,7 +56,7 @@ struct ComposerTextView: NSViewRepresentable {
         // inverse of the typical glass tone — so subtracting it from the background would produce
         // near-white in both modes (the washed-out 'full white' symptom)" — i.e. typed text renders
         // invisible. `.labelColor` here was the transplant regression; `.white` restores v1 parity.
-        textView.textColor = .white
+        textView.textColor = usesAdaptiveColors ? .labelColor : .white
         textView.isRichText = false
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.drawsBackground = false
@@ -63,7 +69,7 @@ struct ComposerTextView: NSViewRepresentable {
         textView.autoresizingMask = [.width]
         textView.typingAttributes = [
             .font: textView.font ?? .systemFont(ofSize: 14),
-            .foregroundColor: NSColor.white
+            .foregroundColor: usesAdaptiveColors ? NSColor.labelColor : NSColor.white
         ]
         textView.insertionPointColor = .controlAccentColor
         textView.string = text

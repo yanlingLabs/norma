@@ -94,8 +94,10 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         panel.acceptsMouseMovedEvents = true
         panel.delegate = self
 
-        // Task 4 swaps in ChatWindowRootView.
-        let hosting = NSHostingView(rootView: Text("norma"))
+        let hosting = NSHostingView(rootView: ChatWindowRootView(
+            adapter: adapter,
+            onRequestClose: { [weak self] in self?.close() }
+        ))
         hosting.autoresizingMask = [.width, .height]
         panel.contentView = hosting
         self.panel = panel
