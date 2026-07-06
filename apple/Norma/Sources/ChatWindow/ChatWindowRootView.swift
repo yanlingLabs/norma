@@ -12,11 +12,22 @@ func chatWindowTint(darkMode: Bool) -> (white: Double, opacity: Double) {
 /// here). Everything below uses ADAPTIVE colors (`.primary`/`.secondary`/`.tertiary`): this
 /// surface is opaque, so the difference-blend white-text LAW the field lives under does NOT apply
 /// here and must not be imported.
+///
+/// Gate r4 (fully self-drawn window): the window is BORDERLESS for its whole life
+/// (`ChatWindowController.show(from:)`) — no native titlebar, no system traffic-light buttons.
+/// This view draws its OWN traffic lights (`MacTrafficLights`) in a top-leading header band and
+/// owns its OWN rounded corners again (`RoundedRectangle` clip/fill — the borderless window has no
+/// system window shape to lean on, so this reverts the r2 "let the system round it" decision).
 struct ChatWindowRootView: View {
     @ObservedObject var adapter: FieldStateAdapter
-    /// Closing is owned by the native red traffic light (ChatWindowController's
-    /// windowShouldClose); kept as a seam for keyboard/programmatic close paths.
+    /// Red traffic light — dismiss the window (animated shrink back to the orb).
     let onRequestClose: () -> Void
+    /// Yellow traffic light — minimize. The orb IS Norma's minimized state, so today this shares
+    /// the shrink-to-orb gesture with `onRequestClose`; the semantics may diverge in a later phase.
+    let onRequestMinimize: () -> Void
+    /// Green traffic light — manual zoom toggle (fill the screen / restore), since a borderless
+    /// window has no native zoom.
+    let onRequestZoom: () -> Void
     @Environment(\.colorScheme) private var colorScheme
 
     private var tint: Color {
@@ -24,16 +35,29 @@ struct ChatWindowRootView: View {
         return Color(white: t.white).opacity(t.opacity)
     }
 
+    private var windowShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: chatWindowCornerRadius, style: .continuous)
+    }
+
     var body: some View {
         VStack(spacing: 10) {
-            // Gate r2: no in-content close button — the native red traffic light (F2) owns
-            // closing; a second gray ✕ read as leftover chrome.
-            HStack {
+            // Gate r4: self-drawn header band — our own traffic lights (leading, inset to Safari
+            // proportions) plus the status text. Replaces both the removed native titlebar and the
+            // r2/r3 52pt content inset that used to dodge it.
+            HStack(spacing: 12) {
+                MacTrafficLights(
+                    onClose: onRequestClose,
+                    onMinimize: onRequestMinimize,
+                    onZoom: onRequestZoom
+                )
+                .padding(.leading, 4) // 16pt content pad + 4 = ~20pt from the window's left edge
+
                 Text(adapter.statusText)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.secondary)
                 Spacer()
             }
+            .frame(height: chatWindowHeaderHeight)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
@@ -70,31 +94,67 @@ struct ChatWindowRootView: View {
         }
         .padding(.horizontal, 16)
         .padding(.bottom, 16)
-        // Gate fix (F2 — native traffic lights): reserve the native title-bar button row
-        // (`.fullSizeContentView` lets our content extend all the way up under it) so the
-        // status text/close button never sit underneath the real traffic lights.
-        .padding(.top, chatWindowContentTopInset)
+        // Gate r4: no native titlebar to dodge — a normal top pad. The header band above sits
+        // directly under it.
+        .padding(.top, 14)
         .background(
-            // Gate fix (F2 — corner radius): the window is now `.titled` (real traffic lights +
-            // native resize, see `ChatWindowController.show(from:)`), so the SYSTEM draws the
-            // window's rounded-corner shape and clips our content to it automatically — a titled
-            // NSWindow's content view is clipped to the window's own shape. A second, manually
-            // rounded/clipped layer here would either show a mismatched double-rounded seam or a
-            // square glass corner poking past the system's round one, depending on which radius
-            // is bigger. Fill flush to the window edge with a plain rectangle instead, and let
-            // the system's own shape do ALL the rounding. `.ignoresSafeArea()` lets the tint
-            // bleed all the way up under the titlebar so the button row reads as part of the
-            // same glass surface (not a separate bar) — spec's Safari-screenshot reference.
-            Rectangle()
+            // Gate r4 (self-drawn corners): the borderless window has NO system window shape, so we
+            // round the content ourselves — a continuous `RoundedRectangle` fills the tint + glass
+            // and the whole view is clipped to it (AppKit's window shadow follows this shape).
+            // `.ignoresSafeArea()` lets the tint bleed to the very edge of the (rounded) clip.
+            windowShape
                 .fill(tint)
-                .glassEffect(in: Rectangle())
+                .glassEffect(in: windowShape)
                 .ignoresSafeArea()
         )
+        .clipShape(windowShape)
     }
 }
 
-/// Gate fix (F2, retuned r2): vertical space reserved at the top of the content so the status
-/// row clears the native traffic lights (`.fullSizeContentView` extends our content under
-/// them). r2 attached an empty unified toolbar (Safari-style chrome — see
-/// ChatWindowController), which makes the titlebar band ~52pt tall instead of 28.
-private let chatWindowContentTopInset: CGFloat = 52
+/// Gate r4: the three self-drawn macOS-style traffic lights, replacing the removed native window
+/// buttons (the borderless window has none). Three 12pt circles, 8pt apart, each with a subtle
+/// darker ring; hovering ANYWHERE over the group reveals the ×/−/+ glyphs (macOS behavior). Wired:
+/// red → close, yellow → minimize, green → zoom (see `ChatWindowRootView`).
+private struct MacTrafficLights: View {
+    let onClose: () -> Void
+    let onMinimize: () -> Void
+    let onZoom: () -> Void
+    @State private var hovering = false
+
+    // Standard macOS traffic-light fills.
+    private static let closeColor = Color(red: 1.0, green: 0.373, blue: 0.341)    // #FF5F57
+    private static let minimizeColor = Color(red: 0.996, green: 0.737, blue: 0.176) // #FEBC2E
+    private static let zoomColor = Color(red: 0.157, green: 0.784, blue: 0.251)   // #28C840
+    private static let glyphColor = Color(red: 0.28, green: 0.14, blue: 0.0).opacity(0.55) // dark brown-ish
+
+    var body: some View {
+        HStack(spacing: 8) {
+            light(color: Self.closeColor, glyph: "xmark", action: onClose)
+            light(color: Self.minimizeColor, glyph: "minus", action: onMinimize)
+            light(color: Self.zoomColor, glyph: "plus", action: onZoom)
+        }
+        .onHover { hovering = $0 }
+    }
+
+    private func light(color: Color, glyph: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            ZStack {
+                Circle().fill(color)
+                Circle().strokeBorder(Color.black.opacity(0.12), lineWidth: 0.5)
+                if hovering {
+                    Image(systemName: glyph)
+                        .font(.system(size: 7.5, weight: .bold))
+                        .foregroundStyle(Self.glyphColor)
+                }
+            }
+            .frame(width: 12, height: 12)
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// Gate r4: height of the self-drawn header band that holds the traffic lights + status text (the
+/// buttons sit vertically centered within it). Sized to the user's Safari-proportions ask without
+/// wasting the vertical space the old 52pt native-titlebar inset did.
+let chatWindowHeaderHeight: CGFloat = 28

@@ -60,12 +60,22 @@ func chatWindowTargetFrame(
 /// If `collapsedWindowSize` ever changes, update this alongside it.
 let chatWindowCollapsedSize = NSSize(width: 240, height: 140)
 
+/// Gate r4 (fully self-drawn window): the window is borderless for life, so the CONTENT owns its
+/// corners — `ChatWindowRootView` clips/fills a `RoundedRectangle` at this radius (the modern
+/// macOS-26 look), and AppKit's window shadow follows that tinted shape. 16pt reads as a normal
+/// contemporary window; tune here if the gate wants it rounder/squarer.
+let chatWindowCornerRadius: CGFloat = 16
+
+/// Gate r4 (custom green zoom button): how far `ChatWindowController.zoomToggle()` insets the
+/// screen's visible frame when zooming to fill — a small breathing gap so the zoomed window doesn't
+/// sit flush against the screen edges / menu bar.
+let chatWindowZoomInset: CGFloat = 8
+
 /// Gate r3 (W1): the shrink's end-of-animation frame — orb-sized, centered on `point` (the
 /// cursor: `OrbWindowController.exitWindowMode()`'s `show()` re-summons the orb exactly there
 /// once `ChatWindowController.closeAnimated()`'s teardown runs). Position-only clamp
 /// (`clampedChatWindowPosition`) — deliberately NOT `clampedChatWindowFrame`'s full clamp, which
-/// would inflate this back up to the 340×360 floor and defeat the "shrinks to a tiny orb" effect,
-/// same reasoning as the grow's own `isAnimatingFrame` sanitizer bypass.
+/// would inflate this back up to the 340×360 floor and defeat the "shrinks to a tiny orb" effect.
 func chatWindowShrinkTargetFrame(centeredOn point: NSPoint, screenVisibleFrame: NSRect) -> NSRect {
     let size = chatWindowCollapsedSize
     let proposed = NSRect(

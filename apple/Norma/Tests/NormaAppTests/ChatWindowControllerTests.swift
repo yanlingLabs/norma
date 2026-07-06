@@ -76,59 +76,47 @@ final class ChatWindowControllerTests: XCTestCase {
         c.close()
     }
 
-    /// Gate fix (F1 — expand choreography): the grow's source is now the collapsed orb's own
-    /// tiny panel frame (`OrbWindowController.finishCollapse()`, ~240×140 in production —
-    /// smaller than the chat window's own 340×360 floor in BOTH dimensions). The very FIRST
-    /// `setFrame` of the grow (synchronous, before the 60Hz grow timer's first tick) must
-    /// actually apply that small size, not get force-inflated to OUR OWN 340×360 floor by
-    /// `clampedChatWindowFrame` — this pins the sanitizer-bypass-during-grow fix.
+    /// Gate fix (F1 — expand choreography): the grow's source is the collapsed orb's own tiny
+    /// panel frame (`OrbWindowController.finishCollapse()`, ~240×140 in production — smaller than
+    /// the chat window's own 340×360 floor in BOTH dimensions). The very FIRST `setFrame` of the
+    /// grow (synchronous, before the 60Hz grow timer's first tick) must actually apply that small
+    /// size, not get force-inflated to OUR OWN 340×360 floor by `clampedChatWindowFrame` — this
+    /// pins the sanitizer-bypass-during-grow fix.
     ///
-    /// Gate r3 (W2 — chrome pop fix): the toolbar is now attached at CONSTRUCTION (not deferred
-    /// to the grow's settle), so AppKit's OWN chrome frame minimum binds on this very first frame
-    /// too — a floor `isAnimatingFrame`'s sanitizer bypass cannot lift (that bypass only lifts
-    /// OUR 340×360 floor, not AppKit's internal one). Empirically (see `show(from:)`'s doc)
-    /// AppKit's own minimum is roughly 40 wide × ~220 tall — well under our own 340×360 floor in
-    /// WIDTH, so a production-realistic source frame (the real collapsed orb's own
-    /// `chatWindowCollapsedSize`, 240×140 — both this test's source and every real orb frame are
-    /// comfortably wider than AppKit's ~40pt floor) still starts narrow; only the HEIGHT actually
-    /// gets chrome-floored above the raw source height.
-    func testGrowStartsFromOrbSizedFrameWidthSmallHeightFlooredByChrome() {
+    /// Gate r4 (fully self-drawn window): the window is now BORDERLESS — there is NO AppKit chrome
+    /// minimum anymore, so BOTH dimensions start at the raw orb size (r3's "height gets chrome-
+    /// floored above the source" no longer happens). This is the cleaner "grows from something
+    /// small" the whole choreography wanted.
+    func testGrowStartsFromFullOrbSizedFrame() {
         let c = makeController()
         let orbFrame = NSRect(origin: NSPoint(x: 400, y: 400), size: chatWindowCollapsedSize) // 240×140
         c.show(from: orbFrame)
         let size = c.panel?.frame.size ?? .zero
-        XCTAssertEqual(size.width, chatWindowCollapsedSize.width, accuracy: 0.5, "width must stay small — the 'grows from something small' effect")
-        XCTAssertGreaterThan(size.height, chatWindowCollapsedSize.height, "gate r3: AppKit's own chrome minimum binds now that the toolbar is attached from construction")
+        XCTAssertEqual(size.width, chatWindowCollapsedSize.width, accuracy: 0.5, "width starts orb-small — no chrome minimum")
+        XCTAssertEqual(size.height, chatWindowCollapsedSize.height, accuracy: 0.5, "gate r4: borderless has no chrome minimum, so height starts orb-small too")
         c.close()
     }
 
-    /// Gate fix (F2 — native traffic lights + resizable): the panel must carry the styleMask
-    /// that gives it real system close/minimize/zoom buttons and native edge-resizing, plus the
-    /// resize floor matching the sanitizer's own 340×360 minimum.
-    ///
-    /// Gate r3 (W2) empirical note: once the toolbar is attached (now at construction — see
-    /// `show(from:)`), AppKit silently overrides `panel.contentMinSize` with its OWN
-    /// chrome-driven minimum (observed live: ~40×220-228, NOT what we assign) — reading
-    /// `contentMinSize` back is no longer a meaningful assertion. The REAL guarantee this test
-    /// exists to pin — the panel can never actually be resized below 340×360 — is still enforced
-    /// by our own `frameSanitizer` (`ChatWindowPanel.setFrame`'s override), independent of
-    /// whatever AppKit's own `contentMinSize` bookkeeping says; asserted directly below by
-    /// attempting a tiny `setFrame` once settled (`isAnimatingFrame` false) and checking it gets
-    /// clamped back up.
-    func testPanelHasTitledResizableStyleMaskAndMinSize() async throws {
+    /// Gate r4 (fully self-drawn window): the panel is borderless for life —
+    /// `[.borderless, .nonactivatingPanel, .resizable]`, NO `.titled`/toolbar. The resize floor is
+    /// still enforced by our own `frameSanitizer` (`ChatWindowPanel.setFrame`'s override),
+    /// asserted directly by attempting a tiny `setFrame` once settled (`isAnimatingFrame` false)
+    /// and checking it clamps back up to 340×360. (Without a toolbar, AppKit no longer overrides
+    /// `contentMinSize`, but the sanitizer floor is the real guarantee and is what's pinned here.)
+    func testPanelHasBorderlessResizableStyleMaskAndSanitizerFloor() async throws {
         let c = makeController()
         c.show(from: NSRect(x: 400, y: 400, width: 240, height: 44))
         let styleMask = c.panel?.styleMask ?? []
-        XCTAssertTrue(styleMask.contains(.titled))
-        XCTAssertTrue(styleMask.contains(.closable))
-        XCTAssertTrue(styleMask.contains(.miniaturizable))
+        XCTAssertTrue(styleMask.contains(.nonactivatingPanel))
         XCTAssertTrue(styleMask.contains(.resizable))
-        XCTAssertTrue(styleMask.contains(.fullSizeContentView))
+        XCTAssertFalse(styleMask.contains(.titled), "gate r4: no native titlebar — traffic lights are self-drawn")
+        // `.borderless` is rawValue 0, so `.contains` is not meaningful; assert the titled bit is
+        // absent (above) as the real "is it borderless chrome" signal.
 
         try await waitUntilFrameStable(c) // let the grow settle — isAnimatingFrame goes false
         c.panel?.setFrame(NSRect(x: 0, y: 0, width: 50, height: 50), display: false)
         XCTAssertEqual(c.panel?.frame.size, NSSize(width: 340, height: 360),
-                       "our own sanitizer must still floor the size at 340×360 once settled, regardless of AppKit's own contentMinSize bookkeeping")
+                       "our own sanitizer must still floor a USER resize at 340×360 once settled")
         c.close()
     }
 
@@ -235,16 +223,60 @@ final class ChatWindowControllerTests: XCTestCase {
         XCTAssertEqual(fired, 1)
     }
 
-    // MARK: Gate r3 — W2 (chrome pop fix)
+    // MARK: Gate r4 — fully self-drawn window (borderless always, custom traffic lights, manual zoom)
 
-    /// The toolbar (Safari-style chrome) is now attached at panel CONSTRUCTION, not deferred to
-    /// the grow's natural settle (superseding gate r2's original deferred-attach) — no more
-    /// end-of-grow pop in corner radius/traffic-light insets.
-    func testToolbarAttachedImmediatelyAtShow() {
+    /// Hypothesis 2 (the mystery post-stall "fade"): titled windows default to `.documentWindow`
+    /// animation behavior, which adds a SYSTEM fade on `orderOut()`. `animationBehavior = .none` at
+    /// construction kills it for every close path (borderless keeps this too).
+    func testPanelAnimationBehaviorIsNoneToSuppressSystemFade() {
         let c = makeController()
         c.show(from: NSRect(x: 400, y: 400, width: 240, height: 44))
-        XCTAssertNotNil(c.panel?.toolbar, "gate r3: toolbar must exist from construction, not lazily at grow-settle")
-        XCTAssertEqual(c.panel?.toolbarStyle, .unified)
+        XCTAssertEqual(c.panel?.animationBehavior, NSWindow.AnimationBehavior.none,
+                       "system orderOut fade must be suppressed — our spring is the only motion language")
+        c.close()
+    }
+
+    /// THE regression test for the stall (hypothesis 1): the close-shrink must actually REACH the
+    /// orb-sized target (~240×140) — the original defect was it freezing at AppKit's titled/toolbar
+    /// chrome minimum (~40×220, the big rounded square the user saw). With the window borderless for
+    /// life there is no chrome minimum, so it lands exactly on target. Captured via
+    /// `lastShrinkSettledFrameForTesting` — the true on-screen frame the spring settled on right
+    /// before teardown.
+    func testShrinkReachesOrbSizedTargetBeforeClose() async throws {
+        let c = makeController()
+        c.show(from: NSRect(x: 400, y: 400, width: 240, height: 44))
+        try await waitUntilFrameStable(c)
+
+        c.closeAnimated()
+        try await waitUntilClosed(c)
+
+        let settled = c.lastShrinkSettledFrameForTesting
+        XCTAssertNotNil(settled, "the shrink must have settled and recorded its final on-screen frame")
+        XCTAssertEqual(settled?.size.width ?? 0, chatWindowCollapsedSize.width, accuracy: 2,
+                       "the shrink reaches orb WIDTH — no chrome minimum")
+        XCTAssertEqual(settled?.size.height ?? 0, chatWindowCollapsedSize.height, accuracy: 2,
+                       "the shrink reaches orb HEIGHT — borderless has no chrome minimum; before the pivot AppKit floored this at ~220 and the close stalled")
+    }
+
+    /// The custom GREEN traffic light drives `zoomToggle()` (a borderless window has no native
+    /// zoom): first press fills the screen's visible frame (inset a touch), second press restores
+    /// the pre-zoom frame. Runs after the grow settles so no animation is in flight.
+    func testZoomToggleMaximizesThenRestores() async throws {
+        let c = makeController()
+        c.show(from: NSRect(x: 400, y: 400, width: 240, height: 44))
+        try await waitUntilFrameStable(c)
+        let settled = c.panel?.frame ?? .zero
+        let visible = (NSScreen.screens.first { $0.frame.intersects(settled) } ?? NSScreen.main)?.visibleFrame ?? .zero
+
+        c.zoomToggle() // → fill screen
+        let zoomed = c.panel?.frame ?? .zero
+        XCTAssertEqual(zoomed.size.width, visible.width - 2 * chatWindowZoomInset, accuracy: 1, "zoom fills the visible width (inset)")
+        XCTAssertGreaterThan(zoomed.size.height, settled.height, "zoom grew the window toward the screen")
+
+        c.zoomToggle() // → restore
+        let restored = c.panel?.frame ?? .zero
+        XCTAssertEqual(restored.size.width, settled.width, accuracy: 1, "second press restores the pre-zoom size")
+        XCTAssertEqual(restored.size.height, settled.height, accuracy: 1, "second press restores the pre-zoom size")
         c.close()
     }
 }

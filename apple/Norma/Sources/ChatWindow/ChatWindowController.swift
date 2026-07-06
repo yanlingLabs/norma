@@ -50,9 +50,14 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
     /// Gate r3 (W1 — animated close): generalized to drive BOTH directions with the SAME spring —
     /// `growTimer`/`growStart`/`growTarget` etc. renamed `frameAnimTimer`/`frameAnimStart`/
     /// `frameAnimTarget` and a `frameAnimDirection` (`.grow`/`.shrink`) added so `frameAnimTick()`
-    /// knows which way is "done" (attach nothing / call `close()`) and which way the titlebar
-    /// button fade (see `chromeButtonAlpha` helpers below) should run. Everything about the manual-
+    /// knows which way is "done" (attach nothing / call `close()`). Everything about the manual-
     /// Timer-not-`.animator()` reasoning above is unchanged and now covers the shrink too.
+    /// Gate r4 (fully self-drawn window): the window is now BORDERLESS for its whole life (no
+    /// `.titled`, no toolbar, no system traffic-light buttons — `ChatWindowRootView` draws its own),
+    /// so there is NO chrome minimum for either direction to fight and NO styleMask change anywhere:
+    /// the grow/shrink simply run tiny↔full. This deleted the r2/r3 chrome machinery entirely (the
+    /// attach-at-construction toolbar, the `standardWindowButton` alpha ramps, and the r4-draft
+    /// chrome-strip-at-close) — see `show(from:)` and the report for the full "why".
     private enum FrameAnimDirection { case grow, shrink }
     private var frameAnimTimer: Timer?
     private var frameAnimDirection: FrameAnimDirection = .grow
@@ -61,14 +66,6 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
     private var frameAnimProgress: Double = 0
     private var frameAnimVelocity: Double = 0
     private var lastFrameAnimTick: CFTimeInterval = 0
-    /// Titlebar chrome-button fade (gate r3, W2 polish) — interpolated across the SAME
-    /// `frameAnimProgress` the rect lerp uses, from wherever the buttons' alpha actually was when
-    /// this leg of the animation started (`startFrameAnimation(from:to:direction:)` reads it live
-    /// off the panel) to 1 (grow) or 0 (shrink). Reading the live value, not just assuming 0/1,
-    /// keeps a mid-grow `closeAnimated()` retarget from popping the buttons back to full opacity
-    /// before fading them back out.
-    private var frameAnimAlphaFrom: CGFloat = 0
-    private var frameAnimAlphaTo: CGFloat = 0
 
     /// True while a shrink (`closeAnimated()`) is actively driving frames — `closeAnimated()`
     /// reads this to stay idempotent (a second call while one is already in flight is a no-op).
@@ -86,6 +83,20 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
     /// each animation's first frame, cleared in `cancelFrameAnimation()` (both directions' natural
     /// t>=1 finish and `close()`'s mid-flight cancel), same lifecycle as `programmaticMove`.
     private var isAnimatingFrame = false
+
+    /// Gate r4 regression seam (window shrink stall fix): the true on-screen frame the close-shrink
+    /// actually REACHED at settle, captured right before teardown. Tests assert this landed at orb
+    /// size (`chatWindowCollapsedSize`, ~240×140) — proving the shrink reaches its target instead of
+    /// stalling. With the window now borderless for life (no titled/toolbar chrome minimum to clamp
+    /// the small frames — the class of bug the r4-draft chrome-strip existed to work around) this
+    /// passes trivially; it stays as a permanent guard against any future chrome/minimum regression.
+    /// nil until a shrink has settled.
+    private(set) var lastShrinkSettledFrameForTesting: NSRect?
+
+    /// Gate r4 (custom green zoom button): the frame to restore to when the manual zoom toggle is
+    /// pressed a second time. nil = not currently zoomed. Kept separate from `rememberedFrame`
+    /// (drag memory) on purpose — a zoom is a transient toggle, not a new remembered home.
+    private var preZoomFrame: NSRect?
 
     /// Spec §4: closing the window restores focus to the previously active app — the same
     /// snapshot/restore type the field uses (see OrbWindowController's `externalFocus`).
@@ -121,56 +132,29 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         // Panel construction: v1 transplant (InteractionController.swift:849-877), with
         // v2's orb collectionBehavior (adds .canJoinAllSpaces — proven above-fullscreen).
         //
-        // Gate fix (F2 — real traffic lights + resizable): `.titled + .closable +
-        // .miniaturizable + .resizable + .fullSizeContentView` gives the window the three
-        // native system traffic-light buttons (native behavior/metrics, routed through OUR
-        // teardown for close — see `windowShouldClose(_:)` below) and native edge-resizing,
-        // while `.fullSizeContentView` still lets the SwiftUI content extend under the titlebar
-        // so the glass tint reads as one continuous surface (`ChatWindowRootView`'s background
-        // now bleeds to the window edge and relies on the SYSTEM window shape for corner
-        // rounding — no more manual `.clipShape`, see that file's doc). `.nonactivatingPanel` is
-        // KEPT alongside `.titled`: reasoned from AppKit docs (this combination is the standard
-        // technique behind e.g. Spotlight-style/inspector panels that show real chrome without
-        // stealing app activation) and empirically exercised by this file's own test suite
-        // (`ChatWindowControllerTests` constructs/orders-front/closes this exact panel
-        // repeatedly on a live WindowServer session with no crash/assertion) — if a future gate
-        // finds it misbehaving live, drop `.nonactivatingPanel` here and note that the window
-        // will then activate Norma on interaction (`ExternalFocusSnapshot` restore on close
-        // already handles giving focus back).
+        // Gate r4 (fully self-drawn window): the panel is BORDERLESS for its entire life —
+        // `[.borderless, .nonactivatingPanel, .resizable]`, exactly v1's approach (v1 drew ALL its
+        // UI on borderless panels). No `.titled`, no toolbar, no `standardWindowButton` — the three
+        // traffic lights are drawn by `ChatWindowRootView` and wired back here (close/minimize →
+        // `closeAnimated()`, green → `zoomToggle()`). This is the root-cause cure for BOTH classes
+        // of chrome bug the earlier gates fought: (1) AppKit hard-clamps a titled/toolbar window's
+        // frame to its own chrome minimum (~40×220), which STALLED the close-shrink at a big rounded
+        // square (r4's original defect); and (2) the r2/r3 "chrome pops at grow-settle" fight. With
+        // no system window shape at all, neither exists — the grow/shrink run tiny↔full with zero
+        // styleMask changes, and the CONTENT owns its own rounded corners again (`ChatWindowRootView`
+        // restores its `RoundedRectangle` clip/fill). `.resizable` is kept so any future native
+        // edge-resize works if the OS supports it on borderless (see the resize note in the report);
+        // our own 340×360 floor still governs user resizes via `frameSanitizer`. `.nonactivatingPanel`
+        // keeps the window from stealing app activation (`ExternalFocusSnapshot` restores focus on
+        // close regardless).
         let panel = ChatWindowPanel(
             contentRect: target,
-            styleMask: [
-                .titled, .closable, .miniaturizable, .resizable, .fullSizeContentView,
-                .nonactivatingPanel,
-            ],
+            styleMask: [.borderless, .nonactivatingPanel, .resizable],
             backing: .buffered,
             defer: false
         )
-        panel.title = "Norma" // a11y/Dock — titleVisibility hides it from the (hidden) title bar text
-        // Gate r3 (W2 — chrome pop fix, supersedes r2's deferred attach): the Safari-style chrome
-        // (traffic lights inset in a taller bar + the larger macOS 26 corner radius) comes from
-        // an empty unified toolbar, attached HERE at construction instead of deferred to the
-        // grow's natural settle. r2's original reasoning still holds — a toolbar imposes AppKit's
-        // OWN chrome frame minimum (observed live: roughly 40pt wide × ~220-228pt tall — and, more
-        // surprisingly, AppKit silently overrides `panel.contentMinSize` itself to this value the
-        // moment the toolbar is attached and the window displays, regardless of what we assign it
-        // below; our OWN 340×360 floor is enforced independently by `frameSanitizer`/
-        // `ChatWindowPanel.setFrame`, not by `contentMinSize`, so this doesn't weaken it — see
-        // `ChatWindowControllerTests.testPanelHasTitledResizableStyleMaskAndMinSize`'s doc for the
-        // empirical trail). This binds even through `isAnimatingFrame`'s sanitizer bypass (that
-        // bypass only lifts OUR OWN floor, not AppKit's internal one) — but a live-gate finding
-        // showed the deferred attach's real cost: the corner radius and traffic-light insets
-        // visibly POPPED at the exact instant the grow settled. Constant chrome geometry
-        // throughout the whole grow (the window is a touch taller than the raw orb frame from
-        // frame one) reads better than a correct-but-momentary tiny start frame followed by a
-        // jump — the "grows from something small" effect survives regardless, since every real
-        // orb frame (`chatWindowCollapsedSize`, 240×140) is comfortably wider than AppKit's own
-        // ~40pt width floor, so only the HEIGHT actually ends up chrome-floored in practice.
-        let toolbar = NSToolbar(identifier: "norma.chatwindow.toolbar")
-        toolbar.displayMode = .iconOnly
-        panel.toolbar = toolbar
-        panel.toolbarStyle = .unified
-        panel.contentMinSize = NSSize(width: 340, height: 360) // best-effort — see the toolbar comment above for why AppKit may override this
+        panel.title = "Norma" // a11y/Dock — no visible titlebar to show it in
+        panel.contentMinSize = NSSize(width: 340, height: 360) // governs USER resizes; animations bypass via isAnimatingFrame
         panel.frameSanitizer = { [weak self] proposed, _ in
             // Gate fix (F1, generalized r3/W1 to the shrink too): bypass the SIZE floor while a
             // frame animation (grow OR shrink) is driving frames — see `isAnimatingFrame`'s doc.
@@ -182,29 +166,27 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         }
         panel.backgroundColor = .clear
         panel.isOpaque = false
-        panel.hasShadow = true // opaque-looking window wants a real shadow (unlike the field)
+        panel.hasShadow = true // borderless: AppKit's shadow follows the tinted RoundedRectangle content shape
         panel.isFloatingPanel = true
         panel.level = .screenSaver
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
-        panel.titleVisibility = .hidden
-        panel.titlebarAppearsTransparent = true
-        panel.isMovableByWindowBackground = true
+        panel.isMovableByWindowBackground = true // drag the glass body to move (no titlebar to grab)
         panel.acceptsMouseMovedEvents = true
         // Task-5 review catch: AppKit auto-hides key-capable panels when the app deactivates,
         // and Norma (accessory, non-activating panels) is "deactivated" almost always — without
         // this the window vanishes the moment the user clicks any other app, with close()/
         // onClose never firing. Same explicit opt-out the orb panel carries.
         panel.hidesOnDeactivate = false
+        // Gate r4 (hypothesis 2): kill the SYSTEM window-hide fade on `orderOut()` — our spring is
+        // the only motion language, no close path should get a system-drawn fade layered on top.
+        panel.animationBehavior = .none
         panel.delegate = self
-        // Gate r3 (W2 polish): traffic lights start invisible and fade in across the grow
-        // (`frameAnimTick()`'s alpha ramp) instead of popping in at full opacity alongside the
-        // now-constant chrome geometry above — guards nil (buttons exist only under `.titled`,
-        // which this panel always carries, so this is defensive, not load-bearing).
-        setChromeButtonsAlpha(0, on: panel)
 
         let hosting = NSHostingView(rootView: ChatWindowRootView(
             adapter: adapter,
-            onRequestClose: { [weak self] in self?.closeAnimated() }
+            onRequestClose: { [weak self] in self?.closeAnimated() },
+            onRequestMinimize: { [weak self] in self?.closeAnimated() },
+            onRequestZoom: { [weak self] in self?.zoomToggle() }
         ))
         hosting.autoresizingMask = [.width, .height]
         panel.contentView = hosting
@@ -224,8 +206,10 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         // floor before the grow animation even starts. `isAnimatingFrame` makes the panel's own
         // `setFrame` override bypass that floor (position only, see `frameSanitizer` above) for
         // this placement and every tick that follows; read `panel.frame` back afterward so
-        // `frameAnimStart` is the exact (position-clamped, chrome-floored — see the toolbar
-        // comment above) frame actually on-screen at t=0, not the raw un-clamped proposal.
+        // `frameAnimStart` is the exact (position-clamped) frame actually on-screen at t=0, not the
+        // raw un-clamped proposal. Gate r4: the window is borderless now, so there is no AppKit
+        // chrome minimum — the start frame keeps the orb's full ~240×140 in BOTH dimensions (r3's
+        // "height gets chrome-floored" no longer happens).
         isAnimatingFrame = true
         programmaticMove = true
         panel.setFrame(sourceFrame, display: false)
@@ -281,6 +265,12 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
     /// `panel.frame` — the shrink then reads `panel.frame` fresh, so it starts from wherever the
     /// grow had actually gotten to, not a jump back to the grow's original start or forward to its
     /// target.
+    ///
+    /// Gate r4 (fully self-drawn window): the window is borderless for life, so this no longer has
+    /// to touch the styleMask/chrome at all — the shrink simply runs to orb size. Both the RED close
+    /// and the YELLOW minimize buttons route here (see `ChatWindowRootView`): the orb IS Norma's
+    /// minimized state, so "dismiss" and "minimize" currently share this shrink-to-orb gesture; the
+    /// semantics may diverge in a later phase. Esc during the shrink is a no-op (`isShrinking`).
     func closeAnimated() {
         guard let panel else { return }
         guard !isShrinking else { return }
@@ -295,6 +285,28 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         startFrameAnimation(from: shrinkFrom, to: shrinkTo, direction: .shrink)
     }
 
+    /// Gate r4 (custom GREEN zoom button): manual zoom toggle, since a borderless window has no
+    /// native zoom. First press remembers the current frame (`preZoomFrame`) and fills the screen's
+    /// visible frame (inset a touch); second press restores the remembered frame. Instant (not
+    /// spring-driven) — a zoom is a discrete state toggle, not a summon choreography; gate feedback
+    /// can decide later whether it wants easing. No-op while a grow/shrink is in flight
+    /// (`frameAnimTimer != nil`) so it never fights the spring. `programmaticMove` brackets the
+    /// `setFrame` so the zoom doesn't pollute `rememberedFrame` (drag memory).
+    func zoomToggle() {
+        guard let panel, frameAnimTimer == nil else { return }
+        let screen = NSScreen.screens.first { $0.frame.intersects(panel.frame) } ?? NSScreen.main
+        let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        programmaticMove = true
+        defer { programmaticMove = false }
+        if let restore = preZoomFrame {
+            preZoomFrame = nil
+            panel.setFrame(restore, display: true)
+        } else {
+            preZoomFrame = panel.frame
+            panel.setFrame(visible.insetBy(dx: chatWindowZoomInset, dy: chatWindowZoomInset), display: true)
+        }
+    }
+
     // MARK: Frame animation — grow + shrink (manual — see `frameAnimTimer`'s doc for why not `.animator()`)
 
     private func startFrameAnimation(from start: NSRect, to end: NSRect, direction: FrameAnimDirection) {
@@ -304,11 +316,6 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         frameAnimProgress = 0
         frameAnimVelocity = 0
         lastFrameAnimTick = CACurrentMediaTime()
-        // Read the buttons' CURRENT live alpha rather than assuming 0/1 — see `frameAnimAlphaFrom`'s
-        // doc: a mid-grow `closeAnimated()` retarget must fade DOWN from wherever the fade-in had
-        // gotten to, not pop back up to 1 first.
-        frameAnimAlphaFrom = currentChromeButtonAlpha(on: panel) ?? (direction == .grow ? 0 : 1)
-        frameAnimAlphaTo = direction == .grow ? 1 : 0
         frameAnimTimer?.invalidate()
         frameAnimTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.frameAnimTick() }
@@ -344,18 +351,21 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         // as intended.
         let frame = unclampedInterpolatedRect(from: frameAnimStart, to: frameAnimTarget, progress: p)
         panel.setFrame(frame, display: true)
-        applyChromeButtonAlpha(forProgress: p, on: panel)
 
         // Settle guard — same epsilon as the core morph (Fix A).
         if abs(1 - p) < 0.004, abs(v) < 0.05 {
             panel.setFrame(frameAnimTarget, display: true)
-            applyChromeButtonAlpha(forProgress: 1, on: panel)
             let direction = frameAnimDirection
+            if direction == .shrink {
+                // Gate r4 regression seam: the real on-screen frame the shrink REACHED, captured
+                // before teardown nils the panel — tests assert this is orb-sized (~240×140).
+                lastShrinkSettledFrameForTesting = panel.frame
+            }
             cancelFrameAnimation()
             // Gate r3 (W1): the shrink's whole point is to lead into teardown — run the exact
             // same instant, idempotent `close()` now that the panel has visibly settled at the
-            // cursor. The grow has nothing further to do (chrome is attached at construction now,
-            // gate r3/W2 — no more `attachChromeToolbar()` call here).
+            // cursor. The grow has nothing further to do (the window is self-drawn borderless — no
+            // chrome to attach or fade in).
             if direction == .shrink { close() }
         }
     }
@@ -367,28 +377,6 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         isAnimatingFrame = false // gate fix (F1): re-arm the sanitizer's size floor for real user/system frame changes
     }
 
-    // MARK: Chrome button fade (gate r3, W2 polish)
-
-    private func currentChromeButtonAlpha(on panel: ChatWindowPanel?) -> CGFloat? {
-        panel?.standardWindowButton(.closeButton)?.alphaValue
-    }
-
-    private func setChromeButtonsAlpha(_ alpha: CGFloat, on panel: ChatWindowPanel?) {
-        guard let panel else { return }
-        for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton].compactMap({ panel.standardWindowButton($0) }) {
-            button.alphaValue = alpha
-        }
-    }
-
-    /// Interpolates from `frameAnimAlphaFrom` to `frameAnimAlphaTo` across the SAME `progress`
-    /// scalar the rect lerp uses (clamped to `[0, 1]` here — unlike the rect lerp, the buttons'
-    /// alpha has no business overshooting past fully opaque/transparent).
-    private func applyChromeButtonAlpha(forProgress progress: Double, on panel: ChatWindowPanel?) {
-        let t = CGFloat(min(max(progress, 0), 1))
-        let alpha = frameAnimAlphaFrom + (frameAnimAlphaTo - frameAnimAlphaFrom) * t
-        setChromeButtonsAlpha(alpha, on: panel)
-    }
-
     // MARK: NSWindowDelegate
 
     func windowDidMove(_ notification: Notification) {
@@ -396,22 +384,23 @@ final class ChatWindowController: NSObject, NSWindowDelegate {
         rememberedFrame = frame
     }
 
-    /// Gate fix (F2 — resizable): native edge-resizing fires `windowDidResize`, not
-    /// `windowDidMove` — mirrors that method's exact programmatic-move guard so a resize driven
-    /// by the grow animation or `chatWindowTargetFrame` never pollutes `rememberedFrame`, only a
-    /// real user drag of a resize handle does.
+    /// `.resizable` (kept in the borderless mask) fires `windowDidResize`, not `windowDidMove`, on a
+    /// user edge-drag — mirrors `windowDidMove`'s exact programmatic-move guard so a resize driven
+    /// by the grow/shrink animation, `chatWindowTargetFrame`, or `zoomToggle()` never pollutes
+    /// `rememberedFrame`, only a real user drag does. (Whether borderless windows actually get a
+    /// native edge-drag on this OS is a live-gate question — see the report; the guard is correct
+    /// regardless.)
     func windowDidResize(_ notification: Notification) {
         guard !programmaticMove, let frame = panel?.frame else { return }
         rememberedFrame = frame
     }
 
-    /// Gate fix (F2 — native traffic lights), re-routed by gate r3 (W1): the native red close
-    /// button invokes this before AppKit's own close sequence runs. Route it through OUR teardown
-    /// — now `closeAnimated()` (spring-shrinks to the cursor first, then runs the same instant
-    /// `close()` this used to call directly) — and refuse AppKit's own close (`return false`)
-    /// since we're tearing the window down ourselves; both `closeAnimated()` (idempotent via
-    /// `isShrinking`) and `close()` itself (guards on `panel` already being nil) mean this can
-    /// never double-fire `onClose` even if something else raced a close in first.
+    /// Gate r4 (self-drawn window): with no `.closable`/`.titled` chrome, AppKit no longer calls
+    /// this — closing is driven by our own red/yellow traffic lights (→ `closeAnimated()`), Esc, and
+    /// the summon toggle. Kept as a harmless safety net: if anything ever does invoke it, route
+    /// through our animated teardown and refuse AppKit's own close (`return false`). `closeAnimated()`
+    /// (idempotent via `isShrinking`) and `close()` (guards `panel` already nil) mean it can never
+    /// double-fire `onClose`.
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         closeAnimated()
         return false

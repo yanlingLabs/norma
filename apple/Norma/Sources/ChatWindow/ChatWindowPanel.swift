@@ -2,18 +2,17 @@ import AppKit
 
 /// v1 transplant (AI pointer InteractionController.swift:1385-1425, `DetachedChatPanel`,
 /// byte-faithful except the class name): a panel whose EVERY frame mutation is routed through
-/// `frameSanitizer`, so no code path (drag, animation, programmatic resize, NATIVE resize —
-/// gate fix F2 added `.resizable` to the styleMask) can ever push the window off-screen or
-/// below its minimum size. Unlike the orb's `KeyableNonActivatingPanel` (canBecomeKey gated on
-/// `acceptsKeyInput`), this panel is unconditionally keyable — the window only exists while the
-/// user is deliberately interacting with it.
+/// `frameSanitizer`, so no code path (drag, animation, programmatic resize, any native resize) can
+/// ever push the window off-screen or below its minimum size. Unlike the orb's
+/// `KeyableNonActivatingPanel` (canBecomeKey gated on `acceptsKeyInput`), this panel is
+/// unconditionally keyable — the window only exists while the user is deliberately interacting
+/// with it.
 ///
-/// Gate fix (F2): the styleMask (set by `ChatWindowController.show(from:)`) went from
-/// `[.borderless, .nonactivatingPanel]` to `[.titled, .closable, .miniaturizable, .resizable,
-/// .fullSizeContentView, .nonactivatingPanel]` — real system traffic-light buttons + native
-/// edge-resizing, while `.fullSizeContentView` keeps the SwiftUI content extending under the
-/// (hidden-title, transparent) title bar so the glass tint reads as one continuous surface. See
-/// that method's doc for why `.nonactivatingPanel` was kept.
+/// Gate r4 (fully self-drawn window): the styleMask (set by `ChatWindowController.show(from:)`) is
+/// `[.borderless, .nonactivatingPanel, .resizable]` for the panel's whole life — v1's approach.
+/// F2's brief `.titled` + unified-toolbar era was reverted: its AppKit chrome minimum stalled the
+/// close-shrink and its chrome popped at grow-settle. The traffic lights are now drawn by
+/// `ChatWindowRootView`; see `show(from:)`'s doc for the full rationale.
 final class ChatWindowPanel: NSPanel {
     var frameSanitizer: ((NSRect, NSRect) -> NSRect)?
 
