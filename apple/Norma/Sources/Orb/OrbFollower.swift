@@ -21,6 +21,11 @@ import QuartzCore
 final class OrbFollower {
     private let cursorTracker = CursorTracker()
     private let morphModel: MorphModel
+    /// Task-3 fix wave: the fluid orb's own dedicated model (split off `MorphModel` — see
+    /// `FluidModel`'s doc, `FieldKit/FluidOrbView.swift`) — `tick()` now writes the per-tick
+    /// acceleration tap directly onto this instead of onto `morphModel.fluidAcceleration`
+    /// (removed: publishing it there re-rendered the WHOLE field body on every tick).
+    private let fluidModel: FluidModel
     private var link: CADisplayLink?
     private var lastUpdate = CACurrentMediaTime()
     private var spring = SpringState(position: .zero, velocity: .zero)
@@ -29,6 +34,12 @@ final class OrbFollower {
     private let baseOffset = CGPoint(x: 24, y: -24) // v1
     private let config = SpringConfig.tracking
     private var lastCursorSampleTime = CACurrentMediaTime()
+    /// Task 2 (fluid orb acceleration tap): the tracking spring's velocity as of the PREVIOUS
+    /// tick — `tick()` diffs against this to get `fluidModel.acceleration`. Reset to `.zero`
+    /// alongside every place `spring.velocity` itself gets reset (`start()`/`snapWindowOrigin`)
+    /// so a fresh spring never reports a one-tick phantom acceleration spike computed against a
+    /// stale velocity left over from before the reset.
+    private var lastVelocity = CGPoint.zero
     /// Wave-3 gate item 2b: gates the answer-arrival auto-expand — see `CursorCalmTracker`'s doc
     /// and `isCursorCalm(at:)` below.
     private var calmTracker = CursorCalmTracker()
@@ -53,8 +64,9 @@ final class OrbFollower {
     private(set) var cursorLocation = NSEvent.mouseLocation
     var currentWindowOrigin: CGPoint { spring.position }
 
-    init(morphModel: MorphModel) {
+    init(morphModel: MorphModel, fluidModel: FluidModel) {
         self.morphModel = morphModel
+        self.fluidModel = fluidModel
     }
 
     /// Snaps the tracking spring directly onto `origin` with zero velocity — called by the
@@ -65,6 +77,7 @@ final class OrbFollower {
     /// 581-583/742-746/1504-1506).
     func snapWindowOrigin(to origin: CGPoint) {
         spring = SpringState(position: origin, velocity: .zero)
+        lastVelocity = .zero
         lastPublished = origin
     }
 
@@ -98,6 +111,7 @@ final class OrbFollower {
         cursorLocation = NSEvent.mouseLocation
         lastCursorSampleTime = CACurrentMediaTime()
         spring = SpringState(position: targetOrigin(), velocity: .zero)
+        lastVelocity = .zero
         publish(spring.position)
 
         let l = (NSScreen.main ?? NSScreen.screens[0]).displayLink(target: self, selector: #selector(tick))
@@ -139,6 +153,18 @@ final class OrbFollower {
         lastUpdate = now
 
         let (next, tier) = springStep(spring, target: targetOrigin(), dt: dt, config: config)
+
+        // Task 2 (fluid orb acceleration tap): (velocity - lastVelocity) / dt, this tick's real
+        // dt — the same one just fed to `springStep` above. Clamped to [1/240, config.dtClampMax]
+        // (the same range the spring integration uses), so both computations share a time base.
+        // Task-3 fix wave: written onto `fluidModel` (NOT `@Published`, see `FluidModel`'s doc) —
+        // this used to be `morphModel.fluidAcceleration`, an `@Published` write on every tick that
+        // re-rendered the whole field body.
+        let accelDt = max(1.0 / 240.0, min(dt, config.dtClampMax))
+        let v = next.velocity
+        fluidModel.acceleration = CGVector(dx: (v.x - lastVelocity.x) / accelDt, dy: (v.y - lastVelocity.y) / accelDt)
+        lastVelocity = v
+
         spring = next
         publish(spring.position)
 

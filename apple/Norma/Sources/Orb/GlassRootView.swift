@@ -15,13 +15,18 @@ struct GlassRootView: View {
     @ObservedObject var session: SessionModel
     @ObservedObject var controller: OrbWindowController
     @ObservedObject var morphModel: MorphModel
+    /// Task-3 fix wave: deliberately NOT `@ObservedObject` — same reason as `NormaFieldView.fluid`
+    /// (see `FluidModel`'s doc, `FieldKit/FluidOrbView.swift`). Held only to pass down to
+    /// `NormaFieldView`, which itself only passes it further down to `FluidOrbSlot`.
+    let fluidModel: FluidModel
     @StateObject private var adapter: FieldStateAdapter
     private let draftCache = DraftCache()
 
-    init(session: SessionModel, controller: OrbWindowController, morphModel: MorphModel) {
+    init(session: SessionModel, controller: OrbWindowController, morphModel: MorphModel, fluidModel: FluidModel) {
         self.session = session
         self.controller = controller
         self.morphModel = morphModel
+        self.fluidModel = fluidModel
         _adapter = StateObject(wrappedValue: FieldStateAdapter(session: session))
         // NOTE: do NOT touch `adapter` here. Accessing a @StateObject's wrappedValue inside
         // init mutates a pre-installation THROWAWAY instance — the installed adapter keeps the
@@ -44,7 +49,7 @@ struct GlassRootView: View {
 
     var body: some View {
         wireCallbacks()
-        return NormaFieldView(adapter: adapter, morph: morphModel)
+        return NormaFieldView(adapter: adapter, morph: morphModel, fluid: fluidModel)
             .onChange(of: controller.surface) { _, newSurface in
                 switch newSurface {
                 case .orb:

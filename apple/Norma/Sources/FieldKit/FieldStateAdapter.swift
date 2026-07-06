@@ -2,6 +2,17 @@ import Foundation
 import Combine
 import SwiftUI
 
+/// Task 2 (fluid orb): the three states the fluid-orb bubble can render — derived purely from
+/// `SessionModel`'s turn/task/unread state by `FieldStateAdapter.fluidState` below. `.idle` means
+/// no fluid view should even be mounted; the other two carry a fill `level` (0…1) the view maps to
+/// the bubble's liquid height, plus a color (blue while working, amber while holding an unread
+/// reply — the view owns that color choice, not this enum).
+enum FluidState: Equatable {
+    case idle
+    case working(level: Double)
+    case unread(level: Double)
+}
+
 /// The ONLY new design in this transplant (everything else in `FieldKit/` is a direct v1 port).
 /// A thin, v1-shaped facade over `SessionModel` so `NormaFieldView` (copied from v1
 /// `GlassFieldView`'s composer path) can read exactly the surface v1's `AppState` used to
@@ -17,9 +28,11 @@ import SwiftUI
 final class FieldStateAdapter: ObservableObject {
     private let session: SessionModel
     private var cancellable: AnyCancellable?
+    private var cancellables = Set<AnyCancellable>()
 
     init(session: SessionModel) {
         self.session = session
+        self.previousLastTurnAborted = session.state.lastTurnAborted
         // Republish the session's own changes as our own — `statusText`/`isThinking`/
         // `visibleResponse` below are computed (not `@Published`) so they always read `session`
         // live; this is what makes `@ObservedObject var adapter: FieldStateAdapter` in the view
@@ -27,6 +40,72 @@ final class FieldStateAdapter: ObservableObject {
         cancellable = session.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
+
+        // Cache the task-completion fill level from the event stream (when state changes),
+        // not from the getter's read-time side effect. This ensures that a fast
+        // taskUpdated→turnCompleted burst hitting the same render doesn't drop the final
+        // level (1.0) because the getter never ran between events.
+        session.$state
+            .sink { [weak self] newState in
+                guard let self else { return }
+                if newState.turnRunning {
+                    let c = newState.taskCounts
+                    self.lastWorkingLevel = c.total > 0 ? Double(c.done) / Double(c.total) : 0.5
+                    // Final-review fix (IMPORTANT-1): a turn_started-driven turnRunning=true must
+                    // clear any still-pending stopped-flash immediately — without this, Esc'ing a
+                    // turn then resubmitting within the 2s auto-clear window renders "⏹ stopped" +
+                    // the slate flash tint OVER a live, working orb (false status: the new turn is
+                    // actually running, but the UI still reports the old one as stopped). Cancel
+                    // the pending auto-clear `DispatchWorkItem` too (not just the flag) so it can't
+                    // fire later and redundantly re-clear an already-false flag. Guarded on
+                    // `showStoppedFlash` currently being true so a turn that never flashed doesn't
+                    // take a spurious `@Published` publish on every single state event while
+                    // running (this sink fires on every task/turn event, not just turn_started).
+                    self.stoppedFlashWorkItem?.cancel()
+                    self.stoppedFlashWorkItem = nil
+                    if self.showStoppedFlash {
+                        self.showStoppedFlash = false
+                    }
+                }
+                // Interrupt-feedback gate polish: fire the transient "stopped" flash exactly on
+                // the false→true edge of the pure reducer's `lastTurnAborted` — never on a
+                // steady-state read (a re-render while it's already true must NOT restart the
+                // timer) and never on the true→false clear a fresh `turn_started` produces (that
+                // clear is silent by design; only the ABORT itself announces).
+                if newState.lastTurnAborted && !self.previousLastTurnAborted {
+                    self.triggerStoppedFlash()
+                }
+                self.previousLastTurnAborted = newState.lastTurnAborted
+            }
+            .store(in: &cancellables)
+    }
+
+    /// Edge-detection memory for the sink above — `OrbSessionState.lastTurnAborted`'s own last
+    /// observed value, NOT itself part of the pure reducer state (view-layer bookkeeping only).
+    private var previousLastTurnAborted: Bool
+
+    /// Interrupt-feedback gate polish: transient, view-layer-only signal that the turn just ended
+    /// via an Esc-interrupt (`OrbSessionState.lastTurnAborted` flipping false→true) — deliberately
+    /// NOT part of the pure reducer (`SessionReducer`/`OrbSessionState`): a self-clearing timer is
+    /// exactly the kind of impurity (wall-clock time, `DispatchQueue`) the reducer's contract
+    /// forbids (see `OrbSessionState.workingVerb`'s doc for the same rule applied to randomness).
+    /// `NormaFieldView`/`FluidOrbSlot` read this to swap in the "⏹ stopped" caption and a muted
+    /// fluid tint for 2 seconds, then fall back to their normal state-driven rendering.
+    @Published var showStoppedFlash: Bool = false
+
+    /// The pending auto-clear for `showStoppedFlash` — cancelled and replaced (not just
+    /// re-scheduled) on every re-trigger so a second interrupt within the 2s window restarts the
+    /// full 2s rather than letting the first timer clear the flash early out from under it.
+    private var stoppedFlashWorkItem: DispatchWorkItem?
+
+    private func triggerStoppedFlash() {
+        stoppedFlashWorkItem?.cancel()
+        showStoppedFlash = true
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.showStoppedFlash = false
+        }
+        stoppedFlashWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: workItem)
     }
 
     // MARK: - v1's composer-display surface (Core/AppState.swift:160-171's `composerDisplayText`)
@@ -36,18 +115,21 @@ final class FieldStateAdapter: ObservableObject {
     /// free-form narration slots have no v2 equivalent.
     ///
     /// Wave 6 gate rework: `.thinking`/`.toolRunning` no longer read `OrbStatus.pillText` (it
-    /// returns nil for both now) — they compose `workingPillText(verb:hasActiveTask:done:total:)`
+    /// returns nil for both now) — they compose `workingVerbText(verb:)` + `workingCountText(...)`
     /// instead, so the collapsed pill shows the turn's CC-style whimsical verb ("Reticulating…")
-    /// rather than a static "thinking…"/tool name, with "☑ n/m" appended only while a task is
-    /// actually `.in_progress`. `.approvalNeeded`/`.disconnected` are checked FIRST and win
-    /// outright even mid-turn — they're the only two `OrbStatus` cases whose `pillText` is
-    /// non-nil, so this two-branch shape (status override, else working-verb composition) is
-    /// exhaustive without a `default`/fallback case.
+    /// rather than a static "thinking…"/tool name, with "☑ n/m" as a separate chip positioned left
+    /// of the orb. `.approvalNeeded`/`.disconnected` are checked FIRST and win outright even
+    /// mid-turn — they're the only two `OrbStatus` cases whose `pillText` is non-nil, so this
+    /// two-branch shape (status override, else working-verb composition) is exhaustive without a
+    /// `default`/fallback case.
     ///
     /// GATE-3 FIX (F3, preserved): only returns `""` when there is truly nothing to report
     /// (`status == .idle` and no turn running) — the collapsed-orb pill's reveal condition
     /// (`NormaFieldView`'s `hasStatusPill`) gates directly on "`statusText` non-empty," mirroring
     /// the pre-transplant `OrbView.pillText`'s contract (nil only for true idle).
+    ///
+    /// Gate polish: split into `verbText` (right of orb) and `countText` (left of orb) for
+    /// separate positioning — this property now re-composes them for backwards compatibility.
     var statusText: String {
         let s = session.state
         let text: String
@@ -70,6 +152,32 @@ final class FieldStateAdapter: ObservableObject {
     }
 
     private var lastLoggedStatusText: String?
+
+    /// Gate polish: the animated verb text for the right-side pill ("Reticulating…", "Noodling…").
+    /// Returns override status text for non-working states (.approvalNeeded, .disconnected),
+    /// or the bare working verb while a turn is running, or empty string for true idle.
+    var verbText: String {
+        let s = session.state
+        if let pillText = s.status.pillText {
+            return pillText // .approvalNeeded / .disconnected — override even mid-turn
+        } else if s.turnRunning {
+            return workingVerbText(verb: s.workingVerb)
+        } else {
+            return "" // true idle
+        }
+    }
+
+    /// Gate polish: the task-count chip text for the left-side chip ("☑ 1/4", "☑ 3/5").
+    /// Returns the count suffix only while a task is in_progress; otherwise empty string.
+    var countText: String {
+        let s = session.state
+        if s.turnRunning {
+            let counts = s.taskCounts
+            return workingCountText(hasActiveTask: s.hasActiveTask, done: counts.done, total: counts.total)
+        } else {
+            return ""
+        }
+    }
 
     /// Wave-7 gate item 2: true exactly when `statusText` is currently showing the CC-style
     /// working-verb composition (`workingPillText`) — i.e. the SAME branch of `statusText` above
@@ -165,6 +273,69 @@ final class FieldStateAdapter: ObservableObject {
     /// is next summoned. Cleared unconditionally on every expand (`GlassRootView`'s
     /// `.onChange(of: controller.surface)` `.field` case) — any summon path counts as "read."
     @Published var hasUnread: Bool = false
+
+    // MARK: - Task 2: fluid-orb state derivation
+
+    /// Last fill level observed while `fluidState` computed `.working` — the level `.unread`
+    /// holds once `hasUnread` flips true (the task/turn that produced the reply may already be
+    /// gone by then: `turnCompleted` clears `turnRunning` before the wave-3 calm-check even marks
+    /// the orb unread, see `OrbFollower.isCursorCalm`/`GlassRootView`'s turn-completion handler).
+    /// Updated inside the `session.$state` sink (`init` above) on every state change while
+    /// `turnRunning`, NOT at `fluidState`'s read time — this ensures a fast taskUpdated→
+    /// turnCompleted burst hitting the same render doesn't drop the final level (1.0) because the
+    /// getter never ran between events (see the sink's own doc). Defaults to 0.5 — the same "no
+    /// signal yet" level `taskLevel` itself falls back to — so an (unexercised in practice)
+    /// unread-before-any-work edge case still renders a sane mid-fill bubble instead of an
+    /// arbitrary stale value.
+    private var lastWorkingLevel: Double = 0.5
+
+    /// Derived, not stored: `hasUnread` wins outright (the reply is waiting, regardless of
+    /// whether a new turn has already started since); otherwise `turnRunning` renders the current
+    /// task-completion fill; otherwise — Finding-3 — the fluid HOLDS its level while any task is
+    /// still incomplete (the WORK isn't done even though this turn ended), and only drains to
+    /// `.idle` once every task is complete (or there were never any tasks).
+    ///
+    /// Finding-3 (gate 2): the fluid represents Norma's WORK, not just the current turn. A turn
+    /// finishing with an incomplete task list (the agent paused between turns, or is waiting to be
+    /// told to continue) used to drain the liquid to empty, reading as "all done" when it isn't.
+    /// Now it holds `.working(level)` at the task-completion fill instead. Implementation choice
+    /// (per the directive's "implementer's choice"): reuse `.working` rather than add a
+    /// `.pausedWork` case — the fluid sim's slosh already decays naturally once the cursor (and so
+    /// the tracking-spring acceleration feeding `FluidSim`) calms, so a held-but-idle bubble reads
+    /// as "paused/settled" on its own, without a distinct dimmed case. Unread still wins above.
+    var fluidState: FluidState {
+        if hasUnread {
+            return .unread(level: lastWorkingLevel)
+        }
+        let s = session.state
+        let counts = s.taskCounts
+        let level = counts.total > 0 ? Double(counts.done) / Double(counts.total) : 0.5
+        if s.turnRunning {
+            return .working(level: level)
+        }
+        // Turn ended: hold the fill while work remains (any task not yet completed); else drain.
+        if counts.total > 0 && counts.done < counts.total {
+            return .working(level: level)
+        }
+        return .idle
+    }
+
+    /// Final-review Important-2 (D9 settled-tick freeze): true exactly in `fluidState`'s
+    /// "hold" branch above — the fluid is rendering `.working(level)` because tasks remain
+    /// incomplete, NOT because a turn is actively advancing it. Threaded down to
+    /// `FluidOrbSlot`/`FluidOrbView` so the tick loop knows it's safe to freeze once the sim
+    /// settles (a held bubble's target level isn't moving) — MUST be false while `turnRunning`
+    /// (the task-completion fill is actively changing then, see `fluidState`'s own `.working`
+    /// branch) and MUST be false for `.unread`/`.idle` (the synthetic breathing and drain
+    /// animations both need to keep ticking; see `FluidOrbView.step`'s `.unread` wobble and the
+    /// `.idle` drain-to-zero target). Computed, not stored — same convention as `fluidState`
+    /// itself, always reflects a live read of `session.state`.
+    var isHoldingWork: Bool {
+        guard !hasUnread else { return false }
+        let s = session.state
+        let counts = s.taskCounts
+        return !s.turnRunning && counts.total > 0 && counts.done < counts.total
+    }
 
     // MARK: - Callbacks (task B wires real behavior)
 

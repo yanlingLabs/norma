@@ -12,6 +12,13 @@ final class AppModel: ObservableObject {
     private var pumpTask: Task<Void, Never>?
     private var selfCreatedSessionId: String?
 
+    /// Finding-1 fix (gate 2): session ids the orb has already forced to `approvalPolicy: "auto"`
+    /// (see `forceAutoPolicyIfNeeded`). One flip per focused session id is enough — the daemon
+    /// persists the policy — so this keeps every subsequent send off the `session.setPolicy` wire.
+    /// A session created BY the orb (`ensureFocusedSession`, born `auto`) is pre-seeded here so it
+    /// never needs a redundant flip.
+    private var forcedAutoSessionIds: Set<String> = []
+
     init(makeTransport: @escaping @Sendable () -> NormaTransport, token: String, clientName: String = "orb") {
         client = NormaClient(makeTransport: makeTransport, token: token, clientName: clientName)
     }
@@ -59,9 +66,15 @@ final class AppModel: ObservableObject {
     }
 
     /// Field summon path: a session to talk to, creating one if none is focused.
+    ///
+    /// Orb-created sessions run approvalPolicy "auto": the orb has no approval UI until 2d,
+    /// so there's nowhere to surface an "ask" prompt. The daemon's reviewer still gates
+    /// dangerous bash regardless of policy — auto ≠ unguarded. Sessions the orb merely
+    /// FOLLOWS (created elsewhere, e.g. the CLI) keep their creator's policy, unchanged.
     func ensureFocusedSession() async -> String? {
         if let sid = focusedSessionId { return sid }
-        guard let created = try? await client.createSession(scope: "global", cwd: NSHomeDirectory()) else { return nil }
+        guard let created = try? await client.createSession(scope: "global", cwd: NSHomeDirectory(), approvalPolicy: "auto") else { return nil }
+        forcedAutoSessionIds.insert(created.sessionId) // born auto — no redundant setPolicy on first send
         // The daemon broadcasts session_created BEFORE the RPC response returns; the pump may
         // have already refocused us onto the new session. Idempotent skip — never double-attach.
         if focusedSessionId == created.sessionId { return focusedSessionId }
@@ -70,10 +83,39 @@ final class AppModel: ObservableObject {
         return focusedSessionId
     }
 
+    /// Finding-1 fix (gate 2 — "the orb still asks approvals despite the auto default"). ROOT CAUSE:
+    /// `ensureFocusedSession()`'s create-with-`auto` path almost never runs, because the orb doesn't
+    /// usually create the session it DRIVES. At startup `focusNewestSession()` attaches to the
+    /// daemon's pre-existing global session (auto-created by the daemon in its DEFAULT "ask" policy),
+    /// and `handle(.sessionCreated)` follows every later broadcast onto whatever session appears — so
+    /// `focusedSessionId` is already set and the create path is skipped. The orb then sends into an
+    /// ASK-mode session; with no orb approval UI until 2d, the daemon's `approval_requested` hangs
+    /// until it times out (observed live in `s_4934f1323319`: a `bash` call sat 300s to the timeout).
+    ///
+    /// Per the user directive "the orb should NEVER require approval, always auto": force the focused
+    /// session to `auto` before the first send/steer we make to it. Idempotent + once-per-session id
+    /// (the daemon persists it) via `forcedAutoSessionIds`.
+    ///
+    /// HONEST NOTE: this also flips the policy for any OTHER harness attached to the same session
+    /// (e.g. the CLI). Accepted as an interim measure per the directive — revisit at 2d when the orb
+    /// grows its own approval UI. Note `auto ≠ unguarded`: the daemon's bash reviewer still gates
+    /// genuinely dangerous commands regardless of policy.
+    private func forceAutoPolicyIfNeeded(_ sessionId: String) async {
+        guard !forcedAutoSessionIds.contains(sessionId) else { return }
+        do {
+            try await client.setPolicy(sessionId: sessionId, policy: "auto")
+            forcedAutoSessionIds.insert(sessionId) // only mark on success — a failed flip retries next send
+            OrbDebug.log("forceAutoPolicy: session \(sessionId.prefix(10)) → auto")
+        } catch {
+            OrbDebug.log("forceAutoPolicy: setPolicy failed for \(sessionId.prefix(10)) — will retry next send")
+        }
+    }
+
     /// Field submit: steer a running turn, otherwise send (starts a turn). CLI parity.
     func sendOrSteer(_ text: String) async -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let sid = await ensureFocusedSession() else { return false }
+        await forceAutoPolicyIfNeeded(sid) // Finding-1: the orb never drives an ask-mode session
         if session.state.turnRunning {
             return (try? await client.steer(sessionId: sid, text: trimmed)) != nil
         }

@@ -91,6 +91,21 @@ final class MorphModel: ObservableObject {
     /// native Liquid Glass backing view to reacquire refraction/shadow state.
     @Published var glassRefreshGeneration = 0
 
+    // MARK: - Task 2/3: fluid orb — MOVED OFF this model (task-3 fix wave)
+
+    // Task-3 fix wave (review finding, "full-body re-render per tick"): `fluid`/`fluidAcceleration`
+    // used to live here as `@Published` properties, advanced every render tick (~120/s while a
+    // turn is active). Because `NormaFieldView` (the WHOLE field body — glass geometry, composer/
+    // response content, nav pill…) also observes this `MorphModel`, every one of those writes
+    // re-ran that entire body for a change nothing but the fluid bubble needed to see — a direct
+    // violation of this codebase's own local-animation-state convention (cf.
+    // `NormaFieldView.WorkingSpinnerGlyph`/`SheenText`, each scoping their own animation state to
+    // themselves via `@State`, never an ancestor). Both fields now live on their own dedicated
+    // `FluidModel` (`FieldKit/FluidOrbView.swift`), observed ONLY by `FluidOrbSlot`/`FluidOrbView`
+    // — `NormaFieldView` holds a plain, non-`@ObservedObject` reference solely to pass one down.
+    // `OrbFollower` writes the acceleration tap onto that `FluidModel` directly instead of onto
+    // this model now.
+
     /// Outer window size. Sized to fit nav pill + composer + screenshot pill
     /// slot + generous halo padding on every side so the breathing glow never
     /// hits the window edge and hard-cuts. Task B: this is the AppKit panel's

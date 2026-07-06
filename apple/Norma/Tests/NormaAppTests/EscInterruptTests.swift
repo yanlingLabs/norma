@@ -43,4 +43,28 @@ final class EscInterruptTests: XCTestCase {
         // flips turnRunning, not this key handler).
         XCTAssertEqual(delegate.orbController?.onEsc?(), true)
     }
+
+    // MARK: - Finding-2 (gate 2): field key monitor routes Esc on the SURFACE, not window identity
+    // (`escMonitorAction`) — so a re-summon key race that misbinds/unbinds the event's window can't
+    // silently drop a valid Esc (wave-9-style window-agnostic acceptance, but for keyDowns).
+
+    func testEscMonitorInterruptsWhenFieldOpenAndTurnRunning() {
+        XCTAssertEqual(escMonitorAction(keyCode: 53, surface: .field, escConsumed: { true }), .interrupt)
+    }
+    func testEscMonitorCollapsesWhenFieldOpenAndIdle() {
+        XCTAssertEqual(escMonitorAction(keyCode: 53, surface: .field, escConsumed: { false }), .collapse)
+    }
+    func testEscMonitorIgnoresEscWhileCollapsed() {
+        // A key while the collapsed orb is showing isn't ours — and `onEsc` must not be probed.
+        var probed = false
+        let action = escMonitorAction(keyCode: 53, surface: .orb, escConsumed: { probed = true; return true })
+        XCTAssertEqual(action, .passThrough)
+        XCTAssertFalse(probed, "collapsed orb: the interrupt side effect must not fire")
+    }
+    func testEscMonitorPassesNonEscKeysWithoutProbingOnEsc() {
+        var probed = false
+        let action = escMonitorAction(keyCode: 36 /* Return */, surface: .field, escConsumed: { probed = true; return true })
+        XCTAssertEqual(action, .passThrough)
+        XCTAssertFalse(probed, "onEsc()'s interrupt side effect must fire ONLY for Esc, never for other keys")
+    }
 }

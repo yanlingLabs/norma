@@ -26,13 +26,31 @@ enum OrbStatus: Equatable {
     }
 }
 
+/// PURE composition for the collapsed-orb "working" verb text (wave 6 gate: CC-style whimsical verb,
+/// randomly re-rolled once per turn by the store — see `SessionModel.apply` / `WorkingVerbs`,
+/// NOT a static "thinking…"/tool name). Returns just the verb with ellipsis.
+func workingVerbText(verb: String) -> String {
+    return "\(verb)…"
+}
+
+/// PURE composition for the collapsed-orb task-count chip (gate polish: moves left of the orb).
+/// Returns "☑ n/m" ONLY while `hasActiveTask` is true (wave-6 item 2) — n = index of the task
+/// being worked (completed + 1, clamped to total), m = total; otherwise returns empty string.
+func workingCountText(hasActiveTask: Bool, done: Int, total: Int) -> String {
+    guard hasActiveTask else { return "" }
+    return "☑ \(min(done + 1, total))/\(total)"
+}
+
 /// PURE composition for the collapsed-orb "working" pill (wave 6 gate: CC-style whimsical verb,
 /// randomly re-rolled once per turn by the store — see `SessionModel.apply` / `WorkingVerbs`,
 /// NOT a static "thinking…"/tool name). The "☑ n/m" task-count suffix appends ONLY while
 /// `hasActiveTask` is true (wave-6 item 2) — n = index of the task being worked (completed + 1,
 /// clamped to total), m = total; an idle-but-nonempty or fully-completed task list shows the bare
 /// verb with no suffix at all.
+/// NOTE: Kept for backwards compatibility with tests; new code should use `workingVerbText` +
+/// `workingCountText` separately for split layout (gate polish).
 func workingPillText(verb: String, hasActiveTask: Bool, done: Int, total: Int) -> String {
-    guard hasActiveTask else { return "\(verb)…" }
-    return "\(verb)… ☑ \(min(done + 1, total))/\(total)"
+    let verbPart = workingVerbText(verb: verb)
+    let countPart = workingCountText(hasActiveTask: hasActiveTask, done: done, total: total)
+    return countPart.isEmpty ? verbPart : "\(verbPart) \(countPart)"
 }

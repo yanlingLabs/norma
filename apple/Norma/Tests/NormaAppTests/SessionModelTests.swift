@@ -24,8 +24,8 @@ final class SessionModelTests: XCTestCase {
     func approvalResolved(callId: String, seq: Int = 5) -> SessionEvent {
         ev(#"{"type":"approval_resolved","seq":\#(seq),"sessionId":"s","ts":0,"threadId":"main","callId":"\#(callId)","approved":true,"by":"cli"}"#)
     }
-    func turnCompleted(seq: Int = 9) -> SessionEvent {
-        ev(#"{"type":"turn_completed","seq":\#(seq),"sessionId":"s","ts":0,"threadId":"main","stopReason":"end_turn","inputTokens":1,"outputTokens":1}"#)
+    func turnCompleted(seq: Int = 9, stopReason: String = "end_turn") -> SessionEvent {
+        ev(#"{"type":"turn_completed","seq":\#(seq),"sessionId":"s","ts":0,"threadId":"main","stopReason":"\#(stopReason)","inputTokens":1,"outputTokens":1}"#)
     }
     func taskUpdated(id: String, subject: String, status: String, seq: Int = 6) -> SessionEvent {
         ev(#"{"type":"task_updated","seq":\#(seq),"sessionId":"s","ts":0,"threadId":"main","task":{"id":"\#(id)","subject":"\#(subject)","status":"\#(status)"}}"#)
@@ -52,6 +52,35 @@ final class SessionModelTests: XCTestCase {
         s = SessionReducer.reduce(s, turnCompleted())
         XCTAssertEqual(s.status, .idle)
         XCTAssertFalse(s.turnRunning)
+    }
+
+    // MARK: Interrupt feedback (gate polish): `turn_completed(main)`'s `stopReason` drives
+    // `lastTurnAborted` — an Esc-interrupt ("aborted") sets it, a normal finish ("end_turn")
+    // doesn't, and the NEXT turn starting always clears it regardless of how the previous one
+    // ended.
+
+    func testAbortedStopReasonSetsLastTurnAborted() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, turnStarted())
+        XCTAssertFalse(s.lastTurnAborted)
+        s = SessionReducer.reduce(s, turnCompleted(stopReason: "aborted"))
+        XCTAssertTrue(s.lastTurnAborted)
+    }
+
+    func testEndTurnStopReasonDoesNotSetLastTurnAborted() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, turnStarted())
+        s = SessionReducer.reduce(s, turnCompleted(stopReason: "end_turn"))
+        XCTAssertFalse(s.lastTurnAborted)
+    }
+
+    func testNextTurnStartedClearsLastTurnAborted() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, turnStarted())
+        s = SessionReducer.reduce(s, turnCompleted(stopReason: "aborted"))
+        XCTAssertTrue(s.lastTurnAborted)
+        s = SessionReducer.reduce(s, turnStarted(seq: 10))
+        XCTAssertFalse(s.lastTurnAborted)
     }
 
     func testApprovalCycleCountsAndRestores() {

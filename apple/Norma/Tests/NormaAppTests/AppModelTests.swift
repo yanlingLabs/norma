@@ -127,6 +127,9 @@ final class AppModelTests: XCTestCase {
         await waitUntilSent(t, 3)
         let create = lineJSON(t.sent[2])
         XCTAssertEqual(create["method"] as? String, "session.create")
+        // Orb-created sessions run auto-approval: no approval UI exists in the orb until 2d.
+        let createParams = create["params"] as? [String: Any]
+        XCTAssertEqual(createParams?["approvalPolicy"] as? String, "auto")
         // REAL daemon wire order: broadcast BEFORE the RPC response.
         t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"session_created","seq":1,"sessionId":"s_new","ts":0,"scope":"global"}}"#)
         t.feed(#"{"jsonrpc":"2.0","id":\#(create["id"] as! Int),"result":{"sessionId":"s_new","trusted":true}}"#)
@@ -162,11 +165,59 @@ final class AppModelTests: XCTestCase {
         await waitUntil { model.session.state.turnRunning }
 
         async let sent = model.sendOrSteer("also do X")
+        // Finding-1 (gate 2): the orb forces the followed (daemon-created, ask-mode) session to
+        // `auto` BEFORE steering — so a setPolicy precedes the steer on the wire.
         await waitUntilSent(t, 4)
-        let steer = lineJSON(t.sent[3])
+        let policy = lineJSON(t.sent[3])
+        XCTAssertEqual(policy["method"] as? String, "session.setPolicy")
+        XCTAssertEqual((policy["params"] as? [String: Any])?["sessionId"] as? String, "s_1")
+        XCTAssertEqual((policy["params"] as? [String: Any])?["policy"] as? String, "auto")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(policy["id"] as! Int),"result":{"ok":true}}"#)
+        await waitUntilSent(t, 5)
+        let steer = lineJSON(t.sent[4])
         XCTAssertEqual(steer["method"] as? String, "session.steer")
         t.feed(#"{"jsonrpc":"2.0","id":\#(steer["id"] as! Int),"result":{"ok":true,"injected":true}}"#)
         _ = await sent
+    }
+
+    /// Finding-1 (gate 2): the orb almost always DRIVES a session it merely followed (the daemon's
+    /// default-`ask` global session), not one it created — so it must force that session to `auto`
+    /// before the first send, and do it exactly once per session id (idempotent; daemon persists).
+    func testForcesAutoPolicyOnceForFollowedSession() async throws {
+        let t = AppScriptedTransport()
+        let model = AppModel(makeTransport: { t }, token: "tok")
+        let startTask = Task { await model.start() }
+        defer { startTask.cancel(); model.stop() }
+        await answerHandshake(t, sessions: #"[{"sessionId":"s_1","scope":"global","createdAt":1,"lastSeq":0}]"#)
+        await waitUntilSent(t, 3)
+        let attach = lineJSON(t.sent[2])
+        t.feed(#"{"jsonrpc":"2.0","id":\#(attach["id"] as! Int),"result":{"ok":true,"lastSeq":0}}"#)
+        await waitUntil { model.session.state.status == .idle }
+
+        // First send forces auto (setPolicy), THEN sends.
+        async let first = model.sendOrSteer("one")
+        await waitUntilSent(t, 4)
+        let policy = lineJSON(t.sent[3])
+        XCTAssertEqual(policy["method"] as? String, "session.setPolicy")
+        XCTAssertEqual((policy["params"] as? [String: Any])?["sessionId"] as? String, "s_1")
+        XCTAssertEqual((policy["params"] as? [String: Any])?["policy"] as? String, "auto")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(policy["id"] as! Int),"result":{"ok":true}}"#)
+        await waitUntilSent(t, 5)
+        let send1 = lineJSON(t.sent[4])
+        XCTAssertEqual(send1["method"] as? String, "session.send")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(send1["id"] as! Int),"result":{"seq":1}}"#)
+        _ = await first
+
+        // Second send: policy already forced — straight to send, NO second setPolicy.
+        async let second = model.sendOrSteer("two")
+        await waitUntilSent(t, 6)
+        let send2 = lineJSON(t.sent[5])
+        XCTAssertEqual(send2["method"] as? String, "session.send", "second send must not re-emit setPolicy: \(t.sent)")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(send2["id"] as! Int),"result":{"seq":2}}"#)
+        _ = await second
+
+        let policyCalls = t.sent.filter { lineJSON($0)["method"] as? String == "session.setPolicy" }
+        XCTAssertEqual(policyCalls.count, 1, "setPolicy must fire exactly once per session id: \(t.sent)")
     }
 
     func testInterruptTargetsFocusedSession() async throws {

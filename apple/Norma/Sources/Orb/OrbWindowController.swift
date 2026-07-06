@@ -37,6 +37,12 @@ final class OrbWindowController: ObservableObject {
 
     let follower: OrbFollower
     let morphModel: MorphModel
+    /// Task-3 fix wave: the fluid orb's own dedicated model (split off `MorphModel` — see
+    /// `FluidModel`'s doc, `FieldKit/FluidOrbView.swift`), created alongside `morphModel` and
+    /// passed down the same path (`GlassRootView` → `NormaFieldView` → `FluidOrbSlot`).
+    /// `OrbFollower` also holds this reference to write its per-tick acceleration tap directly
+    /// onto it instead of onto `morphModel`.
+    let fluidModel = FluidModel()
     private let panel: KeyableNonActivatingPanel
     private(set) var isVisible = false
     /// Derived, not driven directly by callers: `.field` the instant an expand STARTS,
@@ -49,6 +55,22 @@ final class OrbWindowController: ObservableObject {
     /// import`, but tests read through this name so they don't reach past the controller's
     /// public surface into its collaborator's internals.
     var morphProgressForTesting: Double { morphModel.progress }
+
+    /// Test-only counter (gate fix — Esc-interrupt live-gate finding): `MorphTimerReentrancyTests`
+    /// asserts this stays at 1 after a stale/duplicate `morphTick()` fires post-settle — see
+    /// `morphTick()`'s re-entry guard doc for the bug this locks in against.
+    private(set) var finishCollapseCallCountForTesting = 0
+
+    /// Test-only counter (Finding-2, gate 2): every synchronous `makePanelKeyWinningLateActivation`
+    /// pass increments this — a re-summon must re-assert key focus, so a test drives
+    /// expand→collapse→re-expand and asserts this went UP on the second expand (see that method's
+    /// doc for the key-window race it defends against).
+    private(set) var keyAssertionCountForTesting = 0
+
+    /// Test-only read-through — lets a test observe whether the panel actually became the key
+    /// window after a summon (the Finding-2 smoking gun). Key status depends on a live WindowServer
+    /// session, so tests that assert on it must tolerate a headless host where it stays false.
+    var panelIsKeyForTesting: Bool { panel.isKeyWindow }
 
     /// Wired in Task 6: the controller exposes callbacks, it does NOT import AppModel.
     /// Returns send success — GlassRootView's submit() gates the draft clear on this so a
@@ -137,7 +159,7 @@ final class OrbWindowController: ObservableObject {
         self.session = session
         let morph = MorphModel()
         self.morphModel = morph
-        self.follower = OrbFollower(morphModel: morph)
+        self.follower = OrbFollower(morphModel: morph, fluidModel: fluidModel)
 
         // v1 PointerOverlayWindow configuration, verbatim, except the panel now starts sized to
         // the COLLAPSED geometry (task B: the panel resizes between `collapsedWindowSize` and
@@ -171,7 +193,7 @@ final class OrbWindowController: ObservableObject {
         // `NormaFieldView` (FieldKit), which owns its own `GlassEffectContainer` and renders the
         // whole orb↔field morph off `morphModel.progress`.
         panel.contentView = NSHostingView(
-            rootView: GlassRootView(session: session, controller: self, morphModel: morph)
+            rootView: GlassRootView(session: session, controller: self, morphModel: morph, fluidModel: fluidModel)
         )
     }
 
@@ -228,6 +250,17 @@ final class OrbWindowController: ObservableObject {
         // never fire — it settles at 1 instead of 0.
         if surface == .field && morphTarget == 0 {
             startMorph(target: 1)
+            // Finding-2 (belt): teardown never ran on this path, so the panel is still keyable and
+            // still key and NO `restore()` fired this cycle — so unlike the cold path below there's
+            // no live race to beat here. Re-assert only DEFERRED (next runloop tick), purely to
+            // catch an EARLIER collapse cycle's `restore()` activation that might still be in
+            // flight. Deliberately NOT synchronous: this retarget sequence feeds a timing-sensitive
+            // 60Hz morph spring (see `MorphTimerReentrancyTests`), and a synchronous
+            // `orderFrontRegardless()`/`makeKey()` inline here perturbs that spring's settle timing.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.surface == .field, !self.panel.isKeyWindow else { return }
+                self.makePanelKeyWinningLateActivation()
+            }
             OrbDebug.log("expandToField: retarget mid-collapse re-summon, morphTarget=1")
             return
         }
@@ -265,18 +298,42 @@ final class OrbWindowController: ObservableObject {
         externalFocus = ExternalFocusSnapshot.captureCurrent()
         panel.acceptsKeyInput = true
         panel.ignoresMouseEvents = false
-        panel.makeKey()
         surface = .field
+        // Finding-2 fix (gate 2): make the panel key AND keep it key against a late external-app
+        // reactivation — see `makePanelKeyWinningLateActivation`'s doc. `surface = .field` is set
+        // FIRST so the belt in the key monitor (and the retry's `surface == .field` guard) sees the
+        // right surface immediately.
+        makePanelKeyWinningLateActivation()
         startMorph(target: 1)
 
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
-            guard let self, event.window === panel else { return event }
-            if event.keyCode == 53 { // Esc
-                if self.onEsc?() == true { return nil } // consumed as interrupt
+            guard let self else { return event }
+            // Finding-2 belt (gate 2, wave-9 parity): a LOCAL monitor only ever sees OUR app's own
+            // events, and this accessory app has exactly ONE window a keyDown could be meant for
+            // while the field is open — the field panel. So route Esc on the SURFACE, not on
+            // `event.window === panel`: a re-summon key race can leave the keyDown bound to a
+            // stale/nil window (exactly what wave-9 found for synthesized scrolls), and the old
+            // window-identity guard then silently dropped a perfectly good Esc. `escMonitorAction`
+            // is the pure, table-tested decision (window identity is deliberately not one of its
+            // inputs). NOTE the residual case this belt canNOT cover: if the panel isn't key AND
+            // our app isn't active at all, no local monitor fires — that path is closed by
+            // `makePanelKeyWinningLateActivation()` making the panel key on every summon.
+            let running = self.session.state.turnRunning
+            switch escMonitorAction(
+                keyCode: event.keyCode,
+                surface: self.surface,
+                escConsumed: { self.onEsc?() == true }
+            ) {
+            case .passThrough:
+                return event
+            case .interrupt:
+                OrbDebug.log("key monitor: Esc → interrupt isPanel=\(event.window === panel) panelKey=\(panel.isKeyWindow) turnRunning=\(running)")
+                return nil
+            case .collapse:
+                OrbDebug.log("key monitor: Esc → collapse isPanel=\(event.window === panel) panelKey=\(panel.isKeyWindow) turnRunning=\(running)")
                 self.collapseToOrb()
                 return nil
             }
-            return event
         }
 
         // Wave 2c task 4: same lifecycle as the Esc monitor above — installed only while
@@ -345,6 +402,36 @@ final class OrbWindowController: ObservableObject {
         }
 
         OrbDebug.log("expandToField: morphTarget=1")
+    }
+
+    /// Finding-2 fix (gate 2 — "Esc from the field is dead after a re-summon"). ROOT CAUSE: after an
+    /// auto-collapse, `finishCollapse()` calls `externalFocus?.restore()` →
+    /// `NSRunningApplication.activate()` on the app that was frontmost before we summoned. The
+    /// WindowServer processes that activation ASYNCHRONOUSLY. A fast re-summon's `panel.makeKey()`
+    /// can therefore run and win momentarily, only for the in-flight external activation to LAND a
+    /// beat later and steal system key focus back. The panel is then no longer the key window,
+    /// physical keyDowns (incl. Esc) route to the external app, and our LOCAL key monitor — which
+    /// only ever sees OUR app's own events — never fires at all (no belt can recover an event that
+    /// never arrives; that's why the wave-9-style window-agnostic belt in the monitor is necessary
+    /// but not SUFFICIENT — this is the sufficient half).
+    ///
+    /// FIX: assert key now, then RE-ASSERT on the next runloop tick(s). By the next tick the late
+    /// external activation has already landed, so our re-`makeKey()` is the last word and wins.
+    /// `orderFrontRegardless()` + `makeKey()` (deliberately NOT `NSApp.activate(ignoringOtherApps:)`
+    /// — v1's avoided nuclear option; a `.nonactivatingPanel` can hold key focus without activating
+    /// the whole app, Spotlight-style). Bounded retries, and each retry bails the instant the panel
+    /// is already key or the surface has left `.field`, so it can never spin.
+    private func makePanelKeyWinningLateActivation(retriesLeft: Int = 3) {
+        keyAssertionCountForTesting += 1
+        panel.orderFrontRegardless()
+        panel.makeKey()
+        let isKey = panel.isKeyWindow
+        OrbDebug.log("makePanelKey: panelKey=\(isKey) retriesLeft=\(retriesLeft)")
+        guard !isKey, retriesLeft > 0 else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.surface == .field, !self.panel.isKeyWindow else { return }
+            self.makePanelKeyWinningLateActivation(retriesLeft: retriesLeft - 1)
+        }
     }
 
     /// The physical screen point where the composer's chosen corner (`morphModel.corner`,
@@ -478,7 +565,25 @@ final class OrbWindowController: ObservableObject {
         morphVelocity = 0
     }
 
-    private func morphTick() {
+    /// Internal (not `private`) purely so `MorphTimerReentrancyTests` can drive a stale tick
+    /// directly — see the re-entry guard's doc just below for why that's needed.
+    func morphTick() {
+        // Re-entry guard (gate fix — Esc-interrupt live-gate finding): `startMorph()` schedules
+        // this via `Timer.scheduledTimer` whose closure hops through `Task { @MainActor in
+        // self?.morphTick() }` rather than running synchronously. Under main-actor contention
+        // (reproduced live during the gate's repro session: rapid, overlapping summon/collapse
+        // triggers backed up the main actor enough that SEVEN queued `Task` closures all ran in
+        // a burst once it freed up) MULTIPLE Task closures can queue up before any of them runs.
+        // Each one independently re-checks the settle condition below and — with no guard here —
+        // redundantly re-ran the ENTIRE settle-and-teardown branch, including `finishCollapse()`
+        // seven times over for a single collapse (confirmed via `OrbDebug` — see the gate
+        // report). `cancelMorphTimer()` sets `morphTimer = nil` the FIRST time this settles, so
+        // any later/duplicate tick now bails out here instead of redundantly re-running
+        // teardown — cheap insurance against this class of stale-callback bug even though this
+        // session's repro of the reported Esc failure itself did not reproduce through this path
+        // (see the gate report's "what did and didn't reproduce" section).
+        guard morphTimer != nil else { return }
+
         let now = CACurrentMediaTime()
         let dt = now - lastMorphTick
         lastMorphTick = now
@@ -510,6 +615,7 @@ final class OrbWindowController: ObservableObject {
     /// keeping the SAME physical anchor point the field was just occupying (`currentGlassAnchor()`
     /// reads the panel's CURRENT — still big — frame) so the shrink doesn't jump.
     private func finishCollapse() {
+        finishCollapseCallCountForTesting += 1
         if let keyMonitor {
             NSEvent.removeMonitor(keyMonitor)
             self.keyMonitor = nil
@@ -542,4 +648,28 @@ final class OrbWindowController: ObservableObject {
 
         OrbDebug.log("collapseToOrb: complete")
     }
+}
+
+/// Finding-2 (gate 2): what the field key monitor should do with a keyDown, extracted pure so it's
+/// table-tested (`EscInterruptTests`).
+enum EscMonitorAction: Equatable { case passThrough, interrupt, collapse }
+
+/// Esc (keyCode 53) while the field is open is ALWAYS the field's — interrupt a running turn
+/// (whatever `escConsumed` reports, i.e. `onEsc()`), else collapse the field. Every other key, and
+/// any key while the surface is the collapsed orb, passes through untouched.
+///
+/// Window identity is deliberately NOT an input: a local monitor only sees OUR app's events, this
+/// accessory app has a single window, and a re-summon key race can leave the keyDown bound to a
+/// stale/nil window — so routing on the SURFACE (not `event.window === panel`) is what makes the
+/// Esc survive the race (same window-agnostic acceptance wave-9 landed for synthesized scrolls).
+///
+/// `escConsumed` is a closure, not a `Bool`, so `onEsc()`'s interrupt side effect fires ONLY after
+/// the keyCode/surface guard passes — never on unrelated keydowns.
+func escMonitorAction(
+    keyCode: UInt16,
+    surface: OrbWindowController.Surface,
+    escConsumed: () -> Bool
+) -> EscMonitorAction {
+    guard keyCode == 53, surface == .field else { return .passThrough }
+    return escConsumed() ? .interrupt : .collapse
 }

@@ -4,8 +4,10 @@ import AppKit
 /// DIRECT TRANSPLANT of v1 `GlassFieldView`'s COMPOSER PATH (TextField/GlassFieldView.swift) —
 /// `composerBody(in:)` (:313-438), `composerMorphedContent(...)` (:440-721), and every helper
 /// they use that doesn't depend on a cut subsystem: `composerContent` (:942-986, reduced), the
-/// morph geometry helpers (:1014-1269, minus the dashboard variants), `BreathingHalo`
-/// (:1299-1370), `GlassForegroundLegibility` (:1285-1291), the nav pill machinery
+/// morph geometry helpers (:1014-1269, minus the dashboard variants), the breathing/glow halo
+/// (:1299-1370 — DELETED task 3: the fluid orb, `FluidOrbView.swift`, replaces it entirely, both
+/// the orb-collapsed and field-expanded glow and the wave-3 unread blink),
+/// `GlassForegroundLegibility` (:1285-1291), the nav pill machinery
 /// (`NavigationPill` :1835-1893, `SegmentCell` :1916-1959, `NativeGlassCapsuleSurface`
 /// :1900-1914), `FieldThinkingPill` (:2563-2595), `FieldIconButton` (:2599-2613),
 /// `GlassChromeColor` (:2628-2641). `smoothstep`/`interpolatedRect` are NOT re-declared here — v2
@@ -72,6 +74,14 @@ import AppKit
 struct NormaFieldView: View {
     @ObservedObject var adapter: FieldStateAdapter
     @ObservedObject var morph: MorphModel
+    /// Task-3 fix wave (review finding, "full-body re-render per tick"): deliberately NOT
+    /// `@ObservedObject` — see `FluidModel`'s doc (`FluidOrbView.swift`) for why this view must
+    /// never subscribe to the fluid's own publisher (that publisher fires at the sim's ~120Hz
+    /// tick rate, and this view's `body` — the whole field's glass geometry, composer/response
+    /// content, nav pill — is exactly what the fix wave stops from re-running on every one of
+    /// those writes). Held only to hand down to `FluidOrbSlot`, the sole observer, at the mount
+    /// site in `composerMorphedContent` below.
+    let fluid: FluidModel
     @Namespace private var glassNamespace
 
     @State private var composerContentHeight: CGFloat = 22
@@ -137,8 +147,6 @@ struct NormaFieldView: View {
         // as "the empty glass shell still inflating" rather than as a
         // stretched-out pill with chrome visible at tiny sizes.
         let contentReveal = smoothstep(0.45, 0.74, morph.progress)
-        let orbHaloIntensity = 1 - smoothstep(0.0, 0.28, morph.progress)
-        let fieldHaloIntensity = smoothstep(0.90, 1.0, morph.progress)
         // Two distinct morph phases:
         // 1) 0.00...0.48: orb -> composer only.
         // 2) 0.50...1.00: top row splits out of composer.
@@ -161,7 +169,11 @@ struct NormaFieldView: View {
         // (`GlassFieldView.swift:273`: `if !appState.statusText.isEmpty { return
         // appState.statusText }`). Kept as `thinkingReveal` (not renamed) since it still drives
         // the SAME fade-in curve, now for "has a status pill" rather than strictly "is thinking."
-        let hasStatusPill = !adapter.statusText.isEmpty
+        // Interrupt-feedback gate polish: `showStoppedFlash` must reveal the pill even though the
+        // turn has already ended (`adapter.statusText` is `""` the instant `turn_completed`
+        // clears `turnRunning` — see its own doc) — otherwise the "⏹ stopped" caption below would
+        // never actually appear, since the box it lives in only renders while `thinkingReveal > 0`.
+        let hasStatusPill = !adapter.statusText.isEmpty || adapter.showStoppedFlash
         let thinkingReveal = hasStatusPill
             ? 1 - smoothstep(0.04, 0.22, morph.progress)
             : 0
@@ -177,16 +189,32 @@ struct NormaFieldView: View {
         // `+1` today and growth is always rightward; the general (direction-aware) form below
         // still pins correctly if that ever changes.
         let thinkingEdgeGap: CGFloat = morph.orbBubbleSize / 2 + 10
-        let thinkingNearEdgeX = collapsedCenter.x + thinkingDirection * thinkingEdgeGap
-        // `FieldThinkingPill` caps its own width at `.maxWidth` — sizing the (invisible)
-        // alignment box to that same cap and aligning the label to its near edge means short
-        // captions sit flush at the pinned anchor and long ones grow only toward the box's far
-        // edge, never back past the anchor.
-        let thinkingBoxCenter = CGPoint(
-            x: thinkingNearEdgeX + thinkingDirection * FieldThinkingPill.maxWidth / 2,
+
+        // Gate polish: split verb and count into separate chips on opposite sides of the orb.
+        // VERB (right side): pin the leading edge a fixed gap to the right of the orb center.
+        let verbNearEdgeX = collapsedCenter.x + thinkingDirection * thinkingEdgeGap
+        let verbBoxCenter = CGPoint(
+            x: verbNearEdgeX + thinkingDirection * FieldThinkingPill.maxWidth / 2,
             y: collapsedCenter.y
         )
-        let thinkingAlignment: Alignment = thinkingDirection > 0 ? .leading : .trailing
+        let verbAlignment: Alignment = thinkingDirection > 0 ? .leading : .trailing
+
+        // COUNT (left side): pin the trailing edge a fixed gap to the left of the orb center.
+        // For .topLeft corner (isLeft=true, thinkingDirection=+1), the count goes to the LEFT
+        // (negative direction), so we negate the direction for the left-side chip.
+        let countEdgeGap: CGFloat = morph.orbBubbleSize / 2 + 10
+        let countDirection: CGFloat = -thinkingDirection // opposite side
+        let countNearEdgeX = collapsedCenter.x + countDirection * countEdgeGap
+        let countBoxCenter = CGPoint(
+            x: countNearEdgeX + countDirection * FieldCountChip.maxWidth / 2,
+            y: collapsedCenter.y
+        )
+        let countAlignment: Alignment = countDirection > 0 ? .leading : .trailing
+
+        // For backwards compatibility in the tree-building code below
+        let thinkingNearEdgeX = verbNearEdgeX
+        let thinkingBoxCenter = verbBoxCenter
+        let thinkingAlignment = verbAlignment
         let navOrbRect = CGRect(
             x: navFinal.minX,
             y: navFinal.midY - morph.orbBubbleSize / 2,
@@ -206,8 +234,6 @@ struct NormaFieldView: View {
                 composerShape: composerShape,
                 navFinal: navFinal,
                 contentReveal: contentReveal,
-                orbHaloIntensity: orbHaloIntensity,
-                fieldHaloIntensity: fieldHaloIntensity,
                 glassSplitProgress: glassSplitProgress,
                 sideGlassReveal: sideGlassReveal,
                 sideGlassMaterialScale: sideGlassMaterialScale,
@@ -217,6 +243,8 @@ struct NormaFieldView: View {
                 thinkingReveal: thinkingReveal,
                 thinkingBoxCenter: thinkingBoxCenter,
                 thinkingAlignment: thinkingAlignment,
+                countBoxCenter: countBoxCenter,
+                countAlignment: countAlignment,
                 navGlassRect: navGlassRect,
                 haloColor: haloColor
             )
@@ -240,8 +268,6 @@ struct NormaFieldView: View {
         composerShape: CGRect,
         navFinal: CGRect,
         contentReveal: Double,
-        orbHaloIntensity: Double,
-        fieldHaloIntensity: Double,
         glassSplitProgress: Double,
         sideGlassReveal: Double,
         sideGlassMaterialScale: CGFloat,
@@ -251,47 +277,12 @@ struct NormaFieldView: View {
         thinkingReveal: Double,
         thinkingBoxCenter: CGPoint,
         thinkingAlignment: Alignment,
+        countBoxCenter: CGPoint,
+        countAlignment: Alignment,
         navGlassRect: CGRect,
         haloColor: Color
     ) -> some View {
         ZStack {
-            if orbHaloIntensity > 0 {
-                BreathingHalo(
-                    center: collapsedCenter,
-                    width: max(composerShape.width, morph.orbBubbleSize),
-                    height: max(composerShape.height, morph.orbBubbleSize),
-                    cornerRadius: morphedCornerRadius(for: composerShape),
-                    intensity: orbHaloIntensity,
-                    color: haloColor
-                )
-            }
-
-            // Wave-3 gate item 2c: the collapsed orb soft-blinks while a finished reply is
-            // waiting unread (`adapter.hasUnread`, set by `GlassRootView`'s turn-completion
-            // handler when the cursor wasn't calm enough to auto-expand into it). Gated on
-            // `orbHaloIntensity` (same fade-with-progress curve as the halo above it) so the
-            // blink fades out the instant the user starts expanding — any summon clears
-            // `hasUnread` anyway (see that property's doc).
-            if adapter.hasUnread, orbHaloIntensity > 0 {
-                UnreadBlinkOverlay(
-                    center: collapsedCenter,
-                    size: max(composerShape.width, morph.orbBubbleSize),
-                    cornerRadius: morphedCornerRadius(for: composerShape),
-                    intensity: orbHaloIntensity
-                )
-            }
-
-            if fieldHaloIntensity > 0 {
-                BreathingHalo(
-                    center: CGPoint(x: composerFinal.midX, y: composerFinal.midY),
-                    width: composerFinal.width,
-                    height: composerFinal.height,
-                    cornerRadius: morphedCornerRadius(for: composerFinal),
-                    intensity: fieldHaloIntensity,
-                    color: haloColor
-                )
-            }
-
             GlassEffectContainer(spacing: 6) {
                 ZStack {
                     let composerCornerRadius = morphedCornerRadius(for: composerShape)
@@ -327,6 +318,36 @@ struct NormaFieldView: View {
                 }
             }
             .id(morph.glassRefreshGeneration)
+
+            // Task 3 (fluid orb): the liquid renders INSIDE the glass — layered on top of the
+            // translucent glass material above, but below the stroke/foreground layers just
+            // below (both wrapped in `GlassForegroundLegibility`'s difference blend, which would
+            // invert the fluid's literal blue/amber tint if it were applied here too). Replaces
+            // the wave-3 unread blink outright (`FluidOrbSlot`'s doc) — the amber fluid IS the
+            // unread signal now. Sized/positioned to the collapsed orb bubble exactly (not
+            // `composerShape`, which grows through the morph) and hard-clipped to a circle by
+            // `FluidOrbView` itself.
+            //
+            // Task-3 fix wave: mounted UNCONDITIONALLY — `FluidOrbSlot` (observing `FluidModel`,
+            // never this view) owns the visible/empty decision internally, so `NormaFieldView`
+            // never needs to react to the fluid's own state to decide whether to include it in
+            // the tree at all (see `FluidModel`'s doc).
+            //
+            // Task-3 fix wave (review finding, "no progress fade"): the fluid is an ORB-state
+            // visual — the deleted BreathingHalo faded via this exact
+            // `1 - smoothstep(0.0, 0.28, progress)` curve as the field expanded; without it the
+            // fluid would sit visible at the expanded panel's center with no fade at all. Reads
+            // `morph.progress`, which this view already observes, so this adds no new
+            // invalidation source. The slot's `TimelineView` still ticks while the field is
+            // expanded (opacity 0 doesn't unmount it) — acceptable: D9 (idle = zero draw cost)
+            // concerns true idle (state == .idle AND drained), not "field open." Gating the MOUNT
+            // itself on progress too was considered and rejected — mount stays driven purely by
+            // fluidState/level (`FluidOrbSlot`'s own doc) so drain-visibility doesn't depend on
+            // which surface happens to be showing.
+            FluidOrbSlot(fluid: fluid, state: adapter.fluidState, isStoppedFlash: adapter.showStoppedFlash, isHeld: adapter.isHoldingWork)
+                .frame(width: morph.orbBubbleSize, height: morph.orbBubbleSize)
+                .position(x: collapsedCenter.x, y: collapsedCenter.y)
+                .opacity(1 - smoothstep(0.0, 0.28, morph.progress))
 
             RoundedRectangle(
                 cornerRadius: morphedCornerRadius(for: composerShape),
@@ -445,6 +466,21 @@ struct NormaFieldView: View {
                 .allowsHitTesting(false)
             }
 
+            // Gate polish: task count chip on the LEFT (grows leftward from the orb)
+            if thinkingReveal > 0 && !adapter.countText.isEmpty {
+                Color.clear
+                    .frame(width: FieldCountChip.maxWidth, height: FieldCountChip.height)
+                    .overlay(alignment: countAlignment) {
+                        FieldCountChip(
+                            caption: adapter.countText,
+                            contentOpacity: thinkingReveal
+                        )
+                    }
+                    .position(x: countBoxCenter.x, y: countBoxCenter.y)
+                    .modifier(GlassForegroundLegibility())
+                    .allowsHitTesting(false)
+            }
+
             if thinkingReveal > 0 {
                 // GATE-4 FIX (item 1 + 3): an invisible box, sized to `FieldThinkingPill`'s own
                 // width cap and pinned at `thinkingBoxCenter`, with the label aligned to its
@@ -454,13 +490,23 @@ struct NormaFieldView: View {
                 // text (no glass/stroke chrome — item 3); legibility comes from
                 // `GlassForegroundLegibility`'s difference blend below, same as every other label
                 // in this file.
+                // Gate polish: now shows just the verb text (with animated spinner/sheen if working);
+                // the count chip is rendered separately to the left above.
+                //
+                // Interrupt-feedback gate polish: `showStoppedFlash` REPLACES the verb text with
+                // "⏹ stopped" for 2s after an Esc-interrupt — the verb is gone anyway by then
+                // (the turn already ended, so `adapter.verbText` reads `""`), so this is never
+                // fighting the normal verb display for the same slot, just filling the gap it
+                // leaves with an explicit confirmation instead of a silent blank. Plain,
+                // unanimated text (`animated: false`) — same convention as the other static
+                // override pills (disconnected/needs approval), not the working-verb sheen.
                 Color.clear
                     .frame(width: FieldThinkingPill.maxWidth, height: FieldThinkingPill.height)
                     .overlay(alignment: thinkingAlignment) {
                         FieldThinkingPill(
-                            caption: adapter.statusText,
+                            caption: adapter.showStoppedFlash ? "⏹ stopped" : adapter.verbText,
                             contentOpacity: thinkingReveal,
-                            animated: adapter.isWorkingVerb
+                            animated: adapter.showStoppedFlash ? false : adapter.isWorkingVerb
                         )
                     }
                     .position(x: thinkingBoxCenter.x, y: thinkingBoxCenter.y)
@@ -909,119 +955,6 @@ private struct GlassForegroundLegibility: ViewModifier {
     }
 }
 
-// MARK: - BreathingHalo (v1 GlassFieldView.swift:1299-1370, verbatim)
-
-/// Soft blue glow placed directly behind the morphing composer pill. Sized
-/// to the composer so the glow hugs the pill rather than floating. Blur
-/// radius is tuned to stay inside the window's `haloPadding` so the edge of
-/// the blur never hits the window border and hard-cuts.
-struct BreathingHalo: View {
-    var center: CGPoint
-    var width: CGFloat
-    var height: CGFloat
-    /// The composer container's own corner radius. We derive the halo's
-    /// corner radius from this so the glow tracks the container shape
-    /// (rounded-rect at multi-line heights, capsule at single-line) instead
-    /// of being forced into a capsule by `height / 2`.
-    var cornerRadius: CGFloat
-    var intensity: Double
-    var color: Color
-
-    var body: some View {
-        if shouldAnimateBreathing {
-            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
-                let t = timeline.date.timeIntervalSinceReferenceDate
-                let breath = 0.5 + 0.5 * sin(t * (.pi * 2 / 4.5))
-                haloLayers(breathOpacity: 0.8 + 0.2 * breath)
-            }
-        } else {
-            haloLayers(breathOpacity: 1.0)
-        }
-    }
-
-    private var shouldAnimateBreathing: Bool {
-        width * height < 360_000
-    }
-
-    private func haloLayers(breathOpacity: Double) -> some View {
-        let outerExtension: CGFloat = 8
-        let midExtension: CGFloat = 4
-        let edgeExtension: CGFloat = 1
-
-        let outerWidth = width + outerExtension * 2
-        let outerHeight = height + outerExtension * 2
-        let midWidth = width + midExtension * 2
-        let midHeight = height + midExtension * 2
-        let edgeWidth = width + edgeExtension * 2
-        let edgeHeight = height + edgeExtension * 2
-
-        return ZStack {
-            RoundedRectangle(cornerRadius: cornerRadius + outerExtension, style: .continuous)
-                .strokeBorder(
-                    color
-                        .opacity(0.55 * breathOpacity * intensity),
-                    lineWidth: 10
-                )
-                .frame(width: outerWidth, height: outerHeight)
-                .blur(radius: 12)
-
-            RoundedRectangle(cornerRadius: cornerRadius + midExtension, style: .continuous)
-                .strokeBorder(
-                    color
-                        .opacity(0.45 * intensity),
-                    lineWidth: 4
-                )
-                .frame(width: midWidth, height: midHeight)
-                .blur(radius: 5)
-
-            RoundedRectangle(cornerRadius: cornerRadius + edgeExtension, style: .continuous)
-                .strokeBorder(
-                    color
-                        .opacity(0.35 * intensity),
-                    lineWidth: 1
-                )
-                .frame(width: edgeWidth, height: edgeHeight)
-                .blur(radius: 1)
-        }
-        .position(x: center.x, y: center.y)
-        .allowsHitTesting(false)
-    }
-}
-
-// MARK: - UnreadBlinkOverlay (wave-3 gate item 2c)
-
-/// A soft bluish tint pulse on the collapsed orb, signaling a finished reply the user hasn't
-/// seen yet (`FieldStateAdapter.hasUnread` — set when a turn completed while the cursor was
-/// moving too fast to auto-expand into, see `GlassRootView.handleTurnCompleted()`).
-///
-/// v1 LAW (PointerRenderer.swift:28-39): the animation lives INSIDE this Group, not on an outer
-/// view, so it doesn't get canceled by an unrelated transaction (e.g. the morph progressing) —
-/// same rule `shimmerRow` follows. No `.drawingGroup()` here either, for the same reason.
-private struct UnreadBlinkOverlay: View {
-    var center: CGPoint
-    var size: CGFloat
-    var cornerRadius: CGFloat
-    var intensity: Double
-
-    @State private var pulse = 0.0
-
-    var body: some View {
-        Group {
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                // 0.25...0.6 opacity pulse, per the wave-3 gate spec.
-                .fill(Color.blue.opacity((0.25 + 0.35 * pulse) * intensity))
-                .frame(width: size, height: size)
-                .position(x: center.x, y: center.y)
-                .allowsHitTesting(false)
-        }
-        .onAppear {
-            withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
-                pulse = 1.0
-            }
-        }
-    }
-}
-
 // MARK: - Nav pill (v1 GlassFieldView.swift:1900-1959, `Segment.id` retyped — see below)
 
 /// GlassEffectID has to live on the actual view receiving `.glassEffect`.
@@ -1206,6 +1139,32 @@ private struct FieldThinkingPill: View {
         // somewhere in the middle of unused width.
         .frame(maxWidth: Self.maxWidth, alignment: .leading)
         .fixedSize(horizontal: true, vertical: true)
+    }
+}
+
+// MARK: - FieldCountChip (gate polish: task-count chip for the left side of the orb)
+
+/// The task-count chip positioned to the left of the collapsed orb ("☑ 1/4", "☑ 3/5", etc.).
+/// Bare text, no chrome, same legibility mechanism as `FieldThinkingPill`.
+private struct FieldCountChip: View {
+    /// Cap on the label's width before `lineLimit`/`truncationMode` kick in.
+    static let maxWidth: CGFloat = 80
+    /// Height of the alignment box. Keeps the chip vertically centered on the orb row.
+    static let height: CGFloat = 28
+
+    var caption: String = ""
+    var contentOpacity: Double = 1
+
+    var body: some View {
+        Text(caption)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .opacity(contentOpacity)
+            // Align to the trailing edge so the chip grows leftward (away from the orb).
+            .frame(maxWidth: Self.maxWidth, alignment: .trailing)
+            .fixedSize(horizontal: true, vertical: true)
     }
 }
 
