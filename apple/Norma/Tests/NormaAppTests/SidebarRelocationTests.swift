@@ -26,20 +26,63 @@ final class SidebarRelocationTests: XCTestCase {
         }
     }
 
-    /// Reuse the Task-4 width engine: at the 560-wide morph window the work content places INLINE
-    /// while the right sidebar is collapsed, and RELOCATES into the (overlay) work sidebar the
-    /// instant the right side is expanded — 560 fits neither content+right inline, so it opens as
-    /// an overlay, but the placement decision still moves work off the content column.
+    /// Tap-only overlays (SPEC): at the 560-wide morph window with the DEFAULT state (right
+    /// expanded), the right sidebar is too narrow to sit inline, so it collapses to a CHEVRON — NO
+    /// auto-overlay. Work therefore renders INLINE below the composer and BOTH edge chevrons show.
+    /// The work relocates into the (overlay) work sidebar ONLY after an explicit chevron tap.
     func testMorphWidthPlacesWorkInlineUntilRightOverlayOpens() {
-        let collapsed = sidebarContentPlacement(resolveSidebars(width: 560, leftExpanded: false, rightExpanded: false))
-        XCTAssertTrue(collapsed.inlineWork)
-        XCTAssertFalse(collapsed.sidebarWork)
+        let defaultState = SidebarState(leftExpanded: false, rightExpanded: true,
+                                        leftOverlayOpen: false, rightOverlayOpen: false)
+        let resolved = resolveSidebars(width: 560,
+                                       leftExpanded: defaultState.leftExpanded, rightExpanded: defaultState.rightExpanded,
+                                       leftOverlayOpen: defaultState.leftOverlayOpen, rightOverlayOpen: defaultState.rightOverlayOpen)
+        XCTAssertFalse(resolved.rightVisible, "expanded-but-unfit right is a chevron, never an auto-overlay")
+        XCTAssertFalse(resolved.rightOverlay)
+        XCTAssertFalse(resolved.leftVisible, "left collapsed → a chevron on the left edge too")
+        let placed = sidebarContentPlacement(resolved)
+        XCTAssertTrue(placed.inlineWork, "work renders inline below the composer")
+        XCTAssertFalse(placed.sidebarWork)
 
-        let expanded = resolveSidebars(width: 560, leftExpanded: false, rightExpanded: true)
-        XCTAssertTrue(expanded.rightOverlay, "560 is too narrow for the right sidebar to sit inline — it overlays")
-        let placed = sidebarContentPlacement(expanded)
-        XCTAssertFalse(placed.inlineWork)
-        XCTAssertTrue(placed.sidebarWork)
+        // Explicit chevron tap on the unfitting right → an overlay, and work relocates into it.
+        let opened = openRightViaChevron(defaultState, width: 560)
+        XCTAssertTrue(opened.rightOverlayOpen)
+        let afterOpen = resolveSidebars(width: 560,
+                                        leftExpanded: opened.leftExpanded, rightExpanded: opened.rightExpanded,
+                                        leftOverlayOpen: opened.leftOverlayOpen, rightOverlayOpen: opened.rightOverlayOpen)
+        XCTAssertTrue(afterOpen.rightOverlay, "560 too narrow to sit inline — the tap opens it as an overlay")
+        XCTAssertTrue(afterOpen.rightVisible)
+        let placedAfter = sidebarContentPlacement(afterOpen)
+        XCTAssertFalse(placedAfter.inlineWork)
+        XCTAssertTrue(placedAfter.sidebarWork, "work relocates into the (overlay) work sidebar")
+    }
+
+    /// Tap-open an overlay, then DISMISS (scrim): clears BOTH the overlay AND the `expanded` flag so
+    /// the side collapses back to a chevron rather than snapping inline (stays hidden until re-tapped).
+    func testDismissOverlayCollapsesToChevron() {
+        let opened = openRightViaChevron(SidebarState(leftExpanded: false, rightExpanded: true,
+                                                      leftOverlayOpen: false, rightOverlayOpen: false), width: 560)
+        XCTAssertTrue(opened.rightOverlayOpen)
+        let dismissed = dismissRightOverlay(opened)
+        XCTAssertFalse(dismissed.rightOverlayOpen)
+        XCTAssertFalse(dismissed.rightExpanded)
+        let r = resolveSidebars(width: 560,
+                                leftExpanded: dismissed.leftExpanded, rightExpanded: dismissed.rightExpanded,
+                                leftOverlayOpen: dismissed.leftOverlayOpen, rightOverlayOpen: dismissed.rightOverlayOpen)
+        XCTAssertFalse(r.rightVisible, "dismissed overlay → chevron, not visible")
+    }
+
+    /// Width growth while an overlay is tap-open: once the side FITS INLINE it renders inline (the
+    /// chevron tap set `expanded` true), regardless of the lingering `overlayOpen` flag.
+    func testOverlayRendersInlineOnceWidthFits() {
+        let opened = openRightViaChevron(SidebarState(leftExpanded: false, rightExpanded: true,
+                                                      leftOverlayOpen: false, rightOverlayOpen: false), width: 560)
+        XCTAssertTrue(opened.rightExpanded)
+        // Grow to 800 (≥780): right now fits inline → inline, not overlay.
+        let r = resolveSidebars(width: 800,
+                                leftExpanded: opened.leftExpanded, rightExpanded: opened.rightExpanded,
+                                leftOverlayOpen: opened.leftOverlayOpen, rightOverlayOpen: opened.rightOverlayOpen)
+        XCTAssertTrue(r.rightVisible)
+        XCTAssertFalse(r.rightOverlay, "fits inline now — the overlayOpen flag is irrelevant")
     }
 
     // MARK: - CARRIED ITEM 1: chevron force-open defeats the T4 resize-drift double-tap
@@ -59,23 +102,35 @@ final class SidebarRelocationTests: XCTestCase {
         let naive = toggleLeftSidebar(leftExpanded: true, rightExpanded: true, width: 900)
         XCTAssertFalse(naive.left, "documents the bug the chevron handler must avoid")
 
-        // The chevron handler force-opens instead: ONE tap → left opens, right collapses.
-        let opened = openLeftViaChevron(rightExpanded: true, width: 900)
-        XCTAssertTrue(opened.left)
-        XCTAssertFalse(opened.right)
-        // …and the resolved state after that one tap actually shows the left.
-        let after = resolveSidebars(width: 900, leftExpanded: opened.left, rightExpanded: opened.right)
+        // The chevron handler force-opens instead: ONE tap → left opens INLINE (900≥740 fits),
+        // right collapses.
+        let state = SidebarState(leftExpanded: true, rightExpanded: true,
+                                 leftOverlayOpen: false, rightOverlayOpen: false)
+        let opened = openLeftViaChevron(state, width: 900)
+        XCTAssertTrue(opened.leftExpanded)
+        XCTAssertFalse(opened.rightExpanded)
+        XCTAssertFalse(opened.leftOverlayOpen, "fits inline → inline, not an overlay")
+        // …and the resolved state after that one tap actually shows the left inline.
+        let after = resolveSidebars(width: 900,
+                                    leftExpanded: opened.leftExpanded, rightExpanded: opened.rightExpanded,
+                                    leftOverlayOpen: opened.leftOverlayOpen, rightOverlayOpen: opened.rightOverlayOpen)
         XCTAssertTrue(after.leftVisible)
+        XCTAssertFalse(after.leftOverlay)
         XCTAssertFalse(after.rightVisible)
     }
 
     /// Mirror: at 900 with the LEFT inline (leftExpanded, rightExpanded=false), the right chevron
     /// force-opens the right in one tap and collapses the left.
     func testRightChevronForcesOpenInOneTap() {
-        let opened = openRightViaChevron(leftExpanded: true, width: 900)
-        XCTAssertTrue(opened.right)
-        XCTAssertFalse(opened.left)
-        let after = resolveSidebars(width: 900, leftExpanded: opened.left, rightExpanded: opened.right)
+        let state = SidebarState(leftExpanded: true, rightExpanded: false,
+                                 leftOverlayOpen: false, rightOverlayOpen: false)
+        let opened = openRightViaChevron(state, width: 900)
+        XCTAssertTrue(opened.rightExpanded)
+        XCTAssertFalse(opened.leftExpanded)
+        XCTAssertFalse(opened.rightOverlayOpen)
+        let after = resolveSidebars(width: 900,
+                                    leftExpanded: opened.leftExpanded, rightExpanded: opened.rightExpanded,
+                                    leftOverlayOpen: opened.leftOverlayOpen, rightOverlayOpen: opened.rightOverlayOpen)
         XCTAssertTrue(after.rightVisible)
         XCTAssertFalse(after.leftVisible)
     }
@@ -83,8 +138,10 @@ final class SidebarRelocationTests: XCTestCase {
     /// At a both-fit width the force-open applies NO mutual exclusion — opening the left leaves the
     /// right untouched (the sides are independent above the both-fit threshold).
     func testChevronForceOpenIndependentAtBothFit() {
-        let opened = openLeftViaChevron(rightExpanded: true, width: 1200)
-        XCTAssertTrue(opened.left)
-        XCTAssertTrue(opened.right)
+        let state = SidebarState(leftExpanded: false, rightExpanded: true,
+                                 leftOverlayOpen: false, rightOverlayOpen: false)
+        let opened = openLeftViaChevron(state, width: 1200)
+        XCTAssertTrue(opened.leftExpanded)
+        XCTAssertTrue(opened.rightExpanded)
     }
 }

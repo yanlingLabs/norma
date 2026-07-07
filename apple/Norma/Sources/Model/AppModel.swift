@@ -121,13 +121,16 @@ final class AppModel: ObservableObject {
         return focusedSessionId
     }
 
-    /// Task 4 (detach choreography): the orb's "clean slate" step after a detach — the session it
-    /// was just focused on now belongs to a standalone detached window (its own harness, see
-    /// `makeDetachedFeed(sessionId:)`), so the orb's NEXT summon must never keep talking into that
-    /// same session. Exact `ensureFocusedSession()` creation body above, but UNCONDITIONAL: skips
-    /// the `if let sid = focusedSessionId { return sid }` early-out on purpose — a focus almost
-    /// always exists at this point (the session that was just detached), and this must create+
-    /// refocus onto a brand-new one regardless.
+    /// The generic "create a brand-new session and focus onto it" primitive — despite the name it is
+    /// NOT detach-specific. Two callers: (1) Task 4 detach choreography, the orb's "clean slate" step
+    /// after a detach (the session it was just focused on now belongs to a standalone detached window
+    /// — its own harness, see `makeDetachedFeed(sessionId:)` — so the orb's NEXT summon must never
+    /// keep talking into that same session); (2) 2e-iii Task 6, the sidebars' "new session"
+    /// affordance (`SidebarWiring.onNewSession`), a plain create+focus with no detach involved.
+    ///
+    /// Exact `ensureFocusedSession()` creation body above, but UNCONDITIONAL: skips the
+    /// `if let sid = focusedSessionId { return sid }` early-out on purpose — a focus almost always
+    /// exists at these call sites, and this must create+refocus onto a brand-new one regardless.
     func startFreshSessionAfterDetach() async {
         guard let created = try? await client.createSession(scope: "global", cwd: NSHomeDirectory(), approvalPolicy: "auto") else { return }
         // Same belt as ensureFocusedSession(): the daemon's session_created broadcast can arrive

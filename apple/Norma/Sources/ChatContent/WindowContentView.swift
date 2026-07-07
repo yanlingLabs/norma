@@ -33,11 +33,13 @@ struct WindowContentView<Accessory: View>: View {
     /// NEVER GeometryReader-in-ScrollView). `0` until the first layout pass — treated as "not yet
     /// measured" (no sidebars resolved) so a stale zero never briefly opens the right overlay.
     @State private var measuredWidth: CGFloat = 0
-    /// Task 6 (2e-iii): the raw expand flags the Task-4 width engine (`resolveSidebars`) resolves
-    /// against `measuredWidth`. Defaults per the brief: the left switcher collapsed, the right work
-    /// sidebar expanded (shown inline when it fits, as an overlay when it doesn't).
-    @State private var leftExpanded = false
-    @State private var rightExpanded = true
+    /// Task 6 (2e-iii): the raw sidebar flags the width engine (`resolveSidebars`) resolves against
+    /// `measuredWidth`. Defaults per the brief: the left switcher collapsed, the right work sidebar
+    /// EXPANDED — so it appears INLINE the moment the width fits it, and collapses to a CHEVRON (never
+    /// an auto-overlay) when it doesn't. Overlays are tap-only: `overlayOpen` is set solely by a
+    /// chevron tap on a side that can't fit inline, and cleared on dismiss / once it fits inline.
+    @State private var sidebar = SidebarState(leftExpanded: false, rightExpanded: true,
+                                              leftOverlayOpen: false, rightOverlayOpen: false)
 
     var body: some View {
         // `sidebars == nil` → today's exact layout, byte-identical: `contentColumn(rightVisible:
@@ -119,7 +121,9 @@ struct WindowContentView<Accessory: View>: View {
     @ViewBuilder
     private func sidebarLayout(_ sidebars: SidebarWiring) -> some View {
         let resolved = measuredWidth > 0
-            ? resolveSidebars(width: measuredWidth, leftExpanded: leftExpanded, rightExpanded: rightExpanded)
+            ? resolveSidebars(width: measuredWidth,
+                              leftExpanded: sidebar.leftExpanded, rightExpanded: sidebar.rightExpanded,
+                              leftOverlayOpen: sidebar.leftOverlayOpen, rightOverlayOpen: sidebar.rightOverlayOpen)
             : EffectiveSidebars(leftVisible: false, rightVisible: false, leftOverlay: false, rightOverlay: false)
         ZStack {
             HStack(spacing: 0) {
@@ -139,15 +143,13 @@ struct WindowContentView<Accessory: View>: View {
             HStack(spacing: 0) {
                 if !resolved.leftVisible {
                     sidebarChevron("chevron.right") {
-                        let r = openLeftViaChevron(rightExpanded: rightExpanded, width: measuredWidth)
-                        leftExpanded = r.left; rightExpanded = r.right
+                        sidebar = openLeftViaChevron(sidebar, width: measuredWidth)
                     }
                 }
                 Spacer(minLength: 0)
                 if !resolved.rightVisible {
                     sidebarChevron("chevron.left") {
-                        let r = openRightViaChevron(leftExpanded: leftExpanded, width: measuredWidth)
-                        leftExpanded = r.left; rightExpanded = r.right
+                        sidebar = openRightViaChevron(sidebar, width: measuredWidth)
                     }
                 }
             }
@@ -155,7 +157,7 @@ struct WindowContentView<Accessory: View>: View {
             // Overlay panels + a tap-to-dismiss scrim BEHIND each (the scrim is added first so the
             // `.ultraThinMaterial` panel draws over it; the panel slides in from its edge).
             if resolved.leftOverlay {
-                sidebarScrim { leftExpanded = false }
+                sidebarScrim { sidebar = dismissLeftOverlay(sidebar) }
                 HStack(spacing: 0) {
                     sessionSidebarColumn(sidebars).background(.ultraThinMaterial)
                     Spacer(minLength: 0)
@@ -163,7 +165,7 @@ struct WindowContentView<Accessory: View>: View {
                 .transition(.move(edge: .leading))
             }
             if resolved.rightOverlay {
-                sidebarScrim { rightExpanded = false }
+                sidebarScrim { sidebar = dismissRightOverlay(sidebar) }
                 HStack(spacing: 0) {
                     Spacer(minLength: 0)
                     workSidebarColumn.background(.ultraThinMaterial)
@@ -171,7 +173,16 @@ struct WindowContentView<Accessory: View>: View {
                 .transition(.move(edge: .trailing))
             }
         }
-        .onGeometryChange(for: CGFloat.self, of: { $0.size.width }, action: { measuredWidth = $0 })
+        .onGeometryChange(for: CGFloat.self, of: { $0.size.width }, action: { newWidth in
+            measuredWidth = newWidth
+            // Width growth makes an open overlay obsolete: once a side FITS INLINE it renders inline
+            // (its `expanded` flag drives that — set true when the overlay was tap-opened), so drop
+            // the now-irrelevant `overlayOpen`. Otherwise a later shrink back below the fit width
+            // would silently re-open the overlay. Overlays are honored ONLY while the side does NOT
+            // fit inline (see `resolveSidebars`), so clearing here is the simplest correct wiring.
+            if newWidth >= sidebarContentMinWidth + sidebarLeftWidth { sidebar.leftOverlayOpen = false }
+            if newWidth >= sidebarContentMinWidth + sidebarRightWidth { sidebar.rightOverlayOpen = false }
+        })
         .animation(.easeInOut(duration: 0.18), value: resolved)
     }
 

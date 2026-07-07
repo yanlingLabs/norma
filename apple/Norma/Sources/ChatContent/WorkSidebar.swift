@@ -27,20 +27,65 @@ func sidebarContentPlacement(_ e: EffectiveSidebars) -> (inlineWork: Bool, sideb
     (!e.rightVisible, e.rightVisible)
 }
 
-/// CARRIED ITEM 1 (T4 resize-drift): a chevron is only ever shown for a side that is NOT effectively
-/// visible, so its tap is always an OPEN, never a blind toggle. A resize below the both-fit width can
-/// leave `leftExpanded` stale-true while the right won the tie and the left is invisible — a naive
-/// `toggleLeftSidebar` on that stale-true flag would flip it to `false` (still closed → TWO taps to
-/// open). Force the open by feeding the toggle helper `false` for THIS side, so `newLeft = !false =
-/// true` reliably opens, while the helper still applies the below-both-fit mutual exclusion to the
-/// OTHER side.
-func openLeftViaChevron(rightExpanded: Bool, width: CGFloat) -> (left: Bool, right: Bool) {
-    toggleLeftSidebar(leftExpanded: false, rightExpanded: rightExpanded, width: width)
+/// Chevron tap = "I want to see this side", tap-only overlays (SPEC). A chevron is only ever shown
+/// for a side that is NOT effectively visible, so its tap is always an OPEN, never a blind toggle:
+/// - If the side FITS INLINE at the current width → set its `expanded` true (force-open in ONE tap,
+///   defeating the T4 resize-drift double-tap — a stale-true `expanded` can leave the side invisible
+///   after a shrink; feeding `toggleLeftSidebar` `false` makes `newLeft = !false = true` reliably
+///   open), applying the below-both-fit mutual exclusion to the OTHER side, and clearing overlay state.
+/// - If it DOESN'T fit inline → open it as an OVERLAY (`overlayOpen` true). Also set `expanded` true
+///   so a later WIDEN renders it inline (and the symmetric dismiss clears both). Clears the other
+///   side's `overlayOpen` (at most one overlay) and — below both-fit — collapses the other side
+///   entirely (mutual exclusion). `!fitsInline` ⇒ width < both-fit, so that collapse always applies.
+func openLeftViaChevron(_ s: SidebarState, width: CGFloat) -> SidebarState {
+    let bothFit = width >= sidebarContentMinWidth + sidebarLeftWidth + sidebarRightWidth
+    let leftFitsInline = width >= sidebarContentMinWidth + sidebarLeftWidth
+    var out = s
+    out.leftOverlayOpen = false
+    if leftFitsInline {
+        // Reuse the tested mutual-exclusion rule for the expanded flags (force-open: feed `false`).
+        let t = toggleLeftSidebar(leftExpanded: false, rightExpanded: s.rightExpanded, width: width)
+        out.leftExpanded = t.left       // == true
+        out.rightExpanded = t.right     // collapsed below both-fit; untouched at both-fit
+    } else {
+        // Doesn't fit → overlay. `expanded` true so a later widen renders it inline (dismiss clears both).
+        out.leftExpanded = true
+        out.leftOverlayOpen = true
+    }
+    // Mutual exclusion below both-fit: opening the left collapses the right ENTIRELY — including a
+    // lingering right overlay that would otherwise win the tie and hide the left. (`!leftFitsInline`
+    // already implies below both-fit, so this also covers the overlay branch.)
+    if !bothFit { out.rightExpanded = false; out.rightOverlayOpen = false }
+    return out
 }
 
 /// Mirror of `openLeftViaChevron` for the right edge — see that function's doc.
-func openRightViaChevron(leftExpanded: Bool, width: CGFloat) -> (left: Bool, right: Bool) {
-    toggleRightSidebar(leftExpanded: leftExpanded, rightExpanded: false, width: width)
+func openRightViaChevron(_ s: SidebarState, width: CGFloat) -> SidebarState {
+    let bothFit = width >= sidebarContentMinWidth + sidebarLeftWidth + sidebarRightWidth
+    let rightFitsInline = width >= sidebarContentMinWidth + sidebarRightWidth
+    var out = s
+    out.rightOverlayOpen = false
+    if rightFitsInline {
+        let t = toggleRightSidebar(leftExpanded: s.leftExpanded, rightExpanded: false, width: width)
+        out.leftExpanded = t.left       // collapsed below both-fit; untouched at both-fit
+        out.rightExpanded = t.right     // == true
+    } else {
+        out.rightExpanded = true
+        out.rightOverlayOpen = true
+    }
+    if !bothFit { out.leftExpanded = false; out.leftOverlayOpen = false }
+    return out
+}
+
+/// Scrim/chevron dismiss of an open overlay clears BOTH that side's `overlayOpen` AND its `expanded`
+/// so it collapses back to a chevron (stays hidden until re-tapped) rather than snapping inline.
+func dismissLeftOverlay(_ s: SidebarState) -> SidebarState {
+    var out = s; out.leftOverlayOpen = false; out.leftExpanded = false; return out
+}
+
+/// Mirror of `dismissLeftOverlay` for the right edge.
+func dismissRightOverlay(_ s: SidebarState) -> SidebarState {
+    var out = s; out.rightOverlayOpen = false; out.rightExpanded = false; return out
 }
 
 // MARK: - The right work sidebar (a function-family on WindowContentView, like `subagentSection`/
