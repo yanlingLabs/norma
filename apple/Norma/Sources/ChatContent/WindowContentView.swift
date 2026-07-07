@@ -27,6 +27,21 @@ struct WindowContentView<Accessory: View>: View {
             TranscriptView(adapter: adapter, tint: tint)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
+            // Task 3 (2d-iii): the pending-interaction cards — mounted here, between the
+            // transcript and the pinned-tasks section, in BOTH windows (the morph window's
+            // `.window` surface and every native `DetachedWindowController`, since both render
+            // this shared `WindowContentView`).
+            if !adapter.pendingInteractions.isEmpty {
+                PendingCardsView(
+                    interactions: adapter.pendingInteractions,
+                    inFlight: adapter.interactionInFlight,
+                    errorLines: adapter.interactionErrors,
+                    onApproval: adapter.onApprovalRespond,
+                    onQuestion: adapter.onQuestionRespond,
+                    onPlan: adapter.onPlanRespond
+                )
+            }
+
             if !adapter.pinnedTasks.isEmpty {
                 pinnedTasksSection(adapter.pinnedTasks)
             }

@@ -175,6 +175,32 @@ final class AppModel: ObservableObject {
         _ = try? await client.interrupt(sessionId: sid)
     }
 
+    // MARK: - Task 3 (2d-iii): pending-interaction respond — the orb's own focused-session surface,
+    // mirroring `sendOrSteer`'s shape exactly (guard a focused session, `try?` the RPC, `nil` on
+    // throw means failure). Deliberately does NOT force-auto/create a session the way
+    // `sendOrSteer`/`ensureFocusedSession` do — a respond only ever targets a callId the daemon
+    // already asked THIS focused session about, so there is nothing to create here; no focused
+    // session simply means there is nothing to respond to (fails closed, `false`).
+    //
+    // `NormaClient`'s three respond methods each return `alreadyResolved` (a race indicator, not
+    // a success flag) — that's a different signal than "did the RPC succeed," so it's discarded
+    // here in favor of the same `!= nil` success convention `sendOrSteer` already uses.
+
+    func respondApproval(callId: String, approved: Bool) async -> Bool {
+        guard let sid = focusedSessionId else { return false }
+        return (try? await client.approvalRespond(sessionId: sid, callId: callId, approved: approved)) != nil
+    }
+
+    func respondQuestion(callId: String, answers: [String: String]) async -> Bool {
+        guard let sid = focusedSessionId else { return false }
+        return (try? await client.askUserRespond(sessionId: sid, callId: callId, answers: answers)) != nil
+    }
+
+    func respondPlan(callId: String, approved: Bool, autoAccept: Bool, feedback: String?) async -> Bool {
+        guard let sid = focusedSessionId else { return false }
+        return (try? await client.planRespond(sessionId: sid, callId: callId, approved: approved, autoAccept: autoAccept, feedback: feedback)) != nil
+    }
+
     private func handle(_ ev: NormaEvent) async {
         switch ev {
         case .session(let e):

@@ -44,6 +44,44 @@ struct GlassRootView: View {
         // `OrbWindowController.isShowingDraft`'s doc).
         controller.isShowingDraft = { [adapter] in adapter.showingDraft }
         controller.setShowingDraft = { [adapter] value in adapter.showingDraft = value }
+
+        // Task 3 (2d-iii): the three pending-interaction respond callbacks — exact same
+        // strong-`[adapter]`-capture idiom as `onClearMessage` above (a self-cycle through the
+        // adapter's own stored closure property, harmless here because this is the ORB's single
+        // app-lifetime `fieldAdapter`, never torn down — see `DetachedWindowController.init`'s
+        // `[weak adapter]` for the one-adapter-per-window case where that same cycle IS a real
+        // leak). `controller` (not `model`) is the reach — `GlassRootView` stays model-free,
+        // mirroring `submit(_:)`'s own `controller.onSubmit` chain exactly. In-flight/error
+        // discipline: insert + clear any stale error SYNCHRONOUSLY (before the await), remove
+        // in-flight once the RPC settles, set an error line ONLY on failure — a success does
+        // nothing further, the resolved event removes the card via the reducer.
+        adapter.onApprovalRespond = { [adapter, controller] callId, approved in
+            adapter.interactionInFlight.insert(callId)
+            adapter.interactionErrors[callId] = nil
+            Task { @MainActor in
+                let ok = await controller.onApprovalRespond?(callId, approved) ?? false
+                adapter.interactionInFlight.remove(callId)
+                if !ok { adapter.interactionErrors[callId] = "couldn't send — try again" }
+            }
+        }
+        adapter.onQuestionRespond = { [adapter, controller] callId, answers in
+            adapter.interactionInFlight.insert(callId)
+            adapter.interactionErrors[callId] = nil
+            Task { @MainActor in
+                let ok = await controller.onQuestionRespond?(callId, answers) ?? false
+                adapter.interactionInFlight.remove(callId)
+                if !ok { adapter.interactionErrors[callId] = "couldn't send — try again" }
+            }
+        }
+        adapter.onPlanRespond = { [adapter, controller] callId, approved, autoAccept, feedback in
+            adapter.interactionInFlight.insert(callId)
+            adapter.interactionErrors[callId] = nil
+            Task { @MainActor in
+                let ok = await controller.onPlanRespond?(callId, approved, autoAccept, feedback) ?? false
+                adapter.interactionInFlight.remove(callId)
+                if !ok { adapter.interactionErrors[callId] = "couldn't send — try again" }
+            }
+        }
     }
 
     var body: some View {

@@ -407,4 +407,32 @@ final class FieldStateAdapter: ObservableObject {
         if case .approvalNeeded = session.state.status { return true }
         return false
     }
+
+    // MARK: - Task 3 (2d-iii): pending-interaction cards — mount + respond wiring
+
+    /// `PendingCardsView`'s data source (`WindowContentView`'s mount, both windows) — a thin
+    /// read-through onto the reducer's own ordered (oldest-first) list, same convention as
+    /// `pinnedTasks`/`transcript` above.
+    var pendingInteractions: [PendingInteraction] { session.state.pendingInteractions }
+
+    /// callIds with a respond RPC currently awaiting — `PendingCardsView`'s per-card `isInFlight`
+    /// (disables that card's buttons while true). Mutated ONLY by whichever surface wires the
+    /// three respond callbacks below (`GlassRootView.wireCallbacks()` for the orb/window,
+    /// `DetachedWindowController.init` for a detached window) — never by this adapter itself.
+    @Published var interactionInFlight: Set<String> = []
+
+    /// callId → inline error text (`PendingCard`'s `errorLine`) — set on a failed respond RPC,
+    /// cleared at the START of the next attempt for that callId (never lingers across a retry).
+    /// A SUCCESSFUL respond does nothing here beyond removing the in-flight entry above — the
+    /// card itself disappears once the daemon's `*_resolved` event removes it from
+    /// `pendingInteractions` via the reducer; there is no optimistic dismiss.
+    @Published var interactionErrors: [String: String] = [:]
+
+    /// Wired by whichever surface owns this adapter (see `interactionInFlight`'s doc) to reach
+    /// the daemon's `approval.respond` — callId, approved.
+    var onApprovalRespond: (String, Bool) -> Void = { _, _ in }
+    /// callId, answers (keyed by question text — see `PendingCards.swift`'s `questionAnswers`).
+    var onQuestionRespond: (String, [String: String]) -> Void = { _, _ in }
+    /// callId, approved, autoAccept, feedback.
+    var onPlanRespond: (String, Bool, Bool, String?) -> Void = { _, _, _, _ in }
 }
