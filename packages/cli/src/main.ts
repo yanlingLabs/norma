@@ -50,6 +50,19 @@ interface KeyListener {
 }
 let activeKeyListener: KeyListener | null = null;
 
+/** True for exactly the span of the chat composer's `readLine("› ")` call (final-review Finding 1).
+ *  readLine() writes its prompt text directly to stdout, bypassing `emit()`'s tracking, so the
+ *  closure-local `atLineStart` a repaint would consult is stale-true for the whole wait — an event
+ *  arriving mid-composer (bg_task_output from a still-running background task, task_updated from a
+ *  co-attached window, …) would otherwise look "safe" to `repaintBlockIfSafe` and paint/erase the
+ *  pinned block right under the live prompt, corrupting it. `repaintBlockIfSafe` below is the ONLY
+ *  place this is checked — gating it is sufficient to keep the whole erase/repaint cycle inert
+ *  during the composer (see the comment on that function), so events can still update state and
+ *  emit() can still print transcript text (which just scrolls the prompt down, harmlessly) while
+ *  this is true. Module-level (not a runTurnSession local) only because that's where the flag is
+ *  read from; it's set/cleared from inside runTurnSession's chat loop, the sole writer. */
+let composerActive = false;
+
 function makeKeyListener(onChunk: (chunk: Buffer) => void): KeyListener {
   let attached = false; // raw "data" handler currently on stdin
   let wantActive = false; // a turn is running → we WANT the raw handler on
@@ -261,7 +274,13 @@ async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boole
     }
   }
   function repaintBlockIfSafe(): void {
-    if (!process.stdout.isTTY || !atLineStart) return;
+    // composerActive gate (Finding 1): the `› ` composer owns the screen for the span of its
+    // readLine() call — never paint/erase the pinned block during it (see the module-level doc
+    // comment). eraseBlockIfPinned() is left ungated deliberately: `pinnedLineLengths` is already
+    // empty by the time composerActive goes true (the chat loop erases before showing the prompt),
+    // and since repaint never runs while this flag is set, it stays empty — so eraseBlockIfPinned
+    // is a no-op for the whole span anyway, with no separate gate needed there.
+    if (composerActive || !process.stdout.isTTY || !atLineStart) return;
     // Width passed per-repaint (not cached): terminal resizes between repaints pick up the new
     // width; truncation keeps 1 logical line == 1 physical row so the erase count stays exact.
     const columns = process.stdout.columns;
@@ -416,10 +435,13 @@ async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boole
   // Resize (design §8, hard requirement): erase-then-repaint immediately so aggressive mid-turn
   // resizing leaves no stranded fragments. eraseBlockIfPinned reads the CURRENT columns against the
   // stored visible lengths (a width shrink that re-wrapped the block is cleared exactly); the
-  // repaint re-truncates to the new width. Gated on turnRunning — between turns the block is erased
-  // and the `› ` composer owns the screen, so a resize there must NOT paint chrome under it.
+  // repaint re-truncates to the new width. Finding 1 consolidation: this used to gate on
+  // `turnRunning` itself (between turns the composer owns the screen, so a resize there must NOT
+  // paint chrome under it) — that's now subsumed by repaintBlockIfSafe's own composerActive gate,
+  // so refreshBlock() alone is enough here: mid-turn it repaints as before, and during the composer
+  // it's a no-op via that same gate (no separate turnRunning check needed).
   if (process.stdout.isTTY) {
-    process.stdout.on("resize", () => { if (process.stdout.isTTY && turnRunning) refreshBlock(); });
+    process.stdout.on("resize", () => { if (process.stdout.isTTY) refreshBlock(); });
   }
 
   const c = await connect(chat ? "cli-chat" : "cli-p", (e) => {
@@ -467,6 +489,21 @@ async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boole
       // Yield raw stdin → cooked so the whole "y\n" line reaches the approval reader (only on the
       // first of a batch; the reader resumes the key listener once the batch fully drains).
       if (wasEmpty) activeKeyListener?.suspend();
+    } else if (e.type === "approval_resolved") {
+      // Finding 2: the approval may have been resolved WITHOUT this stdin reader ever seeing a
+      // "y\n" — another attached window answered it, or the server-side broker timed it out. If
+      // it's still sitting in our local `pending` queue, unwind it exactly as the cooked reader
+      // below does for a normal answer: drop it (wherever it is in the queue — not necessarily the
+      // head, so a stale entry ahead of a still-live one can't misdirect the next keystroke) and,
+      // once that drains `pending` back to empty, resume the raw key listener. Without this, a
+      // resolved-elsewhere approval leaves `pending` and the suspended raw listener stuck for the
+      // rest of the turn, and the next typed line gets consumed answering the stale entry instead
+      // of whatever it was actually meant for.
+      const idx = pending.indexOf(e.callId);
+      if (idx !== -1) {
+        pending.splice(idx, 1);
+        if (pending.length === 0) activeKeyListener?.resume();
+      }
     } else if (e.type === "directory_added") emit(`${DIM}+ dir ${e.path}${e.persisted ? " (remembered)" : ""}${RESET}\n`);
     else if (e.type === "bg_task_started") emit(`${DIM}▶ bg ${e.taskId} started: ${e.command.slice(0, 80)}${RESET}\n`);
     else if (e.type === "bg_task_output") emit(`${DIM}${e.chunk}${RESET}`);
@@ -654,7 +691,9 @@ async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boole
     for (;;) {
       eraseBlockIfPinned(); // drop any lingering chrome before the composer
       atLineStart = true;
+      composerActive = true; // Finding 1: block painting/erasing suspended for the span of this read
       const line = await readLine("› ");
+      composerActive = false; // the composer resolved (line submitted or EOF) — the gate lifts immediately
       if (line === null) { await teardownAndExit(0); return; } // ctrl+D / EOF → exit
       if (line === "") continue; // empty line → re-prompt (no send)
       await runOneTurn(line);
@@ -665,17 +704,63 @@ async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boole
   await new Promise(() => {}); // safety net if runOneTurn ever resolves unexpectedly
 }
 
+// Final-review Findings 3+4: pure arg-routing decision, factored out of the `import.meta.main`
+// block below so it's cheaply unit-testable without any process/stdin/socket machinery. `argv` is
+// the USER-supplied args (i.e. `process.argv.slice(2)` — argv[0] is the first real arg, not the
+// binary/script path); `isTTY` is `process.stdin.isTTY && process.stdout.isTTY` from the caller.
+//
+//  - bare (`argv` empty) or a single bare `--auto`/`--plan` flag → "chat" (no sessionId): a fresh
+//    session, policy seeded by whichever flag is present — runTurnSession reads `--auto`/`--plan`
+//    back out of `process.argv` itself, so this route carries no policy field of its own.
+//  - `resume <id>` with nothing after it, or with EXACTLY one of `--auto`/`--plan` and nothing
+//    else, → "chat" WITH that sessionId (Finding 3: previously "--auto" was sent as literal prompt
+//    text). A flag followed by more text (`resume <id> --auto and then some`) is NOT this case —
+//    that's real prompt text starting with a flag-shaped word, unchanged below.
+//  - `resume <id> <anything else>` → "resumeOneShot" (existing continue-headless behavior).
+//  - everything else (subcommands, `-p`, `resume` with no id, …) → "fallthrough": defer to the
+//    switch statement's existing handling, untouched.
+//
+// Finding 4: the two "chat" outcomes reachable with NO existing session (bare / --auto / --plan)
+// require `isTTY` — a script piping into bare `norma` must keep seeing the original usage output,
+// not silently open a chat loop it can't drive. (`resume <id>` chat entry is pre-existing,
+// unflagged behavior and isn't gated here — see the fix report.)
+export type CliRoute =
+  | { kind: "chat"; existingSessionId?: string }
+  | { kind: "resumeOneShot"; sessionId: string; text: string }
+  | { kind: "fallthrough" };
+
+const isPolicyFlag = (s: string | undefined): boolean => s === "--auto" || s === "--plan";
+
+export function routeCliInvocation(argv: string[], isTTY: boolean): CliRoute {
+  const [cmd, sub, ...rest] = argv;
+  if (cmd === undefined || isPolicyFlag(cmd)) {
+    return isTTY ? { kind: "chat" } : { kind: "fallthrough" };
+  }
+  if (cmd === "resume" && sub !== undefined) {
+    const text = rest.join(" ");
+    if (text === "" || isPolicyFlag(text)) return { kind: "chat", existingSessionId: sub };
+    return { kind: "resumeOneShot", sessionId: sub, text };
+  }
+  return { kind: "fallthrough" };
+}
+
 // Guarded so `main.ts` can be imported (e.g. by tests, for INIT_PROMPT/runTurnSession) without
 // executing the CLI — import.meta.main is true only when this file is the entry point.
 if (import.meta.main) {
-  if (process.argv[2] === "-p") {
+  const argv = process.argv.slice(2);
+  const isTTY = !!(process.stdin.isTTY && process.stdout.isTTY);
+  const route = routeCliInvocation(argv, isTTY);
+
+  if (argv[0] === "-p") {
     await runTurnSession({ chat: false }); // one-shot; never resolves normally — exits via process.exit()
   }
-  if (process.argv[2] === undefined) {
-    await runTurnSession({ chat: true }); // bare `norma` → persistent chat mode on a fresh session (loops until ctrl+C/ctrl+D)
+  if (route.kind === "chat" && route.existingSessionId === undefined) {
+    // bare `norma`, or `norma --auto`/`--plan` (Finding 3) → persistent chat mode on a fresh
+    // session (loops until ctrl+C/ctrl+D); Finding 4 — routeCliInvocation already gated this on
+    // isTTY, so a non-TTY bare/--auto/--plan invocation falls through to the switch below instead.
+    await runTurnSession({ chat: true });
   }
 
-  const argv = process.argv.slice(2);
   const [cmd, sub] = argv;
 
   // Two-word subcommands use "cmd sub"; single-word commands match on cmd alone.
@@ -982,13 +1067,24 @@ if (import.meta.main) {
       for (const r of rows) console.log(`${r.sessionId}  ${DIM}${r.scope}  ${r.lastSeq} events${process.stdout.isTTY && r.title ? ` — ${r.title}` : ""}${RESET}`);
       c.close(); process.exit(0);
     }
-    const text = process.argv.slice(4).join(" ");
-    if (!text) {
-      // No message → resume INTO chat mode on this session (§0). runTurnSession does its own
-      // existence check + "↻ resuming …" line; policy seeds from flags (default ask).
+    // `route` was computed from this same `argv` up front (routeCliInvocation), so — sid being
+    // truthy here means `sub !== undefined` held there too — it's necessarily "chat" or
+    // "resumeOneShot", never "fallthrough". Finding 4 hygiene: previously this was two consecutive
+    // unconditional `if`s with no `else`/`return` between them, so the chat call (below) fell
+    // through into the one-shot call with empty prompt text right after — harmless only because
+    // runTurnSession(chat:true) never returns in normal operation (teardownAndExit always
+    // process.exit()s), not a guarantee. (A bare top-level `return` isn't legal here — this file's
+    // dispatch runs at module top level, not inside a function — so the fix is this if/else rather
+    // than a literal `return`.)
+    if (route.kind === "chat") {
+      // No message, or exactly `--auto`/`--plan` (Finding 3 — previously sent as literal prompt
+      // text) → resume INTO chat mode on this session (§0). runTurnSession does its own existence
+      // check + "↻ resuming …" line; policy seeds from that flag (default ask) via the same
+      // process.argv read runTurnSession already does for the bare-chat path.
       await runTurnSession({ existingSessionId: sid, chat: true });
+    } else if (route.kind === "resumeOneShot") {
+      await runTurnSession({ promptOverride: route.text, forceAuto: true, existingSessionId: sid, chat: false }); // continue the existing session (auto, one-shot)
     }
-    await runTurnSession({ promptOverride: text, forceAuto: true, existingSessionId: sid, chat: false }); // continue the existing session (auto, one-shot)
     break;
   }
   case "provider-smoke": {
