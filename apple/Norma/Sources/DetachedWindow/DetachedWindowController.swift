@@ -30,6 +30,11 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
     private let sessionId: String
 
     private var escMonitor: Any?
+    /// FINAL-REVIEW FIX (minor #3): the feed-start Task is stored so close can CANCEL it —
+    /// `SessionFeed.start()`'s initial connect-backoff loop exits only on Task.isCancelled;
+    /// without this, closing a window whose daemon never came up left the loop spinning
+    /// (bounded at 10s backoff, but D9 says a closed window leaves NOTHING running).
+    private var feedTask: Task<Void, Never>?
     /// One-shot latch: `windowWillClose` runs teardown + fires `onClosed` exactly once, whether it
     /// arrived via the programmatic `close()` (termination hook) or the user's red traffic light —
     /// both funnel through this same AppKit delegate callback.
@@ -95,7 +100,11 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
 
         window.delegate = self
         adapter.onSubmit = { [weak self] text in self?.submit(text) }
-        adapter.onClearMessage = { [adapter] in adapter.composerDraft = "" }
+        // FINAL-REVIEW FIX: [weak adapter] — the strong capture (GlassRootView's idiom) forms an
+        // adapter→closure→adapter cycle. Harmless on the app-lifetime orb adapter, a REAL leak
+        // here: detached windows create one adapter per window, and the cycle kept adapter +
+        // SessionModel + its Combine sinks alive after every close (once per open/close cycle).
+        adapter.onClearMessage = { [weak adapter] in adapter?.composerDraft = "" }
         window.contentView = NSHostingView(rootView: DetachedWindowRootView(adapter: adapter))
         window.setFrame(frame, display: true)
     }
@@ -105,7 +114,7 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
     /// task 4 calls this exactly once per spawned controller.
     func show() {
         window.makeKeyAndOrderFront(nil)
-        Task { await feed.start() }
+        feedTask = Task { await feed.start() }
         installEscMonitor()
     }
 
@@ -154,6 +163,8 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         guard !didClose else { return }
         didClose = true
+        feedTask?.cancel()
+        feedTask = nil
         feed.stop()
         if let escMonitor {
             NSEvent.removeMonitor(escMonitor)

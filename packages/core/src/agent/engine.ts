@@ -263,7 +263,14 @@ export class AgentEngine {
     if (!this.cfg.tasks) return undefined;
     const tasks = this.cfg.tasks.list(sessionId);
     if (tasks.length === 0) return undefined;
-    const lines = tasks.map((t) => `#${t.id} [${t.status}] ${t.subject}`).join("\n");
+    // FINAL-REVIEW FIX: subjects are model-authored strings that may carry attacker-influenced
+    // content (the model quotes user/tool/file text into subjects) — sanitize before embedding
+    // in the reminder block: newlines would inject fake reminder lines, and a literal
+    // </system-reminder> would close the block early, leaving durable ambient "system" text
+    // in-context on every later turn.
+    const sanitize = (s: string) =>
+      s.replace(/\r?\n/g, " ").replace(/<\/?system-reminder>/gi, "[tag]");
+    const lines = tasks.map((t) => `#${t.id} [${t.status}] ${sanitize(t.subject)}`).join("\n");
     const content = "<system-reminder>\nCurrent task list (update these by id — do NOT create a new task for work already listed):\n"
       + lines
       + "\nUse task_update with the task's id to change status; task_list shows full details."
