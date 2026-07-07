@@ -6,6 +6,15 @@ struct TaskItem: Equatable {
     let id: String
     var subject: String
     var status: String
+    /// The wire's present-tense task description ("Running tests") — dropped entirely until
+    /// Task 2 (2e-i); carried straight off `event.task.activeForm`. Defaulted `nil` so existing
+    /// `TaskItem(id:subject:status:)` call sites/tests compile unchanged.
+    var activeForm: String? = nil
+    /// `event.ts` (never a client clock — the reducer stays pure) the moment this task FIRST
+    /// entered `in_progress`. Stamped once and preserved across later updates (including a
+    /// repeated in_progress) so Task 3's elapsed timer has a stable start; `nil` for a task that
+    /// has never been in_progress. Defaulted `nil` for the same compile-compat reason as above.
+    var startedTs: Int? = nil
 }
 
 /// A single outstanding human-in-the-loop interaction the daemon is waiting on — approval,
@@ -208,6 +217,16 @@ enum SessionReducer {
             if let i = s.tasks.firstIndex(where: { $0.id == v.task.id }) {
                 s.tasks[i].subject = v.task.subject
                 s.tasks[i].status = v.task.status
+                s.tasks[i].activeForm = v.task.activeForm
+                // Task 2 (2e-i): stamp startedTs the moment this task FIRST enters in_progress —
+                // previousStatus != "in_progress" covers both "was pending" and "was absent until
+                // the branch above just wrote status" (previousStatus is read BEFORE this
+                // mutation). A repeated in_progress update (previousStatus already "in_progress")
+                // must NOT reset the timer, so startedTs is left untouched in that case —
+                // event.ts only, never a client clock, keeps the reducer pure.
+                if v.task.status == "in_progress", previousStatus != "in_progress" {
+                    s.tasks[i].startedTs = v.ts
+                }
             } else {
                 // GATE-4 FIX (item 2 — "tasks never clear"): `v.task.id` not being in `s.tasks`
                 // means the daemon just called `task_create`, never `task_update` (see
@@ -241,7 +260,15 @@ enum SessionReducer {
                    s.tasks.allSatisfy({ $0.status == "completed" }) {
                     s.tasks.removeAll()
                 }
-                s.tasks.append(TaskItem(id: v.task.id, subject: v.task.subject, status: v.task.status))
+                s.tasks.append(TaskItem(
+                    id: v.task.id,
+                    subject: v.task.subject,
+                    status: v.task.status,
+                    activeForm: v.task.activeForm,
+                    // Brand-new task (previousStatus nil, i.e. "absent") — same "absent OR not
+                    // already in_progress" rule as the upsert branch above.
+                    startedTs: v.task.status == "in_progress" ? v.ts : nil
+                ))
             }
             // Transcript activity is MAIN-thread only (child-thread task churn still upserts
             // above — tasks are session-wide — but must not pollute the main transcript).
