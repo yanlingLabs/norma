@@ -99,7 +99,7 @@ struct GlassRootView: View {
 
     var body: some View {
         wireCallbacks()
-        return NormaFieldView(adapter: adapter, morph: morphModel, fluid: fluidModel)
+        return NormaFieldView(adapter: adapter, morph: morphModel, fluid: fluidModel, sidebars: controller.sidebars)
             .onChange(of: controller.surface) { _, newSurface in
                 switch newSurface {
                 case .orb:

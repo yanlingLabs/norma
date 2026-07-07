@@ -93,6 +93,10 @@ struct NormaFieldView: View {
     /// those writes). Held only to hand down to `FluidOrbSlot`, the sole observer, at the mount
     /// site in `composerMorphedContent` below.
     let fluid: FluidModel
+    /// Task 6 (2e-iii): the morph window's sidebar wiring, threaded from `OrbWindowController` via
+    /// `GlassRootView` down to the `.window` surface's `WindowContentView`. `nil` on paths that
+    /// don't wire it (e.g. previews/tests) → the window renders its zero-sidebar layout.
+    let sidebars: SidebarWiring?
     @Namespace private var glassNamespace
 
     @State private var composerContentHeight: CGFloat = 22
@@ -128,6 +132,7 @@ struct NormaFieldView: View {
                 WindowSurfaceView(
                     adapter: adapter, morph: morph, fluid: fluid,
                     namespace: glassNamespace, windowSize: geo.size,
+                    sidebars: sidebars,
                     onClose: { adapter.onWindowClose() },
                     onMinimize: { adapter.onWindowDetach() },
                     onZoom: { adapter.onWindowZoom() }

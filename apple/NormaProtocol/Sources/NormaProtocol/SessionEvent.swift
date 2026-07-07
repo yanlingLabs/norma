@@ -28,6 +28,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
     case worktreeExited(WorktreeExited)
     case threadStarted(ThreadStarted)
     case threadCompleted(ThreadCompleted)
+    case sessionTitled(SessionTitled)
 
     public struct SessionCreated: Codable, Equatable, Sendable {
         public let seq: Int
@@ -294,6 +295,14 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         public let stopReason: String
     }
 
+    public struct SessionTitled: Codable, Equatable, Sendable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let title: String
+    }
+
     private enum Discriminator: String, Codable {
         case session_created
         case harness_attached
@@ -322,6 +331,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         case worktree_exited
         case thread_started
         case thread_completed
+        case session_titled
     }
 
     private enum TypeKey: String, CodingKey { case type }
@@ -356,6 +366,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         case .worktree_exited:      self = .worktreeExited(try WorktreeExited(from: decoder))
         case .thread_started:       self = .threadStarted(try ThreadStarted(from: decoder))
         case .thread_completed:     self = .threadCompleted(try ThreadCompleted(from: decoder))
+        case .session_titled:       self = .sessionTitled(try SessionTitled(from: decoder))
         }
     }
 
@@ -469,6 +480,10 @@ public enum SessionEvent: Codable, Equatable, Sendable {
             try v.encode(to: encoder)
             var c = encoder.container(keyedBy: TypeKey.self)
             try c.encode(Discriminator.thread_completed.rawValue, forKey: .type)
+        case .sessionTitled(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.session_titled.rawValue, forKey: .type)
         }
     }
 }

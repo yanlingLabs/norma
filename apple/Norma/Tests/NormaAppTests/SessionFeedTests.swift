@@ -163,4 +163,66 @@ final class SessionFeedTests: XCTestCase {
         let hellos = t.sent.filter { feedLineJSON($0)["method"] as? String == "protocol.hello" }
         XCTAssertEqual(hellos.count, 1, "deliberate stop must not trigger a reconnect attempt: \(t.sent)")
     }
+
+    /// Task 5 (2e-iii): `repin(to:)` — the detached window's "switch in place" primitive. A fresh
+    /// attach must go out for the NEW id, the OLD session's events must stop reducing, and the NEW
+    /// session's events must start reducing — all on the SAME feed/socket (no second `protocol.hello`).
+    func testRepinReattachesToNewSessionAndRoutesItsEvents() async throws {
+        let t = FeedScriptedTransport()
+        let session = SessionModel()
+        let feed = SessionFeed(makeTransport: { t }, token: "tok", clientName: "orb", mode: .pinned(sessionId: "S1"), session: session)
+        let startTask = Task { await feed.start() }
+        defer { startTask.cancel(); feed.stop() }
+
+        await answerPinnedHandshake(t)
+        await waitUntilSent(t, 2)
+        let attachS1 = feedLineJSON(t.sent[1])
+        XCTAssertEqual((attachS1["params"] as? [String: Any])?["sessionId"] as? String, "S1")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(attachS1["id"] as! Int),"result":{"ok":true,"lastSeq":0}}"#)
+        await feedWaitUntil { session.state.status != .disconnected }
+
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"turn_started","seq":1,"sessionId":"S1","ts":0,"threadId":"main"}}"#)
+        await feedWaitUntil { session.state.turnRunning }
+        XCTAssertTrue(session.state.turnRunning)
+
+        async let repinDone: Void = feed.repin(to: "S2")
+        await waitUntilSent(t, 3)
+        let attachS2 = feedLineJSON(t.sent[2])
+        XCTAssertEqual(attachS2["method"] as? String, "session.attach")
+        XCTAssertEqual((attachS2["params"] as? [String: Any])?["sessionId"] as? String, "S2")
+        XCTAssertEqual((attachS2["params"] as? [String: Any])?["fromSeq"] as? Int, 0)
+        t.feed(#"{"jsonrpc":"2.0","id":\#(attachS2["id"] as! Int),"result":{"ok":true,"lastSeq":0}}"#)
+        await repinDone
+
+        XCTAssertEqual(feed.pinnedSessionId, "S2")
+        // reset() dropped S1's reducer state — no stale turnRunning survives the repin.
+        await feedWaitUntil { !session.state.turnRunning }
+        XCTAssertFalse(session.state.turnRunning)
+
+        // a STALE S1 event must no longer reduce — this feed only listens to S2 now.
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"turn_started","seq":2,"sessionId":"S1","ts":0,"threadId":"main"}}"#)
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(session.state.turnRunning, "stale S1 event must not reduce after repin to S2")
+
+        // a fresh S2 event DOES reduce.
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"turn_started","seq":1,"sessionId":"S2","ts":0,"threadId":"main"}}"#)
+        await feedWaitUntil { session.state.turnRunning }
+        XCTAssertTrue(session.state.turnRunning)
+
+        // exactly one hello ever went out — repin reuses the same socket, no reconnect.
+        let hellos = t.sent.filter { feedLineJSON($0)["method"] as? String == "protocol.hello" }
+        XCTAssertEqual(hellos.count, 1, "repin must not open a new connection: \(t.sent)")
+    }
+
+    /// `.followFocus` mode never re-pins — `AppModel.focusSession` uses its own `refocus` machinery
+    /// instead (SessionFeed's hook composition, not this method). Guard against a caller mistake.
+    func testRepinIsANoOpInFollowFocusMode() async throws {
+        let t = FeedScriptedTransport()
+        let session = SessionModel()
+        let feed = SessionFeed(makeTransport: { t }, token: "tok", clientName: "orb", mode: .followFocus, session: session)
+
+        await feed.repin(to: "S9")
+        XCTAssertNil(feed.pinnedSessionId, "followFocus has no pinned id before OR after a repin() no-op")
+        XCTAssertTrue(t.sent.isEmpty, "a no-op repin must never touch the wire")
+    }
 }

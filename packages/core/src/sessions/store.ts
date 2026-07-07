@@ -12,6 +12,17 @@ export interface SessionRow {
   scope: string;
   createdAt: number;
   lastSeq: number;
+  title?: string;
+  cwd?: string;
+}
+
+/** Derives a fallback title from the first line of the session's first main-thread
+ *  user_message, when no explicit session_titled event has set one. */
+function fallbackTitle(firstMessage: string | null): string | undefined {
+  if (!firstMessage) return undefined;
+  const line = (firstMessage.split("\n", 1)[0] ?? "").trim();
+  if (!line) return undefined;
+  return line.length > 60 ? `${line.slice(0, 59)}…` : line;
 }
 
 /** Event payload before the store assigns seq/ts. Uses the protocol's exported
@@ -33,7 +44,12 @@ export class SessionStore {
       approval_policy TEXT NOT NULL DEFAULT 'ask'
     )`);
     // Handle pre-existing index.db files by adding missing columns
-    for (const ddl of ["ALTER TABLE sessions ADD COLUMN cwd TEXT", "ALTER TABLE sessions ADD COLUMN approval_policy TEXT NOT NULL DEFAULT 'ask'"]) {
+    for (const ddl of [
+      "ALTER TABLE sessions ADD COLUMN cwd TEXT",
+      "ALTER TABLE sessions ADD COLUMN approval_policy TEXT NOT NULL DEFAULT 'ask'",
+      "ALTER TABLE sessions ADD COLUMN title TEXT",
+      "ALTER TABLE sessions ADD COLUMN first_message TEXT",
+    ]) {
       try { this.db.run(ddl); }
       catch (e) {
         // Idempotent migration: only a re-added column is expected. Anything else is a real failure.
@@ -41,6 +57,19 @@ export class SessionStore {
       }
     }
     this.recoverAll();
+  }
+
+  /** Derives the index's title/first_message columns from a session's parsed event log:
+   *  title = the LAST session_titled event's title (undo-able if a later one is appended);
+   *  first_message = the FIRST main-thread user_message's text (first only, never overwritten). */
+  private deriveIndexFields(events: SessionEvent[]): { title: string | null; firstMessage: string | null } {
+    let title: string | null = null;
+    let firstMessage: string | null = null;
+    for (const e of events) {
+      if (e.type === "session_titled") title = e.title;
+      if (e.type === "user_message" && e.threadId === "main" && firstMessage === null) firstMessage = e.text;
+    }
+    return { title, firstMessage };
   }
 
   /** Index is disposable (spec §4.4): on open, scan log files on disk to rebuild the index,
@@ -54,14 +83,18 @@ export class SessionStore {
       known.add(r.session_id);
       const path = this.logPath(r.scope, r.session_id);
       if (!existsSync(path)) continue;
-      const { good, sawBad } = this.readGoodLines(path);
+      const { good, parsed, sawBad } = this.readGoodLines(path);
       if (sawBad) {
         const tmp = path + ".repair";
         writeFileSync(tmp, good.map((l) => l + "\n").join(""));
         renameSync(tmp, path); // atomic: a crash never leaves a partial log
       }
       const lastSeq = good.length ? (JSON.parse(good[good.length - 1]!) as SessionEvent).seq : 0;
-      this.db.run("UPDATE sessions SET last_seq = ? WHERE session_id = ?", [lastSeq, r.session_id]);
+      const { title, firstMessage } = this.deriveIndexFields(parsed);
+      this.db.run(
+        "UPDATE sessions SET last_seq = ?, title = ?, first_message = ? WHERE session_id = ?",
+        [lastSeq, title, firstMessage, r.session_id],
+      );
     }
 
     // Pass 2: scan filesystem for sessions not yet in sqlite (index rebuild from logs)
@@ -79,7 +112,7 @@ export class SessionStore {
         const sessionId = file.slice(0, -6); // strip .jsonl
         if (known.has(sessionId)) continue;
         const path = join(scopeDir, file);
-        const { good, sawBad } = this.readGoodLines(path);
+        const { good, parsed, sawBad } = this.readGoodLines(path);
         if (good.length === 0) continue;
         if (sawBad) {
           const tmp = path + ".repair";
@@ -89,10 +122,11 @@ export class SessionStore {
         const firstEvent = JSON.parse(good[0]!) as SessionEvent;
         const createdAt = firstEvent.ts;
         const lastSeq = (JSON.parse(good[good.length - 1]!) as SessionEvent).seq;
+        const { title, firstMessage } = this.deriveIndexFields(parsed);
         // cwd/approval_policy are index-only metadata: after index loss they reset to defaults.
         this.db.run(
-          "INSERT INTO sessions (session_id, scope, created_at, last_seq, cwd, approval_policy) VALUES (?, ?, ?, ?, NULL, 'ask')",
-          [sessionId, scope, createdAt, lastSeq],
+          "INSERT INTO sessions (session_id, scope, created_at, last_seq, cwd, approval_policy, title, first_message) VALUES (?, ?, ?, ?, NULL, 'ask', ?, ?)",
+          [sessionId, scope, createdAt, lastSeq, title, firstMessage],
         );
         known.add(sessionId);
       }
@@ -141,6 +175,15 @@ export class SessionStore {
     const event = SessionEvent.parse({ ...input, seq: row.last_seq + 1, ts: Date.now() });
     appendFileSync(this.logPath(row.scope, sessionId), JSON.stringify(event) + "\n");
     this.db.run("UPDATE sessions SET last_seq = ? WHERE session_id = ?", [event.seq, sessionId]);
+    if (event.type === "session_titled") {
+      this.db.run("UPDATE sessions SET title = ? WHERE session_id = ?", [event.title, sessionId]);
+    }
+    if (event.type === "user_message" && event.threadId === "main") {
+      this.db.run(
+        "UPDATE sessions SET first_message = ? WHERE session_id = ? AND first_message IS NULL",
+        [event.text, sessionId],
+      );
+    }
     return event;
   }
 
@@ -162,9 +205,25 @@ export class SessionStore {
   }
 
   list(): SessionRow[] {
-    return (this.db.query("SELECT session_id, scope, created_at, last_seq FROM sessions ORDER BY created_at").all() as
-      { session_id: string; scope: string; created_at: number; last_seq: number }[])
-      .map((r) => ({ sessionId: r.session_id, scope: r.scope, createdAt: r.created_at, lastSeq: r.last_seq }));
+    return (this.db.query("SELECT session_id, scope, created_at, last_seq, title, first_message, cwd FROM sessions ORDER BY created_at").all() as
+      { session_id: string; scope: string; created_at: number; last_seq: number; title: string | null; first_message: string | null; cwd: string | null }[])
+      .map((r) => ({
+        sessionId: r.session_id,
+        scope: r.scope,
+        createdAt: r.created_at,
+        lastSeq: r.last_seq,
+        title: r.title ?? fallbackTitle(r.first_message),
+        cwd: r.cwd ?? undefined,
+      }));
+  }
+
+  /** Returns the GENERATED title only (never the fallback-from-first-message) — callers that
+   *  need a once-only "generate a title" guard (Task 3) must not treat a fallback as already-titled. */
+  getTitle(sessionId: string): string | null {
+    const row = this.db.query("SELECT title FROM sessions WHERE session_id = ?").get(sessionId) as
+      | { title: string | null } | null;
+    if (!row) throw new Error(`unknown session: ${sessionId}`);
+    return row.title;
   }
 
   setCwd(sessionId: string, cwd: string): void {

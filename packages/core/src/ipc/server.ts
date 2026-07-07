@@ -79,6 +79,18 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
   // Added on successful hello (role === "harness"); removed on socket close.
   const harnessConns = new Set<ConnState>();
 
+  // session_titled (Task 3) is broadcast to EVERY authed harness, not just clients attached to
+  // that session — mirrors the session.create broadcast above for the same reason: a harness
+  // watching the session list (but not attached to this particular session) still needs to learn
+  // its title live. Attached harnesses may receive it twice (fanOut + this); seq-based dedupe
+  // absorbs that (NormaKit dedupes on seq; the CLI ignores unknown/duplicate event types).
+  hub.onGlobalEvent = (event) => {
+    for (const conn of harnessConns) {
+      try { conn.writer.enqueue(encodeLine({ jsonrpc: "2.0", method: METHODS.event, params: event })); }
+      catch { /* dead socket — its close() handler will evict it from harnessConns */ }
+    }
+  };
+
   function parseParams<S extends z.ZodTypeAny>(schema: S, params: unknown): z.infer<S> {
     const result = schema.safeParse(params);
     if (!result.success) {

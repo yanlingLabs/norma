@@ -61,6 +61,22 @@ final class AppModelTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(t.sent.count, n, "timed out waiting for \(n) sent lines: \(t.sent)")
     }
 
+    /// 2e-iii Task 5: `session_created`/`session_titled` now ALSO kick an unawaited
+    /// `SessionDirectory` refresh (a `session.list` RPC) alongside whatever "real" RPC a test is
+    /// waiting for — since that refresh races on its own `Task`, it can land on the wire at an
+    /// unpredictable position relative to a fixed `t.sent[n]` index. This polls for the Nth line of
+    /// a SPECIFIC method instead, tolerant of any interloping calls of other methods.
+    func waitUntilMethod(_ t: AppScriptedTransport, _ method: String, occurrence: Int = 1, timeout: TimeInterval = 3) async -> [String: Any] {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let matches = t.sent.map(lineJSON).filter { $0["method"] as? String == method }
+            if matches.count >= occurrence { return matches[occurrence - 1] }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail("timed out waiting for occurrence \(occurrence) of method \(method): \(t.sent)")
+        return [:]
+    }
+
     func testStartAttachesNewestSessionAndReducesReplay() async throws {
         let t = AppScriptedTransport()
         let model = AppModel(makeTransport: { t }, token: "tok")
@@ -96,11 +112,12 @@ final class AppModelTests: XCTestCase {
         t.feed(#"{"jsonrpc":"2.0","id":\#(attachA["id"] as! Int),"result":{"ok":true,"lastSeq":0}}"#)
         await waitUntil { model.session.state.status == .idle }
 
-        // another harness creates s_b → the orb follows (most-recent focus)
+        // another harness creates s_b → the orb follows (most-recent focus). Occurrence 2: the
+        // FIRST session.attach was the initial s_a attach above — a directory-refresh session.list
+        // may also land somewhere in between (2e-iii Task 5), but session.attach itself still
+        // only fires twice total.
         t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"session_created","seq":1,"sessionId":"s_b","ts":5,"scope":"global"}}"#)
-        await waitUntilSent(t, 4)
-        let attachB = lineJSON(t.sent[3])
-        XCTAssertEqual(attachB["method"] as? String, "session.attach")
+        let attachB = await waitUntilMethod(t, "session.attach", occurrence: 2)
         XCTAssertEqual((attachB["params"] as? [String: Any])?["sessionId"] as? String, "s_b")
         t.feed(#"{"jsonrpc":"2.0","id":\#(attachB["id"] as! Int),"result":{"ok":true,"lastSeq":1}}"#)
 
@@ -130,18 +147,16 @@ final class AppModelTests: XCTestCase {
         // Orb-created sessions run auto-approval: no approval UI exists in the orb until 2d.
         let createParams = create["params"] as? [String: Any]
         XCTAssertEqual(createParams?["approvalPolicy"] as? String, "auto")
-        // REAL daemon wire order: broadcast BEFORE the RPC response.
+        // REAL daemon wire order: broadcast BEFORE the RPC response. The broadcast also kicks an
+        // unawaited directory refresh (2e-iii Task 5, a session.list RPC) — `waitUntilMethod` below
+        // finds the attach/send calls by METHOD rather than a fixed index, tolerant of that.
         t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"session_created","seq":1,"sessionId":"s_new","ts":0,"scope":"global"}}"#)
         t.feed(#"{"jsonrpc":"2.0","id":\#(create["id"] as! Int),"result":{"sessionId":"s_new","trusted":true}}"#)
         // exactly ONE attach must follow (either path — never both)
-        await waitUntilSent(t, 4)
-        let attach = lineJSON(t.sent[3])
-        XCTAssertEqual(attach["method"] as? String, "session.attach")
+        let attach = await waitUntilMethod(t, "session.attach")
         t.feed(#"{"jsonrpc":"2.0","id":\#(attach["id"] as! Int),"result":{"ok":true,"lastSeq":1}}"#)
         // then the send goes out
-        await waitUntilSent(t, 5)
-        let send = lineJSON(t.sent[4])
-        XCTAssertEqual(send["method"] as? String, "session.send")
+        let send = await waitUntilMethod(t, "session.send")
         t.feed(#"{"jsonrpc":"2.0","id":\#(send["id"] as! Int),"result":{"seq":2}}"#)
         let ok = await sent
         XCTAssertTrue(ok)
@@ -255,13 +270,14 @@ final class AppModelTests: XCTestCase {
         let createParams = create["params"] as? [String: Any]
         XCTAssertEqual(createParams?["approvalPolicy"] as? String, "auto")
 
-        // REAL daemon wire order: broadcast BEFORE the RPC response.
+        // REAL daemon wire order: broadcast BEFORE the RPC response. The broadcast also kicks an
+        // unawaited directory refresh (2e-iii Task 5, a session.list RPC) that can interleave here
+        // — `waitUntilMethod` finds the SECOND session.attach (the first was the initial s_old
+        // attach above) by method rather than a fixed sent-array index.
         t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"session_created","seq":1,"sessionId":"s_new","ts":0,"scope":"global"}}"#)
         t.feed(#"{"jsonrpc":"2.0","id":\#(create["id"] as! Int),"result":{"sessionId":"s_new","trusted":true}}"#)
 
-        await waitUntilSent(t, 5)
-        let attach = lineJSON(t.sent[4])
-        XCTAssertEqual(attach["method"] as? String, "session.attach")
+        let attach = await waitUntilMethod(t, "session.attach", occurrence: 2)
         XCTAssertEqual((attach["params"] as? [String: Any])?["sessionId"] as? String, "s_new", "must attach to the NEW id, not stay on s_old")
         t.feed(#"{"jsonrpc":"2.0","id":\#(attach["id"] as! Int),"result":{"ok":true,"lastSeq":1}}"#)
 

@@ -13,6 +13,10 @@ final class AppModel: ObservableObject {
     /// it.
     private let feed: SessionFeed
     private var client: NormaClient { feed.client }
+    /// Task 5 (2e-iii): the left sidebar's live session list (`SessionSidebar`, not yet mounted —
+    /// Task 6 does that). Lists via this AppModel's own `client`, same socket the orb's focus-follow
+    /// feed already uses — no second harness for the directory.
+    let directory: SessionDirectory
     /// Task 4: `private(set)` (was fully `private`) so AppDelegate's detach closure can capture the
     /// currently-focused session id BEFORE `startFreshSessionAfterDetach()` flips it — the
     /// detached window needs the OLD id (via `makeDetachedFeed(sessionId:)`), the orb needs a NEW
@@ -40,6 +44,16 @@ final class AppModel: ObservableObject {
         self.token = token
         self.clientName = clientName
         feed = SessionFeed(makeTransport: makeTransport, token: token, clientName: clientName, mode: .followFocus, session: session)
+        let feedClient = feed.client
+        directory = SessionDirectory(lister: {
+            try await feedClient.listSessions().map {
+                SessionSummary(sessionId: $0.sessionId, title: $0.title, createdAt: $0.createdAt, scope: $0.scope, cwd: $0.cwd)
+            }
+        })
+        // FINAL-REVIEW FIX (M1): cold-window bootstrap — session.list on construction, not only on
+        // the next session_created/session_titled broadcast. See SessionDirectory.startInitialLoad's
+        // doc for why a lost race against this AppModel's own not-yet-connected client is harmless.
+        directory.startInitialLoad()
         // Hook composition (see SessionFeed's doc comment for why): these four closures are the
         // ONLY seam between the extracted mechanics and AppModel's focus-follow behavior, each
         // firing at the exact point the original monolithic start()/handle() touched app state.
@@ -50,6 +64,11 @@ final class AppModel: ObservableObject {
             self.connectionSummary = self.summaryLine()
         }
         feed.onEvent = { [weak self] ev in
+            // Task 5 (2e-iii): forward session_created/session_titled to the directory FIRST —
+            // composed at the top of the existing closure, not a replacement of it (the hook
+            // contract's "return true consumes the event" doesn't apply here: `handle(ev)` below
+            // still fully owns event application in followFocus mode, same as before this task).
+            if case .session(let e) = ev { self?.directory.handle(e) }
             await self?.handle(ev)
             return true // AppModel's handle() fully owns event application in followFocus mode.
         }
@@ -106,13 +125,16 @@ final class AppModel: ObservableObject {
         return focusedSessionId
     }
 
-    /// Task 4 (detach choreography): the orb's "clean slate" step after a detach — the session it
-    /// was just focused on now belongs to a standalone detached window (its own harness, see
-    /// `makeDetachedFeed(sessionId:)`), so the orb's NEXT summon must never keep talking into that
-    /// same session. Exact `ensureFocusedSession()` creation body above, but UNCONDITIONAL: skips
-    /// the `if let sid = focusedSessionId { return sid }` early-out on purpose — a focus almost
-    /// always exists at this point (the session that was just detached), and this must create+
-    /// refocus onto a brand-new one regardless.
+    /// The generic "create a brand-new session and focus onto it" primitive — despite the name it is
+    /// NOT detach-specific. Two callers: (1) Task 4 detach choreography, the orb's "clean slate" step
+    /// after a detach (the session it was just focused on now belongs to a standalone detached window
+    /// — its own harness, see `makeDetachedFeed(sessionId:)` — so the orb's NEXT summon must never
+    /// keep talking into that same session); (2) 2e-iii Task 6, the sidebars' "new session"
+    /// affordance (`SidebarWiring.onNewSession`), a plain create+focus with no detach involved.
+    ///
+    /// Exact `ensureFocusedSession()` creation body above, but UNCONDITIONAL: skips the
+    /// `if let sid = focusedSessionId { return sid }` early-out on purpose — a focus almost always
+    /// exists at these call sites, and this must create+refocus onto a brand-new one regardless.
     func startFreshSessionAfterDetach() async {
         guard let created = try? await client.createSession(scope: "global", cwd: NSHomeDirectory(), approvalPolicy: "auto") else { return }
         // Same belt as ensureFocusedSession(): the daemon's session_created broadcast can arrive
@@ -215,6 +237,15 @@ final class AppModel: ObservableObject {
         case .unknown:
             break // newer daemon event — orb has nothing to render for it
         }
+    }
+
+    /// Task 5 (2e-iii): the left sidebar's "switch in place" action for the morph window (a plain
+    /// click on a `SessionSidebar` row) — the EXACT same refocus machinery `focusNewestSession()`
+    /// already uses below, just parameterized to an explicit id instead of always picking the
+    /// newest. `refocus(onto:)` is already idempotent (a no-op if already focused+attached there),
+    /// so re-selecting the current row is safe.
+    func focusSession(_ sessionId: String) async {
+        await refocus(onto: sessionId)
     }
 
     private func focusNewestSession() async {

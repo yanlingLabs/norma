@@ -1,0 +1,8 @@
+{
+  "type": "session_titled",
+  "seq": 9,
+  "sessionId": "s_1",
+  "ts": 5,
+  "threadId": "main",
+  "title": "Fixing the login flow"
+}

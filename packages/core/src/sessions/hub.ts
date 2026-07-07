@@ -10,6 +10,13 @@ export class SessionHub {
   private attachments = new Map<string, Set<HubClient>>(); // sessionId -> clients
   private byClient = new Map<HubClient, string>();         // client -> sessionId
 
+  // Set by the IPC server (Task 3): a narrow, additional broadcast path for event types that must
+  // reach EVERY authed harness, not just clients attached to the session in question (mirrors the
+  // session_created broadcast the server already does for its own reasons). session_titled is the
+  // first (only) such type — a harness viewing the session list needs a session it isn't attached
+  // to to pick up its title live.
+  onGlobalEvent?: (event: SessionEvent) => void;
+
   constructor(private readonly store: SessionStore) {}
 
   attach(client: HubClient, sessionId: string, fromSeq: number): number {
@@ -61,6 +68,9 @@ export class SessionHub {
   private appendAndBroadcast(sessionId: string, input: EventInput): SessionEvent {
     const event = this.store.append(sessionId, input);
     this.fanOut(sessionId, event);
+    // Narrow on purpose: session_created already has its own server-side broadcast, and every
+    // other event type is scoped to a session's own attachments.
+    if (event.type === "session_titled") this.onGlobalEvent?.(event);
     return event;
   }
 

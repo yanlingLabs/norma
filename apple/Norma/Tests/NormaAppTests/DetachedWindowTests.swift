@@ -137,6 +137,105 @@ final class DetachedWindowTests: XCTestCase {
         XCTAssertTrue(controller.adapterForTesting.composerDraft.isEmpty)
     }
 
+    /// Task 5 (2e-iii): `selectSession(_:)` — the sidebar's plain-click "switch in place" action.
+    /// `sessionId` must flip SYNCHRONOUSLY (before the repin's own attach round-trip completes),
+    /// and every closure that reads it live (submit, in particular) must target the NEW session —
+    /// this is the exact correctness fix Task 5 needed (previously `sessionId` was a `let` captured
+    /// once at construction into the respond/submit closures).
+    func testSelectSessionRepinsFeedAndSubmitTargetsNewSession() async throws {
+        let t = DetachedScriptedTransport()
+        let session = SessionModel()
+        let feed = SessionFeed(makeTransport: { t }, token: "tok", clientName: "orb", mode: .pinned(sessionId: "S1"), session: session)
+        let controller = DetachedWindowController(
+            feed: feed, session: session,
+            frame: NSRect(x: 0, y: 0, width: 560, height: 640), title: "Norma"
+        )
+        defer { controller.close() }
+        controller.show()
+
+        await answerHandshake(t, sessionId: "S1")
+        await feedWaitUntil { session.state.status != .disconnected }
+
+        XCTAssertEqual(controller.sessionId, "S1")
+        controller.selectSession("S2")
+        XCTAssertEqual(controller.sessionId, "S2", "sessionId must flip synchronously, before the repin's attach round-trip")
+
+        // the repin fires a fresh attach for S2 on the SAME socket (no second hello).
+        await waitUntilSent(t, 3)
+        let attach = feedLineJSON(t.sent[2])
+        XCTAssertEqual(attach["method"] as? String, "session.attach")
+        XCTAssertEqual((attach["params"] as? [String: Any])?["sessionId"] as? String, "S2")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(attach["id"] as! Int),"result":{"ok":true,"lastSeq":0}}"#)
+        await feedWaitUntil { session.state.status != .disconnected }
+
+        // a submit AFTER the repin must target S2, not the stale S1 (the closure-capture fix).
+        controller.adapterForTesting.composerDraft = "hi S2"
+        controller.adapterForTesting.onSubmit("hi S2")
+        await waitUntilSent(t, 4)
+        let send = feedLineJSON(t.sent[3])
+        XCTAssertEqual(send["method"] as? String, "session.send")
+        XCTAssertEqual((send["params"] as? [String: Any])?["sessionId"] as? String, "S2")
+
+        let hellos = t.sent.filter { feedLineJSON($0)["method"] as? String == "protocol.hello" }
+        XCTAssertEqual(hellos.count, 1, "repin must reuse the same socket: \(t.sent)")
+    }
+
+    /// A no-op re-select (the current row tapped again) must not touch the wire at all.
+    func testSelectSessionIsANoOpForTheAlreadyPinnedSession() async throws {
+        let t = DetachedScriptedTransport()
+        let session = SessionModel()
+        let feed = SessionFeed(makeTransport: { t }, token: "tok", clientName: "orb", mode: .pinned(sessionId: "S1"), session: session)
+        let controller = DetachedWindowController(
+            feed: feed, session: session,
+            frame: NSRect(x: 0, y: 0, width: 560, height: 640), title: "Norma"
+        )
+        defer { controller.close() }
+        controller.show()
+
+        await answerHandshake(t, sessionId: "S1")
+        await feedWaitUntil { session.state.status != .disconnected }
+
+        controller.selectSession("S1")
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        let attaches = t.sent.filter { feedLineJSON($0)["method"] as? String == "session.attach" }
+        XCTAssertEqual(attaches.count, 1, "re-selecting the already-pinned session must not re-attach: \(t.sent)")
+    }
+
+    /// Task 5 (2e-iii): the sidebar's "+ New session" action — create, then re-pin onto the freshly
+    /// created id (this window's own feed is `.pinned`, so it never auto-follows `session_created`
+    /// broadcasts — `newSession()`'s explicit `selectSession` call is the only path).
+    func testNewSessionCreatesThenRepins() async throws {
+        let t = DetachedScriptedTransport()
+        let session = SessionModel()
+        let feed = SessionFeed(makeTransport: { t }, token: "tok", clientName: "orb", mode: .pinned(sessionId: "S1"), session: session)
+        let controller = DetachedWindowController(
+            feed: feed, session: session,
+            frame: NSRect(x: 0, y: 0, width: 560, height: 640), title: "Norma"
+        )
+        defer { controller.close() }
+        controller.show()
+
+        await answerHandshake(t, sessionId: "S1")
+        await feedWaitUntil { session.state.status != .disconnected }
+
+        controller.newSession()
+        await waitUntilSent(t, 3)
+        let create = feedLineJSON(t.sent[2])
+        XCTAssertEqual(create["method"] as? String, "session.create")
+        let createParams = create["params"] as? [String: Any]
+        XCTAssertEqual(createParams?["approvalPolicy"] as? String, "auto")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(create["id"] as! Int),"result":{"sessionId":"S2","trusted":true}}"#)
+
+        await waitUntilSent(t, 4)
+        let attach = feedLineJSON(t.sent[3])
+        XCTAssertEqual(attach["method"] as? String, "session.attach")
+        XCTAssertEqual((attach["params"] as? [String: Any])?["sessionId"] as? String, "S2")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(attach["id"] as! Int),"result":{"ok":true,"lastSeq":0}}"#)
+
+        await feedWaitUntil { controller.sessionId == "S2" }
+        XCTAssertEqual(controller.sessionId, "S2")
+    }
+
     func testAppModelMakeDetachedFeedSharesTokenAndTransport() async throws {
         let t = DetachedScriptedTransport()
         let appModel = AppModel(makeTransport: { t }, token: "shared-tok", clientName: "orb")

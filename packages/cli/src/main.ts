@@ -414,7 +414,7 @@ if (import.meta.main) {
   case "sessions": {
     const c = await connect("cli-sessions");
     const { sessions } = (await c.listSessions()) as any;
-    for (const s of sessions) console.log(`${AQUA}${s.sessionId}${RESET} ${DIM}${s.scope} · ${s.lastSeq} events${RESET}`);
+    for (const s of sessions) console.log(`${AQUA}${s.sessionId}${RESET} ${DIM}${s.scope} · ${s.lastSeq} events${process.stdout.isTTY && s.title ? ` — ${s.title}` : ""}${RESET}`);
     c.close();
     break;
   }
@@ -698,7 +698,7 @@ if (import.meta.main) {
       const c = await connect("cli-resume");
       const rows = (await c.listSessions()).sessions;
       if (!rows.length) console.log("no sessions yet");
-      for (const r of rows) console.log(`${r.sessionId}  ${DIM}${r.scope}  ${r.lastSeq} events${RESET}`);
+      for (const r of rows) console.log(`${r.sessionId}  ${DIM}${r.scope}  ${r.lastSeq} events${process.stdout.isTTY && r.title ? ` — ${r.title}` : ""}${RESET}`);
       c.close(); process.exit(0);
     }
     const text = process.argv.slice(4).join(" ");

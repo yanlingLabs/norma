@@ -112,6 +112,10 @@ export const ThreadCompletedEvent = ThreadBase.extend({
   type: z.literal("thread_completed"), stopReason: z.enum(["end_turn", "aborted", "error"]),
 });
 
+export const SessionTitledEvent = ThreadBase.extend({
+  type: z.literal("session_titled"), title: z.string().min(1),
+});
+
 export const SessionEvent = z.discriminatedUnion("type", [
   SessionCreatedEvent,
   HarnessAttachedEvent,
@@ -140,6 +144,7 @@ export const SessionEvent = z.discriminatedUnion("type", [
   WorktreeExitedEvent,
   ThreadStartedEvent,
   ThreadCompletedEvent,
+  SessionTitledEvent,
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 

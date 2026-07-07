@@ -32,6 +32,8 @@ struct WindowSurfaceView: View {
     /// (v1 kept "chat-shell" and "composer-shell" in the same namespace; they never coexist).
     let namespace: Namespace.ID
     let windowSize: CGSize
+    /// Task 6 (2e-iii): the morph window's sidebar wiring, passed straight to `WindowContentView`.
+    let sidebars: SidebarWiring?
     /// Red traffic light + 4-finger tap + Esc collapse to the orb. Task 4: yellow (minimize) no
     /// longer collapses — it detaches into a native, non-morphing window instead.
     let onClose: () -> Void
@@ -135,7 +137,8 @@ struct WindowSurfaceView: View {
         WindowContentView(
             adapter: adapter,
             tint: Color(red: 0.45, green: 0.75, blue: 1.0),
-            topInset: 14
+            topInset: 14,
+            sidebars: sidebars
         ) {
             MacTrafficLights(onClose: onClose, onMinimize: onMinimize, onZoom: onZoom)
                 .padding(.leading, 6)

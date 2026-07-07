@@ -18,12 +18,12 @@ extension NormaClient {
         return (id, trusted)
     }
 
-    public func listSessions() async throws -> [(sessionId: String, scope: String, createdAt: Int, lastSeq: Int)] {
+    public func listSessions() async throws -> [(sessionId: String, scope: String, createdAt: Int, lastSeq: Int, title: String?, cwd: String?)] {
         let r = try await request("session.list", params: nil)
         return (r["sessions"]?.arrayValue ?? []).compactMap { s in
             guard let id = s["sessionId"]?.stringValue, let scope = s["scope"]?.stringValue,
                   let created = s["createdAt"]?.intValue, let last = s["lastSeq"]?.intValue else { return nil }
-            return (id, scope, created, last)
+            return (id, scope, created, last, s["title"]?.stringValue, s["cwd"]?.stringValue)
         }
     }
 
