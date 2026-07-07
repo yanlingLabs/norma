@@ -435,4 +435,30 @@ final class FieldStateAdapter: ObservableObject {
     var onQuestionRespond: (String, [String: String]) -> Void = { _, _ in }
     /// callId, approved, autoAccept, feedback.
     var onPlanRespond: (String, Bool, Bool, String?) -> Void = { _, _, _, _ in }
+
+    // MARK: - Task 4 (2d-iii): ⋯ menu — per-session approval-mode policy
+
+    /// `WindowContentView`'s ⋯ menu current-value readout — a LAST-KNOWN value, not a live daemon
+    /// read: neither `session.list` nor `session.attach` returns `approvalPolicy` in its result
+    /// (verified against `packages/protocol/src/methods.ts`'s `SessionListResult`/
+    /// `SessionAttachResult` — neither field exists there, and `NormaClient+Methods.swift`'s
+    /// `listSessions()`/`attach()` accordingly don't expose one), so there is no cheap wire read to
+    /// seed this from at attach time. Seeded `"auto"` (the orb-created-session default, see
+    /// `AppModel.ensureFocusedSession`'s doc) and updated ONLY on a successful `onSetPolicy` round
+    /// trip (the wirer sets this, not this var itself — same convention as `interactionInFlight`/
+    /// `interactionErrors` above). A session this adapter merely FOLLOWED (e.g. a daemon-default
+    /// "ask" session, per the force-auto removal) shows a stale "auto" here until the user actually
+    /// changes it via the menu — honest given there is currently no way to learn otherwise.
+    @Published var sessionPolicy: String = "auto"
+
+    /// True while a `session.setPolicy` RPC is in flight — the picker's rows disable themselves on
+    /// this. One session-wide flag (not keyed by id like `interactionInFlight`): only one policy
+    /// change can be in flight at a time. Set synchronously before the RPC, cleared once it
+    /// settles — same insert/remove discipline as `interactionInFlight`.
+    @Published var policyChangeInFlight: Bool = false
+
+    /// Wired by whichever surface owns this adapter (`GlassRootView.wireCallbacks()` for the orb/
+    /// window, `DetachedWindowController.init` for a detached window) to `session.setPolicy` — the
+    /// same onSubmit-precedent chain as `onSubmit`/the three respond callbacks above.
+    var onSetPolicy: (String) -> Void = { _ in }
 }

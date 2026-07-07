@@ -97,6 +97,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await self?.appModel?.respondPlan(callId: callId, approved: approved, autoAccept: autoAccept, feedback: feedback) ?? false
         }
 
+        // Task 4 (2d-iii): the ⋯ menu's approval-mode picker — same seam as the three respond
+        // closures above.
+        orb.onSetPolicy = { [weak self] policy in
+            await self?.appModel?.setSessionPolicy(policy) ?? false
+        }
+
         // Task 4 (detach choreography): the yellow traffic light. `requestWindowDetach()` OWNS the
         // ordering — it fires this closure (spawning the detached window SYNCHRONOUSLY via
         // `show()`, before this closure returns) and only THEN runs its own no-animation exit

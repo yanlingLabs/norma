@@ -9,10 +9,10 @@ import NormaKit
 /// session creation.
 ///
 /// SHAPE SHIPPED: hook composition, not extraction-by-delegation. `AppModel`'s focus-follow logic
-/// (`refocus`/`focusNewestSession`/`ensureFocusedSession`/`forceAutoPolicyIfNeeded`) stays
-/// PHYSICALLY in `AppModel` — it depends on `AppModel`-private state (`focusedSessionId`,
-/// `selfCreatedSessionId`, `forcedAutoSessionIds`, `connectionSummary`) that has no reason to live
-/// here. `SessionFeed` owns only the mechanical parts that are IDENTICAL for both modes — the
+/// (`refocus`/`focusNewestSession`/`ensureFocusedSession`/`setSessionPolicy`) stays PHYSICALLY in
+/// `AppModel` — it depends on `AppModel`-private state (`focusedSessionId`, `selfCreatedSessionId`,
+/// `connectionSummary`) that has no reason to live here. `SessionFeed` owns only the mechanical
+/// parts that are IDENTICAL for both modes — the
 /// connect-with-backoff loop, the event pump, and `stop()` (AppModel.swift original :33-66,
 /// verbatim) — and calls back into the mode's owner through four small hooks at the exact points
 /// `AppModel`'s original `start()`/`handle()` touched app-only state. `pinned` mode leaves every

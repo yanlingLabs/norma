@@ -147,6 +147,19 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
             }
         }
 
+        // Task 4 (2d-iii): the ⋯ menu's approval-mode picker — wired DIRECTLY to this window's own
+        // `feed.client`/pinned `sessionId`, same posture as the three respond callbacks just above.
+        // `[weak adapter]` throughout for the same leak reason (one adapter per detached window).
+        adapter.onSetPolicy = { [weak adapter] policy in
+            guard let adapter else { return }
+            adapter.policyChangeInFlight = true
+            Task { @MainActor [weak adapter] in
+                let ok = (try? await client.setPolicy(sessionId: sid, policy: policy)) != nil
+                adapter?.policyChangeInFlight = false
+                if ok { adapter?.sessionPolicy = policy }
+            }
+        }
+
         window.contentView = NSHostingView(rootView: DetachedWindowRootView(adapter: adapter))
         window.setFrame(frame, display: true)
     }

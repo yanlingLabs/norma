@@ -131,6 +131,11 @@ final class OrbWindowController: ObservableObject {
     var onQuestionRespond: ((String, [String: String]) async -> Bool)?
     var onPlanRespond: ((String, Bool, Bool, String?) async -> Bool)?
 
+    /// Task 4 (2d-iii): the ⋯ menu's approval-mode picker — SAME seam as `onApprovalRespond` et al
+    /// just above (`AppDelegate.boot()` wires this to `AppModel.setSessionPolicy`). New policy
+    /// string in, success out.
+    var onSetPolicy: ((String) async -> Bool)?
+
     /// Task 4: fired by `requestWindowDetach()` with the panel's CURRENT frame (spawn the detached
     /// window exactly there). AppDelegate's closure spawns the detached window SYNCHRONOUSLY
     /// (`DetachedWindowController.show()`'s `makeKeyAndOrderFront` runs before the closure

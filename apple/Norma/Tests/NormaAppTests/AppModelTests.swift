@@ -165,25 +165,23 @@ final class AppModelTests: XCTestCase {
         await waitUntil { model.session.state.turnRunning }
 
         async let sent = model.sendOrSteer("also do X")
-        // Finding-1 (gate 2): the orb forces the followed (daemon-created, ask-mode) session to
-        // `auto` BEFORE steering — so a setPolicy precedes the steer on the wire.
+        // 2d-iii task 4 (force-auto removal): the steer goes straight out — no setPolicy precedes
+        // it anymore (see testNoSetPolicyOnAttachOrSteer below).
         await waitUntilSent(t, 4)
-        let policy = lineJSON(t.sent[3])
-        XCTAssertEqual(policy["method"] as? String, "session.setPolicy")
-        XCTAssertEqual((policy["params"] as? [String: Any])?["sessionId"] as? String, "s_1")
-        XCTAssertEqual((policy["params"] as? [String: Any])?["policy"] as? String, "auto")
-        t.feed(#"{"jsonrpc":"2.0","id":\#(policy["id"] as! Int),"result":{"ok":true}}"#)
-        await waitUntilSent(t, 5)
-        let steer = lineJSON(t.sent[4])
+        let steer = lineJSON(t.sent[3])
         XCTAssertEqual(steer["method"] as? String, "session.steer")
         t.feed(#"{"jsonrpc":"2.0","id":\#(steer["id"] as! Int),"result":{"ok":true,"injected":true}}"#)
         _ = await sent
     }
 
-    /// Finding-1 (gate 2): the orb almost always DRIVES a session it merely followed (the daemon's
-    /// default-`ask` global session), not one it created — so it must force that session to `auto`
-    /// before the first send, and do it exactly once per session id (idempotent; daemon persists).
-    func testForcesAutoPolicyOnceForFollowedSession() async throws {
+    /// 2d-iii task 4 (force-auto removal): replaces the old `testForcesAutoPolicyOnceForFollowedSession`.
+    /// Attaching to an existing (daemon-created, ask-policy) session and sending/steering into it
+    /// must NEVER touch `session.setPolicy` — the orb no longer force-flips a followed session's
+    /// policy onto `auto`; it now has its own approval UI (pending-interaction cards, task 3), so
+    /// an ask/plan-mode session simply surfaces its approvals as cards instead of being silently
+    /// forced past. Attached sessions keep their own policy; the ⋯ menu's `setSessionPolicy` (see
+    /// PolicyMenuTests) is the only way a policy changes now, and only on explicit user action.
+    func testNoSetPolicyOnAttachOrSteer() async throws {
         let t = AppScriptedTransport()
         let model = AppModel(makeTransport: { t }, token: "tok")
         let startTask = Task { await model.start() }
@@ -194,30 +192,25 @@ final class AppModelTests: XCTestCase {
         t.feed(#"{"jsonrpc":"2.0","id":\#(attach["id"] as! Int),"result":{"ok":true,"lastSeq":0}}"#)
         await waitUntil { model.session.state.status == .idle }
 
-        // First send forces auto (setPolicy), THEN sends.
         async let first = model.sendOrSteer("one")
         await waitUntilSent(t, 4)
-        let policy = lineJSON(t.sent[3])
-        XCTAssertEqual(policy["method"] as? String, "session.setPolicy")
-        XCTAssertEqual((policy["params"] as? [String: Any])?["sessionId"] as? String, "s_1")
-        XCTAssertEqual((policy["params"] as? [String: Any])?["policy"] as? String, "auto")
-        t.feed(#"{"jsonrpc":"2.0","id":\#(policy["id"] as! Int),"result":{"ok":true}}"#)
-        await waitUntilSent(t, 5)
-        let send1 = lineJSON(t.sent[4])
-        XCTAssertEqual(send1["method"] as? String, "session.send")
-        t.feed(#"{"jsonrpc":"2.0","id":\#(send1["id"] as! Int),"result":{"seq":1}}"#)
+        let send = lineJSON(t.sent[3])
+        XCTAssertEqual(send["method"] as? String, "session.send")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(send["id"] as! Int),"result":{"seq":1}}"#)
         _ = await first
 
-        // Second send: policy already forced — straight to send, NO second setPolicy.
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"turn_started","seq":1,"sessionId":"s_1","ts":0,"threadId":"main"}}"#)
+        await waitUntil { model.session.state.turnRunning }
+
         async let second = model.sendOrSteer("two")
-        await waitUntilSent(t, 6)
-        let send2 = lineJSON(t.sent[5])
-        XCTAssertEqual(send2["method"] as? String, "session.send", "second send must not re-emit setPolicy: \(t.sent)")
-        t.feed(#"{"jsonrpc":"2.0","id":\#(send2["id"] as! Int),"result":{"seq":2}}"#)
+        await waitUntilSent(t, 5)
+        let steer = lineJSON(t.sent[4])
+        XCTAssertEqual(steer["method"] as? String, "session.steer")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(steer["id"] as! Int),"result":{"ok":true,"injected":true}}"#)
         _ = await second
 
         let policyCalls = t.sent.filter { lineJSON($0)["method"] as? String == "session.setPolicy" }
-        XCTAssertEqual(policyCalls.count, 1, "setPolicy must fire exactly once per session id: \(t.sent)")
+        XCTAssertEqual(policyCalls.count, 0, "attached session must keep its own policy — no setPolicy on attach/send/steer: \(t.sent)")
     }
 
     func testInterruptTargetsFocusedSession() async throws {

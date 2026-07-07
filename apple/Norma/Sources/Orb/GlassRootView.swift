@@ -82,6 +82,19 @@ struct GlassRootView: View {
                 if !ok { adapter.interactionErrors[callId] = "couldn't send — try again" }
             }
         }
+
+        // Task 4 (2d-iii): the ⋯ menu's approval-mode picker — same seam/discipline as the three
+        // respond callbacks above (in-flight flipped SYNCHRONOUSLY, cleared once the RPC settles),
+        // except `sessionPolicy` itself is bumped to the new value ONLY on success — a failed flip
+        // leaves the picker showing the still-true last-known value instead of lying about it.
+        adapter.onSetPolicy = { [adapter, controller] policy in
+            adapter.policyChangeInFlight = true
+            Task { @MainActor in
+                let ok = await controller.onSetPolicy?(policy) ?? false
+                adapter.policyChangeInFlight = false
+                if ok { adapter.sessionPolicy = policy }
+            }
+        }
     }
 
     var body: some View {
