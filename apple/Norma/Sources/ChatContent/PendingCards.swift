@@ -63,6 +63,18 @@ func questionAnswers(
     return answers
 }
 
+/// Whether a question card's local state answers EVERY question — the gate for enabling the
+/// whole-card Submit button. Mirrors `questionAnswers`'s own definition of "answered" (a non-empty
+/// Other text, or a non-empty selection) rather than re-deriving it independently, so the gate and
+/// the payload never disagree about what counts as answered.
+func questionCardComplete(
+    questions: [SessionEvent.Question],
+    selections: [Int: Set<Int>],
+    otherTexts: [Int: String]
+) -> Bool {
+    questionAnswers(for: questions, selections: selections, otherTexts: otherTexts).count == questions.count
+}
+
 /// Per-kind card header text. Approval names the tool; a question card titles itself after its
 /// FIRST question's `header` (a batch ask's later questions render their own `question` text
 /// inline in the body — see `PendingQuestionBody`); a plan card's title is fixed (the plan text
@@ -185,13 +197,14 @@ private struct PendingApprovalBody: View {
 
 // MARK: - Question card
 
-/// One ask can carry 1-4 questions (`packages/core/src/agent/tools/ask-user.ts`); this body
-/// renders all of them, accumulating selections/Other text across the WHOLE card in local state
-/// so `questionAnswers` always computes the full, current dict — every answer affordance below
-/// (an option button, a multiSelect Confirm, an Other Send) calls `submit()`, which re-derives and
-/// forwards that whole-card dict, so the last one you interact with carries every answer you've
-/// given so far. Task 3 owns de-duplication of repeat sends (via `inFlight`, once it flips true
-/// for this callId after the first accepted answer).
+/// One ask can carry 1-4 questions (`packages/core/src/agent/tools/ask-user.ts`). The daemon's
+/// `QuestionBroker.respond` is FIRST-RESPONSE-WINS: the first `onQuestion` RPC resolves the
+/// ENTIRE `ask_user` call, and the reducer removes the whole card. So per-question affordances
+/// (an option button, a multiSelect toggle, the Other text field) must NOT call `onQuestion` —
+/// they only RECORD local selection/Other-text state. There is exactly one submit path: the
+/// whole-card Submit button below, disabled until `questionCardComplete` says every question has
+/// an answer, which calls `onQuestion` once with the full, current `questionAnswers` dict.
+/// Single-question cards go through the same gate — no divergent single-vs-multi submit path.
 private struct PendingQuestionBody: View {
     let callId: String
     let questions: [SessionEvent.Question]
@@ -201,6 +214,10 @@ private struct PendingQuestionBody: View {
     @State private var selections: [Int: Set<Int>] = [:]
     @State private var otherTexts: [Int: String] = [:]
     @State private var otherExpanded: Set<Int> = []
+
+    private var isComplete: Bool {
+        questionCardComplete(questions: questions, selections: selections, otherTexts: otherTexts)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -215,19 +232,26 @@ private struct PendingQuestionBody: View {
                     isInFlight: isInFlight,
                     onSelectSingle: { optionIndex in
                         selections[index] = [optionIndex]
-                        submit()
+                        otherTexts[index] = ""
                     },
                     onToggleMulti: { optionIndex in
                         var current = selections[index] ?? []
                         if current.contains(optionIndex) { current.remove(optionIndex) } else { current.insert(optionIndex) }
                         selections[index] = current
+                        otherTexts[index] = ""
                     },
-                    onConfirmMulti: { submit() },
                     onExpandOther: { otherExpanded.insert(index) },
-                    onOtherTextChange: { otherTexts[index] = $0 },
-                    onSendOther: { submit() }
+                    onOtherTextChange: { text in
+                        otherTexts[index] = text
+                        selections[index] = []
+                    }
                 )
             }
+
+            Button("Submit", action: submit)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(isInFlight || !isComplete)
         }
     }
 
@@ -236,9 +260,11 @@ private struct PendingQuestionBody: View {
     }
 }
 
-/// One question's options + Other row. Non-multiSelect renders plain option buttons (a click IS
-/// the answer — matches the CLI's single-choice-per-click flow); multiSelect renders toggle rows
-/// plus an explicit Confirm (there's no single click that unambiguously means "done picking").
+/// One question's options + Other row. Selecting a listed option (single or multi) clears that
+/// question's Other text, and typing into Other clears that question's selection — the two
+/// affordances are mutually exclusive per question so a stale Other string can never silently
+/// outrank (or be outranked by) a fresh selection in `questionAnswers`. No affordance here submits
+/// the card — see `PendingQuestionBody`'s single whole-card Submit button.
 private struct QuestionBlock: View {
     let index: Int
     let question: SessionEvent.Question
@@ -249,10 +275,8 @@ private struct QuestionBlock: View {
     let isInFlight: Bool
     let onSelectSingle: (Int) -> Void
     let onToggleMulti: (Int) -> Void
-    let onConfirmMulti: () -> Void
     let onExpandOther: () -> Void
     let onOtherTextChange: (String) -> Void
-    let onSendOther: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -267,13 +291,6 @@ private struct QuestionBlock: View {
 
             ForEach(Array(question.options.enumerated()), id: \.offset) { optionIndex, option in
                 optionRow(optionIndex, option)
-            }
-
-            if question.multiSelect {
-                Button("Confirm", action: onConfirmMulti)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .disabled(isInFlight)
             }
 
             otherRow
@@ -323,15 +340,10 @@ private struct QuestionBlock: View {
     @ViewBuilder
     private var otherRow: some View {
         if isOtherExpanded {
-            HStack(spacing: 8) {
-                TextField("Other…", text: Binding(get: { otherText }, set: onOtherTextChange))
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 12))
-                Button("Send", action: onSendOther)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .disabled(isInFlight || otherText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
+            TextField("Other…", text: Binding(get: { otherText }, set: onOtherTextChange))
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12))
+                .disabled(isInFlight)
         } else {
             Button("Other…", action: onExpandOther)
                 .buttonStyle(.plain)

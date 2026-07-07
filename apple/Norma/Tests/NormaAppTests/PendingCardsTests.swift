@@ -41,6 +41,49 @@ final class PendingCardsTests: XCTestCase {
         XCTAssertEqual(answers.count, 2)
     }
 
+    func testQuestionAnswersCountReflectsPartialAnswers() {
+        let qs = questions(#"[{"question":"Which db?","header":"DB","options":[{"label":"Postgres","description":null}],"multiSelect":false},{"question":"Which port?","header":"Port","options":[{"label":"80","description":null}],"multiSelect":false}]"#)
+        let partial = questionAnswers(for: qs, selections: [0: [0]], otherTexts: [:])
+        XCTAssertEqual(partial.count, 1)
+        XCTAssertLessThan(partial.count, qs.count)
+
+        let full = questionAnswers(for: qs, selections: [0: [0], 1: [0]], otherTexts: [:])
+        XCTAssertEqual(full.count, qs.count)
+    }
+
+    // MARK: - questionCardComplete (whole-card Submit gate)
+
+    func testQuestionCardCompleteFalseWhenUnanswered() {
+        let qs = questions(#"[{"question":"Which db?","header":"DB","options":[{"label":"Postgres","description":null}],"multiSelect":false}]"#)
+        XCTAssertFalse(questionCardComplete(questions: qs, selections: [:], otherTexts: [:]))
+    }
+
+    func testQuestionCardCompleteFalseWhenPartiallyAnswered() {
+        let qs = questions(#"[{"question":"Which db?","header":"DB","options":[{"label":"Postgres","description":null}],"multiSelect":false},{"question":"Which port?","header":"Port","options":[{"label":"80","description":null}],"multiSelect":false}]"#)
+        XCTAssertFalse(questionCardComplete(questions: qs, selections: [0: [0]], otherTexts: [:]))
+    }
+
+    func testQuestionCardCompleteTrueWhenAllAnsweredBySelection() {
+        let qs = questions(#"[{"question":"Which db?","header":"DB","options":[{"label":"Postgres","description":null}],"multiSelect":false},{"question":"Which port?","header":"Port","options":[{"label":"80","description":null}],"multiSelect":false}]"#)
+        XCTAssertTrue(questionCardComplete(questions: qs, selections: [0: [0], 1: [0]], otherTexts: [:]))
+    }
+
+    func testQuestionCardCompleteTrueWhenAnsweredByOtherText() {
+        let qs = questions(#"[{"question":"Which db?","header":"DB","options":[{"label":"Postgres","description":null}],"multiSelect":false}]"#)
+        XCTAssertTrue(questionCardComplete(questions: qs, selections: [:], otherTexts: [0: "SQLite"]))
+    }
+
+    func testQuestionCardCompleteFalseWhenOtherTextIsWhitespaceOnly() {
+        let qs = questions(#"[{"question":"Which db?","header":"DB","options":[{"label":"Postgres","description":null}],"multiSelect":false}]"#)
+        XCTAssertFalse(questionCardComplete(questions: qs, selections: [:], otherTexts: [0: "   "]))
+    }
+
+    func testQuestionCardCompleteSingleQuestionMatchesOneAnswerGate() {
+        let qs = questions(#"[{"question":"Which db?","header":"DB","options":[{"label":"Postgres","description":null}],"multiSelect":false}]"#)
+        XCTAssertFalse(questionCardComplete(questions: qs, selections: [:], otherTexts: [:]))
+        XCTAssertTrue(questionCardComplete(questions: qs, selections: [0: [0]], otherTexts: [:]))
+    }
+
     func testCardTitles() {
         let approval = PendingInteraction.approval(callId: "a1", toolName: "bash", summary: "rm x")
         XCTAssertEqual(cardTitle(approval), "Approval needed — bash")
