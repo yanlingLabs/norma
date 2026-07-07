@@ -17,6 +17,22 @@ struct TaskItem: Equatable {
     var startedTs: Int? = nil
 }
 
+/// One live child thread (2e-ii) — lifecycle + ACTIVE-time spans only. Tokens are deliberately
+/// absent: the window shows time, the CLI shows tokens (each side's reducer tracks only what it
+/// displays — spec §2). All timestamps are daemon `event.ts` (reducer purity).
+struct SubagentItem: Equatable {
+    let threadId: String
+    var agentType: String
+    var label: String
+    /// "queued" (spawned, waiting for a SubagentManager slot) → "working" → "done".
+    var status: String
+    var stopReason: String? = nil
+    /// Banked sum of completed child-turn windows (ms).
+    var activeMs: Int = 0
+    /// event.ts of the open turn_started; nil when not currently working.
+    var activeSince: Int? = nil
+}
+
 /// A single outstanding human-in-the-loop interaction the daemon is waiting on — approval,
 /// question, or plan — carrying the payload cards need to render (2d-iii task 1). Replaces the
 /// old `pendingApprovalIds: Set<String>`, which tracked only callIds and dropped everything else
@@ -79,6 +95,10 @@ struct Exchange: Equatable {
 struct OrbSessionState: Equatable {
     var status: OrbStatus = .disconnected // until markConnected() — M2 contract
     var tasks: [TaskItem] = []
+    /// Live child threads of the CURRENT main turn (2e-ii) — pruned wholesale when the main turn
+    /// ends (children always finish first: the parent tool loop awaits the batch), so a replayed
+    /// finished session correctly shows none.
+    var subagents: [SubagentItem] = []
     /// Ordered (oldest first), replay-rebuildable list of outstanding approvals/questions/plans —
     /// 2d-iii task 1. `*_requested`/`*_asked`/`*_presented` append (skipping a callId already
     /// present, so a replayed duplicate event is a no-op, not a second card); the matching
@@ -157,6 +177,13 @@ enum SessionReducer {
             s.status = .thinking
             s.streamingText = ""
             s.lastTurnAborted = false // a fresh turn clears any prior interrupt flag
+        case .turnStarted(let v):
+            // CHILD thread got a SubagentManager slot — the active timer starts here, not at
+            // thread_started (queued-but-idle time must NOT count — spec §2).
+            if let i = s.subagents.firstIndex(where: { $0.threadId == v.threadId }) {
+                s.subagents[i].status = "working"
+                s.subagents[i].activeSince = v.ts
+            }
         case .toolCall(let v) where v.threadId == mainThread:
             if s.pendingInteractions.isEmpty { s.status = .toolRunning(name: v.name) }
             appendActivity(.tool(name: v.name, detail: extractToolDetail(name: v.name, argsJson: v.argsJson)), to: &s)
@@ -199,6 +226,16 @@ enum SessionReducer {
                 // lastTurnAborted flash above, this stays on the exchange for the transcript.
                 s.exchanges[s.exchanges.count - 1].aborted = true
             }
+            s.subagents = [] // 2e-ii prune: children always complete before the main turn does
+        case .turnCompleted(let v):
+            // CHILD turn window closed — bank the active span. Status stays "working" (alive)
+            // until thread_completed; a next child turn would reopen a span.
+            if let i = s.subagents.firstIndex(where: { $0.threadId == v.threadId }) {
+                if let since = s.subagents[i].activeSince {
+                    s.subagents[i].activeMs += max(0, v.ts - since)
+                    s.subagents[i].activeSince = nil
+                }
+            }
         case .agentError(let v) where v.threadId == mainThread:
             s.turnRunning = false
             s.pendingInteractions = []
@@ -208,6 +245,7 @@ enum SessionReducer {
             if let last = s.exchanges.indices.last, s.exchanges[last].reply.isEmpty {
                 s.exchanges[last].reply = "⚠︎ \(v.message)"
             }
+            s.subagents = [] // defensive prune — an errored main turn must not strand a live block
         case .taskUpdated(let v): // any thread — tasks are session-wide
             // 2d-ii-a task 1: remember the PRE-upsert status so activity capture below can
             // append only when this event actually transitioned the task (nil = brand-new
@@ -284,8 +322,26 @@ enum SessionReducer {
             // would drop all of them — yet they ARE main-transcript-relevant ("spawned an agent").
             // Guard on turnRunning instead: only capture while the main turn is actually going.
             if s.turnRunning { appendActivity(.subagent(agentType: v.agentType), to: &s) }
-        case .threadCompleted:
+            // 2e-ii: live-list insert — dedupe by threadId (replay-safe).
+            if !s.subagents.contains(where: { $0.threadId == v.threadId }) {
+                s.subagents.append(SubagentItem(
+                    threadId: v.threadId,
+                    agentType: v.agentType,
+                    label: subagentLabel(description: v.description, prompt: v.prompt),
+                    status: "queued"
+                ))
+            }
+        case .threadCompleted(let v):
             if s.turnRunning { appendActivity(.subagentDone, to: &s) }
+            if let i = s.subagents.firstIndex(where: { $0.threadId == v.threadId }) {
+                s.subagents[i].status = "done"
+                s.subagents[i].stopReason = v.stopReason
+                if let since = s.subagents[i].activeSince {
+                    // Defensive: an aborted child can die without its own turn_completed.
+                    s.subagents[i].activeMs += max(0, v.ts - since)
+                    s.subagents[i].activeSince = nil
+                }
+            }
         default:
             break // messages/deltas/bg/checkpoint/harness + child-thread events don't move state
         }
