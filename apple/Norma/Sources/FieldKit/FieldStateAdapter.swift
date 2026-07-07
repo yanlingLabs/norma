@@ -232,6 +232,15 @@ final class FieldStateAdapter: ObservableObject {
         return tasks.contains(where: { $0.status != "completed" }) ? tasks : []
     }
 
+    /// 2e-ii: the live subagent block (WindowContentView renders it below the composer). Empty —
+    /// hiding the whole section — once every child is done (or none exist): the block is "what's
+    /// working now", the transcript's ⌥/✓ activity rows are the durable record. The reducer prunes
+    /// the list at main turn end, so this also never shows a previous turn's batch.
+    var liveSubagents: [SubagentItem] {
+        let subagents = session.state.subagents
+        return anySubagentAlive(subagents.map(\.status)) ? subagents : []
+    }
+
     /// Task B hook (mirrors `OrbWindowController.exchangeIndex`): which historical exchange, if
     /// any, `visibleResponse` should read instead of the live stream / most recent reply. `nil`
     /// = live/most-recent. Wired by `GlassRootView`'s `.onChange(of: controller.exchangeIndex)`
