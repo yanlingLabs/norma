@@ -1047,11 +1047,16 @@ final class OrbWindowController: ObservableObject {
     /// progress 0 and exactly `zoomedContentSize` at progress 1 with no floating-point drift at
     /// either end).
     private func interpolatedZoomContentSize(progress: Double) -> CGSize {
-        CGSize(
+        // Task-5 review: clamp like morphedWindowSurfaceRect does — 140/22 is barely underdamped
+        // (ζ≈0.93), so the scalar can transiently tick past [0,1] before the settle epsilon
+        // fires; unclamped, that overshoot fed panel.setFrame directly (a few px past the
+        // intended bounds for 1-2 ticks).
+        let p = max(0.0, min(1.0, progress))
+        return CGSize(
             width: chatWindowDefaultSize.width
-                + (zoomedContentSize.width - chatWindowDefaultSize.width) * progress,
+                + (zoomedContentSize.width - chatWindowDefaultSize.width) * p,
             height: chatWindowDefaultSize.height
-                + (zoomedContentSize.height - chatWindowDefaultSize.height) * progress
+                + (zoomedContentSize.height - chatWindowDefaultSize.height) * p
         )
     }
 
@@ -1073,7 +1078,11 @@ final class OrbWindowController: ObservableObject {
         )
         morphModel.windowFinalRect = layout.finalRect
         morphModel.windowOrbPoint = layout.orbPoint
-        panel.setFrame(layout.windowFrame, display: true)
+        // Task-5 review: `display: false` like EVERY other per-tick setFrame in this file
+        // (rideWindowCollapseToCursor's precedent) — `true` forced a synchronous WindowServer
+        // redisplay 60×/s; let AppKit coalesce with the run loop. The mouse gate reads
+        // panel.frame directly, which updates synchronously regardless of the flag.
+        panel.setFrame(layout.windowFrame, display: false)
         morphModel.activeWindowSize = layout.windowFrame.size
     }
 
