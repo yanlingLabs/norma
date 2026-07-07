@@ -224,7 +224,13 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
       emit(`${AQUA}${(e as { delta: string }).delta}${RESET}`);
     } else if (sa.action === "close_line") emit("\n");
     applyEvent(wd, e, Date.now());
-    if (e.type === "turn_started") {
+    if (e.type === "turn_started" && e.threadId === "main") {
+      // Task-4 review fix: MAIN-thread only. runThread() emits turn_started/turn_completed for
+      // every spawned subagent CHILD thread too (broadcast to all harnesses with a non-"main"
+      // threadId — same reason stream-state.ts guards deltas on "main"). Without this guard a
+      // child's turn_started reset the parent's clock/token estimate and a child's turn_completed
+      // flipped turnRunning off mid-parent-turn — the status line flickered/vanished while the
+      // real turn was still running.
       turnRunning = true;
       turnStartMs = Date.now();
       streamedChars = 0;
@@ -306,7 +312,12 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
       emit(`${DIM}✓ subagent done${e.stopReason !== "end_turn" ? ` (${e.stopReason})` : ""}${RESET}\n`);
     } else if (e.type === "agent_error") {
       console.error(`agent error: ${e.message}`);
-    } else if (e.type === "turn_completed") {
+    } else if (e.type === "turn_completed" && e.threadId === "main") {
+      // Task-4 review fix (MAIN-thread only — see turn_started above). This ALSO fixes a
+      // pre-existing latent bug the review surfaced: a subagent CHILD's turn_completed always
+      // fires BEFORE the main thread's own (children are awaited inside the main tool loop), so an
+      // unguarded endHeadlessTurn() would c.close()/exit the CLI the instant the FIRST subagent
+      // finished — while the main turn was still running. The threadId guard closes both.
       turnRunning = false;
       lastInTokens = e.inputTokens;
       lastOutTokens = e.outputTokens;
