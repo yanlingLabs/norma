@@ -209,4 +209,39 @@ describe("SessionStore", () => {
     expect(store.lastSeq(id)).toBe(2);
     expect(() => store.lastSeq("s_nope")).toThrow("unknown session");
   });
+
+  test("session_titled append sets title; list() returns it; getTitle only sees generated", () => {
+    const { store } = makeStore();
+    const sid = store.createSession("global");
+    store.append(sid, { type: "user_message", sessionId: sid, threadId: "main", text: "help me fix the login flow please\nsecond line", clientName: "t" });
+    expect(store.getTitle(sid)).toBeNull();
+    expect(store.list().find(r => r.sessionId === sid)!.title).toBe("help me fix the login flow please"); // fallback: first line, ≤60
+    store.append(sid, { type: "session_titled", sessionId: sid, threadId: "main", title: "Fixing the login flow" });
+    expect(store.getTitle(sid)).toBe("Fixing the login flow");
+    expect(store.list().find(r => r.sessionId === sid)!.title).toBe("Fixing the login flow");
+  });
+
+  test("fallback truncates to 60 chars with ellipsis; no messages → undefined title", () => {
+    const { store } = makeStore();
+    const sid = store.createSession("global");
+    expect(store.list().find(r => r.sessionId === sid)!.title).toBeUndefined();
+    store.append(sid, { type: "user_message", sessionId: sid, threadId: "main", text: "x".repeat(80), clientName: "t" });
+    expect(store.list().find(r => r.sessionId === sid)!.title).toBe("x".repeat(59) + "…");
+  });
+
+  test("index rebuild from logs restores title and first_message", () => {
+    const { store, dir } = makeStore();
+    const sid = store.createSession("global");
+    store.append(sid, { type: "user_message", sessionId: sid, threadId: "main", text: "hello there", clientName: "t" });
+    store.append(sid, { type: "session_titled", sessionId: sid, threadId: "main", title: "Greeting session" });
+    store.close();
+    rmSync(join(dir, "sessions", "index.db"));
+    for (const ext of ["-wal", "-shm"]) {
+      const f = join(dir, "sessions", "index.db" + ext);
+      try { rmSync(f); } catch { /* ignore if not present */ }
+    }
+    const reopened = new SessionStore(dir);
+    expect(reopened.list().find(r => r.sessionId === sid)!.title).toBe("Greeting session");
+    reopened.close();
+  });
 });
