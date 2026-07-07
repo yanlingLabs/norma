@@ -25,4 +25,12 @@ final class WindowTaskSectionTests: XCTestCase {
         XCTAssertEqual(result.rows.map(\.status), ["in_progress", "completed", "completed"])
         XCTAssertEqual(result.collapsedCompleted, 1)
     }
+
+    /// Task-3 review: the D9 invariant — with NO in_progress task, `activeStartedTs` is nil, so the
+    /// view's `TimelineView` elapsed tick never mounts (no idle per-second cost). The single most
+    /// important behavioral guarantee of this task, now regression-pinned.
+    func testNoActiveTaskYieldsNilStartedTs() {
+        let result = buildTaskSection([item("p1", "pending"), item("c1", "completed")])
+        XCTAssertNil(result.activeStartedTs)
+    }
 }

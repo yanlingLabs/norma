@@ -188,7 +188,9 @@ struct WindowContentView<Accessory: View>: View {
                 // D9: the periodic tick is mounted ONLY for the active row's elapsed suffix, and
                 // only when there IS an active row with a startedTs — no idle ticking otherwise.
                 TimelineView(.periodic(from: .now, by: 1)) { _ in
-                    Text("· " + formatElapsed(Int(Date().timeIntervalSince1970 * 1000) - startedTs))
+                    // max(0,…): startedTs is daemon-stamped; a small clock skew (or an event
+                    // arriving "ahead") must never render a negative "-5s".
+                    Text("· " + formatElapsed(max(0, Int(Date().timeIntervalSince1970 * 1000) - startedTs)))
                 }
             }
         }
