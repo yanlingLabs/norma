@@ -55,6 +55,15 @@ final class SessionFeed {
         self.session = session
     }
 
+    /// Task 3: the fixed session id in `.pinned` mode; `nil` in `.followFocus` mode (which has no
+    /// single fixed id — the focused session changes over time). `DetachedWindowController`'s
+    /// `init(feed:session:frame:title:)` doesn't carry a separate sessionId parameter — its
+    /// submit/steer/interrupt wire needs the id, and this is the only place it lives.
+    var pinnedSessionId: String? {
+        if case .pinned(let sessionId) = mode { return sessionId }
+        return nil
+    }
+
     /// Connect w/ capped backoff → mode's attach phase → mark connected → pump `client.events`
     /// into the reducer until the stream ends. Verbatim extraction of `AppModel`'s original
     /// `start()` (AppModel.swift :33-61), generalized via the hooks above.

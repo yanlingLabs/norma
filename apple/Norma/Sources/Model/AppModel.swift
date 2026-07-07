@@ -16,6 +16,21 @@ final class AppModel: ObservableObject {
     private var focusedSessionId: String?
     private var selfCreatedSessionId: String?
 
+    /// Task 3 (2d-ii-b): stashed so `makeDetachedFeed(sessionId:)` can mint a FRESH `SessionFeed`
+    /// (its own `NormaClient`/socket — a full harness, spec §"harness-per-window") for a detached
+    /// window, sharing the same transport factory + token AppModel itself connects with (one
+    /// Keychain read, shared — no per-window Keychain prompts). Previously only passed through to
+    /// the `followFocus` feed built in `init` below; nothing needed to reconstruct another one.
+    private let makeTransport: @Sendable () -> NormaTransport
+    private let token: String
+    private let clientName: String
+
+    /// The sentinel `AppDelegate.boot()` passes when the Keychain has no harness token yet (see
+    /// `AppDelegate.swift`'s `production`/`tokenMissing` wiring) — kept in sync with that literal
+    /// by hand; `makeDetachedFeed` refuses to spawn a harness against it (spec §4: "cannot spawn a
+    /// harness without a token").
+    static let missingTokenSentinel = "missing-token"
+
     /// Finding-1 fix (gate 2): session ids the orb has already forced to `approvalPolicy: "auto"`
     /// (see `forceAutoPolicyIfNeeded`). One flip per focused session id is enough — the daemon
     /// persists the policy — so this keeps every subsequent send off the `session.setPolicy` wire.
@@ -24,6 +39,9 @@ final class AppModel: ObservableObject {
     private var forcedAutoSessionIds: Set<String> = []
 
     init(makeTransport: @escaping @Sendable () -> NormaTransport, token: String, clientName: String = "orb") {
+        self.makeTransport = makeTransport
+        self.token = token
+        self.clientName = clientName
         feed = SessionFeed(makeTransport: makeTransport, token: token, clientName: clientName, mode: .followFocus, session: session)
         // Hook composition (see SessionFeed's doc comment for why): these four closures are the
         // ONLY seam between the extracted mechanics and AppModel's focus-follow behavior, each
@@ -53,6 +71,25 @@ final class AppModel: ObservableObject {
 
     func stop() {
         feed.stop()
+    }
+
+    /// Task 3 (2d-ii-b): a detached window's own harness — a FRESH `SessionModel` + a `pinned`
+    /// `SessionFeed` sharing AppModel's transport factory/token/clientName, wired to `sessionId`
+    /// forever (never follows focus). Returns `nil` when this AppModel was booted with the
+    /// degraded "no daemon token yet" fallback (`AppDelegate.boot()`'s `tokenMissing` path,
+    /// `missingTokenSentinel`) — spec §4: "cannot spawn a harness without a token," logged rather
+    /// than silently handed a client that can never authenticate.
+    func makeDetachedFeed(sessionId: String) -> (feed: SessionFeed, session: SessionModel)? {
+        guard token != Self.missingTokenSentinel else {
+            OrbDebug.log("makeDetachedFeed: no daemon token — refusing to spawn a detached harness for \(sessionId.prefix(10))")
+            return nil
+        }
+        let detachedSession = SessionModel()
+        let detachedFeed = SessionFeed(
+            makeTransport: makeTransport, token: token, clientName: clientName,
+            mode: .pinned(sessionId: sessionId), session: detachedSession
+        )
+        return (detachedFeed, detachedSession)
     }
 
     /// Field summon path: a session to talk to, creating one if none is focused.

@@ -12,6 +12,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var startTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
 
+    /// Task 3 (2d-ii-b) registry: every currently-open detached window. Task 4's detach
+    /// choreography appends via `registerDetachedWindow` on spawn; `onClosed` (wired there) removes
+    /// it again on either a programmatic `close()` or the user's own red traffic light — the list
+    /// never accumulates closed controllers.
+    private(set) var detachedWindows: [DetachedWindowController] = []
+
+    /// Registers a freshly spawned detached window and wires its one-shot `onClosed` to remove it
+    /// from `detachedWindows` again. Called by Task 4's detach choreography (yellow on the morph
+    /// window) — nothing in this task spawns one yet.
+    func registerDetachedWindow(_ controller: DetachedWindowController) {
+        detachedWindows.append(controller)
+        controller.onClosed = { [weak self] closed in
+            self?.detachedWindows.removeAll { $0 === closed }
+        }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         guard !Self.isRunningUnitTests else { return }
@@ -148,6 +164,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         startTask?.cancel()
         appModel?.stop()
+        // Best-effort: each detached window's own feed/socket must not survive the app (spec §5
+        // D9 — a closed window leaves nothing running; termination is a harder stop than that).
+        detachedWindows.forEach { $0.close() }
     }
 
     static var isRunningUnitTests: Bool {
