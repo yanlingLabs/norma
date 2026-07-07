@@ -203,7 +203,7 @@ describe("TASK_ICONS (unchanged — still used for the non-TTY one-line-per-upda
 describe("renderSubagentBlock", () => {
   const sub = (over: Partial<CliSubagent>): CliSubagent => ({
     threadId: "th_a", agentType: "general-purpose", label: "explore auth module",
-    status: "working", outputTokens: 0, liveOutputChars: 0, ...over,
+    status: "working", outputTokens: 0, liveOutputChars: 0, activeMs: 0, toolCalls: 0, ...over,
   });
 
   test("empty when no items or all done", () => {

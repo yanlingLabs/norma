@@ -1,7 +1,11 @@
-/** Shared pure subagent-display logic (Phase 2e-ii) — glyph/label/alive are LOCKSTEP with
+/** Shared pure subagent-display logic (Phase 2e-ii/2e-iii-b) — glyph/label/alive are LOCKSTEP with
  *  `apple/Norma/Sources/ChatContent/SubagentDisplay.swift` (same fixtures both sides, like
- *  task-display.ts). `subagentTokens` is TS-ONLY: token arrows render only in the CLI (the window
- *  shows time instead — its Swift-only twin is `subagentActiveMs`). Pure — no ANSI, no I/O. */
+ *  task-display.ts). `subagentTokens` is TS-ONLY: token arrows render only in the CLI (2e-iii-b
+ *  corrects this — the CLI now shows BOTH time and tokens). `extractToolDetail` is a TS port of
+ *  SessionModel.swift's `private static func extractToolDetail` — same field-picking rules per
+ *  tool name, mirrored exactly. `subagentElapsedMs` is the CLI-side twin of Swift's
+ *  `subagentActiveMs`: banked `activeMs` plus the still-open span while `status === "working"`.
+ *  Pure — no ANSI, no I/O. */
 
 import { formatTokens } from "./task-display";
 
@@ -34,4 +38,56 @@ export function subagentTokens(inputTokens: number | undefined, outputTokens: nu
   const down = outputTokens + Math.ceil(liveOutputChars / 4);
   if (inputTokens === undefined) return down === 0 ? "" : `↓ ${formatTokens(down)}`;
   return `↑ ${formatTokens(inputTokens)} ↓ ${formatTokens(down)}`;
+}
+
+/** TS port of SessionModel.swift's `private static func extractToolDetail(name:argsJson:)`.
+ *  Parses `argsJson` defensively (malformed JSON, non-object JSON, or an empty/missing field all
+ *  yield `undefined` rather than throwing) and picks a per-tool detail field:
+ *  - `bash` → the command's first line, capped at 100 chars
+ *  - `task_create` / `task_update` → `subject`
+ *  - `read` / `write` / `edit` / `glob` / `grep` / `ls` → `file_path` ?? `path` ?? `pattern`
+ *  - anything else → `undefined` */
+export function extractToolDetail(name: string, argsJson: string): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(argsJson);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const obj = parsed as Record<string, unknown>;
+
+  const str = (key: string): string | undefined => {
+    const v = obj[key];
+    return typeof v === "string" && v.length > 0 ? v : undefined;
+  };
+
+  switch (name) {
+    case "bash": {
+      const command = str("command");
+      if (command === undefined) return undefined;
+      const firstLine = command.split("\n", 1)[0] ?? command;
+      return firstLine.slice(0, 100);
+    }
+    case "task_create":
+    case "task_update":
+      return str("subject");
+    case "read":
+    case "write":
+    case "edit":
+    case "glob":
+    case "grep":
+    case "ls":
+      return str("file_path") ?? str("path") ?? str("pattern");
+    default:
+      return undefined;
+  }
+}
+
+/** Elapsed active time for a subagent row: banked `activeMs` plus the still-open span while
+ *  `status === "working"` (the open span is clamped to ≥ 0 to absorb clock skew between the
+ *  daemon-stamped `activeSince` and the caller's `nowMs`). Mirrors Swift's `subagentActiveMs`. */
+export function subagentElapsedMs(s: { activeMs: number; activeSince?: number; status: string }, nowMs: number): number {
+  const open = s.status === "working" && s.activeSince !== undefined ? Math.max(0, nowMs - s.activeSince) : 0;
+  return s.activeMs + open;
 }
