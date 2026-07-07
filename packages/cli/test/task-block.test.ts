@@ -73,17 +73,18 @@ describe("renderTaskBlock (CC tree: shared sort/collapse + colored glyphs)", () 
     ]);
   });
 
-  test("testBlockSortsAndCollapses: 1 in_progress + 3 completed → in_progress row first (■), '… +1 completed' present", () => {
+  test("testBlockSortsAndCollapses: 1 in_progress + 4 completed → in_progress row first (■), '… +1 completed' present (cap 3)", () => {
     const tasks = [
       task("c1", "alpha", "completed"),
       task("c2", "beta", "completed"),
       task("ip", "active one", "in_progress"),
       task("c3", "gamma", "completed"),
+      task("c4", "delta", "completed"),
     ];
     const lines = renderTaskBlock(tasks);
     expect(lines[0]).toBe(`${BLUE}■${RESET}${BOLD} active one${RESET}`);
     expect(lines).toContain(`${DIM}… +1 completed${RESET}`);
-    expect(lines).toHaveLength(4); // in_progress + 2 kept completed + 1 collapsed summary row
+    expect(lines).toHaveLength(5); // in_progress + 3 kept completed + 1 collapsed summary row
   });
 
   test("testBlockGlyphsBlueGreen: output contains the blue ANSI for ■ and the green ANSI for ✓", () => {

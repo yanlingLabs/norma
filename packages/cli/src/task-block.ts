@@ -55,7 +55,7 @@ function glyphColor(status: string): string {
 }
 
 /** Pure block content: the Claude-Code-style task tree — in_progress first, then pending, with
- *  completed rows collapsed to the 2 most recent plus a "… +N completed" summary (shared
+ *  completed rows collapsed to the 3 most recent plus a "… +N completed" summary (shared
  *  sort/collapse rules from task-display.ts, kept in lockstep with the Swift window twin). Each
  *  row's glyph is colored by status (blue/in_progress, green/completed, dim/pending); the single
  *  in_progress row's subject is bold. Empty when there are no tasks, or when every task is

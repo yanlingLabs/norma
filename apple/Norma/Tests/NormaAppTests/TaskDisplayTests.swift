@@ -15,16 +15,30 @@ final class TaskDisplayTests: XCTestCase {
         XCTAssertEqual(r.map(\.id), ["c", "b", "d", "a"])
     }
 
-    func testCollapseAllIncompletePlusTwoCompletedRestCounted() {
+    func testCollapseAllIncompletePlusThreeCompletedAtCapShowsAllCountZero() {
         let sorted = sortTasksForDisplay([row("p1", "pending"), row("ip", "in_progress"), row("c1", "completed"), row("c2", "completed"), row("c3", "completed")])
         let r = collapseCompleted(sorted)
-        XCTAssertEqual(r.rows.map(\.id), ["ip", "p1", "c1", "c2"])
-        XCTAssertEqual(r.collapsedCompletedCount, 1)
+        XCTAssertEqual(r.rows.map(\.id), ["ip", "p1", "c1", "c2", "c3"])
+        XCTAssertEqual(r.collapsedCompletedCount, 0)
     }
 
-    func testCollapseAtMostTwoCompletedShowsAllCountZero() {
-        let r = collapseCompleted(sortTasksForDisplay([row("c1", "completed"), row("c2", "completed")]))
+    func testCollapseAtMostThreeCompletedShowsAllCountZero() {
+        let r = collapseCompleted(sortTasksForDisplay([row("c1", "completed"), row("c2", "completed"), row("c3", "completed")]))
+        XCTAssertEqual(r.rows.map(\.id), ["c1", "c2", "c3"])
         XCTAssertEqual(r.collapsedCompletedCount, 0)
+    }
+
+    func testCollapseCapIsThreeCCParity() {
+        let sorted = sortTasksForDisplay([row("ip", "in_progress"), row("c1", "completed"), row("c2", "completed"), row("c3", "completed"), row("c4", "completed"), row("c5", "completed")])
+        let r = collapseCompleted(sorted)
+        XCTAssertEqual(r.rows.map(\.id), ["ip", "c1", "c2", "c3"])
+        XCTAssertEqual(r.collapsedCompletedCount, 2)
+    }
+
+    func testTaskCountsLine() {
+        XCTAssertEqual(taskCountsLine([row("a", "completed"), row("b", "in_progress"), row("c", "pending"), row("d", "weird")]),
+                        "4 tasks (1 done, 1 in progress, 2 open)")
+        XCTAssertEqual(taskCountsLine([]), "0 tasks (0 done, 0 in progress, 0 open)")
     }
 
     func testGlyphs() {

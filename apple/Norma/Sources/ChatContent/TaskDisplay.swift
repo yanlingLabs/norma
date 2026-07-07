@@ -42,7 +42,7 @@ func sortTasksForDisplay(_ tasks: [TaskRow]) -> [TaskRow] {
 /// `sorted` is assumed already in `sortTasksForDisplay` order. Keeps every non-completed row plus
 /// the first `showCompleted` completed rows (in that sorted order); the rest are collapsed into a
 /// count.
-func collapseCompleted(_ sorted: [TaskRow], showCompleted: Int = 2) -> TaskDisplayResult {
+func collapseCompleted(_ sorted: [TaskRow], showCompleted: Int = 3) -> TaskDisplayResult {
     var rows: [TaskRow] = []
     var totalCompleted = 0
     var keptCompleted = 0
@@ -58,6 +58,15 @@ func collapseCompleted(_ sorted: [TaskRow], showCompleted: Int = 2) -> TaskDispl
         }
     }
     return TaskDisplayResult(rows: rows, collapsedCompletedCount: max(0, totalCompleted - showCompleted))
+}
+
+/// "7 tasks (5 done, 1 in progress, 1 open)" — the CC count header. "open" = pending + any
+/// unrecognized status. Lockstep with `task-display.ts`'s `taskCountsLine`.
+func taskCountsLine(_ tasks: [TaskRow]) -> String {
+    let done = tasks.filter { $0.status == "completed" }.count
+    let inProgress = tasks.filter { $0.status == "in_progress" }.count
+    let open = tasks.count - done - inProgress
+    return "\(tasks.count) tasks (\(done) done, \(inProgress) in progress, \(open) open)"
 }
 
 func taskGlyph(_ status: String) -> String {
