@@ -84,6 +84,34 @@ export function renderTaskBlock(tasks: Task[], columns?: number): string[] {
   return [`${DIM}${truncatePlain(taskCountsLine(tasks), columns)}${RESET}`, ...lines];
 }
 
+/** Pure CC-style transcript line for a spawned subagent (Task 5, 2e-iii-b) — printed once when a
+ *  `thread_started` event lands on a TTY (main.ts's non-TTY branch keeps the plain
+ *  `⌥ spawned <agentType> subagent` line unchanged). `label` is the CliSubagent's already-computed
+ *  `subagentLabel` (description, or the prompt's truncated first line) — this function just lays
+ *  out the given strings, it does no label derivation itself. */
+export function agentSpawnLine(label: string, agentType: string): string {
+  return `${BLUE}●${RESET} Agent(${label}) ${DIM}${agentType}${RESET}`;
+}
+
+/** Pure CC-style transcript lines for a finished subagent (Task 5, 2e-iii-b) — printed once when a
+ *  `thread_completed` event lands on a TTY (main.ts's non-TTY branch keeps the plain
+ *  `✓ subagent done` line unchanged). The second (tool-call count) line is omitted when the
+ *  subagent never called a tool (`toolCalls === 0`) — nothing to report. */
+export function agentFinishLines(label: string, activeMs: number, toolCalls: number): string[] {
+  const lines = [`${GREEN}●${RESET} ${DIM}Agent "${label}" finished · ${formatElapsed(activeMs)}${RESET}`];
+  if (toolCalls > 0) lines.push(`${DIM}⎿ Ran ${toolCalls} tool calls${RESET}`);
+  return lines;
+}
+
+/** Pure CC-style turn-summary transcript line (Task 5, 2e-iii-b) — printed once when the MAIN
+ *  thread's `turn_completed` lands on a TTY, just above the turn's final block teardown (main.ts's
+ *  non-TTY branch prints nothing extra here — unchanged). `activeForm` is the caller's job
+ *  (main.ts): the LAST in_progress task's activeForm, else "Worked" (past tense — the turn has
+ *  already ended, unlike `renderStatusLine`'s in-flight "Working" fallback). */
+export function turnSummaryLine(activeForm: string, elapsedMs: number, inTokens: number, outTokens: number): string {
+  return `${DIM}✳ ${activeForm} for ${formatElapsed(elapsedMs)} · ↑ ${formatTokens(inTokens)} ↓ ${formatTokens(outTokens)} tokens${RESET}`;
+}
+
 /** `FooterSelection`: which thread's transcript is currently selected (default `"main"`), and —
  *  while the footer has keyboard focus (§4 of the design doc) — which row index the highlight
  *  cursor sits on (row 0 = main, then each live subagent in `items` order). `focusIndex: null`

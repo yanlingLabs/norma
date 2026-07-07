@@ -11,10 +11,13 @@ import {
   RESET,
   SPINNER_FRAMES,
   TASK_ICONS,
+  agentFinishLines,
+  agentSpawnLine,
   renderStatusLine,
   renderTaskBlock,
   trackLineStart,
   truncateStatusLine,
+  turnSummaryLine,
   upsertTask,
 } from "./task-block";
 import { installPlugin, removePluginDir, removePluginFromSettings, setPluginEnabled } from "./plugin-cli";
@@ -221,7 +224,7 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
   }
 
   const c = await connect("cli-p", (e) => {
-    const sa = streamAction(streaming, e as { type: string; threadId?: string });
+    const sa = streamAction(streaming, e as { type: string; threadId?: string }, "main");
     streaming = sa.streaming;
     if (sa.action === "write_delta") {
       streamedChars += (e as { delta: string }).delta.length; // rough ↓ out-tokens proxy while the turn is still running
@@ -318,9 +321,21 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
     } else if (e.type === "worktree_exited") {
       emit(`${DIM}⟲ left worktree ${e.name}${e.removed ? " (removed)" : ""}${RESET}\n`);
     } else if (e.type === "thread_started") {
-      emit(`${DIM}⌥ spawned ${e.agentType} subagent${RESET}\n`);
+      // Task 5 (2e-iii-b): TTY gets the CC-style "Agent(label) agentType" line (subagents was
+      // just updated above, so the freshly-pushed CliSubagent's label is already there); non-TTY
+      // keeps the exact original literal (headless consumers parse this).
+      const label = subagents.find((s) => s.threadId === e.threadId)?.label ?? "";
+      emit(process.stdout.isTTY
+        ? `${agentSpawnLine(label, e.agentType)}\n`
+        : `${DIM}⌥ spawned ${e.agentType} subagent${RESET}\n`);
     } else if (e.type === "thread_completed") {
-      emit(`${DIM}✓ subagent done${e.stopReason !== "end_turn" ? ` (${e.stopReason})` : ""}${RESET}\n`);
+      // Task 5: read finish stats from `subagents` BEFORE they're pruned — updateSubagents (run
+      // earlier in this handler) only flips this entry to "done" here; the prune to [] happens
+      // later, on the MAIN thread's own turn_completed — so the item is still present.
+      const item = subagents.find((s) => s.threadId === e.threadId);
+      emit(process.stdout.isTTY
+        ? `${agentFinishLines(item?.label ?? "", item?.activeMs ?? 0, item?.toolCalls ?? 0).join("\n")}\n`
+        : `${DIM}✓ subagent done${e.stopReason !== "end_turn" ? ` (${e.stopReason})` : ""}${RESET}\n`);
     } else if (e.type === "agent_error") {
       console.error(`agent error: ${e.message}`);
     } else if (e.type === "turn_completed" && e.threadId === "main") {
@@ -329,6 +344,12 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
       // fires BEFORE the main thread's own (children are awaited inside the main tool loop), so an
       // unguarded endHeadlessTurn() would c.close()/exit the CLI the instant the FIRST subagent
       // finished — while the main turn was still running. The threadId guard closes both.
+      if (process.stdout.isTTY) {
+        // Task 5: printed BEFORE the bookkeeping below so it lands above the final block teardown.
+        // Non-TTY prints nothing extra here (unchanged).
+        const activeForm = tasks.filter((t) => t.status === "in_progress").at(-1)?.activeForm ?? "Worked";
+        emit(`${turnSummaryLine(activeForm, Date.now() - turnStartMs, e.inputTokens, e.outputTokens)}\n`);
+      }
       turnRunning = false;
       lastInTokens = e.inputTokens;
       lastOutTokens = e.outputTokens;
