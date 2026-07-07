@@ -335,10 +335,18 @@ final class SurfaceWindowTests: XCTestCase {
     }
 
     /// Task 4: the yellow traffic light — `requestWindowDetach()` fires `onWindowDetach` exactly
-    /// once with the panel's CURRENT (window-sized) frame, then runs the no-animation exit back to
-    /// the orb (surface flips to `.orb`, the panel stays visible/on-screen at `collapsedWindowSize`
-    /// — never ordered out). A second call, now that `surface` is `.orb`, is a no-op.
-    func testRequestWindowDetachFiresOnceWithCurrentFrameAndExitsToOrb() async throws {
+    /// once, then runs the no-animation exit back to the orb (surface flips to `.orb`, the panel
+    /// stays visible/on-screen at `collapsedWindowSize` — never ordered out). A second call, now
+    /// that `surface` is `.orb`, is a no-op.
+    ///
+    /// LIVE-GATE W1a: the fired frame is the visible glass CONTENT rect (`windowFinalRect` mapped
+    /// to screen coords, `windowSurfaceContentScreenRect`), NOT the raw panel frame — the panel
+    /// frame spans content + the invisible halo padding + the orb-anchor union
+    /// (`windowSurfaceLayout`'s doc), so firing with it verbatim used to spawn the detached window
+    /// visibly bigger than the morph window it replaced. The fired frame must therefore be
+    /// STRICTLY SMALLER than (and fully contained within) the panel's own frame at the moment of
+    /// detach.
+    func testRequestWindowDetachFiresOnceWithContentFrameAndExitsToOrb() async throws {
         let controller = OrbWindowController(session: SessionModel())
         controller.show()
         controller.expandToField()
@@ -352,11 +360,16 @@ final class SurfaceWindowTests: XCTestCase {
             return true // spawn "succeeded" — the exit must run
         }
 
-        let windowFrame = controller.panelFrameForTesting
+        let panelFrame = controller.panelFrameForTesting
+        let finalRect = try XCTUnwrap(controller.morphModel.windowFinalRect, "layout must be live while .window")
+        let expectedContentFrame = windowSurfaceContentScreenRect(panelFrame: panelFrame, finalRect: finalRect)
         controller.requestWindowDetach()
 
         XCTAssertEqual(firedFrames.count, 1, "onWindowDetach must fire exactly once")
-        XCTAssertEqual(firedFrames.first, windowFrame, "must fire with the CURRENT (still window-sized) frame")
+        XCTAssertEqual(firedFrames.first, expectedContentFrame, "must fire with the visible CONTENT rect, not the panel frame")
+        XCTAssertTrue(panelFrame.contains(firedFrames.first!), "the content rect must be fully inside the panel frame")
+        XCTAssertLessThan(firedFrames.first!.width, panelFrame.width, "content is smaller than the halo-padded panel — the W1a fix")
+        XCTAssertLessThan(firedFrames.first!.height, panelFrame.height, "content is smaller than the halo-padded panel — the W1a fix")
         XCTAssertEqual(controller.surface, .orb, "exitWindowModeForDetach() collapses the panel's surface back to .orb")
         XCTAssertTrue(controller.isVisible, "the orb panel stays on screen — never ordered out on detach")
         XCTAssertEqual(controller.panelFrameForTesting.size, controller.morphModel.collapsedWindowSize)

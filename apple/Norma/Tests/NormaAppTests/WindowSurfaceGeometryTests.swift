@@ -105,6 +105,43 @@ final class WindowSurfaceGeometryTests: XCTestCase {
         XCTAssertEqual(chatWindowCornerRadius, 26)
     }
 
+    // MARK: - LIVE-GATE W1a: content screen rect (detach must spawn at the visible content, not
+    // the halo panel frame)
+
+    /// Hand-computed case: a panel frame at (100, 200) sized 680×760, with a `finalRect` (window-
+    /// local, y-down) of (60, 60, 560, 640) — mirroring the halo-inset geometry `windowSurfaceLayout`
+    /// actually produces (60pt margin on every side of a 560×640 content). The content's screen
+    /// origin must land 60pt right of the panel's left edge and 60pt below the panel's top edge —
+    /// i.e. INSET from the panel frame on every side, never equal to the whole panel frame (the W1a
+    /// bug: detach used to spawn at the panel frame itself, which is bigger than this).
+    func testWindowSurfaceContentScreenRectHandComputed() {
+        let panelFrame = CGRect(x: 100, y: 200, width: 680, height: 760)
+        let finalRect = CGRect(x: 60, y: 60, width: 560, height: 640)
+        let contentRect = windowSurfaceContentScreenRect(panelFrame: panelFrame, finalRect: finalRect)
+        // x: panel.minX + finalRect.minX = 100 + 60 = 160
+        XCTAssertEqual(contentRect.minX, 160, accuracy: 0.001)
+        // y: panel.maxY - finalRect.maxY = (200 + 760) - (60 + 640) = 960 - 700 = 260
+        XCTAssertEqual(contentRect.minY, 260, accuracy: 0.001)
+        XCTAssertEqual(contentRect.width, 560, accuracy: 0.001)
+        XCTAssertEqual(contentRect.height, 640, accuracy: 0.001)
+        // Strictly smaller than (and fully contained within) the panel frame — the whole point.
+        XCTAssertTrue(panelFrame.contains(contentRect))
+        XCTAssertLessThan(contentRect.width, panelFrame.width)
+        XCTAssertLessThan(contentRect.height, panelFrame.height)
+    }
+
+    /// Round-trips through the real `windowSurfaceLayout` output — the content rect this produces
+    /// must be centered on the SAME screen frame `windowSurfaceLayout` centered its content on
+    /// (same property `testContentCenteredOnScreen` above already proves via a different path).
+    func testWindowSurfaceContentScreenRectMatchesLayoutCenter() {
+        let anchor = CGPoint(x: 300, y: 300)
+        let l = layout(anchor: anchor)
+        let contentRect = windowSurfaceContentScreenRect(panelFrame: l.windowFrame, finalRect: l.finalRect)
+        XCTAssertEqual(contentRect.midX, screen.midX, accuracy: 0.5)
+        XCTAssertEqual(contentRect.midY, screen.midY, accuracy: 0.5)
+        XCTAssertEqual(contentRect.size, content)
+    }
+
     // MARK: hit test
 
     func testHitTestInsideShellAccepts_HaloRejects() {

@@ -847,18 +847,33 @@ final class OrbWindowController: ObservableObject {
     /// that case discarded the window's content into the orb with nothing spawned to replace it).
     /// So there is never a frame where neither the window surface nor a detached window is on
     /// screen, AND a failed spawn leaves the window surface untouched rather than vanishing it.
+    ///
+    /// LIVE-GATE W1a fix: `frame` used to be the raw panel frame — which spans content + the
+    /// invisible halo padding + the orb-anchor union (`windowSurfaceLayout`'s doc), so the
+    /// detached window spawned visibly BIGGER than the morph window it replaced. It now fires with
+    /// the visible glass CONTENT rect instead, derived from `morphModel.windowFinalRect` (window-
+    /// local, y-down) mapped to screen coords against the panel's live frame — same conversion
+    /// `updateWindowMouseGate()` already uses for hit-testing, extracted pure as
+    /// `windowSurfaceContentScreenRect` so it's unit-tested. `windowFinalRect` is always set here
+    /// in practice (the `surface == .window` guard above is only reachable once
+    /// `presentWindowSurface()` has run, which sets it, and nothing clears it before
+    /// `finishWindowCollapse()` — reached only once `surface` has already left `.window`) — the
+    /// `?? frame` fallback is defensive only, never expected to fire.
     func requestWindowDetach() {
         guard surface == .window, morphTimer == nil, zoomTimer == nil, !pendingWindowExpand, !detachInFlight else { return }
         detachInFlight = true
         let frame = panel.frame
+        let contentFrame = morphModel.windowFinalRect.map {
+            windowSurfaceContentScreenRect(panelFrame: frame, finalRect: $0)
+        } ?? frame
         // `?? true`: unwired (nil) defaults to the old unconditional-exit behavior, so callers/
         // tests that never set `onWindowDetach` keep seeing the exit run.
-        let spawned = onWindowDetach?(frame) ?? true
+        let spawned = onWindowDetach?(contentFrame) ?? true
         if spawned {
             exitWindowModeForDetach()
         }
         detachInFlight = false
-        OrbDebug.log("requestWindowDetach: frame=\(frame) spawned=\(spawned)")
+        OrbDebug.log("requestWindowDetach: panelFrame=\(frame) contentFrame=\(contentFrame) spawned=\(spawned)")
     }
 
     /// Task 4: the `hide()` `.window` branch (see that method, above), with one deliberate

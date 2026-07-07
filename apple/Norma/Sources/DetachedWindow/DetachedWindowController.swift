@@ -73,6 +73,19 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
         window.minSize = NSSize(width: 340, height: 360)
         window.backgroundColor = .clear
         window.isOpaque = false
+        // LIVE-GATE W1b fix (Safari-style unified-toolbar technique, proven in this repo's
+        // history around commit dd48b68): an empty toolbar + `.unified` style inserts the taller
+        // titlebar band macOS gives a real toolbar window — traffic lights inset like Safari's
+        // (~22pt, matching the morph window's own 14pt lights) instead of a bare titled window's
+        // compact chrome, and macOS 26 gives that band the larger corner radius the morph
+        // window's shell draws (26pt, `chatWindowCornerRadius`). AppKit enforces a chrome-minimum
+        // frame (~40×220 observed historically) on toolbar windows, but that's irrelevant here:
+        // `minSize` is already 340×360, and a detached window never animates open from a tiny
+        // frame (unlike the morph panel), so there's no tiny-frame collision to guard against.
+        let toolbar = NSToolbar(identifier: "norma.detached.toolbar")
+        toolbar.displayMode = .iconOnly
+        window.toolbar = toolbar
+        window.toolbarStyle = .unified
         self.window = window
 
         let adapter = FieldStateAdapter(session: session)
@@ -156,8 +169,9 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
 /// NO `clipShape`/corner mask — the corner rounding comes for free from the SYSTEM window shape (a
 /// real titled `NSWindow`), unlike the morph window's self-drawn `RoundedRectangle` shell. Content
 /// bleeds up under the (hidden, transparent) native titlebar via the window's
-/// `.fullSizeContentView` style mask + this view's `topInset: 40` (clears the native traffic
-/// lights — tuned at gate).
+/// `.fullSizeContentView` style mask + this view's `topInset: 52` (LIVE-GATE W1b: bumped from 40
+/// to clear the TALLER unified-toolbar titlebar band the window construction above now attaches —
+/// tune-at-gate constant).
 struct DetachedWindowRootView: View {
     @ObservedObject var adapter: FieldStateAdapter
     @Environment(\.colorScheme) private var colorScheme
@@ -166,7 +180,7 @@ struct DetachedWindowRootView: View {
         WindowContentView(
             adapter: adapter,
             tint: Color(red: 0.45, green: 0.75, blue: 1.0),
-            topInset: 40
+            topInset: 52
         ) {
             EmptyView()
         }
