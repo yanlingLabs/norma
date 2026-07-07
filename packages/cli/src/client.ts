@@ -162,5 +162,10 @@ export class NormaClient {
   async sessionSetPolicy(params: { sessionId: string; policy: ApprovalPolicy }): Promise<{ ok: true }> {
     return this.validated(SessionSetPolicyResult, await this.request(METHODS.sessionSetPolicy, params), METHODS.sessionSetPolicy);
   }
+  /** Interactive-chrome convenience wrapper (2e-iii-b Task 6): the mode bar's shift+tab cycle
+   *  calls this. Thin positional-arg alias over `sessionSetPolicy` (same `session.setPolicy` RPC). */
+  async setPolicy(sessionId: string, policy: ApprovalPolicy): Promise<void> {
+    await this.sessionSetPolicy({ sessionId, policy });
+  }
   close(): void { this.socket.end(); }
 }

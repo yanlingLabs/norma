@@ -41,7 +41,7 @@ export function sortTasksForDisplay(tasks: TaskRow[]): TaskRow[] {
 /** `sorted` is assumed already in `sortTasksForDisplay` order. Keeps every non-completed row plus
  *  the first `showCompleted` completed rows (in that sorted order); the rest are collapsed into a
  *  count. */
-export function collapseCompleted(sorted: TaskRow[], showCompleted: number = 2): TaskDisplayResult {
+export function collapseCompleted(sorted: TaskRow[], showCompleted: number = 3): TaskDisplayResult {
   const rows: TaskRow[] = [];
   let totalCompleted = 0;
   let keptCompleted = 0;
@@ -57,6 +57,15 @@ export function collapseCompleted(sorted: TaskRow[], showCompleted: number = 2):
     }
   }
   return { rows, collapsedCompletedCount: Math.max(0, totalCompleted - showCompleted) };
+}
+
+/** "7 tasks (5 done, 1 in progress, 1 open)" — the CC count header. "open" = pending + any
+ *  unrecognized status. Lockstep with TaskDisplay.swift's taskCountsLine. */
+export function taskCountsLine(tasks: { status: string }[]): string {
+  const done = tasks.filter((t) => t.status === "completed").length;
+  const inProgress = tasks.filter((t) => t.status === "in_progress").length;
+  const open = tasks.length - done - inProgress;
+  return `${tasks.length} tasks (${done} done, ${inProgress} in progress, ${open} open)`;
 }
 
 export function taskGlyph(status: string): string {

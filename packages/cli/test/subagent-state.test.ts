@@ -6,7 +6,7 @@ const spawn = { type: "thread_started", threadId: "th_a", parentThreadId: "main"
 describe("updateSubagents (spec §2, CLI column: lifecycle + tokens, NO time)", () => {
   test("thread_started inserts queued with label; duplicate threadId is a no-op", () => {
     const s1 = updateSubagents([], spawn);
-    expect(s1).toEqual([{ threadId: "th_a", agentType: "general-purpose", label: "explore auth module", status: "queued", outputTokens: 0, liveOutputChars: 0 }]);
+    expect(s1).toEqual([{ threadId: "th_a", agentType: "general-purpose", label: "explore auth module", status: "queued", outputTokens: 0, liveOutputChars: 0, activeMs: 0, toolCalls: 0 }]);
     expect(updateSubagents(s1, spawn)).toBe(s1); // same reference — replay dedupe
   });
 
@@ -35,5 +35,26 @@ describe("updateSubagents (spec §2, CLI column: lifecycle + tokens, NO time)", 
   test("main agent_error prunes defensively", () => {
     const s = updateSubagents([], spawn);
     expect(updateSubagents(s, { type: "agent_error", threadId: "main", message: "boom" })).toEqual([]);
+  });
+
+  test("child turn window banks active span; thread_completed defensively closes", () => {
+    let s = updateSubagents([], spawn);
+    s = updateSubagents(s, { type: "turn_started", threadId: "th_a", ts: 1000 });
+    expect(s[0]!.activeSince).toBe(1000);
+    s = updateSubagents(s, { type: "turn_completed", threadId: "th_a", ts: 4500, stopReason: "end_turn", inputTokens: 1, outputTokens: 1 });
+    expect(s[0]).toMatchObject({ activeMs: 3500, activeSince: undefined });
+    // defensive close path
+    let d = updateSubagents(updateSubagents([], spawn), { type: "turn_started", threadId: "th_a", ts: 1000 });
+    d = updateSubagents(d, { type: "thread_completed", threadId: "th_a", ts: 6000, stopReason: "aborted" });
+    expect(d[0]).toMatchObject({ status: "done", activeMs: 5000, activeSince: undefined });
+  });
+
+  test("child tool_call bumps toolCalls and sets activity via extractToolDetail", () => {
+    let s = updateSubagents([], spawn);
+    s = updateSubagents(s, { type: "tool_call", threadId: "th_a", callId: "c1", name: "bash", argsJson: JSON.stringify({ command: "bun test" }) });
+    s = updateSubagents(s, { type: "tool_call", threadId: "th_a", callId: "c2", name: "weird", argsJson: "{}" });
+    expect(s[0]!.toolCalls).toBe(2);
+    expect(s[0]!.activity).toBe("bun test"); // undefined detail keeps the previous activity
+    expect(updateSubagents(s, { type: "tool_call", threadId: "main", callId: "c3", name: "bash", argsJson: "{}" })).toBe(s); // main no-op
   });
 });

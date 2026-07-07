@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { Task } from "@norma/protocol";
-import { taskGlyph } from "../src/task-display";
+import { taskCountsLine, taskGlyph } from "../src/task-display";
 import type { CliSubagent } from "../src/subagent-state";
 import {
   BLUE,
@@ -10,12 +10,15 @@ import {
   RESET,
   SPINNER_FRAMES,
   TASK_ICONS,
+  physicalRows,
+  renderAgentsFooter,
+  renderModeBar,
   renderStatusLine,
-  renderSubagentBlock,
   renderTaskBlock,
   trackLineStart,
   truncateStatusLine,
   upsertTask,
+  type FooterSelection,
 } from "../src/task-block";
 
 function task(id: string, subject: string, status: Task["status"]): Task {
@@ -55,10 +58,17 @@ describe("renderTaskBlock (CC tree: shared sort/collapse + colored glyphs)", () 
     expect(renderTaskBlock(tasks)).toEqual([]);
   });
 
+  // Task 3 (2e-iii-b): brief's Step-1 contract test, verbatim modulo this file's 3-arg `task()`.
+  test("renderTaskBlock prepends the dim count header", () => {
+    const lines = renderTaskBlock([task("a", "do a thing", "in_progress")], 80);
+    expect(lines[0]).toBe(`${DIM}1 tasks (0 done, 1 in progress, 0 open)${RESET}`);
+  });
+
   test("in_progress row sorts first, is blue + bold; pending sorts after, dim, not bold", () => {
     const tasks = [task("1", "write tests", "pending"), task("2", "run tests", "in_progress")];
     const lines = renderTaskBlock(tasks);
     expect(lines).toEqual([
+      `${DIM}${taskCountsLine(tasks)}${RESET}`,
       `${BLUE}${taskGlyph("in_progress")}${RESET}${BOLD} run tests${RESET}`,
       `${DIM}${taskGlyph("pending")}${RESET} write tests`,
     ]);
@@ -68,22 +78,25 @@ describe("renderTaskBlock (CC tree: shared sort/collapse + colored glyphs)", () 
     const tasks = [task("1", "write tests", "completed"), task("2", "ship it", "pending")];
     const lines = renderTaskBlock(tasks);
     expect(lines).toEqual([
+      `${DIM}${taskCountsLine(tasks)}${RESET}`,
       `${DIM}${taskGlyph("pending")}${RESET} ship it`,
       `${GREEN}${taskGlyph("completed")}${RESET} write tests`,
     ]);
   });
 
-  test("testBlockSortsAndCollapses: 1 in_progress + 3 completed → in_progress row first (■), '… +1 completed' present", () => {
+  test("testBlockSortsAndCollapses: 1 in_progress + 4 completed → count header, then in_progress row (■), '… +1 completed' present (cap 3)", () => {
     const tasks = [
       task("c1", "alpha", "completed"),
       task("c2", "beta", "completed"),
       task("ip", "active one", "in_progress"),
       task("c3", "gamma", "completed"),
+      task("c4", "delta", "completed"),
     ];
     const lines = renderTaskBlock(tasks);
-    expect(lines[0]).toBe(`${BLUE}■${RESET}${BOLD} active one${RESET}`);
+    expect(lines[0]).toBe(`${DIM}${taskCountsLine(tasks)}${RESET}`);
+    expect(lines[1]).toBe(`${BLUE}■${RESET}${BOLD} active one${RESET}`);
     expect(lines).toContain(`${DIM}… +1 completed${RESET}`);
-    expect(lines).toHaveLength(4); // in_progress + 2 kept completed + 1 collapsed summary row
+    expect(lines).toHaveLength(6); // count header + in_progress + 3 kept completed + 1 collapsed summary row
   });
 
   test("testBlockGlyphsBlueGreen: output contains the blue ANSI for ■ and the green ANSI for ✓", () => {
@@ -116,23 +129,29 @@ describe("renderTaskBlock width truncation (final-review fix: erase math needs 1
 
   test("a subject longer than the terminal truncates to columns-2 visible chars with an ellipsis (never wraps)", () => {
     const lines = renderTaskBlock([long], 80);
-    expect(lines).toHaveLength(1);
+    expect(lines).toHaveLength(2); // count header + the (truncated) task row
+    expect(lines[0]).toBe(`${DIM}${taskCountsLine([long])}${RESET}`);
     const prefix = `${DIM}${taskGlyph("pending")}${RESET}`;
-    expect(lines[0]!.startsWith(prefix)).toBe(true);
-    const rest = lines[0]!.slice(prefix.length);
+    expect(lines[1]!.startsWith(prefix)).toBe(true);
+    const rest = lines[1]!.slice(prefix.length);
     expect(rest.length).toBe(77); // (columns - 2) visible chars total, minus the 1-char glyph
     expect(rest.endsWith("…")).toBe(true);
   });
 
   test("short subjects pass through untouched at any width", () => {
     const short = { id: "2", subject: "ship it", status: "pending" } as Task;
-    expect(renderTaskBlock([short], 80)).toEqual([`${DIM}${taskGlyph("pending")}${RESET} ship it`]);
+    expect(renderTaskBlock([short], 80)).toEqual([
+      `${DIM}${taskCountsLine([short])}${RESET}`,
+      `${DIM}${taskGlyph("pending")}${RESET} ship it`,
+    ]);
   });
 
   test("undefined or tiny columns fall back to no truncation (pre-fix behavior)", () => {
-    expect(renderTaskBlock([long])[0]!.length).toBeGreaterThan(100);
-    expect(renderTaskBlock([long], 0)[0]!.length).toBeGreaterThan(100);
-    expect(renderTaskBlock([long], 2)[0]!.length).toBeGreaterThan(100);
+    // index [1]: the task row, NOT [0] (the count header, which is short and never needs
+    // truncation at this fixture size regardless of columns).
+    expect(renderTaskBlock([long])[1]!.length).toBeGreaterThan(100);
+    expect(renderTaskBlock([long], 0)[1]!.length).toBeGreaterThan(100);
+    expect(renderTaskBlock([long], 2)[1]!.length).toBeGreaterThan(100);
   });
 });
 
@@ -199,31 +218,151 @@ describe("TASK_ICONS (unchanged — still used for the non-TTY one-line-per-upda
   });
 });
 
-describe("renderSubagentBlock", () => {
-  const sub = (over: Partial<CliSubagent>): CliSubagent => ({
-    threadId: "th_a", agentType: "general-purpose", label: "explore auth module",
-    status: "working", outputTokens: 0, liveOutputChars: 0, ...over,
+// renderSubagentBlock (2e-ii) DELETED for 2e-iii-b Task 3 — the agents footer below supersedes it
+// as the pinned area's "what's working now" surface (now a thread SELECTOR, not a status list).
+
+describe("renderAgentsFooter (2e-iii-b: thread selector — supersedes renderSubagentBlock)", () => {
+  const sub = (over: Partial<CliSubagent> = {}): CliSubagent => ({
+    threadId: "th_a", agentType: "general-purpose", label: "explore auth",
+    status: "working", activeMs: 60000, activeSince: undefined, toolCalls: 3,
+    activity: "Reading main.ts", inputTokens: undefined, outputTokens: 75000, liveOutputChars: 0,
+    ...over,
+  });
+  const mainSelected: FooterSelection = { selectedThreadId: "main", focusIndex: null };
+
+  test("footer hidden when idle and no agents", () => {
+    expect(renderAgentsFooter([], mainSelected, false, 0, 80)).toEqual([]);
   });
 
-  test("empty when no items or all done", () => {
-    expect(renderSubagentBlock([])).toEqual([]);
-    expect(renderSubagentBlock([sub({ status: "done" })])).toEqual([]);
+  test("footer visible (main row only) when a turn is running even with zero subagents", () => {
+    expect(renderAgentsFooter([], mainSelected, true, 0, 80)).toEqual([`${BLUE}●${RESET} main`]);
   });
 
-  test("working row: blue glyph, bold body, tokens suffix", () => {
-    const [line] = renderSubagentBlock([sub({ inputTokens: 12300, outputTokens: 4100 })]);
-    expect(line).toBe(`${BLUE}●${RESET}${BOLD} explore auth module (general-purpose) ↑ 12.3k ↓ 4.1k${RESET}`);
+  test("footer visible when a subagent is alive even if turnRunning is false", () => {
+    expect(renderAgentsFooter([sub()], mainSelected, false, 0, 80)).toHaveLength(2);
   });
 
-  test("queued row dim with no token noise; done row keeps final tokens while siblings run", () => {
-    const lines = renderSubagentBlock([sub({ status: "queued" }), sub({ threadId: "th_b", status: "done", inputTokens: 1000, outputTokens: 100 })]);
-    expect(lines[0]).toBe(`${DIM}◌${RESET} explore auth module (general-purpose)`);
-    expect(lines[1]).toBe(`${GREEN}✓${RESET} explore auth module (general-purpose) ↑ 1.0k ↓ 100`);
+  test("footer rows: selected dot, focus bold, right-aligned time+tokens — byte-exact", () => {
+    const lines = renderAgentsFooter([sub()], mainSelected, true, 0, 80);
+    expect(lines).toEqual([
+      `${BLUE}●${RESET} main`,
+      `${DIM}○${RESET} general-purpose  Reading main.ts${" ".repeat(29)}1m 0s · ↓ 75.0k`,
+    ]);
   });
 
-  test("width truncation happens on plain text before coloring", () => {
-    const [line] = renderSubagentBlock([sub({})], 20);
-    expect(line!.includes("…")).toBe(true);
-    expect(line!.endsWith(RESET)).toBe(true);
+  test("selecting the subagent flips the dots: main dim ○, subagent blue ●", () => {
+    const lines = renderAgentsFooter([sub()], { selectedThreadId: "th_a", focusIndex: null }, true, 0, 80);
+    expect(lines[0]!.startsWith(`${DIM}○${RESET}`)).toBe(true);
+    expect(lines[1]!.startsWith(`${BLUE}●${RESET}`)).toBe(true);
+  });
+
+  test("focusIndex bolds the whole body of that row only (keyboard cursor, distinct from the selection dot)", () => {
+    const lines = renderAgentsFooter([sub()], { selectedThreadId: "main", focusIndex: 0 }, true, 0, 80);
+    expect(lines[0]).toBe(`${BLUE}●${RESET}${BOLD} main${RESET}`);
+    expect(lines[1]!.startsWith(`${DIM}○${RESET}`)).toBe(true); // not bold, focusIndex points at row 0
+    expect(lines[1]).not.toContain(BOLD);
+  });
+
+  test("queued row: activity slot shows 'waiting', no time/tokens at all", () => {
+    const queued = sub({ threadId: "th_b", status: "queued", activeMs: 0, activity: undefined, outputTokens: 0 });
+    const lines = renderAgentsFooter([queued], { selectedThreadId: "th_b", focusIndex: null }, true, 0, 80);
+    expect(lines[1]).toBe(`${BLUE}●${RESET} general-purpose  waiting`);
+  });
+
+  test("undefined activity on a working row falls back to 'working…'", () => {
+    const working = sub({ activity: undefined });
+    const lines = renderAgentsFooter([working], mainSelected, true, 0, 80);
+    expect(lines[1]!.includes("working…")).toBe(true);
+  });
+
+  test("narrow width: drops the right-aligned time+tokens first, keeps the left (never wraps)", () => {
+    const lines = renderAgentsFooter([sub()], mainSelected, true, 0, 30);
+    expect(lines[1]).toBe(`${DIM}○${RESET} general-purp…ading main.ts`);
+    expect(lines[1]!.includes("1m 0s")).toBe(false);
+  });
+
+  test("very narrow width: right already dropped, left middle-truncates (ellipsis mid-string, not at the end)", () => {
+    const lines = renderAgentsFooter([sub()], mainSelected, true, 0, 15);
+    expect(lines[1]).toBe(`${DIM}○${RESET} gener…in.ts`);
+  });
+
+  test("main row selected + a second subagent: main dot blue, subagent order preserved", () => {
+    const a = sub();
+    const b = sub({ threadId: "th_b", agentType: "researcher", activity: "grep foo" });
+    const lines = renderAgentsFooter([a, b], mainSelected, true, 0, 80);
+    expect(lines).toHaveLength(3);
+    expect(lines[1]!.includes("general-purpose")).toBe(true);
+    expect(lines[2]!.includes("researcher")).toBe(true);
+  });
+
+  test("footer filters out done subagents: [working, done, queued] renders 3 rows (main + working + queued only), done absent", () => {
+    const working = sub({ threadId: "th_work", status: "working" });
+    const done = sub({ threadId: "th_done", status: "done" });
+    const queued = sub({ threadId: "th_queue", status: "queued" });
+    const lines = renderAgentsFooter([working, done, queued], mainSelected, true, 0, 80);
+    expect(lines).toHaveLength(3); // main + working + queued (done filtered out)
+    expect(lines[0]!.includes("main")).toBe(true);
+    expect(lines[1]!.includes("general-purpose")).toBe(true); // working row
+    expect(lines[2]!.includes("waiting")).toBe(true); // queued row
+    // Verify done is not in output
+    const output = lines.join("\n");
+    expect(output).not.toContain("th_done");
+  });
+
+  test("focus indexes stay consistent with filtered rows: focusIndex maps to visible subagents only", () => {
+    const working = sub({ threadId: "th_work", status: "working" });
+    const done = sub({ threadId: "th_done", status: "done" });
+    const queued = sub({ threadId: "th_queue", status: "queued" });
+    // Focus on the queued subagent (row index 2: main=0, working=1, queued=2)
+    const lines = renderAgentsFooter([working, done, queued], { selectedThreadId: "main", focusIndex: 2 }, true, 0, 80);
+    expect(lines).toHaveLength(3);
+    expect(lines[2]!.includes(BOLD)).toBe(true); // queued row is focused (index 2)
+    expect(lines[1]!.includes(BOLD)).toBe(false); // working row is not focused
+  });
+});
+
+describe("renderModeBar (2e-iii-b §7: interactive policy bar, two-span ANSI-safe truncation)", () => {
+  test("mode bar renders and truncates ANSI-safely", () => {
+    expect(renderModeBar("auto", 120)).toBe(`${BLUE}▶▶ auto mode${RESET}${DIM} (shift+tab to cycle) · esc to interrupt${RESET}`);
+    expect(renderModeBar("auto", 16)!.endsWith(RESET)).toBe(true);
+  });
+
+  test("undefined/tiny columns: unchanged (full two-span string)", () => {
+    const full = `${BLUE}▶▶ plan mode${RESET}${DIM} (shift+tab to cycle) · esc to interrupt${RESET}`;
+    expect(renderModeBar("plan")).toBe(full);
+    expect(renderModeBar("plan", 2)).toBe(full);
+  });
+
+  test("narrow width: the DIM tail truncates first, mid-string, keeping the BLUE span intact", () => {
+    const bar = renderModeBar("auto", 16);
+    expect(bar).toBe(`${BLUE}▶▶ auto mode${RESET}${DIM} …${RESET}`);
+  });
+
+  test("extremely narrow width: even the BLUE span truncates, no DIM span emitted at all", () => {
+    const bar = renderModeBar("auto", 6);
+    expect(bar.startsWith(BLUE)).toBe(true);
+    expect(bar).not.toContain(DIM);
+    expect(bar.endsWith(RESET)).toBe(true);
+  });
+});
+
+describe("physicalRows (2e-iii-b §8: wrap-aware resize erase math)", () => {
+  test("physicalRows wrap math", () => {
+    expect(physicalRows([10, 80, 81], 80)).toBe(1 + 1 + 2);
+    expect(physicalRows([0, 5], 80)).toBe(2);
+    expect(physicalRows([200], undefined)).toBe(1);
+  });
+
+  test("columns 0 behaves like undefined — 1 row per line", () => {
+    expect(physicalRows([10, 200, 0], 0)).toBe(3);
+  });
+
+  test("exact-fit boundary: len === columns is still exactly 1 row (not 2)", () => {
+    expect(physicalRows([80], 80)).toBe(1);
+    expect(physicalRows([160], 80)).toBe(2);
+  });
+
+  test("empty lengths array is 0 rows", () => {
+    expect(physicalRows([], 80)).toBe(0);
   });
 });

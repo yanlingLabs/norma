@@ -1,28 +1,101 @@
 import { join, resolve } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { resolveNormaHome, KeychainSecretStore, startDaemon, TOKEN_NAMES } from "@norma/core";
-import { METHODS, type Task } from "@norma/protocol";
+import { METHODS, type ApprovalPolicy, type Task } from "@norma/protocol";
 import { NormaClient } from "./client";
 import { applyEvent, isStalled, type WatchdogState } from "./watchdog";
 import { streamAction } from "./stream-state";
 import { updateSubagents, type CliSubagent } from "./subagent-state";
+import { decodeKey, footerKeyAction } from "./keys";
 import {
   DIM,
   RESET,
   SPINNER_FRAMES,
-  TASK_ICONS,
+  NONTTY_TASK_LINE,
+  NONTTY_SPAWN_LINE,
+  NONTTY_FINISH_LINE,
+  agentFinishLines,
+  agentSpawnLine,
+  renderAgentsFooter,
+  renderModeBar,
   renderStatusLine,
-  renderSubagentBlock,
   renderTaskBlock,
+  physicalRows,
   trackLineStart,
   truncateStatusLine,
+  turnSummaryLine,
   upsertTask,
+  type FooterSelection,
 } from "./task-block";
 import { installPlugin, removePluginDir, removePluginFromSettings, setPluginEnabled } from "./plugin-cli";
 import { isOtherChoice, parseQuestionAnswer } from "./questions";
 import { parsePlanResponse } from "./plan-response";
 
 const AQUA = "\x1b[38;2;53;214;232m";
+
+/** A raw-mode control-key listener (2e-iii-b Task 6) that owns stdin ONLY while a turn is running
+ *  on a TTY (esc-interrupt, shift+tab policy cycle, ↑/↓/Enter footer selection — see §0/§4/§7).
+ *  It yields cleanly to any COOKED-mode line reader (readLine/askYesNo, and the y/N approval read)
+ *  via a suspend/resume counter: those need line-buffered stdin, so while any of them holds it the
+ *  raw handler detaches and cooked mode is restored, then re-attaches when they're done (if a turn
+ *  is still running). `activeKeyListener` is the module-level handle those readers reach for — null
+ *  outside a turn and on non-TTY, so their suspend/resume calls are safe no-ops there (this is what
+ *  keeps the non-TTY `-p` path byte-unchanged). */
+interface KeyListener {
+  beginTurn(): void; // a turn started → we want the raw handler on
+  endTurn(): void; // the turn ended → detach (the composer read owns cooked stdin next)
+  suspend(): void; // a cooked-mode reader is taking stdin — detach + restore cooked mode
+  resume(): void; // that reader finished — re-attach iff a turn is still running and nobody else holds it
+  destroy(): void; // final teardown — detach, restore cooked mode, pause stdin
+}
+let activeKeyListener: KeyListener | null = null;
+
+/** True for exactly the span of the chat composer's `readLine("› ")` call (final-review Finding 1).
+ *  readLine() writes its prompt text directly to stdout, bypassing `emit()`'s tracking, so the
+ *  closure-local `atLineStart` a repaint would consult is stale-true for the whole wait — an event
+ *  arriving mid-composer (bg_task_output from a still-running background task, task_updated from a
+ *  co-attached window, …) would otherwise look "safe" to `repaintBlockIfSafe` and paint/erase the
+ *  pinned block right under the live prompt, corrupting it. `repaintBlockIfSafe` below is the ONLY
+ *  place this is checked — gating it is sufficient to keep the whole erase/repaint cycle inert
+ *  during the composer (see the comment on that function), so events can still update state and
+ *  emit() can still print transcript text (which just scrolls the prompt down, harmlessly) while
+ *  this is true. Module-level (not a runTurnSession local) only because that's where the flag is
+ *  read from; it's set/cleared from inside runTurnSession's chat loop, the sole writer. */
+let composerActive = false;
+
+function makeKeyListener(onChunk: (chunk: Buffer) => void): KeyListener {
+  let attached = false; // raw "data" handler currently on stdin
+  let wantActive = false; // a turn is running → we WANT the raw handler on
+  let suspendDepth = 0; // cooked-mode readers currently holding stdin (counter, not bool: readLine + a queued approval can both hold it)
+  let destroyed = false;
+  const handler = (chunk: Buffer) => onChunk(chunk);
+  // Reconcile the desired attach state after any input to the four levers above. The raw handler
+  // is on iff a turn wants it, no cooked reader holds stdin, we're not torn down, and we're a TTY.
+  function sync(): void {
+    const shouldAttach = wantActive && suspendDepth === 0 && !destroyed && process.stdin.isTTY;
+    if (shouldAttach && !attached) {
+      process.stdin.setRawMode(true);
+      process.stdin.on("data", handler);
+      process.stdin.resume();
+      attached = true;
+    } else if (!shouldAttach && attached) {
+      process.stdin.off("data", handler);
+      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+      attached = false;
+    }
+  }
+  return {
+    beginTurn() { wantActive = true; sync(); },
+    endTurn() { wantActive = false; sync(); },
+    suspend() { suspendDepth++; sync(); },
+    resume() { if (suspendDepth > 0) suspendDepth--; sync(); },
+    destroy() {
+      destroyed = true; wantActive = false; sync();
+      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+      process.stdin.pause();
+    },
+  };
+}
 
 async function readSecret(promptText: string): Promise<string> {
   process.stdout.write(promptText);
@@ -52,12 +125,13 @@ async function readSecret(promptText: string): Promise<string> {
 // Single y/N question on stdin, reusing the same non-raw "read a chunk, check for a leading y"
 // pattern the approval_requested prompt below uses. TTY-guarded by callers; resolves false on EOF.
 async function askYesNo(promptText: string): Promise<boolean> {
+  activeKeyListener?.suspend(); // yield raw stdin → cooked, so the whole "y\n" line arrives as one chunk
   process.stdout.write(promptText);
   const stdin = process.stdin;
   return new Promise((resolvePromise) => {
     const onData = (d: Buffer) => { cleanup(); resolvePromise(String(d).trim().toLowerCase() === "y"); };
     const onEnd = () => { cleanup(); resolvePromise(false); };
-    function cleanup() { stdin.off("data", onData); stdin.off("end", onEnd); }
+    function cleanup() { stdin.off("data", onData); stdin.off("end", onEnd); activeKeyListener?.resume(); }
     stdin.once("data", onData);
     stdin.once("end", onEnd);
     stdin.resume();
@@ -65,15 +139,20 @@ async function askYesNo(promptText: string): Promise<boolean> {
 }
 
 // Reads one line of free-form text from stdin — same one-shot "data"/"end" pattern as askYesNo,
-// but returns the raw trimmed text instead of parsing y/n. Used for ask_user question answers.
-// TTY-guarded by callers; resolves "" on EOF.
-async function readLine(promptText: string): Promise<string> {
+// but returns the raw trimmed text instead of parsing y/n. Used for ask_user question answers AND
+// the chat composer. Suspends the raw control-key listener (Task 6) while it owns stdin so it gets
+// a cooked, line-buffered read. TTY-guarded by callers. Returns the trimmed line, or `null` on EOF
+// (ctrl+D / closed stdin) — the composer uses null to mean "exit", distinct from "" (empty line →
+// re-prompt); the question-menu callers coalesce null to "" since EOF there is just an empty answer.
+async function readLine(promptText: string): Promise<string | null> {
+  activeKeyListener?.suspend();
   process.stdout.write(promptText);
   const stdin = process.stdin;
   return new Promise((resolvePromise) => {
-    const onData = (d: Buffer) => { cleanup(); resolvePromise(String(d).trim()); };
-    const onEnd = () => { cleanup(); resolvePromise(""); };
-    function cleanup() { stdin.off("data", onData); stdin.off("end", onEnd); }
+    const done = (v: string | null) => { cleanup(); resolvePromise(v); };
+    const onData = (d: Buffer) => done(String(d).trim());
+    const onEnd = () => done(null);
+    function cleanup() { stdin.off("data", onData); stdin.off("end", onEnd); activeKeyListener?.resume(); }
     stdin.once("data", onData);
     stdin.once("end", onEnd);
     stdin.resume();
@@ -98,16 +177,22 @@ async function connect(name: string, onEvent: (e: any) => void = () => {}): Prom
 export const INIT_PROMPT =
   "Survey this project to understand it: read the README, the package manifest (package.json/pyproject/Cargo.toml/etc.), and skim the directory structure and a few key source files. Then write a concise NORMA.md at the project root capturing: what this project is, how to build/test/run it, and the key conventions a new contributor should follow. If a NORMA.md already exists, read it and UPDATE it rather than clobbering. Keep it tight and factual.";
 
-// Headless agent mode: `norma -p "<prompt>" [--auto]`. Streams the turn to stdout and,
-// under the default "ask" approval policy, prompts on stdin for each tool approval.
-// promptOverride/forceAuto let other commands (e.g. `init`) reuse the same headless flow
-// with a canned prompt instead of reading argv. existingSessionId (set by `norma resume`)
-// attaches to a previously-created session instead of creating a new one.
-async function runHeadlessAgent(promptOverride?: string, forceAuto = false, existingSessionId?: string): Promise<void> {
+// Turn-watching runner (2e-iii-b Task 6 — refactored from the former `runHeadlessAgent`). Wires
+// the client, the pinned-block/event machinery, the raw control-key listener, and the stall
+// watchdog ONCE, then either runs a SINGLE turn and exits (chat:false — `-p`, `resume id text`,
+// `init`; byte-identical to before on the non-TTY path, incl. exit codes + the bg grace-kill) or
+// LOOPS (chat:true — bare `norma`, `resume <id>` with no text): after each turn it erases the block
+// and shows the `› ` composer, sends the next line, and watches again. ctrl+C / ctrl+D (EOF) tears
+// down cleanly (timers cleared, terminal restored, client closed).
+async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boolean; existingSessionId?: string; chat: boolean }): Promise<void> {
+  const { promptOverride, forceAuto = false, existingSessionId, chat } = opts;
+
   // -p teardown: mirrors Claude Code's headless grace-kill. Any bg tasks still running when the
   // turn completes get a grace period (NORMA_BG_PRINT_WAIT_MS, default 5000ms; 0 = poll until none
-  // are running rather than racing a fixed timer) before we force-kill whatever remains.
-  async function endHeadlessTurn(c: NormaClient, sessionId: string, wdTimer: ReturnType<typeof setInterval> | undefined, exitCode: number): Promise<void> {
+  // are running rather than racing a fixed timer) before we force-kill whatever remains. One-shot
+  // (chat:false) only — chat mode leaves bg tasks running across turns and tears down via
+  // teardownAndExit instead. Uses the enclosing closures (c/sessionId/wdTimer/spinnerTimer).
+  async function endHeadlessTurn(exitCode: number): Promise<void> {
     if (exiting) return;
     exiting = true;
     if (wdTimer) clearInterval(wdTimer); // normal completion — stop watching for a stall that didn't happen
@@ -124,38 +209,45 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
       }
       await c.bgKillAll(sessionId);
     }
+    eraseBlockIfPinned(); // clear the pinned chrome (status/tasks/footer/mode bar) before exit — the transcript above stays
+    keyListener.destroy(); // restore cooked mode / pause stdin (no-op on non-TTY, so byte-unchanged there)
     c.close();
     process.exit(exitCode);
   }
-  const prompt = promptOverride ?? process.argv[3];
-  if (!prompt) {
+
+  // One-shot needs a prompt up front (argv[3] for `-p`, else the promptOverride); chat starts from
+  // the composer, so it never reads argv[3] (in `resume <id>` chat, argv[3] is the SESSION id).
+  const oneShotPrompt = promptOverride ?? process.argv[3];
+  if (!chat && !oneShotPrompt) {
     console.error('usage: norma -p "<prompt>" [--auto|--plan]');
     process.exit(1);
   }
   const auto = forceAuto || process.argv.includes("--auto");
   const plan = process.argv.includes("--plan"); // plan mode: agent must present a plan before editing; ignored if --auto also set
+  let policy: ApprovalPolicy = auto ? "auto" : plan ? "plan" : "ask"; // seeds the mode bar; shift+tab cycles it live
+  let policyInFlight = false; // in-flight guard — one setPolicy RPC at a time (repeat shift+tab ignored until it settles)
   const pending: string[] = []; // callIds awaiting a y/n on stdin, oldest first
   let sessionId = ""; // set below, before send() — turn_completed can only fire after that
   const wd: WatchdogState = { turnRunning: false, toolsInFlight: 0, approvalsPending: 0, lastEventAt: Date.now() };
-  let wdTimer: ReturnType<typeof setInterval> | undefined; // started once the turn is sent; cleared on completion/stall
-  let exiting = false; // guard to ensure a single exit path wins, not a race between stall watchdog and endHeadlessTurn
+  let wdTimer: ReturnType<typeof setInterval> | undefined; // one session-long stall poll; cleared on teardown
+  let exiting = false; // guard to ensure a single exit path wins (stall watchdog vs endHeadlessTurn vs ctrl+C)
   let streaming = false; // an assistant line is mid-stream on stdout (deltas printed, no newline yet)
+  let resolveTurn: (() => void) | null = null; // chat: the main turn_completed resolves this to advance the loop
 
-  // Pinned incomplete-task block (CC parity): TTY-only. `tasks` mirrors the session's current
-  // task list (upsert on task_updated — see task-block.ts for why a simple upsert is correct
-  // here). `atLineStart`/`pinnedLines` are the bookkeeping the erase/reprint dance needs:
-  // atLineStart tracks whether the last byte written to stdout was a newline (the ONLY safe
-  // moment to erase+redraw the block — never mid a streamed delta or a bg-task-output chunk,
-  // both of which can end without one); pinnedLines is how many trailing lines on screen
-  // currently belong to the block (status line + task rows together), so we know how far to
-  // cursor-up before clearing.
-  // Non-TTY (piped/-p) is untouched: eraseBlockIfPinned/repaintBlockIfSafe are no-ops there, so
-  // `emit()` degenerates to a plain process.stdout.write and task_updated keeps its exact
-  // existing one-line-per-update console output for headless consumers.
+  // Pinned block (CC parity): TTY-only. `tasks` mirrors the session's current task list (upsert on
+  // task_updated). `atLineStart` tracks whether the last byte written to stdout was a newline (the
+  // ONLY safe moment to erase+redraw — never mid a streamed delta or bg-task-output chunk, both of
+  // which can end without one). `pinnedLineLengths` (Task 6, replacing the old plain `pinnedLines`
+  // counter) stores each currently-painted block line's VISIBLE length, so the erase step can
+  // compute how many PHYSICAL rows the block occupies at the CURRENT terminal width — correct even
+  // after a resize re-wraps already-drawn lines (§8). Non-TTY (piped/-p) is untouched:
+  // eraseBlockIfPinned/repaintBlockIfSafe are no-ops there (isTTY gate), so `emit()` degenerates to
+  // a plain write and the non-TTY branches keep their exact one-line-per-update output.
   let tasks: Task[] = [];
   let subagents: CliSubagent[] = []; // live child threads of the current turn (2e-ii)
+  const selection: FooterSelection = { selectedThreadId: "main", focusIndex: null }; // Task 6 thread selector (footer)
   let atLineStart = true;
-  let pinnedLines = 0;
+  let pinnedLineLengths: number[] = [];
 
   // Live turn status (Task 4): drives the "⠋ Working… (14s · ↑ 1.2k ↓ 842 tokens)" line printed
   // above the task rows while a turn is running — Claude Code parity. turnRunning/turnStartMs
@@ -169,11 +261,26 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
   let lastOutTokens = 0;
   let spinnerIdx = 0;
 
+  const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, ""); // visible length = ANSI-stripped length
+
   function eraseBlockIfPinned(): void {
-    if (pinnedLines > 0) { process.stdout.write(`\x1b[${pinnedLines}A\x1b[0J`); pinnedLines = 0; }
+    if (pinnedLineLengths.length > 0) {
+      // §8: count the PHYSICAL rows the painted block occupies at the CURRENT width (a resize may
+      // have re-wrapped it since it was drawn) from each line's stored visible length — not the
+      // logical line count, which would cursor-up too few rows and strand wrapped fragments.
+      const rows = physicalRows(pinnedLineLengths, process.stdout.columns);
+      process.stdout.write(`\x1b[${rows}A\x1b[0J`);
+      pinnedLineLengths = [];
+    }
   }
   function repaintBlockIfSafe(): void {
-    if (!process.stdout.isTTY || !atLineStart) return;
+    // composerActive gate (Finding 1): the `› ` composer owns the screen for the span of its
+    // readLine() call — never paint/erase the pinned block during it (see the module-level doc
+    // comment). eraseBlockIfPinned() is left ungated deliberately: `pinnedLineLengths` is already
+    // empty by the time composerActive goes true (the chat loop erases before showing the prompt),
+    // and since repaint never runs while this flag is set, it stays empty — so eraseBlockIfPinned
+    // is a no-op for the whole span anyway, with no separate gate needed there.
+    if (composerActive || !process.stdout.isTTY || !atLineStart) return;
     // Width passed per-repaint (not cached): terminal resizes between repaints pick up the new
     // width; truncation keeps 1 logical line == 1 physical row so the erase count stays exact.
     const columns = process.stdout.columns;
@@ -189,14 +296,19 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
       });
       lines.push(truncateStatusLine(statusLine, columns));
     }
-    lines.push(...renderSubagentBlock(subagents, columns)); // [status line] [subagents] [tasks]
+    // Task 6 composition (design §1): [status line][task tree][agents footer][mode bar]. The 2e-ii
+    // subagent block is gone (absorbed into the footer). The footer renders itself only while a
+    // turn runs OR a subagent is alive; the mode bar always renders in interactive TTY (this whole
+    // function is isTTY-gated). Each renderer already truncates every row to one physical line at
+    // this width and colors its own spans — no outer wrap here.
     lines.push(...renderTaskBlock(tasks, columns));
+    lines.push(...renderAgentsFooter(subagents, selection, turnRunning, Date.now(), columns));
+    lines.push(renderModeBar(policy, columns));
     if (lines.length === 0) return;
-    // renderTaskBlock/renderStatusLine rows are already ANSI-colored per-row (blue/green/dim
-    // glyphs, blue status line) — no outer DIM wrap here (that was pre-Task-4 behavior, when
-    // renderTaskBlock returned plain text and this was the only styling applied).
     for (const l of lines) process.stdout.write(`${l}\n`);
-    pinnedLines = lines.length;
+    // Store each line's VISIBLE (ANSI-stripped) length so eraseBlockIfPinned's physical-row math is
+    // width-exact regardless of how the terminal is later resized.
+    pinnedLineLengths = lines.map((l) => stripAnsi(l).length);
   }
   function refreshBlock(): void { eraseBlockIfPinned(); repaintBlockIfSafe(); }
   // Spinner/elapsed tick: advances the animation frame and, only while a turn is actually running
@@ -220,11 +332,128 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
     repaintBlockIfSafe();
   }
 
-  const c = await connect("cli-p", (e) => {
-    const sa = streamAction(streaming, e as { type: string; threadId?: string });
+  // --- interactive controls (Task 6) ---
+
+  // shift+tab cycles ask→auto→plan→ask via the session.setPolicy RPC; the mode bar updates only on
+  // success (repaint). An in-flight guard drops repeat presses until the RPC settles; a failure
+  // prints a dim one-line notice and leaves the bar unchanged.
+  async function cyclePolicy(): Promise<void> {
+    if (policyInFlight) return;
+    policyInFlight = true;
+    const order: ApprovalPolicy[] = ["ask", "auto", "plan"];
+    const next = order[(order.indexOf(policy) + 1) % order.length]!;
+    try {
+      await c.setPolicy(sessionId, next);
+      policy = next;
+      refreshBlock();
+    } catch {
+      emit(`${DIM}couldn't switch to ${next} mode${RESET}\n`);
+    } finally {
+      policyInFlight = false;
+    }
+  }
+
+  // The footer's row order — main first, then LIVE subagents in first-seen order — kept in exact
+  // lockstep with renderAgentsFooter's filtered rows (both drop "done" rows) so footerKeyAction's
+  // index math and the enter→select thread-id resolution line up with what's actually on screen.
+  const currentRowThreadIds = (): string[] =>
+    ["main", ...subagents.filter((s) => s.status !== "done").map((s) => s.threadId)];
+
+  // Apply a thread switch (enter in footer focus): select the thread, CLEAR focus (caller-must-
+  // remember invariant), print the dim context line via emit(), repaint.
+  function switchThread(threadId: string): void {
+    selection.selectedThreadId = threadId;
+    selection.focusIndex = null;
+    if (threadId === "main") emit(`${DIM}→ viewing main${RESET}\n`);
+    else {
+      const item = subagents.find((s) => s.threadId === threadId);
+      emit(`${DIM}→ viewing ${item?.agentType ?? ""}: ${item?.label ?? ""}${RESET}\n`);
+    }
+    refreshBlock();
+  }
+
+  // Dispatch one decoded control key through the pure footerKeyAction decision table, then apply
+  // the resulting KeyAction against the live FooterSelection / policy / session (the effectful half
+  // keys.ts deliberately leaves to the caller).
+  function onKey(key: ReturnType<typeof decodeKey>): void {
+    const rowThreadIds = currentRowThreadIds();
+    const action = footerKeyAction(key, selection, rowThreadIds);
+    switch (action.kind) {
+      case "focusFooter": {
+        // Seed focus on the currently-selected row; −1 (selection isn't a live row) → 0 (main).
+        const idx = rowThreadIds.indexOf(selection.selectedThreadId);
+        selection.focusIndex = idx === -1 ? 0 : idx;
+        refreshBlock();
+        break;
+      }
+      case "moveFocus":
+        selection.focusIndex = action.index;
+        refreshBlock();
+        break;
+      case "exitFocus":
+        selection.focusIndex = null;
+        refreshBlock();
+        break;
+      case "select":
+        switchThread(action.threadId);
+        break;
+      case "interrupt":
+        void c.interrupt(sessionId); // wires the mode bar's "esc to interrupt" for real
+        break;
+      case "cyclePolicy":
+        void cyclePolicy();
+        break;
+      case "none":
+        break;
+    }
+  }
+
+  // The raw control-key listener (owns stdin only while a turn runs — see makeKeyListener). ctrl+C
+  // is handled here because raw mode swallows the terminal's SIGINT: chat → clean exit 0, one-shot
+  // → 130 (the conventional interrupted-process code).
+  const keyListener = makeKeyListener((chunk) => {
+    const s = typeof chunk === "string" ? chunk : chunk.toString();
+    if (s === "\x03") { void teardownAndExit(chat ? 0 : 130); return; }
+    onKey(decodeKey(chunk));
+  });
+  activeKeyListener = keyListener;
+
+  // Clean shutdown for ctrl+C / ctrl+D (EOF) and any other non-turn-completion exit: stop the
+  // timers, wipe the pinned chrome, restore the terminal, close the socket. `exiting` makes the
+  // first caller win over a racing watchdog/turn-completion.
+  async function teardownAndExit(code: number): Promise<void> {
+    if (exiting) return;
+    exiting = true;
+    clearInterval(spinnerTimer);
+    if (wdTimer) clearInterval(wdTimer);
+    eraseBlockIfPinned();
+    keyListener.destroy();
+    c.close();
+    process.exit(code);
+  }
+
+  // Resize (design §8, hard requirement): erase-then-repaint immediately so aggressive mid-turn
+  // resizing leaves no stranded fragments. eraseBlockIfPinned reads the CURRENT columns against the
+  // stored visible lengths (a width shrink that re-wrapped the block is cleared exactly); the
+  // repaint re-truncates to the new width. Finding 1 consolidation: this used to gate on
+  // `turnRunning` itself (between turns the composer owns the screen, so a resize there must NOT
+  // paint chrome under it) — that's now subsumed by repaintBlockIfSafe's own composerActive gate,
+  // so refreshBlock() alone is enough here: mid-turn it repaints as before, and during the composer
+  // it's a no-op via that same gate (no separate turnRunning check needed).
+  if (process.stdout.isTTY) {
+    process.stdout.on("resize", () => { if (process.stdout.isTTY) refreshBlock(); });
+  }
+
+  const c = await connect(chat ? "cli-chat" : "cli-p", (e) => {
+    const sa = streamAction(streaming, e as { type: string; threadId?: string }, selection.selectedThreadId);
     streaming = sa.streaming;
+    // ↓ out-tokens proxy stays keyed to the MAIN thread (the status line describes the main turn),
+    // NOT to write_delta — a selected SUBAGENT's deltas stream to the transcript but must not grow
+    // the main turn's estimate; and the main turn keeps counting even while a subagent is selected.
+    if (e.type === "assistant_delta" && (e as { threadId?: string }).threadId === "main") {
+      streamedChars += (e as { delta: string }).delta.length;
+    }
     if (sa.action === "write_delta") {
-      streamedChars += (e as { delta: string }).delta.length; // rough ↓ out-tokens proxy while the turn is still running
       emit(`${AQUA}${(e as { delta: string }).delta}${RESET}`);
     } else if (sa.action === "close_line") emit("\n");
     applyEvent(wd, e, Date.now());
@@ -255,7 +484,26 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
     else if (e.type === "tool_result") emit(`${DIM}  ↳ ${e.isError ? "ERROR: " : ""}${e.output.split("\n")[0]?.slice(0, 120) ?? ""}${RESET}\n`);
     else if (e.type === "approval_requested") {
       emit(`approve ${e.toolName}? ${DIM}${e.summary}${RESET} [y/N] `);
+      const wasEmpty = pending.length === 0;
       pending.push(e.callId);
+      // Yield raw stdin → cooked so the whole "y\n" line reaches the approval reader (only on the
+      // first of a batch; the reader resumes the key listener once the batch fully drains).
+      if (wasEmpty) activeKeyListener?.suspend();
+    } else if (e.type === "approval_resolved") {
+      // Finding 2: the approval may have been resolved WITHOUT this stdin reader ever seeing a
+      // "y\n" — another attached window answered it, or the server-side broker timed it out. If
+      // it's still sitting in our local `pending` queue, unwind it exactly as the cooked reader
+      // below does for a normal answer: drop it (wherever it is in the queue — not necessarily the
+      // head, so a stale entry ahead of a still-live one can't misdirect the next keystroke) and,
+      // once that drains `pending` back to empty, resume the raw key listener. Without this, a
+      // resolved-elsewhere approval leaves `pending` and the suspended raw listener stuck for the
+      // rest of the turn, and the next typed line gets consumed answering the stale entry instead
+      // of whatever it was actually meant for.
+      const idx = pending.indexOf(e.callId);
+      if (idx !== -1) {
+        pending.splice(idx, 1);
+        if (pending.length === 0) activeKeyListener?.resume();
+      }
     } else if (e.type === "directory_added") emit(`${DIM}+ dir ${e.path}${e.persisted ? " (remembered)" : ""}${RESET}\n`);
     else if (e.type === "bg_task_started") emit(`${DIM}▶ bg ${e.taskId} started: ${e.command.slice(0, 80)}${RESET}\n`);
     else if (e.type === "bg_task_output") emit(`${DIM}${e.chunk}${RESET}`);
@@ -278,13 +526,13 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
             // atLineStart if we let it print the real prompt.
             const promptText = q.multiSelect ? "choose (comma-separated numbers or text): " : "choose (number or text): ";
             emit(promptText);
-            const input = await readLine("");
+            const input = (await readLine("")) ?? ""; // readLine now returns null on EOF; "" here (empty answer)
             if (isOtherChoice(input, q.options.length)) {
               // M1: choosing "Other" BY ITS MENU NUMBER isn't itself an answer — that digit is a
               // selection, not free text. Re-prompt for the real answer so the model never sees
               // the literal number as if the user had typed it as their response.
               emit("your answer: ");
-              answers[q.question] = (await readLine("")).trim();
+              answers[q.question] = ((await readLine("")) ?? "").trim();
             } else {
               answers[q.question] = parseQuestionAnswer(input, q.options.map((o: { label: string }) => o.label), q.multiSelect);
             }
@@ -300,7 +548,7 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
           emit(`\n${AQUA}Plan${RESET}\n${e.plan}\n\n`);
           emit(`  1) approve — I'll approve each edit\n  2) approve + auto-accept edits\n  3) reject (type: 3 <reason>)\n`);
           emit("choose (number or text): ");
-          const input = await readLine("");
+          const input = (await readLine("")) ?? "";
           const r = parsePlanResponse(input);
           await c.planRespond({ sessionId, callId: e.callId, ...r });
         })();
@@ -312,15 +560,35 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
       // TTY: the per-line print is replaced by the pinned block (upserted above); non-TTY
       // (headless consumers parse this) keeps the exact original one-line-per-update output.
       if (process.stdout.isTTY) refreshBlock();
-      else emit(`${DIM}${TASK_ICONS[e.task.status]} ${e.task.subject}${RESET}\n`);
+      else emit(NONTTY_TASK_LINE(e.task.status, e.task.subject));
     } else if (e.type === "worktree_entered") {
       emit(`${DIM}⛿ entered worktree ${e.name} (branch ${e.branch})${RESET}\n`);
     } else if (e.type === "worktree_exited") {
       emit(`${DIM}⟲ left worktree ${e.name}${e.removed ? " (removed)" : ""}${RESET}\n`);
     } else if (e.type === "thread_started") {
-      emit(`${DIM}⌥ spawned ${e.agentType} subagent${RESET}\n`);
+      // Task 5 (2e-iii-b): TTY gets the CC-style "Agent(label) agentType" line (subagents was
+      // just updated above, so the freshly-pushed CliSubagent's label is already there); non-TTY
+      // keeps the exact original literal (headless consumers parse this).
+      const label = subagents.find((s) => s.threadId === e.threadId)?.label ?? "";
+      emit(process.stdout.isTTY
+        ? `${agentSpawnLine(label, e.agentType)}\n`
+        : NONTTY_SPAWN_LINE(e.agentType));
     } else if (e.type === "thread_completed") {
-      emit(`${DIM}✓ subagent done${e.stopReason !== "end_turn" ? ` (${e.stopReason})` : ""}${RESET}\n`);
+      // Task 5: read finish stats from `subagents` BEFORE they're pruned — updateSubagents (run
+      // earlier in this handler) only flips this entry to "done" here; the prune to [] happens
+      // later, on the MAIN thread's own turn_completed — so the item is still present.
+      const item = subagents.find((s) => s.threadId === e.threadId);
+      emit(process.stdout.isTTY
+        ? `${agentFinishLines(item?.label ?? "", item?.activeMs ?? 0, item?.toolCalls ?? 0).join("\n")}\n`
+        : NONTTY_FINISH_LINE(e.stopReason));
+      // §4 snap-back: if the just-finished subagent was the one being viewed, selection returns to
+      // main (and a live focus highlight follows to the main row). The dim context line goes through
+      // emit() so the block bookkeeping stays correct.
+      if (selection.selectedThreadId === e.threadId) {
+        selection.selectedThreadId = "main";
+        if (selection.focusIndex !== null) selection.focusIndex = 0;
+        emit(`${DIM}→ viewing main${RESET}\n`);
+      }
     } else if (e.type === "agent_error") {
       console.error(`agent error: ${e.message}`);
     } else if (e.type === "turn_completed" && e.threadId === "main") {
@@ -329,11 +597,25 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
       // fires BEFORE the main thread's own (children are awaited inside the main tool loop), so an
       // unguarded endHeadlessTurn() would c.close()/exit the CLI the instant the FIRST subagent
       // finished — while the main turn was still running. The threadId guard closes both.
+      if (process.stdout.isTTY) {
+        // Task 5: printed BEFORE the bookkeeping below so it lands above the final block teardown.
+        // Non-TTY prints nothing extra here (unchanged).
+        const activeForm = tasks.filter((t) => t.status === "in_progress").at(-1)?.activeForm ?? "Worked";
+        emit(`${turnSummaryLine(activeForm, Date.now() - turnStartMs, e.inputTokens, e.outputTokens)}\n`);
+      }
       turnRunning = false;
       lastInTokens = e.inputTokens;
       lastOutTokens = e.outputTokens;
       refreshBlock(); // safety net: status line gone (turn over), task rows reflect final state (and disappear if all done)
-      void endHeadlessTurn(c, sessionId, wdTimer, e.stopReason === "end_turn" ? 0 : 1);
+      if (chat) {
+        // Chat: don't exit — disarm the key listener (the composer read owns cooked stdin next) and
+        // hand control back to the loop, which erases the block and shows the `› ` composer.
+        keyListener.endTurn();
+        resolveTurn?.();
+        resolveTurn = null;
+      } else {
+        void endHeadlessTurn(e.stopReason === "end_turn" ? 0 : 1);
+      }
     }
   });
 
@@ -357,20 +639,26 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
     await c.attach(sessionId);
   }
 
-  if (!auto) {
+  // Persistent y/N approval reader. Installed whenever approvals are possible: one-shot keeps its
+  // exact `!auto` condition (byte-unchanged); chat always installs it, since shift+tab can cycle
+  // the policy INTO "ask" mid-session. When no approval is pending it early-returns — so during a
+  // running turn it coexists harmlessly with the raw key listener (a keystroke just no-ops here),
+  // and during the composer read it ignores the typed message. When an approval IS pending the raw
+  // key listener is suspended (below), so this cooked handler reads the whole "y\n" line; on the
+  // last pending approval it hands stdin back to the key listener.
+  if (chat || !auto) {
     process.stdin.on("data", async (d) => {
+      if (pending.length === 0) return;
       const yes = String(d).trim().toLowerCase() === "y";
       const callId = pending.shift();
       if (callId) await c.request(METHODS.approvalRespond, { sessionId, callId, approved: yes });
+      if (pending.length === 0) activeKeyListener?.resume();
     });
   }
 
-  await c.send(sessionId, prompt);
-
-  // Stall watchdog: if the turn is running with nothing in flight (no tool executing, no
-  // approval awaiting a human) and no event has landed for thresholdMs, assume the agent/turn
-  // is wedged and abort rather than hang forever. Polled on a 5s tick against the pure
-  // isStalled() check — see watchdog.ts for the (deterministically tested) logic.
+  // Stall watchdog: one session-long poll. If the turn is running with nothing in flight (no tool
+  // executing, no approval awaiting a human) and no event has landed for thresholdMs, assume the
+  // turn is wedged and abort. Between turns (chat) wd.turnRunning is false, so it never false-fires.
   const thresholdMs = Number(process.env.NORMA_TURN_STALL_MS ?? 180000);
   wdTimer = setInterval(() => {
     if (isStalled(wd, Date.now(), thresholdMs)) {
@@ -378,23 +666,101 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
       exiting = true;
       clearInterval(wdTimer);
       clearInterval(spinnerTimer);
+      eraseBlockIfPinned();
+      keyListener.destroy();
       console.error(`\n[stalled: no progress for ${Math.round((Date.now() - wd.lastEventAt) / 1000)}s — aborting]`);
       void c.interrupt(sessionId).finally(() => process.exit(2));
     }
   }, 5000);
   wdTimer.unref?.(); // don't let the poll tick keep the process alive after normal completion
 
-  await new Promise(() => {}); // exits via the turn_completed branch of onEvent above
-}
-
-// Guarded so `main.ts` can be imported (e.g. by tests, for INIT_PROMPT/runHeadlessAgent) without
-// executing the CLI — import.meta.main is true only when this file is the entry point.
-if (import.meta.main) {
-  if (process.argv[2] === "-p") {
-    await runHeadlessAgent(); // never resolves normally — exits via process.exit()
+  // Sends one prompt and waits for the MAIN turn_completed. In chat the handler resolves this so
+  // the loop continues; in one-shot the handler calls endHeadlessTurn → process.exit, so this
+  // await never returns (the process is gone). The key listener is armed for the turn's duration.
+  async function runOneTurn(text: string): Promise<void> {
+    keyListener.beginTurn();
+    const done = new Promise<void>((resolve) => { resolveTurn = resolve; });
+    await c.send(sessionId, text);
+    await done;
   }
 
+  if (chat) {
+    // ctrl+C during the COOKED composer read raises SIGINT (raw mode is off there) → clean exit;
+    // during a turn raw mode swallows SIGINT and the \x03 key handler covers it.
+    process.on("SIGINT", () => { void teardownAndExit(0); });
+    for (;;) {
+      eraseBlockIfPinned(); // drop any lingering chrome before the composer
+      atLineStart = true;
+      composerActive = true; // Finding 1: block painting/erasing suspended for the span of this read
+      const line = await readLine("› ");
+      composerActive = false; // the composer resolved (line submitted or EOF) — the gate lifts immediately
+      if (line === null) { await teardownAndExit(0); return; } // ctrl+D / EOF → exit
+      if (line === "") continue; // empty line → re-prompt (no send)
+      await runOneTurn(line);
+    }
+  }
+
+  await runOneTurn(oneShotPrompt!); // one-shot: never returns — exits via the turn_completed branch above
+  await new Promise(() => {}); // safety net if runOneTurn ever resolves unexpectedly
+}
+
+// Final-review Findings 3+4: pure arg-routing decision, factored out of the `import.meta.main`
+// block below so it's cheaply unit-testable without any process/stdin/socket machinery. `argv` is
+// the USER-supplied args (i.e. `process.argv.slice(2)` — argv[0] is the first real arg, not the
+// binary/script path); `isTTY` is `process.stdin.isTTY && process.stdout.isTTY` from the caller.
+//
+//  - bare (`argv` empty) or a single bare `--auto`/`--plan` flag → "chat" (no sessionId): a fresh
+//    session, policy seeded by whichever flag is present — runTurnSession reads `--auto`/`--plan`
+//    back out of `process.argv` itself, so this route carries no policy field of its own.
+//  - `resume <id>` with nothing after it, or with EXACTLY one of `--auto`/`--plan` and nothing
+//    else, → "chat" WITH that sessionId (Finding 3: previously "--auto" was sent as literal prompt
+//    text). A flag followed by more text (`resume <id> --auto and then some`) is NOT this case —
+//    that's real prompt text starting with a flag-shaped word, unchanged below.
+//  - `resume <id> <anything else>` → "resumeOneShot" (existing continue-headless behavior).
+//  - everything else (subcommands, `-p`, `resume` with no id, …) → "fallthrough": defer to the
+//    switch statement's existing handling, untouched.
+//
+// Finding 4: the two "chat" outcomes reachable with NO existing session (bare / --auto / --plan)
+// require `isTTY` — a script piping into bare `norma` must keep seeing the original usage output,
+// not silently open a chat loop it can't drive. (`resume <id>` chat entry is pre-existing,
+// unflagged behavior and isn't gated here — see the fix report.)
+export type CliRoute =
+  | { kind: "chat"; existingSessionId?: string }
+  | { kind: "resumeOneShot"; sessionId: string; text: string }
+  | { kind: "fallthrough" };
+
+const isPolicyFlag = (s: string | undefined): boolean => s === "--auto" || s === "--plan";
+
+export function routeCliInvocation(argv: string[], isTTY: boolean): CliRoute {
+  const [cmd, sub, ...rest] = argv;
+  if (cmd === undefined || isPolicyFlag(cmd)) {
+    return isTTY ? { kind: "chat" } : { kind: "fallthrough" };
+  }
+  if (cmd === "resume" && sub !== undefined) {
+    const text = rest.join(" ");
+    if (text === "" || isPolicyFlag(text)) return { kind: "chat", existingSessionId: sub };
+    return { kind: "resumeOneShot", sessionId: sub, text };
+  }
+  return { kind: "fallthrough" };
+}
+
+// Guarded so `main.ts` can be imported (e.g. by tests, for INIT_PROMPT/runTurnSession) without
+// executing the CLI — import.meta.main is true only when this file is the entry point.
+if (import.meta.main) {
   const argv = process.argv.slice(2);
+  const isTTY = !!(process.stdin.isTTY && process.stdout.isTTY);
+  const route = routeCliInvocation(argv, isTTY);
+
+  if (argv[0] === "-p") {
+    await runTurnSession({ chat: false }); // one-shot; never resolves normally — exits via process.exit()
+  }
+  if (route.kind === "chat" && route.existingSessionId === undefined) {
+    // bare `norma`, or `norma --auto`/`--plan` (Finding 3) → persistent chat mode on a fresh
+    // session (loops until ctrl+C/ctrl+D); Finding 4 — routeCliInvocation already gated this on
+    // isTTY, so a non-TTY bare/--auto/--plan invocation falls through to the switch below instead.
+    await runTurnSession({ chat: true });
+  }
+
   const [cmd, sub] = argv;
 
   // Two-word subcommands use "cmd sub"; single-word commands match on cmd alone.
@@ -689,7 +1055,7 @@ if (import.meta.main) {
     break;
   }
   case "init": {
-    await runHeadlessAgent(INIT_PROMPT, true); // force auto: writes NORMA.md without approval prompts
+    await runTurnSession({ promptOverride: INIT_PROMPT, forceAuto: true, chat: false }); // force auto: writes NORMA.md without approval prompts
     break;
   }
   case "resume": {
@@ -701,18 +1067,24 @@ if (import.meta.main) {
       for (const r of rows) console.log(`${r.sessionId}  ${DIM}${r.scope}  ${r.lastSeq} events${process.stdout.isTTY && r.title ? ` — ${r.title}` : ""}${RESET}`);
       c.close(); process.exit(0);
     }
-    const text = process.argv.slice(4).join(" ");
-    if (!text) { // recap only: show the session line, tell them how to continue
-      const c = await connect("cli-resume");
-      const info = (await c.listSessions()).sessions.find((r: any) => r.sessionId === sid);
-      if (info) {
-        console.log(`${sid}  ${DIM}${info.scope}  ${info.lastSeq} events${RESET}\nresume with: norma resume ${sid} "<message>"`);
-      } else {
-        console.error(`no such session: ${sid}`);
-      }
-      c.close(); process.exit(info ? 0 : 1);
+    // `route` was computed from this same `argv` up front (routeCliInvocation), so — sid being
+    // truthy here means `sub !== undefined` held there too — it's necessarily "chat" or
+    // "resumeOneShot", never "fallthrough". Finding 4 hygiene: previously this was two consecutive
+    // unconditional `if`s with no `else`/`return` between them, so the chat call (below) fell
+    // through into the one-shot call with empty prompt text right after — harmless only because
+    // runTurnSession(chat:true) never returns in normal operation (teardownAndExit always
+    // process.exit()s), not a guarantee. (A bare top-level `return` isn't legal here — this file's
+    // dispatch runs at module top level, not inside a function — so the fix is this if/else rather
+    // than a literal `return`.)
+    if (route.kind === "chat") {
+      // No message, or exactly `--auto`/`--plan` (Finding 3 — previously sent as literal prompt
+      // text) → resume INTO chat mode on this session (§0). runTurnSession does its own existence
+      // check + "↻ resuming …" line; policy seeds from that flag (default ask) via the same
+      // process.argv read runTurnSession already does for the bare-chat path.
+      await runTurnSession({ existingSessionId: sid, chat: true });
+    } else if (route.kind === "resumeOneShot") {
+      await runTurnSession({ promptOverride: route.text, forceAuto: true, existingSessionId: sid, chat: false }); // continue the existing session (auto, one-shot)
     }
-    await runHeadlessAgent(text, true, sid); // continue the existing session headless (auto)
     break;
   }
   case "provider-smoke": {

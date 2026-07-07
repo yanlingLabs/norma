@@ -19,10 +19,11 @@ final class WindowTaskSectionTests: XCTestCase {
     }
 
     func testManyCompletedCollapse() {
+        // Cap is 3 (CC parity, Task 1): 4 completed rows exceed it by 1, so 3 are kept and 1 collapses.
         let tasks = [item("ip", "in_progress", startedTs: 100),
-                     item("c1", "completed"), item("c2", "completed"), item("c3", "completed")]
+                     item("c1", "completed"), item("c2", "completed"), item("c3", "completed"), item("c4", "completed")]
         let result = buildTaskSection(tasks)
-        XCTAssertEqual(result.rows.map(\.status), ["in_progress", "completed", "completed"])
+        XCTAssertEqual(result.rows.map(\.status), ["in_progress", "completed", "completed", "completed"])
         XCTAssertEqual(result.collapsedCompleted, 1)
     }
 

@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { anySubagentAlive, subagentGlyph, subagentLabel, subagentTokens } from "../src/subagent-display";
+import {
+  anySubagentAlive,
+  extractToolDetail,
+  subagentElapsedMs,
+  subagentGlyph,
+  subagentLabel,
+  subagentTokens,
+} from "../src/subagent-display";
 
 describe("subagentGlyph", () => {
   test("statuses", () => {
@@ -51,4 +58,25 @@ describe("subagentTokens (TS-only: CLI shows the arrows)", () => {
     expect(subagentTokens(12300, 4100, 0)).toBe("↑ 12.3k ↓ 4.1k");
     expect(subagentTokens(1000, 100, 8)).toBe("↑ 1.0k ↓ 102");
   });
+});
+
+describe("extractToolDetail (TS port of SessionModel.swift)", () => {
+  test("bash first line capped 100", () => {
+    expect(extractToolDetail("bash", JSON.stringify({ command: "git status\ngit diff" }))).toBe("git status");
+    expect(extractToolDetail("bash", JSON.stringify({ command: "x".repeat(150) }))).toBe("x".repeat(100));
+    expect(extractToolDetail("bash", JSON.stringify({ command: "" }))).toBeUndefined();
+  });
+  test("tasks → subject; fs tools → path/pattern; unknown/broken → undefined", () => {
+    expect(extractToolDetail("task_update", JSON.stringify({ subject: "Ship it" }))).toBe("Ship it");
+    expect(extractToolDetail("read", JSON.stringify({ file_path: "/a/b.ts" }))).toBe("/a/b.ts");
+    expect(extractToolDetail("glob", JSON.stringify({ pattern: "**/*.ts" }))).toBe("**/*.ts");
+    expect(extractToolDetail("ls", JSON.stringify({ path: "/tmp" }))).toBe("/tmp");
+    expect(extractToolDetail("weird", JSON.stringify({ a: 1 }))).toBeUndefined();
+    expect(extractToolDetail("bash", "not json")).toBeUndefined();
+  });
+});
+test("subagentElapsedMs banks + open span while working", () => {
+  expect(subagentElapsedMs({ activeMs: 5000, activeSince: undefined, status: "done" }, 99999)).toBe(5000);
+  expect(subagentElapsedMs({ activeMs: 5000, activeSince: 10000, status: "working" }, 12500)).toBe(7500);
+  expect(subagentElapsedMs({ activeMs: 0, activeSince: 10000, status: "working" }, 9000)).toBe(0); // skew clamp
 });
