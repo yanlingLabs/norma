@@ -5,12 +5,14 @@ import { METHODS, type Task } from "@norma/protocol";
 import { NormaClient } from "./client";
 import { applyEvent, isStalled, type WatchdogState } from "./watchdog";
 import { streamAction } from "./stream-state";
+import { updateSubagents, type CliSubagent } from "./subagent-state";
 import {
   DIM,
   RESET,
   SPINNER_FRAMES,
   TASK_ICONS,
   renderStatusLine,
+  renderSubagentBlock,
   renderTaskBlock,
   trackLineStart,
   truncateStatusLine,
@@ -151,6 +153,7 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
   // `emit()` degenerates to a plain process.stdout.write and task_updated keeps its exact
   // existing one-line-per-update console output for headless consumers.
   let tasks: Task[] = [];
+  let subagents: CliSubagent[] = []; // live child threads of the current turn (2e-ii)
   let atLineStart = true;
   let pinnedLines = 0;
 
@@ -186,6 +189,7 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
       });
       lines.push(truncateStatusLine(statusLine, columns));
     }
+    lines.push(...renderSubagentBlock(subagents, columns)); // [status line] [subagents] [tasks]
     lines.push(...renderTaskBlock(tasks, columns));
     if (lines.length === 0) return;
     // renderTaskBlock/renderStatusLine rows are already ANSI-colored per-row (blue/green/dim
@@ -224,6 +228,13 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
       emit(`${AQUA}${(e as { delta: string }).delta}${RESET}`);
     } else if (sa.action === "close_line") emit("\n");
     applyEvent(wd, e, Date.now());
+    const nextSubagents = updateSubagents(subagents, e as { type: string; threadId?: string });
+    if (nextSubagents !== subagents) {
+      subagents = nextSubagents;
+      // Child turn_started/turn_completed hit no emit() branch below (their branches are
+      // main-guarded), so repaint here; delta-driven token growth rides the 120ms spinner tick.
+      if ((e.type === "turn_started" || e.type === "turn_completed") && process.stdout.isTTY) refreshBlock();
+    }
     if (e.type === "turn_started" && e.threadId === "main") {
       // Task-4 review fix: MAIN-thread only. runThread() emits turn_started/turn_completed for
       // every spawned subagent CHILD thread too (broadcast to all harnesses with a non-"main"
