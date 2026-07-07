@@ -7,9 +7,13 @@ final class AppModel: ObservableObject {
     let session = SessionModel()
     @Published private(set) var connectionSummary = "connecting…"
 
-    private let client: NormaClient
+    /// Owns the socket + connect/attach/pump mechanics (2d-ii-b Task 1 extraction, see
+    /// SessionFeed.swift). AppModel is its `followFocus` consumer — the focus-tracking state
+    /// below stays here; it's specific to this mode and SessionFeed's `pinned` mode doesn't need
+    /// it.
+    private let feed: SessionFeed
+    private var client: NormaClient { feed.client }
     private var focusedSessionId: String?
-    private var pumpTask: Task<Void, Never>?
     private var selfCreatedSessionId: String?
 
     /// Finding-1 fix (gate 2): session ids the orb has already forced to `approvalPolicy: "auto"`
@@ -20,7 +24,20 @@ final class AppModel: ObservableObject {
     private var forcedAutoSessionIds: Set<String> = []
 
     init(makeTransport: @escaping @Sendable () -> NormaTransport, token: String, clientName: String = "orb") {
-        client = NormaClient(makeTransport: makeTransport, token: token, clientName: clientName)
+        feed = SessionFeed(makeTransport: makeTransport, token: token, clientName: clientName, mode: .followFocus, session: session)
+        // Hook composition (see SessionFeed's doc comment for why): these four closures are the
+        // ONLY seam between the extracted mechanics and AppModel's focus-follow behavior, each
+        // firing at the exact point the original monolithic start()/handle() touched app state.
+        feed.onRetry = { [weak self] in self?.connectionSummary = "daemon unreachable — retrying…" }
+        feed.onAttach = { [weak self] in await self?.focusNewestSession() }
+        feed.onConnected = { [weak self] in
+            guard let self else { return }
+            self.connectionSummary = self.summaryLine()
+        }
+        feed.onEvent = { [weak self] ev in
+            await self?.handle(ev)
+            return true // AppModel's handle() fully owns event application in followFocus mode.
+        }
     }
 
     /// Production wiring: harness token from the Keychain, default unix socket.
@@ -31,38 +48,11 @@ final class AppModel: ObservableObject {
     }
 
     func start() async {
-        // The daemon may not be up yet — retry the INITIAL connect with capped backoff.
-        var attempt = 0
-        while true {
-            do {
-                try await client.connect()
-                break
-            } catch {
-                attempt += 1
-                connectionSummary = "daemon unreachable — retrying…"
-                let backoff = min(0.5 * pow(2.0, Double(attempt - 1)), 10.0)
-                try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
-                if Task.isCancelled { return }
-            }
-        }
-
-        await focusNewestSession()
-        session.markConnected() // M2: connect() success IS the connected signal
-        connectionSummary = summaryLine()
-
-        pumpTask = Task { [weak self] in
-            guard let self else { return }
-            for await ev in self.client.events {
-                await self.handle(ev)
-                if Task.isCancelled { return }
-            }
-        }
-        await pumpTask?.value
+        await feed.start()
     }
 
     func stop() {
-        pumpTask?.cancel()
-        Task { await client.close() }
+        feed.stop()
     }
 
     /// Field summon path: a session to talk to, creating one if none is focused.
