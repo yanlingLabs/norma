@@ -13,7 +13,11 @@ final class AppModel: ObservableObject {
     /// it.
     private let feed: SessionFeed
     private var client: NormaClient { feed.client }
-    private var focusedSessionId: String?
+    /// Task 4: `private(set)` (was fully `private`) so AppDelegate's detach closure can capture the
+    /// currently-focused session id BEFORE `startFreshSessionAfterDetach()` flips it — the
+    /// detached window needs the OLD id (via `makeDetachedFeed(sessionId:)`), the orb needs a NEW
+    /// one.
+    private(set) var focusedSessionId: String?
     private var selfCreatedSessionId: String?
 
     /// Task 3 (2d-ii-b): stashed so `makeDetachedFeed(sessionId:)` can mint a FRESH `SessionFeed`
@@ -108,6 +112,23 @@ final class AppModel: ObservableObject {
         selfCreatedSessionId = created.sessionId // belt: suppress the broadcast if it arrives AFTER us
         await refocus(onto: created.sessionId)
         return focusedSessionId
+    }
+
+    /// Task 4 (detach choreography): the orb's "clean slate" step after a detach — the session it
+    /// was just focused on now belongs to a standalone detached window (its own harness, see
+    /// `makeDetachedFeed(sessionId:)`), so the orb's NEXT summon must never keep talking into that
+    /// same session. Exact `ensureFocusedSession()` creation body above, but UNCONDITIONAL: skips
+    /// the `if let sid = focusedSessionId { return sid }` early-out on purpose — a focus almost
+    /// always exists at this point (the session that was just detached), and this must create+
+    /// refocus onto a brand-new one regardless.
+    func startFreshSessionAfterDetach() async {
+        guard let created = try? await client.createSession(scope: "global", cwd: NSHomeDirectory(), approvalPolicy: "auto") else { return }
+        forcedAutoSessionIds.insert(created.sessionId) // born auto — no redundant setPolicy on first send
+        // Same belt as ensureFocusedSession(): the daemon's session_created broadcast can arrive
+        // (and refocus us) before this RPC response does — idempotent skip, never double-attach.
+        if focusedSessionId == created.sessionId { return }
+        selfCreatedSessionId = created.sessionId // suppress the broadcast if it arrives AFTER us
+        await refocus(onto: created.sessionId)
     }
 
     /// Finding-1 fix (gate 2 — "the orb still asks approvals despite the auto default"). ROOT CAUSE:

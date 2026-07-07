@@ -129,7 +129,7 @@ struct NormaFieldView: View {
                     adapter: adapter, morph: morph, fluid: fluid,
                     namespace: glassNamespace, windowSize: geo.size,
                     onClose: { adapter.onWindowClose() },
-                    onMinimize: { adapter.onWindowClose() },
+                    onMinimize: { adapter.onWindowDetach() },
                     onZoom: { adapter.onWindowZoom() }
                 )
             }

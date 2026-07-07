@@ -32,7 +32,8 @@ struct WindowSurfaceView: View {
     /// (v1 kept "chat-shell" and "composer-shell" in the same namespace; they never coexist).
     let namespace: Namespace.ID
     let windowSize: CGSize
-    /// Red traffic light + yellow (minimize) + 4-finger tap + Esc all collapse to the orb.
+    /// Red traffic light + 4-finger tap + Esc collapse to the orb. Task 4: yellow (minimize) no
+    /// longer collapses — it detaches into a native, non-morphing window instead.
     let onClose: () -> Void
     let onMinimize: () -> Void
     /// Green traffic light — zoom toggle.

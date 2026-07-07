@@ -109,6 +109,14 @@ final class OrbWindowController: ObservableObject {
     /// Returns true when the key was consumed as an interrupt (turn running); false → collapse.
     var onEsc: (() -> Bool)?
 
+    /// Task 4: fired by `requestWindowDetach()` with the panel's CURRENT frame (spawn the detached
+    /// window exactly there). AppDelegate's closure spawns the detached window SYNCHRONOUSLY
+    /// (`DetachedWindowController.show()`'s `makeKeyAndOrderFront` runs before the closure
+    /// returns) — see `requestWindowDetach()`'s doc for the never-both-invisible ordering this
+    /// depends on. The controller exposes this callback, it does NOT import AppModel/AppDelegate
+    /// (same seam convention as `onSubmit`/`onEsc` above).
+    var onWindowDetach: ((NSRect) -> Void)?
+
     /// Wave-5 gate item 4: the composer-hop seam — `handleAcceptedSwipe` below needs to know
     /// whether the shell is CURRENTLY showing the composer (`FieldStateAdapter.showingDraft`) to
     /// decide the swipe against the field's full position space (history ⟷ response ⟷ composer,
@@ -738,9 +746,10 @@ final class OrbWindowController: ObservableObject {
         OrbDebug.log("presentWindowSurface: anchor=\(anchor) windowFrame=\(layout.windowFrame)")
     }
 
-    /// Gate r7: window → orb collapse — Esc (idle), the red/yellow traffic lights, and the 4-finger
-    /// tap all route here. v1 parity: the large surface ALWAYS returns to the orb, never back to the
-    /// field. Reverse-morphs the shell back down to the orb bubble (SAME 140/22 spring);
+    /// Gate r7: window → orb collapse — Esc (idle), the RED traffic light, and the 4-finger tap
+    /// all route here (Task 4: the yellow light no longer does — see `requestWindowDetach()`). v1
+    /// parity: the large surface ALWAYS returns to the orb, never back to the field.
+    /// Reverse-morphs the shell back down to the orb bubble (SAME 140/22 spring);
     /// `finishWindowCollapse()` does the teardown once it settles.
     ///
     /// Gate r8: also arms the cursor-ride (`rideWindowCollapseToCursor()`, driven from `morphTick()`
@@ -753,6 +762,56 @@ final class OrbWindowController: ObservableObject {
         windowCollapseLockedScreen = visibleScreenFrame(containing: currentWindowScreenAnchor())
         startMorph(target: 0)
         OrbDebug.log("collapseWindowToOrb: morphTarget=0")
+    }
+
+    /// Task 4: one-shot re-entrancy latch for `requestWindowDetach()` — armed for the duration of
+    /// the synchronous `onWindowDetach?(frame)` callback (during which `surface` is STILL
+    /// `.window` — it only flips inside `exitWindowModeForDetach()`, called right after), cleared
+    /// once that exit completes. Guards against a reentrant detach request landing inside the
+    /// callback itself, before the ordinary `surface == .window` guard alone would catch it.
+    private var detachInFlight = false
+
+    /// Task 4 (yellow traffic light → detach): spawns a native detached window at the panel's
+    /// CURRENT frame, then frees the orb panel back to `.orb` — no animation, same instant
+    /// teardown `hide()`'s `.window` branch already uses (`exitWindowModeForDetach()` below), just
+    /// without ordering the panel out (the orb stays visible; a new window took the field's
+    /// place).
+    ///
+    /// Guarded against firing mid-morph (`morphTimer != nil` — covers any spring currently
+    /// driving the panel, including the window's own open/close morph — the zoom toggle is still
+    /// an instant re-present today with no spring of its own, so this same check already covers
+    /// it too), mid-handoff (`pendingWindowExpand` — the field hasn't finished collapsing into the
+    /// window yet), when the surface isn't actually `.window`, or re-entrantly (`detachInFlight`).
+    ///
+    /// OWNS the never-both-invisible ordering (see the task brief): fires `onWindowDetach?(frame)`
+    /// FIRST — the caller's closure (AppDelegate) spawns the detached window SYNCHRONOUSLY
+    /// (`DetachedWindowController.show()`'s `makeKeyAndOrderFront` runs before that closure
+    /// returns) — and only THEN runs `exitWindowModeForDetach()`. So there is never a frame where
+    /// neither the window surface nor the detached window is on screen.
+    func requestWindowDetach() {
+        // Task 5 adds zoomTimer to this guard (once the green zoom toggle grows a spring).
+        guard surface == .window, morphTimer == nil, !pendingWindowExpand, !detachInFlight else { return }
+        detachInFlight = true
+        let frame = panel.frame
+        onWindowDetach?(frame)
+        exitWindowModeForDetach()
+        detachInFlight = false
+        OrbDebug.log("requestWindowDetach: fired frame=\(frame)")
+    }
+
+    /// Task 4: the `hide()` `.window` branch (see that method, above) verbatim — cancel the morph
+    /// timer, snap `progress`/`morphVelocity` to settled, then `finishWindowCollapse()` — but
+    /// WITHOUT `panel.orderOut`: the orb panel stays visible/on screen (a detached window has just
+    /// taken the field's place instead of the panel hiding outright). `finishWindowCollapse()`
+    /// already resizes the panel back down to `collapsedWindowSize`, snaps the follower to the
+    /// settled orb anchor, restores global (follow-everywhere) Space behavior, and restores
+    /// `externalFocus` — none of that touches `isVisible`/orders the panel out (verified by
+    /// inspection, `finishWindowCollapse()` above).
+    func exitWindowModeForDetach() {
+        cancelMorphTimer()
+        morphModel.progress = 0
+        morphVelocity = 0
+        finishWindowCollapse()
     }
 
     /// Gate r8 (v1 follow-collapse parity — `trackStep`'s `isCollapsing` branch for `.dashboard`/

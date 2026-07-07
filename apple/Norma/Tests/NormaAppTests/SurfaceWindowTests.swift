@@ -243,6 +243,69 @@ final class SurfaceWindowTests: XCTestCase {
         controller.hide()
     }
 
+    /// Task 4: the yellow traffic light — `requestWindowDetach()` fires `onWindowDetach` exactly
+    /// once with the panel's CURRENT (window-sized) frame, then runs the no-animation exit back to
+    /// the orb (surface flips to `.orb`, the panel stays visible/on-screen at `collapsedWindowSize`
+    /// — never ordered out). A second call, now that `surface` is `.orb`, is a no-op.
+    func testRequestWindowDetachFiresOnceWithCurrentFrameAndExitsToOrb() async throws {
+        let controller = OrbWindowController(session: SessionModel())
+        controller.show()
+        controller.expandToField()
+        try await pollUntil(timeout: 5.0) { controller.morphProgressForTesting > 0.9 }
+        controller.enterWindowMode()
+        try await pollUntil(timeout: 5.0) { controller.surface == .window && controller.isMorphIdleForTesting }
+
+        var firedFrames: [NSRect] = []
+        controller.onWindowDetach = { frame in firedFrames.append(frame) }
+
+        let windowFrame = controller.panelFrameForTesting
+        controller.requestWindowDetach()
+
+        XCTAssertEqual(firedFrames.count, 1, "onWindowDetach must fire exactly once")
+        XCTAssertEqual(firedFrames.first, windowFrame, "must fire with the CURRENT (still window-sized) frame")
+        XCTAssertEqual(controller.surface, .orb, "exitWindowModeForDetach() collapses the panel's surface back to .orb")
+        XCTAssertTrue(controller.isVisible, "the orb panel stays on screen — never ordered out on detach")
+        XCTAssertEqual(controller.panelFrameForTesting.size, controller.morphModel.collapsedWindowSize)
+
+        controller.requestWindowDetach() // second call — surface is now .orb, must no-op
+        XCTAssertEqual(firedFrames.count, 1, "no second fire")
+
+        controller.hide()
+    }
+
+    /// Task 4: `requestWindowDetach()` must never fire mid-handoff (field→window collapse still in
+    /// flight, `pendingWindowExpand` armed, surface still `.field`) nor mid-morph (a spring is
+    /// still actively driving the panel — the SAME guard Task 5's zoom spring will also rely on;
+    /// today the only reachable mid-morph `.window` state is the window's own opening 0→1 present,
+    /// asserted here right after the surface flip).
+    func testDetachGuardedDuringMorphAndZoom() async throws {
+        let controller = OrbWindowController(session: SessionModel())
+        controller.show()
+        controller.expandToField()
+        try await pollUntil(timeout: 5.0) { controller.morphProgressForTesting > 0.9 }
+
+        var fireCount = 0
+        controller.onWindowDetach = { _ in fireCount += 1 }
+
+        // Mid-handoff: pendingWindowExpand armed, reverse-morph running, surface still .field.
+        controller.enterWindowMode()
+        controller.requestWindowDetach()
+        XCTAssertEqual(fireCount, 0, "mid-handoff must no-op")
+        XCTAssertEqual(controller.surface, .field, "must not have presented the window yet")
+
+        try await pollUntil(timeout: 5.0) { controller.surface == .window }
+        // The window's own present spring (0→1) is still running the instant surface flips —
+        // Task 5 adds a zoomTimer to this same guard; the morphTimer check already covers "a
+        // morph is in flight" regardless of which spring drives it.
+        XCTAssertFalse(controller.isMorphIdleForTesting, "the present morph must still be running right after the flip")
+        controller.requestWindowDetach()
+        XCTAssertEqual(fireCount, 0, "mid-morph must no-op")
+        XCTAssertEqual(controller.surface, .window, "must still be .window — the guard, not a completed detach, blocked it")
+
+        try await pollUntil(timeout: 5.0) { controller.isMorphIdleForTesting }
+        controller.hide()
+    }
+
     /// Same polling helper as `MorphTimerReentrancyTests`/`MorphRetargetTests` — the 60Hz morph
     /// timer's settle time isn't deterministic under test-host scheduling load.
     private func pollUntil(

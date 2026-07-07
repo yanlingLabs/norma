@@ -385,12 +385,18 @@ final class FieldStateAdapter: ObservableObject {
 
     // MARK: - Gate r7: window-surface controls (same-panel window morph)
 
-    /// Wired by GlassRootView → `OrbWindowController.collapseWindowToOrb()`. The window's red/yellow
-    /// traffic lights, Esc, and the 4-finger tap all route here — the window always collapses back
-    /// to the ORB (v1 parity: the large surface never returns to the field).
+    /// Wired by GlassRootView → `OrbWindowController.collapseWindowToOrb()`. The window's RED
+    /// traffic light, Esc, and the 4-finger tap all route here — collapses back to the ORB (v1
+    /// parity: the large surface never returns to the field). Task 4: the YELLOW light no longer
+    /// routes here — see `onWindowDetach` below.
     var onWindowClose: () -> Void = {}
     /// Wired by GlassRootView → `OrbWindowController.zoomToggleWindow()`. The green traffic light.
     var onWindowZoom: () -> Void = {}
+    /// Task 4: wired by GlassRootView → `OrbWindowController.requestWindowDetach()`. The window's
+    /// YELLOW traffic light (minimize) — spawns a native detached window at the panel's current
+    /// frame and frees the orb for a fresh session, instead of collapsing back to the orb (plain
+    /// var, wired like `onWindowClose` just above).
+    var onWindowDetach: () -> Void = {}
 
     // MARK: - Task 7: interaction-needed pulses
 

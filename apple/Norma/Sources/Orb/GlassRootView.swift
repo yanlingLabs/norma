@@ -32,10 +32,13 @@ struct GlassRootView: View {
         adapter.onCollapse = { [controller] in controller.collapseToOrb() }
         adapter.onExpandToWindow = { [controller] in controller.requestExpandToWindow() }
         // Gate r7 (same-panel window morph): the window's traffic lights / zoom route back to the
-        // controller — red+yellow collapse to the orb, green toggles zoom. Esc + the 4-finger tap
-        // use `collapseWindowToOrb()` directly (key monitor / AppDelegate summon router).
+        // controller — red collapses to the orb, green toggles zoom. Esc + the 4-finger tap use
+        // `collapseWindowToOrb()` directly (key monitor / AppDelegate summon router).
         adapter.onWindowClose = { [controller] in controller.collapseWindowToOrb() }
         adapter.onWindowZoom = { [controller] in controller.zoomToggleWindow() }
+        // Task 4: the yellow light detaches into a native window instead of collapsing — see
+        // `OrbWindowController.requestWindowDetach()`'s doc for the full ordering it owns.
+        adapter.onWindowDetach = { [controller] in controller.requestWindowDetach() }
         // Wave-5 gate item 4: the composer-hop seam — `OrbWindowController.handleAcceptedSwipe`
         // needs to read/write `adapter.showingDraft` but can't reach the adapter directly (see
         // `OrbWindowController.isShowingDraft`'s doc).
