@@ -56,7 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let production = Self.isRunningUnitTests ? nil : (try? AppModel.production())
         let model = production ?? AppModel(
             makeTransport: { UnixSocketTransport(path: NormaPaths.socketPath()) },
-            token: "missing-token"
+            token: AppModel.missingTokenSentinel
         )
         let tokenMissing = production == nil
         appModel = model
