@@ -12,7 +12,6 @@ import {
   SPINNER_FRAMES,
   TASK_ICONS,
   renderStatusLine,
-  renderSubagentBlock,
   renderTaskBlock,
   trackLineStart,
   truncateStatusLine,
@@ -189,7 +188,8 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
       });
       lines.push(truncateStatusLine(statusLine, columns));
     }
-    lines.push(...renderSubagentBlock(subagents, columns)); // [status line] [subagents] [tasks]
+    // Task 3 (2e-iii-b): the 2e-ii subagent block is gone — absorbed into the (not-yet-wired)
+    // agents footer; Task 6 adds its composition here. [status line] [tasks] for now.
     lines.push(...renderTaskBlock(tasks, columns));
     if (lines.length === 0) return;
     // renderTaskBlock/renderStatusLine rows are already ANSI-colored per-row (blue/green/dim
