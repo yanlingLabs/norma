@@ -23,6 +23,16 @@ final class SubagentDisplayTests: XCTestCase {
         XCTAssertEqual(subagentLabel(description: nil, prompt: String(repeating: "x", count: 40)), String(repeating: "x", count: 40))
     }
 
+    /// Caps by UNICODE CODE POINTS, not UTF-16 units or grapheme clusters — lockstep with TS
+    /// (never cuts a surrogate pair).
+    func testLabelCodePointCapLockstepWithTS() {
+        // 45 flag emoji (each = 2 code points, 90 total): 39 code points = 19 full flags + one
+        // lone regional indicator, never a corrupt half-surrogate.
+        XCTAssertEqual(subagentLabel(description: nil, prompt: String(repeating: "🇦🇺", count: 45)), String(repeating: "🇦🇺", count: 19) + "🇦" + "…")
+        // 40-code-point ASCII prompt still fits untruncated (existing behavior preserved).
+        XCTAssertEqual(subagentLabel(description: nil, prompt: String(repeating: "x", count: 40)), String(repeating: "x", count: 40))
+    }
+
     func testAnyAlive() {
         XCTAssertFalse(anySubagentAlive([]))
         XCTAssertFalse(anySubagentAlive(["done", "done"]))

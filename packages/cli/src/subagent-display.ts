@@ -11,13 +11,16 @@ export function subagentGlyph(status: string): string {
   return "◌"; // queued, or any unrecognized status
 }
 
-/** description (trimmed) if non-empty, else the prompt's FIRST line capped at 40 chars with a
- *  trailing "…" (39 kept + ellipsis; exactly 40 fits untruncated). */
+/** description (trimmed) if non-empty, else the prompt's FIRST line capped at 40 UNICODE CODE
+ *  POINTS with a trailing "…" (39 kept + ellipsis; exactly 40 fits untruncated). Code points
+ *  (not UTF-16 units, not grapheme clusters) count identically in TS (`Array.from`) and Swift
+ *  (`unicodeScalars`) and never split a surrogate pair. */
 export function subagentLabel(description: string | undefined, prompt: string): string {
   const desc = (description ?? "").trim();
   if (desc.length > 0) return desc;
   const firstLine = prompt.split("\n", 1)[0] ?? "";
-  return firstLine.length > 40 ? `${firstLine.slice(0, 39)}…` : firstLine;
+  const cps = Array.from(firstLine);
+  return cps.length > 40 ? `${cps.slice(0, 39).join("")}…` : firstLine;
 }
 
 export function anySubagentAlive(statuses: string[]): boolean {

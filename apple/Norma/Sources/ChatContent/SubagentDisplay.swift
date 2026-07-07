@@ -9,13 +9,16 @@ func subagentGlyph(_ status: String) -> String {
     return "◌" // queued, or any unrecognized status
 }
 
-/// description (trimmed) if non-empty, else the prompt's FIRST line capped at 40 chars with a
-/// trailing "…" (39 kept + ellipsis; exactly 40 fits untruncated).
+/// description (trimmed) if non-empty, else the prompt's FIRST line capped at 40 UNICODE CODE
+/// POINTS with a trailing "…" (39 kept + ellipsis; exactly 40 fits untruncated). Code points
+/// (not UTF-16 units, not grapheme clusters) count identically in TS (`Array.from`) and Swift
+/// (`unicodeScalars`) and never split a surrogate pair.
 func subagentLabel(description: String?, prompt: String) -> String {
     let desc = (description ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     if !desc.isEmpty { return desc }
     let firstLine = prompt.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? ""
-    return firstLine.count > 40 ? String(firstLine.prefix(39)) + "…" : firstLine
+    let scalars = Array(firstLine.unicodeScalars)
+    return scalars.count > 40 ? String(String.UnicodeScalarView(scalars.prefix(39))) + "…" : firstLine
 }
 
 func anySubagentAlive(_ statuses: [String]) -> Bool {

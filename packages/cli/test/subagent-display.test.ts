@@ -21,6 +21,13 @@ describe("subagentLabel", () => {
     expect(subagentLabel("   ", "x".repeat(45))).toBe("x".repeat(39) + "…");
     expect(subagentLabel(undefined, "x".repeat(40))).toBe("x".repeat(40)); // exactly 40 fits
   });
+  test("caps by UNICODE CODE POINTS, not UTF-16 units — lockstep with Swift (never cuts a surrogate pair)", () => {
+    // 45 flag emoji (each = 2 code points, 90 total): 39 code points = 19 full flags + one lone
+    // regional indicator, never a corrupt half-surrogate.
+    expect(subagentLabel(undefined, "🇦🇺".repeat(45))).toBe("🇦🇺".repeat(19) + "🇦" + "…");
+    // 40-code-point ASCII prompt still fits untruncated (existing behavior preserved).
+    expect(subagentLabel(undefined, "x".repeat(40))).toBe("x".repeat(40));
+  });
 });
 
 describe("anySubagentAlive", () => {
