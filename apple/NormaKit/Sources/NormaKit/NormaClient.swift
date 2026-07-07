@@ -221,6 +221,7 @@ extension SessionEvent {
         case .worktreeExited(let v): return v.seq
         case .threadStarted(let v): return v.seq
         case .threadCompleted(let v): return v.seq
+        case .sessionTitled(let v): return v.seq
         }
     }
 
@@ -254,6 +255,7 @@ extension SessionEvent {
         case .worktreeExited(let v): return v.sessionId
         case .threadStarted(let v): return v.sessionId
         case .threadCompleted(let v): return v.sessionId
+        case .sessionTitled(let v): return v.sessionId
         }
     }
 }

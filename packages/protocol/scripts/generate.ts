@@ -43,6 +43,7 @@ const fixtures: Record<string, unknown> = {
   worktree_exited: { type: "worktree_exited", sessionId: "s_1", threadId: "t_1", seq: 16, ts: 1700000000006, name: "fix-auth", action: "keep", removed: false },
   thread_started: { type: "thread_started", sessionId: "s_1", threadId: "th_child1", seq: 17, ts: 1700000000007, parentThreadId: "main", agentType: "researcher", prompt: "Summarize the auth module" },
   thread_completed: { type: "thread_completed", sessionId: "s_1", threadId: "th_child1", seq: 18, ts: 1700000000008, stopReason: "end_turn" },
+  session_titled: { type: "session_titled", seq: 9, sessionId: "s_1", ts: 5, threadId: "main", title: "Fixing the login flow" },
 };
 for (const [name, value] of Object.entries(fixtures)) {
   SessionEvent.parse(value); // fixtures must be valid by construction
