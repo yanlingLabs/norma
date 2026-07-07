@@ -142,3 +142,51 @@ describe("AgentEngine: ask_user / task bridges", () => {
     expect((toolResult as any).output).toContain("Proceed with your best judgment");
   });
 });
+
+describe("AgentEngine: per-turn task-list system-reminder (CC v2 parity)", () => {
+  test("tasks exist → exactly one system-reminder item, appended last, with both #<id> lines", async () => {
+    const { engine, tasks, sessionId, provider } = setup([text("ok")]);
+    const t1 = tasks!.create(sessionId, "Fix auth bug");
+    tasks!.update(sessionId, t1.id, { status: "in_progress" });
+    tasks!.create(sessionId, "Run tests");
+
+    await engine.runTurn(sessionId);
+
+    const input = provider.requests[0]!.input;
+    const reminders = input.filter((it) => "content" in it && typeof it.content === "string" && it.content.includes("<system-reminder>"));
+    expect(reminders).toHaveLength(1);
+    expect(input.at(-1)).toBe(reminders[0]); // positioned last
+
+    const content = (reminders[0] as { content: string }).content;
+    expect(content).toContain("#1 [in_progress] Fix auth bug");
+    expect(content).toContain("#2 [pending] Run tests");
+    expect(content).toContain("do NOT create a new task for work already listed");
+    expect(content).toContain("This reminder is invisible to the user");
+  });
+
+  test("tasks wired but list empty → no reminder appended", async () => {
+    const { engine, sessionId, provider } = setup([text("ok")]);
+    await engine.runTurn(sessionId);
+    const input = provider.requests[0]!.input;
+    expect(input.some((it) => "content" in it && typeof it.content === "string" && it.content.includes("<system-reminder>"))).toBe(false);
+  });
+
+  test("no TaskStore wired → no reminder appended even if somehow tasks existed", async () => {
+    const { engine, sessionId, provider } = setup([text("ok")], { tasks: false });
+    await engine.runTurn(sessionId);
+    const input = provider.requests[0]!.input;
+    expect(input.some((it) => "content" in it && typeof it.content === "string" && it.content.includes("<system-reminder>"))).toBe(false);
+  });
+
+  test("reminder is transient: never persisted as a user_message event", async () => {
+    const { engine, store, tasks, sessionId } = setup([text("ok")]);
+    tasks!.create(sessionId, "Fix auth bug");
+    const before = store.read(sessionId).filter((e) => e.type === "user_message").length;
+
+    await engine.runTurn(sessionId);
+
+    const userMessages = store.read(sessionId).filter((e) => e.type === "user_message");
+    expect(userMessages).toHaveLength(before); // no NEW user_message event from the reminder
+    expect(userMessages.some((e) => e.text.includes("<system-reminder>"))).toBe(false);
+  });
+});

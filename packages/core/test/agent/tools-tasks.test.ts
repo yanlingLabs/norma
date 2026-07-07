@@ -70,4 +70,15 @@ describe("task tools", () => {
     expect(listed.output).toContain("[1] ☐ pending task");
     expect(listed.output).toContain("[2] ◐ in-progress task");
   });
+
+  test("task_create/task_update descriptions steer the model to list-before-create/update (misuse guard)", () => {
+    const store = new TaskStore();
+    const r = buildRegistry(store);
+    const specs = r.specs();
+    const create = specs.find((s) => s.name === "task_create");
+    const update = specs.find((s) => s.name === "task_update");
+    expect(create?.description).toContain("First call task_list to check existing tasks and avoid creating a duplicate.");
+    expect(update?.description).toContain("To complete or change an EXISTING task, pass its id from task_list — do NOT create a new task.");
+    expect(update?.description).toContain("Call task_list first if you don't know the id.");
+  });
 });

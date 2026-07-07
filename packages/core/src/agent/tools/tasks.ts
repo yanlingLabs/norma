@@ -16,7 +16,7 @@ const TaskListArgsSchema = z.object({});
 export function registerTaskTools(r: ToolRegistry, deps: { tasks: TaskStore }): void {
   r.register({
     name: "task_create",
-    description: "Create a task on this session's task list (status starts as pending). Use task_update to mark it in_progress/completed as you work. The list is shown live to the user.",
+    description: "Create a task on this session's task list (status starts as pending). Use task_update to mark it in_progress/completed as you work. The list is shown live to the user. First call task_list to check existing tasks and avoid creating a duplicate.",
     args: TaskCreateArgsSchema,
     run({ subject, activeForm }: z.infer<typeof TaskCreateArgsSchema>, ctx) {
       const t = deps.tasks.create(ctx.sessionId, subject, activeForm);
@@ -26,7 +26,7 @@ export function registerTaskTools(r: ToolRegistry, deps: { tasks: TaskStore }): 
   });
   r.register({
     name: "task_update",
-    description: "Update a task's status (pending | in_progress | completed), subject, or activeForm.",
+    description: "Update a task's status (pending | in_progress | completed), subject, or activeForm. To complete or change an EXISTING task, pass its id from task_list — do NOT create a new task. Call task_list first if you don't know the id.",
     args: TaskUpdateArgsSchema,
     run({ taskId, status, subject, activeForm }: z.infer<typeof TaskUpdateArgsSchema>, ctx) {
       const patch: { status?: typeof status; subject?: typeof subject; activeForm?: typeof activeForm } = {};
