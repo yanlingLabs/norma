@@ -145,7 +145,7 @@ struct WindowSurfaceView: View {
 
 /// The three self-drawn macOS-style traffic lights (moved from the deleted `ChatWindowRootView`):
 /// three 14pt circles, 9pt apart, each with a subtle darker ring; hovering ANYWHERE over the group
-/// reveals the ×/−/+ glyphs (macOS behavior). Wired: red → close, yellow → minimize, green → zoom.
+/// reveals the ×/−/+ glyphs (macOS behavior). Wired: red → close, yellow → detach, green → zoom.
 struct MacTrafficLights: View {
     let onClose: () -> Void
     let onMinimize: () -> Void

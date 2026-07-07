@@ -256,7 +256,10 @@ final class SurfaceWindowTests: XCTestCase {
         try await pollUntil(timeout: 5.0) { controller.surface == .window && controller.isMorphIdleForTesting }
 
         var firedFrames: [NSRect] = []
-        controller.onWindowDetach = { frame in firedFrames.append(frame) }
+        controller.onWindowDetach = { frame in
+            firedFrames.append(frame)
+            return true // spawn "succeeded" — the exit must run
+        }
 
         let windowFrame = controller.panelFrameForTesting
         controller.requestWindowDetach()
@@ -273,6 +276,42 @@ final class SurfaceWindowTests: XCTestCase {
         controller.hide()
     }
 
+    /// I1 fix (review): a spawn failure (`onWindowDetach` returns `false` — e.g. AppDelegate had no
+    /// focused session, or a missing daemon token) must NOT run the exit-to-orb — the window
+    /// surface's content would otherwise vanish into the orb with nothing spawned to replace it.
+    /// Also proves the re-entrancy latch (`detachInFlight`) clears on the failure path: a second,
+    /// true-returning request right after still succeeds instead of silently no-oping forever.
+    ///
+    /// Deliberately uses `setSurfaceForTesting(.window)` (like `testEnterWindowModeFromWindowIsNoOp`
+    /// above) instead of driving a real `expandToField()`/`enterWindowMode()` morph — this test is
+    /// only exercising `requestWindowDetach()`'s boolean-gated exit branch, which needs no spring
+    /// running at all (`morphTimer == nil` is the guard's resting state), so it stays instant and
+    /// immune to the wall-clock jitter a real morph round-trip would add to the suite for no benefit
+    /// here — the round-trip itself is already covered by
+    /// `testRequestWindowDetachFiresOnceWithCurrentFrameAndExitsToOrb` above.
+    func testDetachSpawnFailureKeepsWindowSurface() {
+        let controller = OrbWindowController(session: SessionModel())
+        controller.show()
+        controller.setSurfaceForTesting(.window)
+
+        controller.onWindowDetach = { _ in false } // spawn failed — nothing to hand the surface off to
+        let windowFrame = controller.panelFrameForTesting
+        controller.requestWindowDetach()
+
+        XCTAssertEqual(controller.surface, .window, "a failed spawn must leave the window surface untouched")
+        XCTAssertTrue(controller.isVisible, "the panel stays exactly as it was")
+        XCTAssertEqual(controller.panelFrameForTesting, windowFrame, "no teardown/resize ran on a failed spawn")
+
+        // The latch must have cleared despite the false return — a later successful spawn works.
+        controller.onWindowDetach = { _ in true }
+        controller.requestWindowDetach()
+
+        XCTAssertEqual(controller.surface, .orb, "a subsequent successful spawn now exits normally")
+        XCTAssertEqual(controller.panelFrameForTesting.size, controller.morphModel.collapsedWindowSize)
+
+        controller.hide()
+    }
+
     /// Task 4: `requestWindowDetach()` must never fire mid-handoff (field→window collapse still in
     /// flight, `pendingWindowExpand` armed, surface still `.field`) nor mid-morph (a spring is
     /// still actively driving the panel — the SAME guard Task 5's zoom spring will also rely on;
@@ -285,7 +324,10 @@ final class SurfaceWindowTests: XCTestCase {
         try await pollUntil(timeout: 5.0) { controller.morphProgressForTesting > 0.9 }
 
         var fireCount = 0
-        controller.onWindowDetach = { _ in fireCount += 1 }
+        controller.onWindowDetach = { _ in
+            fireCount += 1
+            return true
+        }
 
         // Mid-handoff: pendingWindowExpand armed, reverse-morph running, surface still .field.
         controller.enterWindowMode()

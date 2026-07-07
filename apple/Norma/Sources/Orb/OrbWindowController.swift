@@ -115,7 +115,15 @@ final class OrbWindowController: ObservableObject {
     /// returns) — see `requestWindowDetach()`'s doc for the never-both-invisible ordering this
     /// depends on. The controller exposes this callback, it does NOT import AppModel/AppDelegate
     /// (same seam convention as `onSubmit`/`onEsc` above).
-    var onWindowDetach: ((NSRect) -> Void)?
+    ///
+    /// I1 fix (review): returns whether a window actually spawned. AppDelegate's closure can bail
+    /// with nothing spawned (no focused session yet — reachable via summon→expand→yellow before
+    /// any message — or `makeDetachedFeed` returning nil on a missing daemon token), and
+    /// `requestWindowDetach()` gates its exit-to-orb on this return so a spawn failure never
+    /// discards the window surface's content into the orb with nothing to show for it. `nil`
+    /// (unwired — e.g. tests that never set this) defaults to `true`, preserving the old
+    /// unconditional-exit behavior.
+    var onWindowDetach: ((NSRect) -> Bool)?
 
     /// Wave-5 gate item 4: the composer-hop seam — `handleAcceptedSwipe` below needs to know
     /// whether the shell is CURRENTLY showing the composer (`FieldStateAdapter.showingDraft`) to
@@ -766,9 +774,12 @@ final class OrbWindowController: ObservableObject {
 
     /// Task 4: one-shot re-entrancy latch for `requestWindowDetach()` — armed for the duration of
     /// the synchronous `onWindowDetach?(frame)` callback (during which `surface` is STILL
-    /// `.window` — it only flips inside `exitWindowModeForDetach()`, called right after), cleared
-    /// once that exit completes. Guards against a reentrant detach request landing inside the
-    /// callback itself, before the ordinary `surface == .window` guard alone would catch it.
+    /// `.window` — it only flips inside `exitWindowModeForDetach()`, called right after only on a
+    /// successful spawn), cleared unconditionally right after (I1 fix: whether or not the exit
+    /// actually ran — a false return must never leave this latch stuck armed, or every later
+    /// detach attempt would silently no-op forever). Guards against a reentrant detach request
+    /// landing inside the callback itself, before the ordinary `surface == .window` guard alone
+    /// would catch it.
     private var detachInFlight = false
 
     /// Task 4 (yellow traffic light → detach): spawns a native detached window at the panel's
@@ -786,31 +797,55 @@ final class OrbWindowController: ObservableObject {
     /// OWNS the never-both-invisible ordering (see the task brief): fires `onWindowDetach?(frame)`
     /// FIRST — the caller's closure (AppDelegate) spawns the detached window SYNCHRONOUSLY
     /// (`DetachedWindowController.show()`'s `makeKeyAndOrderFront` runs before that closure
-    /// returns) — and only THEN runs `exitWindowModeForDetach()`. So there is never a frame where
-    /// neither the window surface nor the detached window is on screen.
+    /// returns) — and only THEN runs `exitWindowModeForDetach()`, and only when that closure
+    /// reports the spawn actually succeeded (I1 fix, review: `onWindowDetach` can no-op — no
+    /// focused session yet, or a missing daemon token — and running the exit unconditionally in
+    /// that case discarded the window's content into the orb with nothing spawned to replace it).
+    /// So there is never a frame where neither the window surface nor a detached window is on
+    /// screen, AND a failed spawn leaves the window surface untouched rather than vanishing it.
     func requestWindowDetach() {
         // Task 5 adds zoomTimer to this guard (once the green zoom toggle grows a spring).
         guard surface == .window, morphTimer == nil, !pendingWindowExpand, !detachInFlight else { return }
         detachInFlight = true
         let frame = panel.frame
-        onWindowDetach?(frame)
-        exitWindowModeForDetach()
+        // `?? true`: unwired (nil) defaults to the old unconditional-exit behavior, so callers/
+        // tests that never set `onWindowDetach` keep seeing the exit run.
+        let spawned = onWindowDetach?(frame) ?? true
+        if spawned {
+            exitWindowModeForDetach()
+        }
         detachInFlight = false
-        OrbDebug.log("requestWindowDetach: fired frame=\(frame)")
+        OrbDebug.log("requestWindowDetach: frame=\(frame) spawned=\(spawned)")
     }
 
-    /// Task 4: the `hide()` `.window` branch (see that method, above) verbatim — cancel the morph
-    /// timer, snap `progress`/`morphVelocity` to settled, then `finishWindowCollapse()` — but
-    /// WITHOUT `panel.orderOut`: the orb panel stays visible/on screen (a detached window has just
-    /// taken the field's place instead of the panel hiding outright). `finishWindowCollapse()`
-    /// already resizes the panel back down to `collapsedWindowSize`, snaps the follower to the
-    /// settled orb anchor, restores global (follow-everywhere) Space behavior, and restores
-    /// `externalFocus` — none of that touches `isVisible`/orders the panel out (verified by
-    /// inspection, `finishWindowCollapse()` above).
+    /// Task 4: the `hide()` `.window` branch (see that method, above), with one deliberate
+    /// difference (I2 fix, review — see below) — cancel the morph timer, snap
+    /// `progress`/`morphVelocity` to settled, clear `externalFocus`, then `finishWindowCollapse()`
+    /// — but WITHOUT `panel.orderOut`: the orb panel stays visible/on screen (a detached window
+    /// has just taken the field's place instead of the panel hiding outright).
+    /// `finishWindowCollapse()` already resizes the panel back down to `collapsedWindowSize`, snaps
+    /// the follower to the settled orb anchor, and restores global (follow-everywhere) Space
+    /// behavior — none of that touches `isVisible`/orders the panel out (verified by inspection,
+    /// `finishWindowCollapse()` above).
     func exitWindowModeForDetach() {
         cancelMorphTimer()
         morphModel.progress = 0
         morphVelocity = 0
+        // I2 fix (review): the detached window IS the new focus. `finishWindowCollapse()`'s
+        // unconditional `externalFocus?.restore()` would otherwise activate the app that was
+        // frontmost BEFORE the orb was ever summoned, immediately AFTER the detached window's
+        // `makeKeyAndOrderFront` in this SAME synchronous call chain (`requestWindowDetach()` ran
+        // `onWindowDetach?(frame)`, which just called `DetachedWindowController.show()`,
+        // synchronously before this method runs) — the exact "late activation wins" hazard
+        // `makePanelKeyWinningLateActivation()`'s doc already catalogs (there, a late external
+        // activation stole key focus back from a re-summoned field; here it would steal frontmost
+        // status from a just-born detached window instead). Nil-ing `externalFocus` here makes
+        // `finishWindowCollapse()`'s `restore()` a no-op via optional chaining, so the detached
+        // window keeps whatever activation it just won. `collapseWindowToOrb()` (ordinary
+        // window→orb, no detach) and `hide()` are untouched — both still reach
+        // `finishWindowCollapse()` with `externalFocus` still set, so they keep restoring the
+        // pre-summon app exactly as before.
+        externalFocus = nil
         finishWindowCollapse()
     }
 

@@ -90,10 +90,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // `show()`, before this closure returns) and only THEN runs its own no-animation exit
         // (`exitWindowModeForDetach()`), so there is never a frame with neither surface visible.
         // This closure therefore only spawns the window and kicks the fresh-session Task.
+        //
+        // I1 fix (review): returns whether a window actually spawned — `requestWindowDetach()`
+        // gates its exit-to-orb on this. Two bail paths return `false` (no window, nothing to
+        // exit into): no focused session yet (reachable via summon→expand→yellow before any
+        // message has ever been sent), and `makeDetachedFeed` returning nil (missing daemon
+        // token). Both leave the window surface exactly as it was — the user just keeps their
+        // open window instead of losing it into the orb with nothing to show for it.
         orb.onWindowDetach = { [weak self] frame in
-            guard let self, let model = self.appModel else { return }
+            guard let self, let model = self.appModel else {
+                OrbDebug.log("onWindowDetach: no self/appModel — spawn aborted, window surface kept")
+                return false
+            }
             let sid = model.focusedSessionId // capture BEFORE the fresh session flips it
-            guard let sid, let (feed, session) = model.makeDetachedFeed(sessionId: sid) else { return }
+            guard let sid, let (feed, session) = model.makeDetachedFeed(sessionId: sid) else {
+                OrbDebug.log("onWindowDetach: no focused session or makeDetachedFeed nil — spawn aborted, window surface kept")
+                return false
+            }
             let title = model.session.state.exchanges.first.map { String($0.prompt.prefix(40)) } ?? "Norma"
             let detached = DetachedWindowController(
                 feed: feed, session: session, frame: frame, title: title.isEmpty ? "Norma" : title
@@ -101,6 +114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.registerDetachedWindow(detached)
             detached.show() // detached window VISIBLE first — the orb panel is still `.window` here
             Task { await model.startFreshSessionAfterDetach() } // orb's next summon = clean slate
+            return true
         }
 
         let sticky = StickinessEngine(onTarget: { [weak orb] target in
