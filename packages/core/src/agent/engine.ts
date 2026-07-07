@@ -448,16 +448,17 @@ export class AgentEngine {
         : [];
       if (spawnCalls.length > 0) {
         await Promise.all(spawnCalls.map(async (call) => {
-          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown } = {};
+          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown } = {};
           try { parsed = JSON.parse(call.argsJson || "{}"); } catch { /* defensive: empty prompt below */ }
           const prompt = typeof parsed.prompt === "string" ? parsed.prompt : "";
           const agentType = typeof parsed.agentType === "string" ? parsed.agentType : undefined;
           const modelOverride = typeof parsed.model === "string" ? parsed.model : undefined;
+          const description = typeof parsed.description === "string" ? parsed.description : undefined;
           const childId = "th_" + randomUUID().slice(0, 8);
           const def = this.cfg.agents!.resolve(agentType, opts.cwd);
           this.emit(sessionId, {
             type: "thread_started", sessionId, threadId: childId, parentThreadId: threadId,
-            agentType: agentType ?? "general-purpose", prompt,
+            agentType: agentType ?? "general-purpose", prompt, description,
           });
           this.registerThread(sessionId, {
             threadId: childId, parentThreadId: threadId, agentType: agentType ?? "general-purpose", status: "running",

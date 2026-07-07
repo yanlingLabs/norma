@@ -106,6 +106,7 @@ export const WorktreeExitedEvent = ThreadBase.extend({
 
 export const ThreadStartedEvent = ThreadBase.extend({
   type: z.literal("thread_started"), parentThreadId: z.string().min(1), agentType: z.string(), prompt: z.string(),
+  description: z.string().optional(),
 });
 export const ThreadCompletedEvent = ThreadBase.extend({
   type: z.literal("thread_completed"), stopReason: z.enum(["end_turn", "aborted", "error"]),

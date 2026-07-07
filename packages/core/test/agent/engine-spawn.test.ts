@@ -78,7 +78,7 @@ function setup(
 
 const done = (reason: "end_turn" | "tool_calls" | "aborted"): ProviderEvent => ({ type: "done", stopReason: reason });
 const text = (t: string): ProviderEvent[] => [{ type: "text_delta", delta: t }, done("end_turn")];
-const spawnCall = (callId: string, prompt: string, extra?: { agentType?: string; model?: string }): ProviderEvent =>
+const spawnCall = (callId: string, prompt: string, extra?: { agentType?: string; model?: string; description?: string }): ProviderEvent =>
   ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, ...extra }) });
 
 describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
@@ -94,6 +94,7 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     expect(started).toMatchObject({ parentThreadId: "main", agentType: "general-purpose", prompt: "do X" });
     const childId = (started as Extract<SessionEvent, { type: "thread_started" }>).threadId;
     expect(childId).toMatch(/^th_/);
+    expect((started as Extract<SessionEvent, { type: "thread_started" }>).description).toBeUndefined();
 
     const completed = events.find((e) => e.type === "thread_completed" && e.threadId === childId);
     expect(completed).toMatchObject({ stopReason: "end_turn" });
@@ -108,6 +109,18 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     expect(fp.requests.length).toBe(3);
     // the child's provider request input is EXACTLY [{message,user,"do X"}] — fresh, not parent history
     expect(fp.requests[1]!.input).toEqual([{ type: "message", role: "user", content: "do X" }]);
+  });
+
+  test("spawn description rides thread_started; absent stays absent", async () => {
+    const { engine, store, sessionId } = setup([
+      [spawnCall("s1", "go do the thing", { description: "explore auth module" }), done("tool_calls")],
+      text("child final report"),
+    ]);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const started = events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>;
+    expect(started.description).toBe("explore auth module");
   });
 
   test("two spawn_agent calls in one assistant message: both children run, two thread events, two results", async () => {
