@@ -32,7 +32,8 @@ struct WindowSurfaceView: View {
     /// (v1 kept "chat-shell" and "composer-shell" in the same namespace; they never coexist).
     let namespace: Namespace.ID
     let windowSize: CGSize
-    /// Red traffic light + yellow (minimize) + 4-finger tap + Esc all collapse to the orb.
+    /// Red traffic light + 4-finger tap + Esc collapse to the orb. Task 4: yellow (minimize) no
+    /// longer collapses — it detaches into a native, non-morphing window instead.
     let onClose: () -> Void
     let onMinimize: () -> Void
     /// Green traffic light — zoom toggle.
@@ -125,82 +126,26 @@ struct WindowSurfaceView: View {
 
     // MARK: - Window content (adaptive colors — moved from the deleted ChatWindowRootView)
 
+    /// Thin wrapper around `WindowContentView` — injects the self-drawn `MacTrafficLights` as the
+    /// header accessory and the morph window's fixed 14pt top inset. Extracted into
+    /// `ChatContent/WindowContentView.swift` so DETACHED windows (native chrome, no accessory) can
+    /// reuse the same content column. ZERO visual change here.
     @ViewBuilder
     private func windowContent(finalRect: CGRect) -> some View {
-        VStack(spacing: 10) {
-            HStack(spacing: 12) {
-                MacTrafficLights(onClose: onClose, onMinimize: onMinimize, onZoom: onZoom)
-                    .padding(.leading, 6)
-                Text(adapter.statusText)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.secondary)
-                Spacer()
-            }
-            .frame(height: chatWindowHeaderHeight)
-
-            TranscriptView(adapter: adapter, tint: Color(red: 0.45, green: 0.75, blue: 1.0))
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            if !adapter.pinnedTasks.isEmpty {
-                pinnedTasksSection(adapter.pinnedTasks)
-            }
-
-            if let queued = adapter.queuedText {
-                Text(queued).font(.system(size: 11)).foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            ComposerTextView(
-                text: adapter.draftBinding,
-                onSubmit: { adapter.onSubmit(adapter.composerDraft) },
-                usesAdaptiveColors: true
-            )
-            .frame(height: 88)
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 14)
-        .padding(.bottom, 16)
-    }
-
-    /// LIVE-GATE G4: the compact "what's left" list — up to 5 rows of `☐`/`◐`/`☑` + subject, with
-    /// a "+N more" tail when there are more than 5. Hidden entirely when `adapter.pinnedTasks` is
-    /// empty (the caller in `windowContent` already gates on that), so this is pure rendering, no
-    /// further emptiness logic here.
-    @ViewBuilder
-    private func pinnedTasksSection(_ tasks: [TaskItem]) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Divider().opacity(0.5)
-            ForEach(Array(tasks.prefix(5).enumerated()), id: \.offset) { _, task in
-                HStack(spacing: 6) {
-                    Text(pinnedTaskGlyph(task.status))
-                    Text(task.subject)
-                }
-                .font(.system(size: 11))
-                .foregroundStyle(task.status == "in_progress" ? .secondary : .tertiary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-            }
-            if tasks.count > 5 {
-                Text("+\(tasks.count - 5) more")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private func pinnedTaskGlyph(_ status: String) -> String {
-        switch status {
-        case "in_progress": return "◐"
-        case "completed": return "☑"
-        default: return "☐" // pending, or any unrecognized status
+        WindowContentView(
+            adapter: adapter,
+            tint: Color(red: 0.45, green: 0.75, blue: 1.0),
+            topInset: 14
+        ) {
+            MacTrafficLights(onClose: onClose, onMinimize: onMinimize, onZoom: onZoom)
+                .padding(.leading, 6)
         }
     }
 }
 
 /// The three self-drawn macOS-style traffic lights (moved from the deleted `ChatWindowRootView`):
 /// three 14pt circles, 9pt apart, each with a subtle darker ring; hovering ANYWHERE over the group
-/// reveals the ×/−/+ glyphs (macOS behavior). Wired: red → close, yellow → minimize, green → zoom.
+/// reveals the ×/−/+ glyphs (macOS behavior). Wired: red → close, yellow → detach, green → zoom.
 struct MacTrafficLights: View {
     let onClose: () -> Void
     let onMinimize: () -> Void

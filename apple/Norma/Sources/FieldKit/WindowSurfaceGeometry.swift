@@ -113,6 +113,29 @@ func morphedWindowSurfaceCornerRadius(for rect: CGRect) -> CGFloat {
     return circleRadius * (1 - t) + chatWindowCornerRadius * t
 }
 
+// MARK: - Content screen rect (LIVE-GATE W1a — detach must spawn at the visible CONTENT, not the
+// halo panel)
+
+/// Maps `finalRect` (window-LOCAL, y-down — `windowSurfaceLayout`'s convention) to a SCREEN rect
+/// (AppKit, y-up), given the panel's live AppKit `panelFrame`. Same inversion as
+/// `OrbWindowController.updateWindowMouseGate`'s point conversion (`local.y = frame.maxY -
+/// screen.y`), applied to a rect instead of a single point — verified against
+/// `WindowSurfaceGeometryTests.testContentStaysPutAsAnchorMovesMidCollapse`'s own inline version of
+/// this same math (`windowFrame.minX + finalRect.minX`, `windowFrame.maxY - finalRect.maxY`).
+///
+/// `requestWindowDetach()` uses this to spawn the detached window at the visible glass CONTENT
+/// rect instead of the panel's frame — which includes the invisible halo padding (60pt margins)
+/// and the orb-anchor union (`windowSurfaceLayout`), and would otherwise make the detached window
+/// spawn visibly larger than the morph window it replaced.
+func windowSurfaceContentScreenRect(panelFrame: CGRect, finalRect: CGRect) -> CGRect {
+    CGRect(
+        x: panelFrame.minX + finalRect.minX,
+        y: panelFrame.maxY - finalRect.maxY,
+        width: finalRect.width,
+        height: finalRect.height
+    )
+}
+
 // MARK: - Mouse-gate hit test (gate r7 — transplant of v1 `roundedRect(contains:)`/`largeSurfaceHitTest`,
 // GlassFieldWindow.swift:1248-1290/1422-1441)
 

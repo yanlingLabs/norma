@@ -135,24 +135,115 @@ final class SurfaceWindowTests: XCTestCase {
         XCTAssertEqual(controller.morphModel.renderSurface, .field)
     }
 
-    /// Green zoom toggle: grows the window to near-fullscreen content, then restores.
-    func testZoomToggleGrowsThenRestores() async throws {
+    /// Task 5: green zoom toggle is now a spring-animated grow (`zoomTimer`, `morphStep` 140/22 —
+    /// same integrator/tuning `morphTick()` uses, own scalar), not the old instant re-present.
+    /// Presses the toggle, samples RIGHT AFTER the press to prove the content size hasn't jumped
+    /// yet (the first tick hasn't fired — proving this is genuinely animated, not instant), samples
+    /// again mid-flight to prove it's actually moving, then polls to settle and checks
+    /// `windowFinalRect` landed exactly at the computed zoom target (lockstep with the mouse gate's
+    /// own read of that field). Finally restores and checks it settles back at the default content
+    /// size — the "grows then restores" contract the old instant test covered, preserved here.
+    func testZoomToggleAnimatesToTargetAndSettles() async throws {
         let controller = OrbWindowController(session: SessionModel())
         controller.show()
         controller.expandToField()
-        try await pollUntil(timeout: 5.0) { controller.morphProgressForTesting > 0.9 }
+        try await pollUntil(timeout: 8.0) { controller.morphProgressForTesting > 0.9 }
         controller.enterWindowMode()
-        try await pollUntil(timeout: 5.0) { controller.surface == .window }
+        try await pollUntil(timeout: 8.0) { controller.surface == .window }
         // Let the window's own 0→1 morph fully settle (`morphTimer == nil`) — zoom no-ops mid-morph.
-        try await pollUntil(timeout: 5.0) { controller.surface == .window && controller.isMorphIdleForTesting }
+        try await pollUntil(timeout: 8.0) { controller.surface == .window && controller.isMorphIdleForTesting }
 
-        let normal = controller.morphModel.activeWindowSize
+        XCTAssertEqual(controller.morphModel.windowFinalRect?.size, chatWindowDefaultSize, "resting at the default content size before any zoom")
+
         controller.zoomToggleWindow()
-        XCTAssertTrue(controller.windowZoomed, "first press zooms")
-        XCTAssertGreaterThanOrEqual(controller.morphModel.activeWindowSize.width, normal.width)
+        XCTAssertTrue(controller.windowZoomed, "first press flips the target immediately")
+        XCTAssertFalse(controller.isZoomIdleForTesting, "a zoom spring is now driving the content size")
+        let widthRightAfterPress = try XCTUnwrap(controller.morphModel.windowFinalRect).size.width
+        XCTAssertEqual(
+            widthRightAfterPress, chatWindowDefaultSize.width, accuracy: 0.5,
+            "must NOT have jumped to the target instantly — the very first 60Hz tick hasn't fired yet"
+        )
 
+        // Sample an intermediate frame — proves this is a genuine animation, not an instant re-present.
+        try await pollUntil(timeout: 8.0) { controller.zoomProgressForTesting > 0.15 }
+        let midWidth = try XCTUnwrap(controller.morphModel.windowFinalRect).size.width
+        XCTAssertGreaterThan(midWidth, chatWindowDefaultSize.width + 5, "already growing past the default content size mid-flight")
+
+        // Settle at the zoom target — windowFinalRect stays in lockstep the whole way (the mouse
+        // gate reads it every tick).
+        try await pollUntil(timeout: 8.0) { controller.isZoomIdleForTesting }
+        XCTAssertTrue(controller.windowZoomed)
+        let screen = try XCTUnwrap(NSScreen.main).visibleFrame
+        let inset = controller.morphModel.haloPadding + chatWindowZoomInset
+        let expected = CGSize(
+            width: max(chatWindowDefaultSize.width, screen.width - 2 * inset),
+            height: max(chatWindowDefaultSize.height, screen.height - 2 * inset)
+        )
+        let finalRect = try XCTUnwrap(controller.morphModel.windowFinalRect, "windowFinalRect must stay live at settle")
+        XCTAssertEqual(finalRect.size.width, expected.width, accuracy: 1.0, "settled exactly at the zoom target")
+        XCTAssertEqual(finalRect.size.height, expected.height, accuracy: 1.0)
+
+        // Restore leg — second press retargets back down and settles at the default size again.
         controller.zoomToggleWindow()
         XCTAssertFalse(controller.windowZoomed, "second press restores")
+        try await pollUntil(timeout: 8.0) { controller.isZoomIdleForTesting }
+        XCTAssertEqual(controller.morphModel.windowFinalRect?.size, chatWindowDefaultSize, "settles back at the default content size")
+
+        controller.hide()
+    }
+
+    /// Task 5: a re-press WHILE the zoom is still animating RETARGETS — flips `zoomTarget` back
+    /// and keeps whatever velocity the spring already has (the same morph retarget idiom
+    /// `expandToField()`'s mid-collapse re-summon uses on `morphTarget`) — rather than snapping,
+    /// queuing, or crashing. Must settle cleanly back at the default content size.
+    func testZoomRetargetsMidFlight() async throws {
+        let controller = OrbWindowController(session: SessionModel())
+        controller.show()
+        controller.expandToField()
+        try await pollUntil(timeout: 8.0) { controller.morphProgressForTesting > 0.9 }
+        controller.enterWindowMode()
+        try await pollUntil(timeout: 8.0) { controller.surface == .window && controller.isMorphIdleForTesting }
+
+        controller.zoomToggleWindow()
+        XCTAssertTrue(controller.windowZoomed, "first press zooms")
+        try await pollUntil(timeout: 8.0) { controller.zoomProgressForTesting > 0.2 }
+        XCTAssertFalse(controller.isZoomIdleForTesting, "still animating toward the zoom target")
+
+        // Retarget mid-flight — same zoom timer keeps running, just heading the other way now.
+        controller.zoomToggleWindow()
+        XCTAssertFalse(controller.windowZoomed, "second press retargets back toward the default size")
+
+        try await pollUntil(timeout: 8.0) { controller.isZoomIdleForTesting }
+        XCTAssertFalse(controller.windowZoomed)
+        XCTAssertEqual(
+            controller.morphModel.windowFinalRect?.size, chatWindowDefaultSize,
+            "settles cleanly back at the default content size, not stuck at some in-between state"
+        )
+
+        controller.hide()
+    }
+
+    /// Task 5 interplay: `collapseWindowToOrb()` mid-zoom must cancel the zoom timer SYNCHRONOUSLY
+    /// (not merely once the collapse itself later settles) — no stray 60Hz zoom timer left ticking
+    /// behind a collapsing/collapsed window.
+    func testCollapseDuringZoomCancelsZoomTimer() async throws {
+        let controller = OrbWindowController(session: SessionModel())
+        controller.show()
+        controller.expandToField()
+        try await pollUntil(timeout: 8.0) { controller.morphProgressForTesting > 0.9 }
+        controller.enterWindowMode()
+        try await pollUntil(timeout: 8.0) { controller.surface == .window && controller.isMorphIdleForTesting }
+
+        controller.zoomToggleWindow()
+        XCTAssertFalse(controller.isZoomIdleForTesting, "zoom spring is running")
+
+        controller.collapseWindowToOrb()
+        XCTAssertTrue(controller.isZoomIdleForTesting, "collapse cancels the zoom timer immediately, synchronously")
+
+        try await pollUntil(timeout: 8.0) { controller.surface == .orb }
+        XCTAssertTrue(controller.isMorphIdleForTesting, "settles at the orb")
+        XCTAssertTrue(controller.isZoomIdleForTesting, "no stray zoom timer survives the collapse")
+        XCTAssertFalse(controller.windowZoomed, "reset on collapse")
 
         controller.hide()
     }
@@ -240,6 +331,132 @@ final class SurfaceWindowTests: XCTestCase {
             "must have actually moved away from the stale open anchor, not melted in place"
         )
 
+        controller.hide()
+    }
+
+    /// Task 4: the yellow traffic light — `requestWindowDetach()` fires `onWindowDetach` exactly
+    /// once, then runs the no-animation exit back to the orb (surface flips to `.orb`, the panel
+    /// stays visible/on-screen at `collapsedWindowSize` — never ordered out). A second call, now
+    /// that `surface` is `.orb`, is a no-op.
+    ///
+    /// LIVE-GATE W1a: the fired frame is the visible glass CONTENT rect (`windowFinalRect` mapped
+    /// to screen coords, `windowSurfaceContentScreenRect`), NOT the raw panel frame — the panel
+    /// frame spans content + the invisible halo padding + the orb-anchor union
+    /// (`windowSurfaceLayout`'s doc), so firing with it verbatim used to spawn the detached window
+    /// visibly bigger than the morph window it replaced. The fired frame must therefore be
+    /// STRICTLY SMALLER than (and fully contained within) the panel's own frame at the moment of
+    /// detach.
+    func testRequestWindowDetachFiresOnceWithContentFrameAndExitsToOrb() async throws {
+        let controller = OrbWindowController(session: SessionModel())
+        controller.show()
+        controller.expandToField()
+        try await pollUntil(timeout: 5.0) { controller.morphProgressForTesting > 0.9 }
+        controller.enterWindowMode()
+        try await pollUntil(timeout: 5.0) { controller.surface == .window && controller.isMorphIdleForTesting }
+
+        var firedFrames: [NSRect] = []
+        controller.onWindowDetach = { frame in
+            firedFrames.append(frame)
+            return true // spawn "succeeded" — the exit must run
+        }
+
+        let panelFrame = controller.panelFrameForTesting
+        let finalRect = try XCTUnwrap(controller.morphModel.windowFinalRect, "layout must be live while .window")
+        let expectedContentFrame = windowSurfaceContentScreenRect(panelFrame: panelFrame, finalRect: finalRect)
+        controller.requestWindowDetach()
+
+        XCTAssertEqual(firedFrames.count, 1, "onWindowDetach must fire exactly once")
+        XCTAssertEqual(firedFrames.first, expectedContentFrame, "must fire with the visible CONTENT rect, not the panel frame")
+        XCTAssertTrue(panelFrame.contains(firedFrames.first!), "the content rect must be fully inside the panel frame")
+        XCTAssertLessThan(firedFrames.first!.width, panelFrame.width, "content is smaller than the halo-padded panel — the W1a fix")
+        XCTAssertLessThan(firedFrames.first!.height, panelFrame.height, "content is smaller than the halo-padded panel — the W1a fix")
+        XCTAssertEqual(controller.surface, .orb, "exitWindowModeForDetach() collapses the panel's surface back to .orb")
+        XCTAssertTrue(controller.isVisible, "the orb panel stays on screen — never ordered out on detach")
+        XCTAssertEqual(controller.panelFrameForTesting.size, controller.morphModel.collapsedWindowSize)
+
+        controller.requestWindowDetach() // second call — surface is now .orb, must no-op
+        XCTAssertEqual(firedFrames.count, 1, "no second fire")
+
+        controller.hide()
+    }
+
+    /// I1 fix (review): a spawn failure (`onWindowDetach` returns `false` — e.g. AppDelegate had no
+    /// focused session, or a missing daemon token) must NOT run the exit-to-orb — the window
+    /// surface's content would otherwise vanish into the orb with nothing spawned to replace it.
+    /// Also proves the re-entrancy latch (`detachInFlight`) clears on the failure path: a second,
+    /// true-returning request right after still succeeds instead of silently no-oping forever.
+    ///
+    /// Deliberately uses `setSurfaceForTesting(.window)` (like `testEnterWindowModeFromWindowIsNoOp`
+    /// above) instead of driving a real `expandToField()`/`enterWindowMode()` morph — this test is
+    /// only exercising `requestWindowDetach()`'s boolean-gated exit branch, which needs no spring
+    /// running at all (`morphTimer == nil` is the guard's resting state), so it stays instant and
+    /// immune to the wall-clock jitter a real morph round-trip would add to the suite for no benefit
+    /// here — the round-trip itself is already covered by
+    /// `testRequestWindowDetachFiresOnceWithCurrentFrameAndExitsToOrb` above.
+    func testDetachSpawnFailureKeepsWindowSurface() {
+        let controller = OrbWindowController(session: SessionModel())
+        controller.show()
+        controller.setSurfaceForTesting(.window)
+
+        controller.onWindowDetach = { _ in false } // spawn failed — nothing to hand the surface off to
+        let windowFrame = controller.panelFrameForTesting
+        controller.requestWindowDetach()
+
+        XCTAssertEqual(controller.surface, .window, "a failed spawn must leave the window surface untouched")
+        XCTAssertTrue(controller.isVisible, "the panel stays exactly as it was")
+        XCTAssertEqual(controller.panelFrameForTesting, windowFrame, "no teardown/resize ran on a failed spawn")
+
+        // The latch must have cleared despite the false return — a later successful spawn works.
+        controller.onWindowDetach = { _ in true }
+        controller.requestWindowDetach()
+
+        XCTAssertEqual(controller.surface, .orb, "a subsequent successful spawn now exits normally")
+        XCTAssertEqual(controller.panelFrameForTesting.size, controller.morphModel.collapsedWindowSize)
+
+        controller.hide()
+    }
+
+    /// Task 4/5: `requestWindowDetach()` must never fire mid-handoff (field→window collapse still
+    /// in flight, `pendingWindowExpand` armed, surface still `.field`), mid-morph (a spring is
+    /// still actively driving the panel — the window's own opening 0→1 present, asserted right
+    /// after the surface flip), or mid-zoom (Task 5's `zoomTimer`, its own separate guard term,
+    /// asserted once the window has settled and a zoom is pressed).
+    func testDetachGuardedDuringMorphAndZoom() async throws {
+        let controller = OrbWindowController(session: SessionModel())
+        controller.show()
+        controller.expandToField()
+        try await pollUntil(timeout: 5.0) { controller.morphProgressForTesting > 0.9 }
+
+        var fireCount = 0
+        controller.onWindowDetach = { _ in
+            fireCount += 1
+            return true
+        }
+
+        // Mid-handoff: pendingWindowExpand armed, reverse-morph running, surface still .field.
+        controller.enterWindowMode()
+        controller.requestWindowDetach()
+        XCTAssertEqual(fireCount, 0, "mid-handoff must no-op")
+        XCTAssertEqual(controller.surface, .field, "must not have presented the window yet")
+
+        try await pollUntil(timeout: 5.0) { controller.surface == .window }
+        // The window's own present spring (0→1) is still running the instant surface flips.
+        XCTAssertFalse(controller.isMorphIdleForTesting, "the present morph must still be running right after the flip")
+        controller.requestWindowDetach()
+        XCTAssertEqual(fireCount, 0, "mid-morph must no-op")
+        XCTAssertEqual(controller.surface, .window, "must still be .window — the guard, not a completed detach, blocked it")
+
+        try await pollUntil(timeout: 8.0) { controller.isMorphIdleForTesting }
+
+        // Task 5: mid-ZOOM (a separate guard term, `zoomTimer == nil`) must also no-op — a detach
+        // must never fire while the green zoom spring is still animating the content size.
+        controller.zoomToggleWindow()
+        XCTAssertFalse(controller.isZoomIdleForTesting, "zoom spring must be running")
+        controller.requestWindowDetach()
+        XCTAssertEqual(fireCount, 0, "mid-zoom must no-op")
+        XCTAssertEqual(controller.surface, .window, "must still be .window — the guard blocked it, not a completed detach")
+
+        try await pollUntil(timeout: 8.0) { controller.isZoomIdleForTesting }
         controller.hide()
     }
 

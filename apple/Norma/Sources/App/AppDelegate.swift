@@ -12,6 +12,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var startTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
 
+    /// Task 3 (2d-ii-b) registry: every currently-open detached window. Task 4's detach
+    /// choreography appends via `registerDetachedWindow` on spawn; `onClosed` (wired there) removes
+    /// it again on either a programmatic `close()` or the user's own red traffic light — the list
+    /// never accumulates closed controllers.
+    private(set) var detachedWindows: [DetachedWindowController] = []
+
+    /// Registers a freshly spawned detached window and wires its one-shot `onClosed` to remove it
+    /// from `detachedWindows` again. Called by `orb.onWindowDetach`'s closure below (Task 4's
+    /// detach choreography — yellow on the morph window).
+    func registerDetachedWindow(_ controller: DetachedWindowController) {
+        detachedWindows.append(controller)
+        controller.onClosed = { [weak self] closed in
+            self?.detachedWindows.removeAll { $0 === closed }
+        }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         guard !Self.isRunningUnitTests else { return }
@@ -40,7 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let production = Self.isRunningUnitTests ? nil : (try? AppModel.production())
         let model = production ?? AppModel(
             makeTransport: { UnixSocketTransport(path: NormaPaths.socketPath()) },
-            token: "missing-token"
+            token: AppModel.missingTokenSentinel
         )
         let tokenMissing = production == nil
         appModel = model
@@ -66,6 +82,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             OrbDebug.log("AppDelegate.onEsc: fired appModel=\(self?.appModel != nil ? "present" : "nil") turnRunning=\(String(describing: running))")
             guard let self, self.appModel?.session.state.turnRunning == true else { return false }
             Task { await self.appModel?.interruptTurn() }
+            return true
+        }
+
+        // Task 4 (detach choreography): the yellow traffic light. `requestWindowDetach()` OWNS the
+        // ordering — it fires this closure (spawning the detached window SYNCHRONOUSLY via
+        // `show()`, before this closure returns) and only THEN runs its own no-animation exit
+        // (`exitWindowModeForDetach()`), so there is never a frame with neither surface visible.
+        // This closure therefore only spawns the window and kicks the fresh-session Task.
+        //
+        // I1 fix (review): returns whether a window actually spawned — `requestWindowDetach()`
+        // gates its exit-to-orb on this. Two bail paths return `false` (no window, nothing to
+        // exit into): no focused session yet (reachable via summon→expand→yellow before any
+        // message has ever been sent), and `makeDetachedFeed` returning nil (missing daemon
+        // token). Both leave the window surface exactly as it was — the user just keeps their
+        // open window instead of losing it into the orb with nothing to show for it.
+        orb.onWindowDetach = { [weak self] frame in
+            guard let self, let model = self.appModel else {
+                OrbDebug.log("onWindowDetach: no self/appModel — spawn aborted, window surface kept")
+                return false
+            }
+            let sid = model.focusedSessionId // capture BEFORE the fresh session flips it
+            guard let sid, let (feed, session) = model.makeDetachedFeed(sessionId: sid) else {
+                OrbDebug.log("onWindowDetach: no focused session or makeDetachedFeed nil — spawn aborted, window surface kept")
+                return false
+            }
+            let title = model.session.state.exchanges.first.map { String($0.prompt.prefix(40)) } ?? "Norma"
+            let detached = DetachedWindowController(
+                feed: feed, session: session, frame: frame, title: title.isEmpty ? "Norma" : title
+            )
+            self.registerDetachedWindow(detached)
+            detached.show() // detached window VISIBLE first — the orb panel is still `.window` here
+            Task { await model.startFreshSessionAfterDetach() } // orb's next summon = clean slate
             return true
         }
 
@@ -148,6 +196,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         startTask?.cancel()
         appModel?.stop()
+        // Best-effort: each detached window's own feed/socket must not survive the app (spec §5
+        // D9 — a closed window leaves nothing running; termination is a harder stop than that).
+        detachedWindows.forEach { $0.close() }
     }
 
     static var isRunningUnitTests: Bool {

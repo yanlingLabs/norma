@@ -7,10 +7,33 @@ final class AppModel: ObservableObject {
     let session = SessionModel()
     @Published private(set) var connectionSummary = "connecting…"
 
-    private let client: NormaClient
-    private var focusedSessionId: String?
-    private var pumpTask: Task<Void, Never>?
+    /// Owns the socket + connect/attach/pump mechanics (2d-ii-b Task 1 extraction, see
+    /// SessionFeed.swift). AppModel is its `followFocus` consumer — the focus-tracking state
+    /// below stays here; it's specific to this mode and SessionFeed's `pinned` mode doesn't need
+    /// it.
+    private let feed: SessionFeed
+    private var client: NormaClient { feed.client }
+    /// Task 4: `private(set)` (was fully `private`) so AppDelegate's detach closure can capture the
+    /// currently-focused session id BEFORE `startFreshSessionAfterDetach()` flips it — the
+    /// detached window needs the OLD id (via `makeDetachedFeed(sessionId:)`), the orb needs a NEW
+    /// one.
+    private(set) var focusedSessionId: String?
     private var selfCreatedSessionId: String?
+
+    /// Task 3 (2d-ii-b): stashed so `makeDetachedFeed(sessionId:)` can mint a FRESH `SessionFeed`
+    /// (its own `NormaClient`/socket — a full harness, spec §"harness-per-window") for a detached
+    /// window, sharing the same transport factory + token AppModel itself connects with (one
+    /// Keychain read, shared — no per-window Keychain prompts). Previously only passed through to
+    /// the `followFocus` feed built in `init` below; nothing needed to reconstruct another one.
+    private let makeTransport: @Sendable () -> NormaTransport
+    private let token: String
+    private let clientName: String
+
+    /// The sentinel `AppDelegate.boot()` passes when the Keychain has no harness token yet (see
+    /// `AppDelegate.swift`'s `production`/`tokenMissing` wiring) — kept in sync with that literal
+    /// by hand; `makeDetachedFeed` refuses to spawn a harness against it (spec §4: "cannot spawn a
+    /// harness without a token").
+    static let missingTokenSentinel = "missing-token"
 
     /// Finding-1 fix (gate 2): session ids the orb has already forced to `approvalPolicy: "auto"`
     /// (see `forceAutoPolicyIfNeeded`). One flip per focused session id is enough — the daemon
@@ -20,7 +43,23 @@ final class AppModel: ObservableObject {
     private var forcedAutoSessionIds: Set<String> = []
 
     init(makeTransport: @escaping @Sendable () -> NormaTransport, token: String, clientName: String = "orb") {
-        client = NormaClient(makeTransport: makeTransport, token: token, clientName: clientName)
+        self.makeTransport = makeTransport
+        self.token = token
+        self.clientName = clientName
+        feed = SessionFeed(makeTransport: makeTransport, token: token, clientName: clientName, mode: .followFocus, session: session)
+        // Hook composition (see SessionFeed's doc comment for why): these four closures are the
+        // ONLY seam between the extracted mechanics and AppModel's focus-follow behavior, each
+        // firing at the exact point the original monolithic start()/handle() touched app state.
+        feed.onRetry = { [weak self] in self?.connectionSummary = "daemon unreachable — retrying…" }
+        feed.onAttach = { [weak self] in await self?.focusNewestSession() }
+        feed.onConnected = { [weak self] in
+            guard let self else { return }
+            self.connectionSummary = self.summaryLine()
+        }
+        feed.onEvent = { [weak self] ev in
+            await self?.handle(ev)
+            return true // AppModel's handle() fully owns event application in followFocus mode.
+        }
     }
 
     /// Production wiring: harness token from the Keychain, default unix socket.
@@ -31,38 +70,30 @@ final class AppModel: ObservableObject {
     }
 
     func start() async {
-        // The daemon may not be up yet — retry the INITIAL connect with capped backoff.
-        var attempt = 0
-        while true {
-            do {
-                try await client.connect()
-                break
-            } catch {
-                attempt += 1
-                connectionSummary = "daemon unreachable — retrying…"
-                let backoff = min(0.5 * pow(2.0, Double(attempt - 1)), 10.0)
-                try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
-                if Task.isCancelled { return }
-            }
-        }
-
-        await focusNewestSession()
-        session.markConnected() // M2: connect() success IS the connected signal
-        connectionSummary = summaryLine()
-
-        pumpTask = Task { [weak self] in
-            guard let self else { return }
-            for await ev in self.client.events {
-                await self.handle(ev)
-                if Task.isCancelled { return }
-            }
-        }
-        await pumpTask?.value
+        await feed.start()
     }
 
     func stop() {
-        pumpTask?.cancel()
-        Task { await client.close() }
+        feed.stop()
+    }
+
+    /// Task 3 (2d-ii-b): a detached window's own harness — a FRESH `SessionModel` + a `pinned`
+    /// `SessionFeed` sharing AppModel's transport factory/token/clientName, wired to `sessionId`
+    /// forever (never follows focus). Returns `nil` when this AppModel was booted with the
+    /// degraded "no daemon token yet" fallback (`AppDelegate.boot()`'s `tokenMissing` path,
+    /// `missingTokenSentinel`) — spec §4: "cannot spawn a harness without a token," logged rather
+    /// than silently handed a client that can never authenticate.
+    func makeDetachedFeed(sessionId: String) -> (feed: SessionFeed, session: SessionModel)? {
+        guard token != Self.missingTokenSentinel else {
+            OrbDebug.log("makeDetachedFeed: no daemon token — refusing to spawn a detached harness for \(sessionId.prefix(10))")
+            return nil
+        }
+        let detachedSession = SessionModel()
+        let detachedFeed = SessionFeed(
+            makeTransport: makeTransport, token: token, clientName: clientName,
+            mode: .pinned(sessionId: sessionId), session: detachedSession
+        )
+        return (detachedFeed, detachedSession)
     }
 
     /// Field summon path: a session to talk to, creating one if none is focused.
@@ -81,6 +112,23 @@ final class AppModel: ObservableObject {
         selfCreatedSessionId = created.sessionId // belt: suppress the broadcast if it arrives AFTER us
         await refocus(onto: created.sessionId)
         return focusedSessionId
+    }
+
+    /// Task 4 (detach choreography): the orb's "clean slate" step after a detach — the session it
+    /// was just focused on now belongs to a standalone detached window (its own harness, see
+    /// `makeDetachedFeed(sessionId:)`), so the orb's NEXT summon must never keep talking into that
+    /// same session. Exact `ensureFocusedSession()` creation body above, but UNCONDITIONAL: skips
+    /// the `if let sid = focusedSessionId { return sid }` early-out on purpose — a focus almost
+    /// always exists at this point (the session that was just detached), and this must create+
+    /// refocus onto a brand-new one regardless.
+    func startFreshSessionAfterDetach() async {
+        guard let created = try? await client.createSession(scope: "global", cwd: NSHomeDirectory(), approvalPolicy: "auto") else { return }
+        forcedAutoSessionIds.insert(created.sessionId) // born auto — no redundant setPolicy on first send
+        // Same belt as ensureFocusedSession(): the daemon's session_created broadcast can arrive
+        // (and refocus us) before this RPC response does — idempotent skip, never double-attach.
+        if focusedSessionId == created.sessionId { return }
+        selfCreatedSessionId = created.sessionId // suppress the broadcast if it arrives AFTER us
+        await refocus(onto: created.sessionId)
     }
 
     /// Finding-1 fix (gate 2 — "the orb still asks approvals despite the auto default"). ROOT CAUSE:

@@ -247,6 +247,37 @@ export class AgentEngine {
     return input;
   }
 
+  /** Per-turn task-list reminder (CC v2 parity): the model's own context carries task IDs
+   *  nowhere else — `historyInput` above replays only user/assistant messages, never the
+   *  task_updated events — so without this the model routinely loses track of ids and calls
+   *  task_create again for work already on the list instead of task_update. Mirrors Claude
+   *  Code's own system-reminder: injected as a "user" message (there's no dedicated reminder
+   *  role on TurnInputItem) wrapped in an explicit <system-reminder> tag so the model treats it
+   *  as ambient state, not something the user said — the tag text itself says as much ("never
+   *  mention it"). ASSEMBLED INPUT ONLY: built fresh every turn from `cfg.tasks.list()`, appended
+   *  to `input` in `turn()` below, and NEVER emitted/persisted as a session event — a session
+   *  replay (historyInput on the NEXT turn) must not see this turn's reminder baked in as a fake
+   *  user message. Returns undefined when there's nothing to remind about (no TaskStore wired,
+   *  or the session's list is empty) so `turn()` can skip appending entirely. */
+  private taskListReminder(sessionId: string): TurnInputItem | undefined {
+    if (!this.cfg.tasks) return undefined;
+    const tasks = this.cfg.tasks.list(sessionId);
+    if (tasks.length === 0) return undefined;
+    // FINAL-REVIEW FIX: subjects are model-authored strings that may carry attacker-influenced
+    // content (the model quotes user/tool/file text into subjects) — sanitize before embedding
+    // in the reminder block: newlines would inject fake reminder lines, and a literal
+    // </system-reminder> would close the block early, leaving durable ambient "system" text
+    // in-context on every later turn.
+    const sanitize = (s: string) =>
+      s.replace(/\r?\n/g, " ").replace(/<\/?system-reminder>/gi, "[tag]");
+    const lines = tasks.map((t) => `#${t.id} [${t.status}] ${sanitize(t.subject)}`).join("\n");
+    const content = "<system-reminder>\nCurrent task list (update these by id — do NOT create a new task for work already listed):\n"
+      + lines
+      + "\nUse task_update with the task's id to change status; task_list shows full details."
+      + "\nThis reminder is invisible to the user — never mention it.\n</system-reminder>";
+    return { type: "message", role: "user", content };
+  }
+
   // Computed ONCE per turn by turn() (same one-per-turn rule as `instructions` itself) — a
   // same-turn ToolSearch load changes `loaded` but must not re-trigger this mid-turn; and the
   // plan-mode reminder is appended off the policy at turn start, not re-checked per round, so an
@@ -302,6 +333,11 @@ export class AgentEngine {
     // turn rather than breaking it.
     try { await this.maybeAutoCompact(sessionId); } catch (e) { console.error("auto-compact failed", e); }
     const input = this.historyInput(sessionId);
+    // Appended AFTER history (nearest the model's attention), BEFORE the tool loop starts — see
+    // taskListReminder's doc comment for why this is transient (assembled input only, never a
+    // persisted event) and why it's a "user" message rather than a new TurnInputItem role.
+    const taskReminder = this.taskListReminder(sessionId);
+    if (taskReminder) input.push(taskReminder);
 
     await this.runThread({
       sessionId,

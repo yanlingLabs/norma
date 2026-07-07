@@ -62,6 +62,19 @@ final class OrbWindowController: ObservableObject {
     /// test waits on this.
     var isMorphIdleForTesting: Bool { morphTimer == nil }
 
+    /// Task 5: mirrors `isMorphIdleForTesting` for the ZOOM spring specifically — a separate timer
+    /// from `morphTimer` (the two never run at once: `zoomToggleWindow()` only starts once the
+    /// window's own morph is idle), so the interplay tests (collapse/hide/detach cancelling an
+    /// in-flight zoom) need a seam that reads the zoom timer's own resting state, independent of
+    /// `isMorphIdleForTesting`.
+    var isZoomIdleForTesting: Bool { zoomTimer == nil }
+
+    /// Task 5: mirrors `morphProgressForTesting` for the zoom spring's own 0…1 scalar (0 =
+    /// `chatWindowDefaultSize`, 1 = the in-flight zoom leg's near-fullscreen target) — lets a test
+    /// poll a genuine mid-flight sample (the retarget test) the same way `MorphRetargetTests`
+    /// polls `morphProgressForTesting` mid-collapse.
+    var zoomProgressForTesting: Double { zoomProgress }
+
     /// Test-only counter (gate fix — Esc-interrupt live-gate finding): `MorphTimerReentrancyTests`
     /// asserts this stays at 1 after a stale/duplicate `morphTick()` fires post-settle — see
     /// `morphTick()`'s re-entry guard doc for the bug this locks in against.
@@ -108,6 +121,22 @@ final class OrbWindowController: ObservableObject {
     var onInterrupt: (() -> Void)?
     /// Returns true when the key was consumed as an interrupt (turn running); false → collapse.
     var onEsc: (() -> Bool)?
+
+    /// Task 4: fired by `requestWindowDetach()` with the panel's CURRENT frame (spawn the detached
+    /// window exactly there). AppDelegate's closure spawns the detached window SYNCHRONOUSLY
+    /// (`DetachedWindowController.show()`'s `makeKeyAndOrderFront` runs before the closure
+    /// returns) — see `requestWindowDetach()`'s doc for the never-both-invisible ordering this
+    /// depends on. The controller exposes this callback, it does NOT import AppModel/AppDelegate
+    /// (same seam convention as `onSubmit`/`onEsc` above).
+    ///
+    /// I1 fix (review): returns whether a window actually spawned. AppDelegate's closure can bail
+    /// with nothing spawned (no focused session yet — reachable via summon→expand→yellow before
+    /// any message — or `makeDetachedFeed` returning nil on a missing daemon token), and
+    /// `requestWindowDetach()` gates its exit-to-orb on this return so a spawn failure never
+    /// discards the window surface's content into the orb with nothing to show for it. `nil`
+    /// (unwired — e.g. tests that never set this) defaults to `true`, preserving the old
+    /// unconditional-exit behavior.
+    var onWindowDetach: ((NSRect) -> Bool)?
 
     /// Wave-5 gate item 4: the composer-hop seam — `handleAcceptedSwipe` below needs to know
     /// whether the shell is CURRENTLY showing the composer (`FieldStateAdapter.showingDraft`) to
@@ -189,6 +218,25 @@ final class OrbWindowController: ObservableObject {
     private var morphVelocity: Double = 0
     private var morphTarget: Double = 0
 
+    // MARK: Zoom spring (Task 5 — green traffic light; SAME Timer+Task-hop pattern as
+    // `morphTimer` above, but a DISTINCT timer/scalar: the window shell itself is not re-morphing
+    // during a zoom (`morphModel.progress` stays pinned at 1 throughout), only its CONTENT size is
+    // animating, so this drives its own independent 0…1 scalar rather than reusing `morphTarget`.
+
+    private var zoomTimer: Timer?
+    private var lastZoomTick = CACurrentMediaTime()
+    private var zoomVelocity: Double = 0
+    /// 0 == `chatWindowDefaultSize`, 1 == `zoomedContentSize` (the currently in-flight/just-settled
+    /// leg's near-fullscreen target).
+    private var zoomProgress: Double = 0
+    private var zoomTarget: Double = 0
+    /// The near-fullscreen content size for the CURRENTLY in-flight (or just-settled) zoom-IN leg —
+    /// recomputed only when a press starts a FRESH zoom-in (`zoomToggleWindow()`'s `else` branch);
+    /// a retarget back toward 0 while already zooming in just flips `zoomTarget`, it never touches
+    /// this, so the interpolation's "1" end stays fixed for the whole animation even though
+    /// `windowSurfaceLayout` itself is recomputed fresh every tick.
+    private var zoomedContentSize = chatWindowDefaultSize
+
     init(session: SessionModel) {
         self.session = session
         self.fieldAdapter = FieldStateAdapter(session: session)
@@ -260,6 +308,9 @@ final class OrbWindowController: ObservableObject {
             // Gate r7: hiding while the window is open — snap-finish the window's collapse to the
             // orb (same teardown the morph settle runs) rather than orphaning its monitors + mouse
             // gate behind a hidden panel.
+            // Task 5: a zoom in flight must never keep animating behind a hidden panel either —
+            // cancel it alongside the morph timer, before the snap-finish below.
+            cancelZoomTimer()
             cancelMorphTimer()
             morphModel.progress = 0
             morphVelocity = 0
@@ -666,8 +717,11 @@ final class OrbWindowController: ObservableObject {
         enterWindowMode()
     }
 
-    /// Gate r7 test seam: the window is zoomed (green traffic light) — instant re-present at a
-    /// near-fullscreen content size; toggles back to `chatWindowDefaultSize`. Reset on collapse.
+    /// Gate r7 test seam: the window is zoomed (green traffic light) — a spring-animated (Task 5)
+    /// grow to a near-fullscreen content size; toggles back to `chatWindowDefaultSize`. Flips
+    /// immediately on press (the TARGET, same "flip now, animate toward it" contract as `surface`
+    /// itself) — `zoomProgress`/`zoomTimer` is what actually animates toward whichever size this
+    /// now says. Reset on collapse.
     private(set) var windowZoomed = false
 
     /// Gate r8: the CONTENT size held fixed for the duration of a window collapse, captured by
@@ -738,9 +792,10 @@ final class OrbWindowController: ObservableObject {
         OrbDebug.log("presentWindowSurface: anchor=\(anchor) windowFrame=\(layout.windowFrame)")
     }
 
-    /// Gate r7: window → orb collapse — Esc (idle), the red/yellow traffic lights, and the 4-finger
-    /// tap all route here. v1 parity: the large surface ALWAYS returns to the orb, never back to the
-    /// field. Reverse-morphs the shell back down to the orb bubble (SAME 140/22 spring);
+    /// Gate r7: window → orb collapse — Esc (idle), the RED traffic light, and the 4-finger tap
+    /// all route here (Task 4: the yellow light no longer does — see `requestWindowDetach()`). v1
+    /// parity: the large surface ALWAYS returns to the orb, never back to the field.
+    /// Reverse-morphs the shell back down to the orb bubble (SAME 140/22 spring);
     /// `finishWindowCollapse()` does the teardown once it settles.
     ///
     /// Gate r8: also arms the cursor-ride (`rideWindowCollapseToCursor()`, driven from `morphTick()`
@@ -749,10 +804,112 @@ final class OrbWindowController: ObservableObject {
     /// opened on (v1 `lockLargeSurface` parity — never re-resolved mid-flight).
     func collapseWindowToOrb() {
         guard surface == .window else { return }
+        // Task 5: a zoom in flight must never keep animating once the collapse takes over the
+        // panel frame — cancel it FIRST. Whatever content size the zoom had reached (mid-flight or
+        // settled) is exactly what `windowFinalRect` reads below, so a collapse mid-zoom rides out
+        // at whichever size it was interrupted at — no separate reconciliation needed.
+        cancelZoomTimer()
         windowCollapseContentSize = morphModel.windowFinalRect?.size ?? chatWindowDefaultSize
         windowCollapseLockedScreen = visibleScreenFrame(containing: currentWindowScreenAnchor())
         startMorph(target: 0)
         OrbDebug.log("collapseWindowToOrb: morphTarget=0")
+    }
+
+    /// Task 4: one-shot re-entrancy latch for `requestWindowDetach()` — armed for the duration of
+    /// the synchronous `onWindowDetach?(frame)` callback (during which `surface` is STILL
+    /// `.window` — it only flips inside `exitWindowModeForDetach()`, called right after only on a
+    /// successful spawn), cleared unconditionally right after (I1 fix: whether or not the exit
+    /// actually ran — a false return must never leave this latch stuck armed, or every later
+    /// detach attempt would silently no-op forever). Guards against a reentrant detach request
+    /// landing inside the callback itself, before the ordinary `surface == .window` guard alone
+    /// would catch it.
+    private var detachInFlight = false
+
+    /// Task 4 (yellow traffic light → detach): spawns a native detached window at the panel's
+    /// CURRENT frame, then frees the orb panel back to `.orb` — no animation, same instant
+    /// teardown `hide()`'s `.window` branch already uses (`exitWindowModeForDetach()` below), just
+    /// without ordering the panel out (the orb stays visible; a new window took the field's
+    /// place).
+    ///
+    /// Guarded against firing mid-morph (`morphTimer != nil` — covers any spring currently
+    /// driving the panel, including the window's own open/close morph), mid-zoom (`zoomTimer !=
+    /// nil` — Task 5's spring-animated green traffic light; a detach mid-zoom is a no-op exactly
+    /// like a detach mid-morph, not a snap-then-detach), mid-handoff (`pendingWindowExpand` — the
+    /// field hasn't finished collapsing into the window yet), when the surface isn't actually
+    /// `.window`, or re-entrantly (`detachInFlight`).
+    ///
+    /// OWNS the never-both-invisible ordering (see the task brief): fires `onWindowDetach?(frame)`
+    /// FIRST — the caller's closure (AppDelegate) spawns the detached window SYNCHRONOUSLY
+    /// (`DetachedWindowController.show()`'s `makeKeyAndOrderFront` runs before that closure
+    /// returns) — and only THEN runs `exitWindowModeForDetach()`, and only when that closure
+    /// reports the spawn actually succeeded (I1 fix, review: `onWindowDetach` can no-op — no
+    /// focused session yet, or a missing daemon token — and running the exit unconditionally in
+    /// that case discarded the window's content into the orb with nothing spawned to replace it).
+    /// So there is never a frame where neither the window surface nor a detached window is on
+    /// screen, AND a failed spawn leaves the window surface untouched rather than vanishing it.
+    ///
+    /// LIVE-GATE W1a fix: `frame` used to be the raw panel frame — which spans content + the
+    /// invisible halo padding + the orb-anchor union (`windowSurfaceLayout`'s doc), so the
+    /// detached window spawned visibly BIGGER than the morph window it replaced. It now fires with
+    /// the visible glass CONTENT rect instead, derived from `morphModel.windowFinalRect` (window-
+    /// local, y-down) mapped to screen coords against the panel's live frame — same conversion
+    /// `updateWindowMouseGate()` already uses for hit-testing, extracted pure as
+    /// `windowSurfaceContentScreenRect` so it's unit-tested. `windowFinalRect` is always set here
+    /// in practice (the `surface == .window` guard above is only reachable once
+    /// `presentWindowSurface()` has run, which sets it, and nothing clears it before
+    /// `finishWindowCollapse()` — reached only once `surface` has already left `.window`) — the
+    /// `?? frame` fallback is defensive only, never expected to fire.
+    func requestWindowDetach() {
+        guard surface == .window, morphTimer == nil, zoomTimer == nil, !pendingWindowExpand, !detachInFlight else { return }
+        detachInFlight = true
+        let frame = panel.frame
+        let contentFrame = morphModel.windowFinalRect.map {
+            windowSurfaceContentScreenRect(panelFrame: frame, finalRect: $0)
+        } ?? frame
+        // `?? true`: unwired (nil) defaults to the old unconditional-exit behavior, so callers/
+        // tests that never set `onWindowDetach` keep seeing the exit run.
+        let spawned = onWindowDetach?(contentFrame) ?? true
+        if spawned {
+            exitWindowModeForDetach()
+        }
+        detachInFlight = false
+        OrbDebug.log("requestWindowDetach: panelFrame=\(frame) contentFrame=\(contentFrame) spawned=\(spawned)")
+    }
+
+    /// Task 4: the `hide()` `.window` branch (see that method, above), with one deliberate
+    /// difference (I2 fix, review — see below) — cancel the morph timer, snap
+    /// `progress`/`morphVelocity` to settled, clear `externalFocus`, then `finishWindowCollapse()`
+    /// — but WITHOUT `panel.orderOut`: the orb panel stays visible/on screen (a detached window
+    /// has just taken the field's place instead of the panel hiding outright).
+    /// `finishWindowCollapse()` already resizes the panel back down to `collapsedWindowSize`, snaps
+    /// the follower to the settled orb anchor, and restores global (follow-everywhere) Space
+    /// behavior — none of that touches `isVisible`/orders the panel out (verified by inspection,
+    /// `finishWindowCollapse()` above).
+    func exitWindowModeForDetach() {
+        // Task 5: belt — `requestWindowDetach()`'s own guard already keeps this unreachable while
+        // `zoomTimer != nil`, but cancel it here too so this method stays independently correct
+        // (same defensive posture as `cancelMorphTimer()` right below, which the guard also
+        // already covers).
+        cancelZoomTimer()
+        cancelMorphTimer()
+        morphModel.progress = 0
+        morphVelocity = 0
+        // I2 fix (review): the detached window IS the new focus. `finishWindowCollapse()`'s
+        // unconditional `externalFocus?.restore()` would otherwise activate the app that was
+        // frontmost BEFORE the orb was ever summoned, immediately AFTER the detached window's
+        // `makeKeyAndOrderFront` in this SAME synchronous call chain (`requestWindowDetach()` ran
+        // `onWindowDetach?(frame)`, which just called `DetachedWindowController.show()`,
+        // synchronously before this method runs) — the exact "late activation wins" hazard
+        // `makePanelKeyWinningLateActivation()`'s doc already catalogs (there, a late external
+        // activation stole key focus back from a re-summoned field; here it would steal frontmost
+        // status from a just-born detached window instead). Nil-ing `externalFocus` here makes
+        // `finishWindowCollapse()`'s `restore()` a no-op via optional chaining, so the detached
+        // window keeps whatever activation it just won. `collapseWindowToOrb()` (ordinary
+        // window→orb, no detach) and `hide()` are untouched — both still reach
+        // `finishWindowCollapse()` with `externalFocus` still set, so they keep restoring the
+        // pre-summon app exactly as before.
+        externalFocus = nil
+        finishWindowCollapse()
     }
 
     /// Gate r8 (v1 follow-collapse parity — `trackStep`'s `isCollapsing` branch for `.dashboard`/
@@ -791,28 +948,144 @@ final class OrbWindowController: ObservableObject {
         morphModel.activeWindowSize = layout.windowFrame.size
     }
 
-    /// Gate r7 (green traffic light): toggle the window between `chatWindowDefaultSize` and a
-    /// near-fullscreen content size. SHIPPED SIMPLE (noted for the gate): an INSTANT re-present of
-    /// the layout at the same anchor — progress stays 1 (no re-morph), so the shell + content just
-    /// resize in place. Deliberately NOT `.animator()`/`NSAnimationContext` for the frame (verified
-    /// SIGBUS class in this codebase); a spring-animated zoom is possible future polish. No-op while
-    /// a morph is in flight (`morphTimer != nil`).
+    /// Gate r7 (green traffic light), Task 5 (spring-animated): toggle the window between
+    /// `chatWindowDefaultSize` and a near-fullscreen content size — a dedicated `zoomTimer` (same
+    /// 60Hz Timer+Task-hop pattern as `morphTimer`, see `startZoomTimer()`) springs a 0…1 scalar
+    /// (`zoomProgress`, `morphStep`'s 140/22 default tuning — SAME integrator `morphTick()` uses,
+    /// just a separate scalar) that `zoomTick()` uses to interpolate `contentSize` between
+    /// `chatWindowDefaultSize` and `zoomedContentSize` every tick, recomputing
+    /// `windowSurfaceLayout(anchor:contentSize:…)` and applying the panel frame +
+    /// `morphModel.windowFinalRect`/`windowOrbPoint`/`activeWindowSize` in lockstep — the mouse
+    /// gate (`updateWindowMouseGate()`) reads those three every tick regardless of which spring is
+    /// driving the panel. Deliberately NOT `.animator()`/`NSAnimationContext` for the frame
+    /// (verified SIGBUS class in this codebase) — manual Timer, same as the morph.
+    ///
+    /// `windowZoomed` flips to the NEW target immediately (same "flip now, animate toward it"
+    /// contract `surface` itself uses) so a re-press mid-flight RETARGETS: `zoomTarget` flips
+    /// (0↔1) while `zoomProgress`/`zoomVelocity` are left exactly where they are — the same morph
+    /// retarget idiom `expandToField()`'s mid-collapse re-summon uses on `morphTarget` — so the
+    /// animation reverses smoothly from wherever it currently sits instead of snapping. A COLD
+    /// start (no zoom currently in flight) instead seeds `zoomProgress` at whichever fixed end the
+    /// window is currently settled at (`windowZoomed ? 1 : 0`), so a fresh press always animates
+    /// FROM the resting state, never from a stale scalar left over from a previous cycle.
+    ///
+    /// No-op while the window's own morph is in flight (`morphTimer != nil`, unchanged from gate
+    /// r7) — zoom only ever starts once that has settled. `zoomedContentSize` (the near-fullscreen
+    /// "1" end) is only recomputed when a press starts a FRESH zoom-IN leg (the `else` branch
+    /// below) — a retarget back toward 0 while already zooming in just flips `zoomTarget`, never
+    /// touching it, so the interpolation's target end stays fixed for the whole animation even
+    /// though the layout itself is recomputed fresh every tick (screen/anchor could otherwise
+    /// drift the target size tick-to-tick, which would fight the spring).
     func zoomToggleWindow() {
         guard surface == .window, morphTimer == nil else { return }
-        let anchor = currentWindowScreenAnchor()
-        let screen = visibleScreenFrame(containing: anchor)
-        let content: CGSize
+        if zoomTimer == nil {
+            zoomProgress = windowZoomed ? 1 : 0
+            zoomVelocity = 0
+        }
         if windowZoomed {
-            content = chatWindowDefaultSize
+            zoomTarget = 0
             windowZoomed = false
         } else {
+            let anchor = currentWindowScreenAnchor()
+            let screen = visibleScreenFrame(containing: anchor)
             let inset = morphModel.haloPadding + chatWindowZoomInset
-            content = CGSize(
+            zoomedContentSize = CGSize(
                 width: max(chatWindowDefaultSize.width, screen.width - 2 * inset),
                 height: max(chatWindowDefaultSize.height, screen.height - 2 * inset)
             )
+            zoomTarget = 1
             windowZoomed = true
         }
+        startZoomTimer()
+        OrbDebug.log("zoomToggleWindow: zoomed=\(windowZoomed) target=\(zoomTarget)")
+    }
+
+    private func startZoomTimer() {
+        guard zoomTimer == nil else { return }
+        lastZoomTick = CACurrentMediaTime()
+        zoomTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.zoomTick()
+            }
+        }
+    }
+
+    private func cancelZoomTimer() {
+        zoomTimer?.invalidate()
+        zoomTimer = nil
+        zoomVelocity = 0
+    }
+
+    /// Internal (not `private`), same access-level convention as `morphTick()` — kept consistent
+    /// in case a future test ever needs to drive a stale tick directly the way
+    /// `MorphTimerReentrancyTests` does for `morphTick()`.
+    func zoomTick() {
+        // Re-entry guard — same rationale as `morphTick()`'s own (see that method's doc): the
+        // Timer's closure hops through `Task { @MainActor in … }` rather than running
+        // synchronously, so multiple queued closures could otherwise redundantly re-run the
+        // settle branch. `cancelZoomTimer()` sets `zoomTimer = nil` the first time this settles,
+        // so any later/duplicate tick bails out here instead.
+        guard zoomTimer != nil else { return }
+
+        let now = CACurrentMediaTime()
+        let dt = now - lastZoomTick
+        lastZoomTick = now
+
+        let (next, velocity) = morphStep(
+            progress: zoomProgress,
+            velocity: zoomVelocity,
+            target: zoomTarget,
+            dt: dt
+        )
+        zoomProgress = next
+        zoomVelocity = velocity
+
+        // Fix A parity (same settle epsilon `morphTick()` uses, v1's own — GlassFieldWindow.swift:
+        // 1841): 0.004 progress / 0.05 velocity, not a tighter ad hoc threshold.
+        let distance = abs(zoomTarget - next)
+        let settled = distance < 0.004 && abs(velocity) < 0.05
+
+        if settled {
+            zoomProgress = zoomTarget
+        }
+        applyZoomContentSize(interpolatedZoomContentSize(progress: zoomProgress))
+
+        if settled {
+            cancelZoomTimer()
+        }
+    }
+
+    /// Linear interpolation between `chatWindowDefaultSize` (0) and `zoomedContentSize` (1) — the
+    /// zoom spring's own scalar drives this directly (unlike the orb↔field morph, there is no
+    /// smoothstep travel-band shaping here: a window CONTENT resize reads fine as a plain linear
+    /// grow, and keeping it linear keeps the interpolated size exactly `chatWindowDefaultSize` at
+    /// progress 0 and exactly `zoomedContentSize` at progress 1 with no floating-point drift at
+    /// either end).
+    private func interpolatedZoomContentSize(progress: Double) -> CGSize {
+        // Task-5 review: clamp like morphedWindowSurfaceRect does — 140/22 is barely underdamped
+        // (ζ≈0.93), so the scalar can transiently tick past [0,1] before the settle epsilon
+        // fires; unclamped, that overshoot fed panel.setFrame directly (a few px past the
+        // intended bounds for 1-2 ticks).
+        let p = max(0.0, min(1.0, progress))
+        return CGSize(
+            width: chatWindowDefaultSize.width
+                + (zoomedContentSize.width - chatWindowDefaultSize.width) * p,
+            height: chatWindowDefaultSize.height
+                + (zoomedContentSize.height - chatWindowDefaultSize.height) * p
+        )
+    }
+
+    /// EVERY zoom tick (Task 5 brief): recompute the window-surface layout at the CURRENT anchor
+    /// for the given interpolated content size, and apply the panel frame + the three model fields
+    /// the mouse gate (`updateWindowMouseGate()`) reads in lockstep — same discipline as
+    /// `rideWindowCollapseToCursor()`'s per-tick `panel.setFrame` + layout-lockstep pattern.
+    /// `currentWindowScreenAnchor()` is self-consistent across resizes (derived from the panel's
+    /// own live frame + the `windowOrbPoint` this same method just set), so recomputing it fresh
+    /// every tick — rather than locking it once at the press — still holds the anchor fixed for
+    /// the whole animation without any separate "locked anchor" state to manage.
+    private func applyZoomContentSize(_ content: CGSize) {
+        let anchor = currentWindowScreenAnchor()
+        let screen = visibleScreenFrame(containing: anchor)
         let layout = windowSurfaceLayout(
             anchor: anchor, contentSize: content,
             haloPadding: morphModel.haloPadding, orbBubbleSize: morphModel.orbBubbleSize,
@@ -820,9 +1093,12 @@ final class OrbWindowController: ObservableObject {
         )
         morphModel.windowFinalRect = layout.finalRect
         morphModel.windowOrbPoint = layout.orbPoint
-        panel.setFrame(layout.windowFrame, display: true)
+        // Task-5 review: `display: false` like EVERY other per-tick setFrame in this file
+        // (rideWindowCollapseToCursor's precedent) — `true` forced a synchronous WindowServer
+        // redisplay 60×/s; let AppKit coalesce with the run loop. The mouse gate reads
+        // panel.frame directly, which updates synchronously regardless of the flag.
+        panel.setFrame(layout.windowFrame, display: false)
         morphModel.activeWindowSize = layout.windowFrame.size
-        OrbDebug.log("zoomToggleWindow: zoomed=\(windowZoomed) content=\(content)")
     }
 
     /// The orb end of the window shell mapped to screen coords, read off the panel's CURRENT frame
