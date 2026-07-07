@@ -8,6 +8,25 @@ struct TaskItem: Equatable {
     var status: String
 }
 
+/// A single outstanding human-in-the-loop interaction the daemon is waiting on — approval,
+/// question, or plan — carrying the payload cards need to render (2d-iii task 1). Replaces the
+/// old `pendingApprovalIds: Set<String>`, which tracked only callIds and dropped everything else
+/// the wire event carried (toolName/summary/questions/plan). `Equatable` (not `Identifiable`) so
+/// reducer tests can assert on values directly, same convention as `ActivityItem`/`TaskItem`.
+enum PendingInteraction: Equatable {
+    case approval(callId: String, toolName: String, summary: String)
+    case question(callId: String, questions: [SessionEvent.Question])
+    case plan(callId: String, plan: String)
+
+    var callId: String {
+        switch self {
+        case .approval(let callId, _, _): return callId
+        case .question(let callId, _): return callId
+        case .plan(let callId, _): return callId
+        }
+    }
+}
+
 /// One line of "what happened during this exchange" — tools run, task transitions, subagents
 /// spawned/finished, worktree enters/exits, and interaction points (approvals/questions/plans).
 /// Captured per-exchange by `SessionReducer.reduce` (2d-ii-a task 1) so the transcript can show
@@ -51,7 +70,13 @@ struct Exchange: Equatable {
 struct OrbSessionState: Equatable {
     var status: OrbStatus = .disconnected // until markConnected() — M2 contract
     var tasks: [TaskItem] = []
-    var pendingApprovalIds: Set<String> = []
+    /// Ordered (oldest first), replay-rebuildable list of outstanding approvals/questions/plans —
+    /// 2d-iii task 1. `*_requested`/`*_asked`/`*_presented` append (skipping a callId already
+    /// present, so a replayed duplicate event is a no-op, not a second card); the matching
+    /// `*_resolved` removes by callId; `turn_completed`/`agent_error` clear it entirely. Tasks
+    /// 2-4 render this as the HITL cards; `status`'s `.approvalNeeded(count:)` is always
+    /// `pendingInteractions.count`.
+    var pendingInteractions: [PendingInteraction] = []
     var turnRunning = false
     var streamingText = ""
     var lastReply: String? = nil
@@ -124,21 +149,18 @@ enum SessionReducer {
             s.streamingText = ""
             s.lastTurnAborted = false // a fresh turn clears any prior interrupt flag
         case .toolCall(let v) where v.threadId == mainThread:
-            if s.pendingApprovalIds.isEmpty { s.status = .toolRunning(name: v.name) }
+            if s.pendingInteractions.isEmpty { s.status = .toolRunning(name: v.name) }
             appendActivity(.tool(name: v.name, detail: extractToolDetail(name: v.name, argsJson: v.argsJson)), to: &s)
         case .toolResult(let v) where v.threadId == mainThread:
-            if s.pendingApprovalIds.isEmpty { s.status = .thinking }
+            if s.pendingInteractions.isEmpty { s.status = .thinking }
         case .approvalRequested(let v) where v.threadId == mainThread:
-            s.pendingApprovalIds.insert(v.callId)
-            s.status = .approvalNeeded(count: s.pendingApprovalIds.count)
+            appendPending(.approval(callId: v.callId, toolName: v.toolName, summary: v.summary), to: &s)
             appendActivity(.interaction(v.summary), to: &s)
         case .questionAsked(let v) where v.threadId == mainThread:
-            s.pendingApprovalIds.insert(v.callId)
-            s.status = .approvalNeeded(count: s.pendingApprovalIds.count)
+            appendPending(.question(callId: v.callId, questions: v.questions), to: &s)
             appendActivity(.interaction(v.questions.first?.question ?? "question"), to: &s)
         case .planPresented(let v) where v.threadId == mainThread:
-            s.pendingApprovalIds.insert(v.callId)
-            s.status = .approvalNeeded(count: s.pendingApprovalIds.count)
+            appendPending(.plan(callId: v.callId, plan: v.plan), to: &s)
             appendActivity(.interaction("plan presented"), to: &s)
         case .approvalResolved(let v):
             s = resolvePending(s, callId: v.callId)
@@ -158,7 +180,7 @@ enum SessionReducer {
             }
         case .turnCompleted(let v) where v.threadId == mainThread:
             s.turnRunning = false
-            s.pendingApprovalIds = []
+            s.pendingInteractions = []
             s.streamingText = ""
             s.status = .idle
             s.queuedSteers = [] // the turn absorbed whatever was queued for it
@@ -170,7 +192,7 @@ enum SessionReducer {
             }
         case .agentError(let v) where v.threadId == mainThread:
             s.turnRunning = false
-            s.pendingApprovalIds = []
+            s.pendingInteractions = []
             s.streamingText = ""
             s.status = .idle
             s.queuedSteers = [] // the turn died with whatever was queued for it
@@ -243,6 +265,16 @@ enum SessionReducer {
         return s
     }
 
+    /// Appends a new pending interaction and re-derives `status`'s count — 2d-iii task 1. Replay
+    /// dedupe: an `*_requested`/`*_asked`/`*_presented` event for a callId already in the list
+    /// (the daemon replaying its event log from the top) is a no-op, not a second card — mirrors
+    /// how `taskUpdated` above treats a re-seen id as an update rather than a duplicate.
+    private static func appendPending(_ item: PendingInteraction, to state: inout OrbSessionState) {
+        guard !state.pendingInteractions.contains(where: { $0.callId == item.callId }) else { return }
+        state.pendingInteractions.append(item)
+        state.status = .approvalNeeded(count: state.pendingInteractions.count)
+    }
+
     /// Appends to the exchange currently being built. Transcript capture is MAIN-thread only
     /// and defensive: no open exchange → drop. Adjacent duplicates collapse — EXCEPT `.tool`
     /// (LIVE-GATE G3): every tool call is now its own item, even back-to-back calls to the same
@@ -301,20 +333,20 @@ enum SessionReducer {
         case .disconnected, .reconnecting:
             s.status = .disconnected
         case .connected:
-            s.status = s.pendingApprovalIds.isEmpty
+            s.status = s.pendingInteractions.isEmpty
                 ? (s.turnRunning ? .thinking : .idle)
-                : .approvalNeeded(count: s.pendingApprovalIds.count)
+                : .approvalNeeded(count: s.pendingInteractions.count)
         }
         return s
     }
 
     private static func resolvePending(_ state: OrbSessionState, callId: String) -> OrbSessionState {
         var s = state
-        s.pendingApprovalIds.remove(callId)
+        s.pendingInteractions.removeAll { $0.callId == callId }
         if case .approvalNeeded = s.status {
-            s.status = s.pendingApprovalIds.isEmpty
+            s.status = s.pendingInteractions.isEmpty
                 ? (s.turnRunning ? .thinking : .idle)
-                : .approvalNeeded(count: s.pendingApprovalIds.count)
+                : .approvalNeeded(count: s.pendingInteractions.count)
         }
         return s
     }

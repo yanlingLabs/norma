@@ -148,10 +148,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 .store(in: &cancellables)
 
-            var lastPendingApprovalCount = model.session.state.pendingApprovalIds.count
+            var lastPendingApprovalCount = model.session.state.pendingInteractions.count
             model.session.$state
                 .sink { state in
-                    let count = state.pendingApprovalIds.count
+                    let count = state.pendingInteractions.count
                     if count > lastPendingApprovalCount {
                         Haptics.approvalRequested()
                     }

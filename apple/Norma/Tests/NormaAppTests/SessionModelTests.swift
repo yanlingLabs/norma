@@ -192,7 +192,7 @@ final class SessionModelTests: XCTestCase {
         s = SessionReducer.reduce(s, approvalRequested(callId: "c1"))
         s = SessionReducer.reduce(s, turnCompleted())
         XCTAssertEqual(s.status, .idle)
-        XCTAssertTrue(s.pendingApprovalIds.isEmpty)
+        XCTAssertTrue(s.pendingInteractions.isEmpty)
     }
 
     func testConnectionStatesOverrideAndRestore() {
