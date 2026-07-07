@@ -169,8 +169,11 @@ final class ActivityCaptureTests: XCTestCase {
             ActivityItem(kind: .task(subject: "Do X", status: "in_progress")),
             ActivityItem(kind: .task(subject: "Do X", status: "completed")),
         ])
-        // Existing side effect preserved: the upsert still landed in tasks.
-        XCTAssertEqual(s.tasks, [TaskItem(id: "1", subject: "Do X", status: "completed")])
+        // Existing side effect preserved: the upsert still landed in tasks. Task 2 (2e-i):
+        // startedTs was stamped (event.ts, always 0 in this file's helper) the moment the task
+        // entered in_progress above, then PRESERVED across the completed transition — non-
+        // in_progress transitions leave startedTs as-is, they don't clear it.
+        XCTAssertEqual(s.tasks, [TaskItem(id: "1", subject: "Do X", status: "completed", startedTs: 0)])
     }
 
     // MARK: Subagents, worktree, interactions
