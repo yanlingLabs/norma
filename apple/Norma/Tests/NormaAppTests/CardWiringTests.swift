@@ -155,6 +155,12 @@ final class CardWiringTests: XCTestCase {
         t.feed(#"{"jsonrpc":"2.0","id":\#(attach["id"] as! Int),"result":{"ok":true,"lastSeq":0}}"#)
         await waitUntil { model.session.state.status == .idle }
 
+        // TASK-3 REVIEW FIX: the respond methods now guard on the callId being pending in the
+        // CURRENT session (the silent-false-success race) — seed the pending approval first,
+        // exactly as the daemon would deliver it.
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"approval_requested","seq":1,"sessionId":"s_1","ts":1,"threadId":"main","callId":"call1","toolName":"bash","summary":"rm -rf x"}}"#)
+        await waitUntil { !model.session.state.pendingInteractions.isEmpty }
+
         async let responded = model.respondApproval(callId: "call1", approved: true)
         await waitUntilSent(t, 4)
         let respond = lineJSON(t.sent[3])
@@ -166,6 +172,28 @@ final class CardWiringTests: XCTestCase {
         t.feed(#"{"jsonrpc":"2.0","id":\#(respond["id"] as! Int),"result":{"alreadyResolved":false}}"#)
         let ok = await responded
         XCTAssertTrue(ok)
+    }
+
+    /// TASK-3 REVIEW FIX: a callId that is NOT pending in the currently-focused session must
+    /// fail closed WITHOUT an RPC — the silent-false-success race (a refocus swapping
+    /// focusedSessionId between click and dispatch would otherwise ship {new sid, old callId},
+    /// which the daemon's brokers report as alreadyResolved:true = fake success).
+    @MainActor
+    func testAppModelRespondStaleCallIdFailsClosedWithoutRPC() async throws {
+        let t = AppScriptedTransport()
+        let model = AppModel(makeTransport: { t }, token: "tok")
+        let startTask = Task { await model.start() }
+        defer { startTask.cancel(); model.stop() }
+        await answerHandshake(t, sessions: #"[{"sessionId":"s_1","scope":"global","createdAt":1,"lastSeq":0}]"#)
+        await waitUntilSent(t, 3)
+        let attach = lineJSON(t.sent[2])
+        t.feed(#"{"jsonrpc":"2.0","id":\#(attach["id"] as! Int),"result":{"ok":true,"lastSeq":0}}"#)
+        await waitUntil { model.session.state.status == .idle }
+
+        let sentBefore = t.sent.count
+        let ok = await model.respondApproval(callId: "ghost", approved: true)
+        XCTAssertFalse(ok, "stale/unknown callId must fail closed")
+        XCTAssertEqual(t.sent.count, sentBefore, "no RPC may go out for a callId not pending in the current session: \(t.sent)")
     }
 
     /// No focused session yet: the respond methods must fail closed (false), never crash / send

@@ -186,18 +186,33 @@ final class AppModel: ObservableObject {
     // a success flag) — that's a different signal than "did the RPC succeed," so it's discarded
     // here in favor of the same `!= nil` success convention `sendOrSteer` already uses.
 
+    // TASK-3 REVIEW FIX (silent false-success race): the callId is bound at click time, but
+    // these methods run in a deferred Task — a concurrent refocus (session_created follow)
+    // could swap `focusedSessionId` in between, shipping {NEW sessionId, OLD callId}. The
+    // daemon's brokers never throw on a miss (they return alreadyResolved: true), so that
+    // mismatch used to read as plain SUCCESS while the real pending interaction sat
+    // unresolved. The guard below closes it on the main actor: `refocus` swaps
+    // `focusedSessionId` and resets `session` state in the same synchronous run, so "callId
+    // still pending in the current session's state" proves the {sessionId, callId} pair is
+    // consistent. A stale click fails closed (false → the card's inline error line; after a
+    // refocus the card itself is already gone anyway).
+
+    private func pendingCallIdIsCurrent(_ callId: String) -> Bool {
+        session.state.pendingInteractions.contains { $0.callId == callId }
+    }
+
     func respondApproval(callId: String, approved: Bool) async -> Bool {
-        guard let sid = focusedSessionId else { return false }
+        guard let sid = focusedSessionId, pendingCallIdIsCurrent(callId) else { return false }
         return (try? await client.approvalRespond(sessionId: sid, callId: callId, approved: approved)) != nil
     }
 
     func respondQuestion(callId: String, answers: [String: String]) async -> Bool {
-        guard let sid = focusedSessionId else { return false }
+        guard let sid = focusedSessionId, pendingCallIdIsCurrent(callId) else { return false }
         return (try? await client.askUserRespond(sessionId: sid, callId: callId, answers: answers)) != nil
     }
 
     func respondPlan(callId: String, approved: Bool, autoAccept: Bool, feedback: String?) async -> Bool {
-        guard let sid = focusedSessionId else { return false }
+        guard let sid = focusedSessionId, pendingCallIdIsCurrent(callId) else { return false }
         return (try? await client.planRespond(sessionId: sid, callId: callId, approved: approved, autoAccept: autoAccept, feedback: feedback)) != nil
     }
 
