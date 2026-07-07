@@ -294,6 +294,31 @@ describe("renderAgentsFooter (2e-iii-b: thread selector — supersedes renderSub
     expect(lines[1]!.includes("general-purpose")).toBe(true);
     expect(lines[2]!.includes("researcher")).toBe(true);
   });
+
+  test("footer filters out done subagents: [working, done, queued] renders 3 rows (main + working + queued only), done absent", () => {
+    const working = sub({ threadId: "th_work", status: "working" });
+    const done = sub({ threadId: "th_done", status: "done" });
+    const queued = sub({ threadId: "th_queue", status: "queued" });
+    const lines = renderAgentsFooter([working, done, queued], mainSelected, true, 0, 80);
+    expect(lines).toHaveLength(3); // main + working + queued (done filtered out)
+    expect(lines[0]!.includes("main")).toBe(true);
+    expect(lines[1]!.includes("general-purpose")).toBe(true); // working row
+    expect(lines[2]!.includes("waiting")).toBe(true); // queued row
+    // Verify done is not in output
+    const output = lines.join("\n");
+    expect(output).not.toContain("th_done");
+  });
+
+  test("focus indexes stay consistent with filtered rows: focusIndex maps to visible subagents only", () => {
+    const working = sub({ threadId: "th_work", status: "working" });
+    const done = sub({ threadId: "th_done", status: "done" });
+    const queued = sub({ threadId: "th_queue", status: "queued" });
+    // Focus on the queued subagent (row index 2: main=0, working=1, queued=2)
+    const lines = renderAgentsFooter([working, done, queued], { selectedThreadId: "main", focusIndex: 2 }, true, 0, 80);
+    expect(lines).toHaveLength(3);
+    expect(lines[2]!.includes(BOLD)).toBe(true); // queued row is focused (index 2)
+    expect(lines[1]!.includes(BOLD)).toBe(false); // working row is not focused
+  });
 });
 
 describe("renderModeBar (2e-iii-b §7: interactive policy bar, two-span ANSI-safe truncation)", () => {

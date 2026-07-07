@@ -173,7 +173,8 @@ export function renderAgentsFooter(
 ): string[] {
   if (!turnRunning && !anySubagentAlive(items.map((s) => s.status))) return [];
   const rows = [footerRow(selection.selectedThreadId === "main", selection.focusIndex === 0, " main", "", columns)];
-  items.forEach((s, i) => {
+  const liveItems = items.filter((s) => s.status !== "done");
+  liveItems.forEach((s, i) => {
     rows.push(footerRow(
       selection.selectedThreadId === s.threadId,
       selection.focusIndex === i + 1,
