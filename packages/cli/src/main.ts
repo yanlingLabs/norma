@@ -5,14 +5,22 @@ import { METHODS, type Task } from "@norma/protocol";
 import { NormaClient } from "./client";
 import { applyEvent, isStalled, type WatchdogState } from "./watchdog";
 import { streamAction } from "./stream-state";
-import { renderTaskBlock, TASK_ICONS, trackLineStart, upsertTask } from "./task-block";
+import {
+  DIM,
+  RESET,
+  SPINNER_FRAMES,
+  TASK_ICONS,
+  renderStatusLine,
+  renderTaskBlock,
+  trackLineStart,
+  truncateStatusLine,
+  upsertTask,
+} from "./task-block";
 import { installPlugin, removePluginDir, removePluginFromSettings, setPluginEnabled } from "./plugin-cli";
 import { isOtherChoice, parseQuestionAnswer } from "./questions";
 import { parsePlanResponse } from "./plan-response";
 
 const AQUA = "\x1b[38;2;53;214;232m";
-const DIM = "\x1b[2m";
-const RESET = "\x1b[0m";
 
 async function readSecret(promptText: string): Promise<string> {
   process.stdout.write(promptText);
@@ -101,6 +109,7 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
     if (exiting) return;
     exiting = true;
     if (wdTimer) clearInterval(wdTimer); // normal completion — stop watching for a stall that didn't happen
+    clearInterval(spinnerTimer); // stop the status-line spinner/elapsed tick — the turn is over
     const running = (await c.bgList(sessionId)).filter((t) => t.status === "running");
     if (running.length) {
       const waitMs = Number(process.env.NORMA_BG_PRINT_WAIT_MS ?? 5000);
@@ -136,13 +145,26 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
   // atLineStart tracks whether the last byte written to stdout was a newline (the ONLY safe
   // moment to erase+redraw the block — never mid a streamed delta or a bg-task-output chunk,
   // both of which can end without one); pinnedLines is how many trailing lines on screen
-  // currently belong to the block, so we know how far to cursor-up before clearing.
+  // currently belong to the block (status line + task rows together), so we know how far to
+  // cursor-up before clearing.
   // Non-TTY (piped/-p) is untouched: eraseBlockIfPinned/repaintBlockIfSafe are no-ops there, so
   // `emit()` degenerates to a plain process.stdout.write and task_updated keeps its exact
   // existing one-line-per-update console output for headless consumers.
   let tasks: Task[] = [];
   let atLineStart = true;
   let pinnedLines = 0;
+
+  // Live turn status (Task 4): drives the "⠋ Working… (14s · ↑ 1.2k ↓ 842 tokens)" line printed
+  // above the task rows while a turn is running — Claude Code parity. turnRunning/turnStartMs
+  // reset on turn_started; streamedChars is a rough token-count proxy while a turn is in flight
+  // (the provider's real outputTokens is only known once turn_completed reports it); spinnerIdx is
+  // advanced independently by the tick timer below.
+  let turnRunning = false;
+  let turnStartMs = 0;
+  let streamedChars = 0;
+  let lastInTokens = 0;
+  let lastOutTokens = 0;
+  let spinnerIdx = 0;
 
   function eraseBlockIfPinned(): void {
     if (pinnedLines > 0) { process.stdout.write(`\x1b[${pinnedLines}A\x1b[0J`); pinnedLines = 0; }
@@ -151,12 +173,39 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
     if (!process.stdout.isTTY || !atLineStart) return;
     // Width passed per-repaint (not cached): terminal resizes between repaints pick up the new
     // width; truncation keeps 1 logical line == 1 physical row so the erase count stays exact.
-    const lines = renderTaskBlock(tasks, process.stdout.columns);
+    const columns = process.stdout.columns;
+    const lines: string[] = [];
+    if (turnRunning) {
+      const activeForm = tasks.find((t) => t.status === "in_progress")?.activeForm ?? "Working";
+      const statusLine = renderStatusLine({
+        activeForm,
+        elapsedMs: Date.now() - turnStartMs,
+        inTokens: lastInTokens,
+        outTokens: turnRunning ? Math.ceil(streamedChars / 4) : lastOutTokens,
+        spinnerFrame: SPINNER_FRAMES[spinnerIdx % SPINNER_FRAMES.length]!,
+      });
+      lines.push(truncateStatusLine(statusLine, columns));
+    }
+    lines.push(...renderTaskBlock(tasks, columns));
     if (lines.length === 0) return;
-    for (const l of lines) process.stdout.write(`${DIM}${l}${RESET}\n`);
+    // renderTaskBlock/renderStatusLine rows are already ANSI-colored per-row (blue/green/dim
+    // glyphs, blue status line) — no outer DIM wrap here (that was pre-Task-4 behavior, when
+    // renderTaskBlock returned plain text and this was the only styling applied).
+    for (const l of lines) process.stdout.write(`${l}\n`);
     pinnedLines = lines.length;
   }
   function refreshBlock(): void { eraseBlockIfPinned(); repaintBlockIfSafe(); }
+  // Spinner/elapsed tick: advances the animation frame and, only while a turn is actually running
+  // on a TTY, asks for a repaint. refreshBlock() itself only ever erases+redraws at a safe stream
+  // boundary (atLineStart) via repaintBlockIfSafe, so a tick landing mid-delta is a harmless no-op
+  // — this timer never needs to know about streaming state. unref() so a live process never keeps
+  // running just because this timer is still armed; cleared explicitly wherever the CLI tears down
+  // (see endHeadlessTurn and the stall-watchdog exit path below).
+  const spinnerTimer = setInterval(() => {
+    spinnerIdx = (spinnerIdx + 1) % SPINNER_FRAMES.length;
+    if (turnRunning && process.stdout.isTTY) refreshBlock();
+  }, 120);
+  spinnerTimer.unref?.();
   // Every stdout write in this event loop funnels through here so the block is always erased
   // before new content lands and (if we're at a safe fresh-line boundary afterwards) redrawn
   // below it — this is what keeps it "pinned" without ever tearing a partial line.
@@ -170,10 +219,17 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
   const c = await connect("cli-p", (e) => {
     const sa = streamAction(streaming, e as { type: string; threadId?: string });
     streaming = sa.streaming;
-    if (sa.action === "write_delta") emit(`${AQUA}${(e as { delta: string }).delta}${RESET}`);
-    else if (sa.action === "close_line") emit("\n");
+    if (sa.action === "write_delta") {
+      streamedChars += (e as { delta: string }).delta.length; // rough ↓ out-tokens proxy while the turn is still running
+      emit(`${AQUA}${(e as { delta: string }).delta}${RESET}`);
+    } else if (sa.action === "close_line") emit("\n");
     applyEvent(wd, e, Date.now());
-    if (e.type === "assistant_message") {
+    if (e.type === "turn_started") {
+      turnRunning = true;
+      turnStartMs = Date.now();
+      streamedChars = 0;
+      refreshBlock(); // show the status line immediately rather than waiting up to 120ms for the first tick
+    } else if (e.type === "assistant_message") {
       if (sa.action === "close_then_print_full") { emit("\n"); emit(`${AQUA}${e.text}${RESET}\n`); }
       else if (sa.action === "print_full") emit(`${AQUA}${e.text}${RESET}\n`);
       else emit("\n");
@@ -251,7 +307,10 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
     } else if (e.type === "agent_error") {
       console.error(`agent error: ${e.message}`);
     } else if (e.type === "turn_completed") {
-      refreshBlock(); // safety net: reflects the final task state (and disappears if all done)
+      turnRunning = false;
+      lastInTokens = e.inputTokens;
+      lastOutTokens = e.outputTokens;
+      refreshBlock(); // safety net: status line gone (turn over), task rows reflect final state (and disappear if all done)
       void endHeadlessTurn(c, sessionId, wdTimer, e.stopReason === "end_turn" ? 0 : 1);
     }
   });
@@ -296,6 +355,7 @@ async function runHeadlessAgent(promptOverride?: string, forceAuto = false, exis
       if (exiting) return;
       exiting = true;
       clearInterval(wdTimer);
+      clearInterval(spinnerTimer);
       console.error(`\n[stalled: no progress for ${Math.round((Date.now() - wd.lastEventAt) / 1000)}s — aborting]`);
       void c.interrupt(sessionId).finally(() => process.exit(2));
     }
