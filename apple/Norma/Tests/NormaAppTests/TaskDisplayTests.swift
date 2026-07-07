@@ -45,4 +45,16 @@ final class TaskDisplayTests: XCTestCase {
         XCTAssertEqual(formatTokens(10600), "10.6k")
         XCTAssertEqual(formatTokens(1200000), "1.2M")
     }
+
+    /// Task-1 review fix: the exact binary-tie cases (n mod 1000 == 250) must round half-UP and
+    /// match the TS side byte-for-byte — %.1f (round-half-to-even) used to give 1.2k here.
+    func testFormatTokensLockstepTieCases() {
+        XCTAssertEqual(formatTokens(1250), "1.3k")
+        XCTAssertEqual(formatTokens(2250), "2.3k")
+        XCTAssertEqual(formatTokens(12250), "12.3k")
+        XCTAssertEqual(formatTokens(100250), "100.3k")
+        XCTAssertEqual(formatTokens(1250000), "1.3M")
+        XCTAssertEqual(formatTokens(1000), "1.0k")
+        XCTAssertEqual(formatTokens(1249), "1.2k")
+    }
 }

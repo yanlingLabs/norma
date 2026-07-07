@@ -85,7 +85,12 @@ func formatElapsed(_ ms: Int) -> String {
 /// `task-display.ts`'s `(n / 1000).toFixed(1)` — both always keep exactly one decimal digit above
 /// the 1000 threshold (never strip a trailing ".0").
 func formatTokens(_ n: Int) -> String {
+    // Task-1 review fix: one-decimal via INTEGER round-half-up, NOT %.1f/toFixed — those diverge
+    // at exact binary ties (n mod 1000 == 250 → %.1f round-half-to-even gives 1.2k, toFixed gives
+    // 1.3k), breaking Swift↔TS lockstep on ordinary token counts. `(x + half) / step` (integer
+    // division) is identical in both languages. `oneDecimal` renders tenths as "<int>.<dec>".
+    func oneDecimal(_ tenths: Int) -> String { "\(tenths / 10).\(tenths % 10)" }
     if n < 1000 { return String(n) }
-    if n < 1_000_000 { return "\(String(format: "%.1f", Double(n) / 1000))k" }
-    return "\(String(format: "%.1f", Double(n) / 1_000_000))M"
+    if n < 1_000_000 { return "\(oneDecimal((n + 50) / 100))k" }   // tenths of thousands, half-up
+    return "\(oneDecimal((n + 50_000) / 100_000))M"                 // tenths of millions, half-up
 }

@@ -20,3 +20,24 @@ describe("task-display", () => {
   test("formatElapsed", () => { expect(formatElapsed(14000)).toBe("14s"); expect(formatElapsed(123000)).toBe("2m 3s"); expect(formatElapsed(3840000)).toBe("1h 4m"); });
   test("formatTokens", () => { expect(formatTokens(842)).toBe("842"); expect(formatTokens(10600)).toBe("10.6k"); expect(formatTokens(1200000)).toBe("1.2M"); });
 });
+
+import { formatTokens as ftok } from "../src/task-display";
+describe("formatTokens lockstep (Task-1 review: no half-even/half-up divergence)", () => {
+  test("the divergent binary-tie cases now round consistently (half-up)", () => {
+    expect(ftok(1250)).toBe("1.3k");   // was the divergence: %.1f gave 1.2k
+    expect(ftok(2250)).toBe("2.3k");
+    expect(ftok(12250)).toBe("12.3k");
+    expect(ftok(100250)).toBe("100.3k");
+    expect(ftok(1250000)).toBe("1.3M");
+  });
+  test("original fixtures unchanged", () => {
+    expect(ftok(842)).toBe("842");
+    expect(ftok(10600)).toBe("10.6k");
+    expect(ftok(1200000)).toBe("1.2M");
+  });
+  test("non-tie values still correct", () => {
+    expect(ftok(1000)).toBe("1.0k");
+    expect(ftok(1240)).toBe("1.2k");
+    expect(ftok(1249)).toBe("1.2k");
+  });
+});

@@ -84,7 +84,12 @@ export function formatElapsed(ms: number): string {
  *  `TaskDisplay.swift`'s `String(format: "%.1f", Double(n)/1000)` — both always keep exactly one
  *  decimal digit above the 1000 threshold (never strip a trailing ".0"). */
 export function formatTokens(n: number): string {
+  // Task-1 review fix: one-decimal via INTEGER round-half-up, NOT toFixed/%.1f — those diverge at
+  // exact binary ties (n mod 1000 == 250 → toFixed gives 1.3k, Swift %.1f round-half-to-even gives
+  // 1.2k), breaking TS↔Swift lockstep on ordinary token counts. `Math.floor((x + half) / step)` is
+  // identical to Swift's integer `(x + half) / step`.
+  const oneDecimal = (tenths: number) => `${Math.floor(tenths / 10)}.${tenths % 10}`;
   if (n < 1000) return String(n);
-  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
-  return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n < 1_000_000) return `${oneDecimal(Math.floor((n + 50) / 100))}k`;
+  return `${oneDecimal(Math.floor((n + 50_000) / 100_000))}M`;
 }
