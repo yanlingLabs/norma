@@ -493,7 +493,7 @@ export class AgentEngine {
         this.emit(sessionId, { type: "tool_call", sessionId, threadId, callId: call.callId, name: call.name, argsJson: call.argsJson });
         input.push({ type: "function_call", callId: call.callId, name: call.name, argsJson: call.argsJson });
 
-        let outcome: { output: string; isError: boolean };
+        let outcome: { output: string; isError: boolean; deniedByHuman?: boolean };
         const spawnOutcome = spawnOutcomes.get(call.callId);
         if (spawnOutcome) {
           outcome = spawnOutcome;
@@ -590,6 +590,16 @@ export class AgentEngine {
 
         this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
         input.push({ type: "tool_result", callId: call.callId, output: outcome.output, isError: outcome.isError });
+
+        // A human explicitly denied this action → end the turn now and return control to the
+        // user (Claude Code parity). The denied tool_result is already persisted above, so the
+        // NEXT turn's context shows "you tried X, the user denied it" alongside whatever the
+        // user then says. Any later calls in this same batch were never emitted/pushed (the
+        // loop pushes function_call + tool_result one at a time), so nothing is left dangling.
+        if (outcome.deniedByHuman) {
+          this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "end_turn", ...usage });
+          return { finalText: lastText, stopReason: "end_turn" };
+        }
       }
     }
 
@@ -616,7 +626,7 @@ export class AgentEngine {
     signal: AbortSignal,
     opts: { timeoutMs: number; summary: string; denialMessage?: string },
     onApprove?: () => Promise<{ output: string; isError: boolean }>,
-  ): Promise<{ output: string; isError: boolean }> {
+  ): Promise<{ output: string; isError: boolean; deniedByHuman?: boolean }> {
     const waiting = this.cfg.broker.wait(sessionId, call.callId, opts.timeoutMs);
     try {
       this.emit(sessionId, {
@@ -630,9 +640,24 @@ export class AgentEngine {
     }
     const res = await waiting;
     this.emit(sessionId, { type: "approval_resolved", sessionId, threadId, callId: call.callId, approved: res.approved, by: res.by });
-    return res.approved
-      ? await (onApprove ? onApprove() : this.executeCall(call, cwd, sessionId, threadId, signal))
-      : { output: opts.denialMessage ?? `denied by ${res.by}`, isError: true };
+    if (res.approved) {
+      return await (onApprove ? onApprove() : this.executeCall(call, cwd, sessionId, threadId, signal));
+    }
+    // An EXPLICIT human denial (any `by` other than the broker's "timeout") ends the turn and
+    // hands control back to the user (Claude Code parity) — see the caller's `deniedByHuman`
+    // check in the tool loop. Crucially it does NOT invite a "retry with a justification"
+    // (that path let a model re-submit the SAME command and have the AI reviewer re-approve it
+    // in-turn with no second human confirmation — a real gate bypass). The retry-with-
+    // justification hint is kept ONLY for genuine timeouts (no human ever answered), where the
+    // caller supplies `denialMessage`.
+    if (res.by !== "timeout") {
+      return {
+        output: `The user denied this ${call.name} action — it was NOT run. Stop here and wait for the user to tell you how to proceed. Do not retry it, rephrase it, or attempt a workaround; the user will give further instructions.`,
+        isError: true,
+        deniedByHuman: true,
+      };
+    }
+    return { output: opts.denialMessage ?? `denied by ${res.by}`, isError: true };
   }
 
   /** exit_plan_mode's approval bridge — wired ONLY when cfg.plans is set (see the else-if guard
