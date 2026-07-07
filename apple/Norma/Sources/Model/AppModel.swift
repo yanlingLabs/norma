@@ -50,6 +50,10 @@ final class AppModel: ObservableObject {
                 SessionSummary(sessionId: $0.sessionId, title: $0.title, createdAt: $0.createdAt, scope: $0.scope, cwd: $0.cwd)
             }
         })
+        // FINAL-REVIEW FIX (M1): cold-window bootstrap — session.list on construction, not only on
+        // the next session_created/session_titled broadcast. See SessionDirectory.startInitialLoad's
+        // doc for why a lost race against this AppModel's own not-yet-connected client is harmless.
+        directory.startInitialLoad()
         // Hook composition (see SessionFeed's doc comment for why): these four closures are the
         // ONLY seam between the extracted mechanics and AppModel's focus-follow behavior, each
         // firing at the exact point the original monolithic start()/handle() touched app state.

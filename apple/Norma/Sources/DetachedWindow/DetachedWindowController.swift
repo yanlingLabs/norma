@@ -94,6 +94,11 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
             }
         })
         directory = sessionDirectory
+        // FINAL-REVIEW FIX (M1): cold-window bootstrap — same "session.list on construction" kick
+        // as AppModel's own directory (see SessionDirectory.startInitialLoad's doc); a freshly
+        // spawned detached window's sidebar (and its own WorkSidebar info block) must not sit empty
+        // until an unrelated session_created/session_titled broadcast arrives.
+        sessionDirectory.startInitialLoad()
         // Task 5 (2e-iii): forward session_created/session_titled to this window's OWN directory —
         // returns false (this feed's `onEvent` was previously nil) so SessionFeed's default
         // pinned-mode fallback (apply only events matching the pinned sessionId, plus every

@@ -115,6 +115,27 @@ final class SessionDirectoryTests: XCTestCase {
                         "title patch must be synchronous, not wait on the refresh round-trip")
     }
 
+    /// FINAL-REVIEW FIX (M1): `startInitialLoad()` is the exact method `AppModel.init` and
+    /// `DetachedWindowController.init` call right after constructing their own `directory` (see
+    /// those files' "FINAL-REVIEW FIX (M1)" comments) instead of inlining a bare
+    /// `Task { await refresh() }` at each call site — pinning ITS contract here (exactly one lister
+    /// call, rows populated from empty) means this test goes red if `startInitialLoad()`'s body is
+    /// ever gutted back to a no-op, the same regression the finding calls out ("SessionDirectory
+    /// never does its INITIAL load").
+    func testStartInitialLoadKicksExactlyOneRefresh() async {
+        let stub = StubSessionLister()
+        stub.rows = [SessionSummary(sessionId: "s1", title: "hi", createdAt: 1, scope: "global", cwd: nil)]
+        let directory = SessionDirectory(lister: stub.list)
+        XCTAssertTrue(directory.rows.isEmpty, "no rows before the initial load")
+
+        directory.startInitialLoad()
+
+        await waitUntilDirectory { directory.rows.count == 1 }
+        XCTAssertEqual(directory.rows.first?.sessionId, "s1")
+        try? await Task.sleep(nanoseconds: 150_000_000) // settle: prove it doesn't double-fire
+        XCTAssertEqual(stub.callCount, 1, "startInitialLoad must kick exactly one lister call")
+    }
+
     func testHandleSessionTitledForUnknownRowStillKicksRefresh() async {
         let stub = StubSessionLister()
         let directory = SessionDirectory(lister: stub.list)

@@ -36,6 +36,13 @@ struct SessionSidebar: View {
             .padding(8)
         }
         .frame(width: sidebarLeftWidth)
+        // FINAL-REVIEW FIX (M1): the wirer-level `startInitialLoad()` kicks (AppModel.init /
+        // DetachedWindowController.init) can lose their race against this directory's own harness
+        // not being connected yet at construction time — this `.task` is the belt: it fires every
+        // time the sidebar itself appears (a real window/appear event, well after connect in
+        // practice), so opening the sidebar always freshens the list regardless of how the earlier
+        // construction-time kick landed.
+        .task { await directory.refresh() }
     }
 
     private var newSessionRow: some View {

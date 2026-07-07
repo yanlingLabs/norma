@@ -25,6 +25,21 @@ final class SessionDirectory: ObservableObject {
         rows = fetched.sorted { $0.createdAt > $1.createdAt }
     }
 
+    /// FINAL-REVIEW FIX (M1): the wirers' (`AppModel.init` / `DetachedWindowController.init`) own
+    /// bootstrap kick, named so it's a single testable seam instead of an inline
+    /// `Task { await refresh() }` duplicated at both construction sites. Fire-and-forget, same
+    /// posture as `handle`'s event-triggered refreshes below: without SOME initial load, a cold
+    /// window's session switcher (and `WorkSidebar`'s info block, which reads this same `directory`
+    /// instance) stays empty until an unrelated session_created/session_titled broadcast happens to
+    /// arrive — spec demands "session.list on appear + refresh on events", not "…or whenever the
+    /// next broadcast happens to land." A failure here (e.g. this directory's own harness hasn't
+    /// finished `client.connect()` yet at construction time) is silently absorbed by `refresh()`'s
+    /// own `try?`; `SessionSidebar`'s own `.task { await directory.refresh() }` and every
+    /// session-lifecycle broadcast are the belt-and-suspenders that keep retrying.
+    func startInitialLoad() {
+        Task { await refresh() }
+    }
+
     /// Session-lifecycle events broadcast to every authed harness (`session_created`,
     /// `session_titled` — see the daemon's fan-out, spec'd in Task 1/2/3 of this phase). Both kick
     /// a full `refresh()` so the row list itself (new row appearing; sort order) stays correct; a
