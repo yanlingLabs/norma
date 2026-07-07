@@ -18,6 +18,12 @@ struct WindowContentView<Accessory: View>: View {
     /// adapter only owns the DATA the menu reads/writes (`sessionPolicy`/`policyChangeInFlight`).
     @State private var showingPolicyMenu = false
 
+    /// Task 3 (2e-i): whether the "… +N completed" tail is expanded to the full completed list.
+    /// Local presentational state, same convention as `showingPolicyMenu` above — resets whenever
+    /// this view is recreated (e.g. a new session), which is fine: there's nothing worth
+    /// preserving about a stale expand/collapse choice across sessions.
+    @State private var expandedCompleted = false
+
     var body: some View {
         VStack(spacing: 10) {
             HStack(spacing: 12) {
@@ -121,38 +127,94 @@ struct WindowContentView<Accessory: View>: View {
         .frame(minWidth: 160)
     }
 
-    /// LIVE-GATE G4: the compact "what's left" list — up to 5 rows of `☐`/`◐`/`☑` + subject, with
-    /// a "+N more" tail when there are more than 5. Hidden entirely when `adapter.pinnedTasks` is
-    /// empty (the caller in `body` already gates on that), so this is pure rendering, no further
-    /// emptiness logic here.
+    /// LIVE-GATE G4, Task 3 (2e-i) redesign: the CC-tree-style pinned task list — blue bold `■`
+    /// in_progress row (with a live elapsed suffix), dim `☐` pending rows, and `✓` completed rows
+    /// pushed to the bottom and capped at 2 with a tappable "… +N completed" affordance. Hidden
+    /// entirely when `adapter.pinnedTasks` is empty (the caller in `body` already gates on that).
     @ViewBuilder
     func pinnedTasksSection(_ tasks: [TaskItem]) -> some View {
+        let built = buildTaskSection(tasks)
         VStack(alignment: .leading, spacing: 4) {
             Divider().opacity(0.5)
-            ForEach(Array(tasks.prefix(5).enumerated()), id: \.offset) { _, task in
-                HStack(spacing: 6) {
-                    Text(pinnedTaskGlyph(task.status))
-                    Text(task.subject)
-                }
-                .font(.system(size: 11))
-                .foregroundStyle(task.status == "in_progress" ? .secondary : .tertiary)
-                .lineLimit(1)
-                .truncationMode(.middle)
+            // Expanded state rebuilds WITHOUT the 2-completed cap (brief: "rebuild without the
+            // cap") rather than reusing `built.rows`, which is always capped.
+            let displayedRows = expandedCompleted ? sortedTaskRows(tasks) : built.rows
+            ForEach(displayedRows, id: \.id) { row in
+                taskRowView(row, activeStartedTs: built.activeStartedTs)
             }
-            if tasks.count > 5 {
-                Text("+\(tasks.count - 5) more")
+            if built.collapsedCompleted > 0 && !expandedCompleted {
+                Text("… +\(built.collapsedCompleted) completed")
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
+                    .onTapGesture { expandedCompleted = true }
+            } else if expandedCompleted && built.collapsedCompleted > 0 {
+                Text("… collapse")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                    .onTapGesture { expandedCompleted = false }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    func pinnedTaskGlyph(_ status: String) -> String {
+    /// Norma blue for the single in_progress row — matches the brief's `Color(red:0.45,
+    /// green:0.75, blue:1.0)`, distinct from the CLI's ANSI blue but the same role: draw the eye
+    /// to what's actively running.
+    private var taskInProgressBlue: Color { Color(red: 0.45, green: 0.75, blue: 1.0) }
+
+    /// Row text color per the brief: in_progress → Norma blue, pending → `.secondary`,
+    /// completed → `.tertiary` (the glyph itself is tinted separately — green for completed).
+    private func rowTextStyle(_ status: String) -> AnyShapeStyle {
         switch status {
-        case "in_progress": return "◐"
-        case "completed": return "☑"
-        default: return "☐" // pending, or any unrecognized status
+        case "in_progress": return AnyShapeStyle(taskInProgressBlue)
+        case "completed": return AnyShapeStyle(.tertiary)
+        default: return AnyShapeStyle(.secondary) // pending, or any unrecognized status
         }
     }
+
+    /// Glyph color — same as the row text EXCEPT completed, whose `✓` is tinted green while its
+    /// subject stays `.tertiary`.
+    private func rowGlyphStyle(_ status: String) -> AnyShapeStyle {
+        status == "completed" ? AnyShapeStyle(.green) : rowTextStyle(status)
+    }
+
+    @ViewBuilder
+    private func taskRowView(_ row: TaskRow, activeStartedTs: Int?) -> some View {
+        HStack(spacing: 6) {
+            Text(taskGlyph(row.status))
+                .foregroundStyle(rowGlyphStyle(row.status))
+            Text(row.subject)
+            if row.status == "in_progress", let startedTs = activeStartedTs {
+                // D9: the periodic tick is mounted ONLY for the active row's elapsed suffix, and
+                // only when there IS an active row with a startedTs — no idle ticking otherwise.
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    Text("· " + formatElapsed(Int(Date().timeIntervalSince1970 * 1000) - startedTs))
+                }
+            }
+        }
+        .font(.system(size: 11))
+        .fontWeight(row.status == "in_progress" ? .bold : nil)
+        .foregroundStyle(rowTextStyle(row.status))
+        .lineLimit(1)
+        .truncationMode(.middle)
+    }
+}
+
+/// `TaskItem` (the session model's wire-shaped type) → Task 1's sorted `[TaskRow]`. Shared by
+/// `buildTaskSection` and `pinnedTasksSection`'s expanded-state rebuild, so both read the SAME
+/// sort order.
+private func sortedTaskRows(_ tasks: [TaskItem]) -> [TaskRow] {
+    sortTasksForDisplay(tasks.map { TaskRow(id: $0.id, subject: $0.subject, status: $0.status, activeForm: $0.activeForm, startedTs: $0.startedTs) })
+}
+
+/// Task 3 (2e-i): the pure decision behind `pinnedTasksSection` — SwiftUI's `body` isn't unit
+/// testable, so the sort/collapse/active-row logic lives here where `WindowTaskSectionTests` can
+/// drive it directly. Surfaces the in_progress row's `startedTs` as the live-elapsed timer's
+/// anchor (`nil` when nothing is in_progress, so the caller mounts no `TimelineView` tick at
+/// all — D9).
+func buildTaskSection(_ tasks: [TaskItem]) -> (rows: [TaskRow], collapsedCompleted: Int, activeStartedTs: Int?) {
+    let sorted = sortedTaskRows(tasks)
+    let r = collapseCompleted(sorted)
+    let active = sorted.first { $0.status == "in_progress" }
+    return (r.rows, r.collapsedCompletedCount, active?.startedTs)
 }
