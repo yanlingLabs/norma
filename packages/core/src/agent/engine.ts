@@ -90,6 +90,10 @@ export interface EngineConfig {
   // the bridge to activate — see the `spawnCalls` filter in runThread's dispatch loop.
   subagents?: SubagentManager;
   agents?: AgentStore;
+  // SessionTitler (Phase 2e-iii Task 3): optional — absent means no session gets an
+  // auto-generated title. Fired fire-and-forget, only at the main thread's (depth 0) turn
+  // completion, never on the error paths (an errored first turn has nothing worth titling).
+  titler?: { maybeTitle(sessionId: string): Promise<void> };
 }
 
 export class AgentEngine {
@@ -430,6 +434,7 @@ export class AgentEngine {
           if (stop !== "aborted" && pending && pending.length) { continue; }
         }
         this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: stop === "aborted" ? "aborted" : "end_turn", ...usage });
+        if (opts.depth === 0 && this.cfg.titler) void this.cfg.titler.maybeTitle(sessionId);
         return { finalText: lastText, stopReason: stop === "aborted" ? "aborted" : "end_turn" };
       }
 
@@ -599,6 +604,7 @@ export class AgentEngine {
         // loop pushes function_call + tool_result one at a time), so nothing is left dangling.
         if (outcome.deniedByHuman) {
           this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "end_turn", ...usage });
+          if (opts.depth === 0 && this.cfg.titler) void this.cfg.titler.maybeTitle(sessionId);
           return { finalText: lastText, stopReason: "end_turn" };
         }
       }

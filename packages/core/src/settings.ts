@@ -26,6 +26,10 @@ export const Settings = z.object({
     model: z.string().optional(),
     allow: z.array(z.string()).optional(),
   }).optional(),
+  titles: z.object({
+    enabled: z.boolean().optional(),
+    model: z.string().optional(),
+  }).optional(),
   plugins: z.object({
     enabled: z.array(z.string()).optional(),
     disabled: z.array(z.string()).optional(),

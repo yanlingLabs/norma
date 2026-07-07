@@ -34,6 +34,7 @@ import { AgentStore } from "./agent/agents";
 import { SubagentManager } from "./agent/subagents";
 import { AgentEngine, SYSTEM_PROMPT } from "./agent/engine";
 import { BashReviewer } from "./agent/reviewer";
+import { SessionTitler } from "./agent/titles";
 import { Compactor } from "./agent/compactor";
 import { SessionDirectories } from "./agent/dirs";
 import { TrustStore } from "./agent/trust";
@@ -167,6 +168,10 @@ export async function startDaemon(opts: {
     const reviewerCfg = settings?.reviewer;
     const reviewer =
       reviewerCfg?.enabled === false ? undefined : new BashReviewer({ provider: agentProvider, model: reviewerCfg?.model });
+    // Default ON: the titler is built unless settings.titles.enabled is explicitly false.
+    const titlesCfg = settings?.titles;
+    const titler =
+      titlesCfg?.enabled === false ? undefined : new SessionTitler({ provider: agentProvider, store, hub, model: titlesCfg?.model });
     engine = new AgentEngine({
       store, hub, registry, broker,
       gate: new PermissionGate(),
@@ -185,6 +190,7 @@ export async function startDaemon(opts: {
       reviewer,
       reviewerEnabled: reviewerCfg?.enabled,
       reviewerAllow: reviewerCfg?.allow ?? [],
+      titler,
       toolSearch: {
         enabled: settings?.toolSearch?.enabled,
         deferThreshold: settings?.toolSearch?.deferThreshold ?? Number(process.env.NORMA_TOOLSEARCH_THRESHOLD ?? 12),
