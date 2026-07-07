@@ -85,6 +85,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return true
         }
 
+        // Task 3 (2d-iii): the same seam as `onSubmit` above — the orb's own focused-session
+        // respond RPCs, mirrored one-for-one onto `AppModel`'s three new methods.
+        orb.onApprovalRespond = { [weak self] callId, approved in
+            await self?.appModel?.respondApproval(callId: callId, approved: approved) ?? false
+        }
+        orb.onQuestionRespond = { [weak self] callId, answers in
+            await self?.appModel?.respondQuestion(callId: callId, answers: answers) ?? false
+        }
+        orb.onPlanRespond = { [weak self] callId, approved, autoAccept, feedback in
+            await self?.appModel?.respondPlan(callId: callId, approved: approved, autoAccept: autoAccept, feedback: feedback) ?? false
+        }
+
+        // Task 4 (2d-iii): the ⋯ menu's approval-mode picker — same seam as the three respond
+        // closures above.
+        orb.onSetPolicy = { [weak self] policy in
+            await self?.appModel?.setSessionPolicy(policy) ?? false
+        }
+
         // Task 4 (detach choreography): the yellow traffic light. `requestWindowDetach()` OWNS the
         // ordering — it fires this closure (spawning the detached window SYNCHRONOUSLY via
         // `show()`, before this closure returns) and only THEN runs its own no-animation exit
@@ -148,10 +166,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 .store(in: &cancellables)
 
-            var lastPendingApprovalCount = model.session.state.pendingApprovalIds.count
+            var lastPendingApprovalCount = model.session.state.pendingInteractions.count
             model.session.$state
                 .sink { state in
-                    let count = state.pendingApprovalIds.count
+                    let count = state.pendingInteractions.count
                     if count > lastPendingApprovalCount {
                         Haptics.approvalRequested()
                     }

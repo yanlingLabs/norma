@@ -50,7 +50,7 @@ function stubReviewer(behavior: { verdict: "safe" | "unsafe"; reason: string } |
 }
 
 describe("engine + safety reviewer (auto-policy bash)", () => {
-  test("unsafe verdict escalates: approval_requested (summary has reason), deny → tool_result has reason + retry hint, bash did NOT run, reviewer saw {command, justification}", async () => {
+  test("unsafe verdict escalates; a HUMAN deny ENDS the turn (no retry-with-justification bypass), bash did NOT run, reviewer saw {command, justification}", async () => {
     const { registry, calls } = stubRegistry();
     const reviewer = stubReviewer({ verdict: "unsafe", reason: "REASON_SENTINEL" });
     const provider = new FakeProvider(bashTurn("rm -rf x", "cleaning up JUST_SENTINEL"));
@@ -71,8 +71,15 @@ describe("engine + safety reviewer (auto-policy bash)", () => {
 
     const result = events.find((e) => e.type === "tool_result") as any;
     expect(result.isError).toBe(true);
-    expect(result.output).toContain("REASON_SENTINEL");
-    expect(result.output.toLowerCase()).toContain("justification");
+    // A human deny must STOP the loop and NOT coach the model to retry with a justification
+    // (that was the gate-bypass the user hit: deny → model re-submits with justification →
+    // reviewer self-approves in-turn). The turn ends so the user regains control.
+    expect(result.output.toLowerCase()).toContain("denied");
+    expect(result.output.toLowerCase()).not.toContain("justification");
+    const completed = events.find((e) => e.type === "turn_completed") as any;
+    expect(completed.stopReason).toBe("end_turn");
+    // round 2 of `bashTurn` ("done") never ran — the turn ended at the denial:
+    expect(events.some((e) => e.type === "assistant_message" && (e as any).text === "done")).toBe(false);
 
     expect(calls.length).toBe(0); // bash did NOT run
     expect(reviewer.seen).toEqual([{ command: "rm -rf x", justification: "cleaning up JUST_SENTINEL" }]);
@@ -191,33 +198,37 @@ describe("engine + safety reviewer (auto-policy bash)", () => {
     expect(calls.length).toBe(1);
   });
 
-  test("injection containment: after a denied review, the NEXT provider request input does NOT contain the reviewer's reason text", async () => {
-    const { registry } = stubRegistry();
-    const reviewer = stubReviewer({ verdict: "unsafe", reason: "REASON_SENTINEL_INJECT" });
-    const provider = new FakeProvider(bashTurn("rm -rf x"));
-    const { engine, hub, broker, sessionId } = setupEngine(provider, { registry, reviewer: reviewer as any });
+  test("injection containment: after a TIMED-OUT review (turn continues), the NEXT provider request carries the reviewer's reason ONLY via the tool_result, never as a raw context push", async () => {
+    // A human deny now ENDS the turn (no next round), so injection containment is tested on the
+    // timeout path — the one case where the reviewer's reason legitimately re-enters the turn
+    // (as the denial tool_result) and the loop continues.
+    const prev = process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS;
+    process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS = "30"; // short: no watcher answers → broker times out fast
+    try {
+      const { registry } = stubRegistry();
+      const reviewer = stubReviewer({ verdict: "unsafe", reason: "REASON_SENTINEL_INJECT" });
+      const provider = new FakeProvider(bashTurn("rm -rf x"));
+      const { engine, sessionId } = setupEngine(provider, { registry, reviewer: reviewer as any });
 
-    const watcher: HubClient = {
-      clientName: "auto-denier",
-      deliver(e) { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, false, "auto-denier"); return true; },
-    };
-    hub.attach(watcher, sessionId, 0);
+      await engine.runTurn(sessionId);
 
-    await engine.runTurn(sessionId);
-
-    // Round 1 (index 1) is the NEXT provider request after the bash tool_call/tool_result round.
-    const round1 = provider.requests[1];
-    expect(round1).toBeDefined();
-    // The denial message DOES legitimately carry the reason (it's the bash tool_result output) —
-    // but it must be there exactly once, via the tool_result item, never duplicated as a raw
-    // reviewer-verdict push into the turn context.
-    const toolResultItems = round1!.input.filter((i) => i.type === "tool_result");
-    expect(toolResultItems.length).toBe(1);
-    expect((toolResultItems[0] as any).output).toContain("REASON_SENTINEL_INJECT");
-    // No OTHER input item (message/function_call) carries the raw reason:
-    const nonToolResult = round1!.input.filter((i) => i.type !== "tool_result");
-    for (const item of nonToolResult) {
-      expect(JSON.stringify(item)).not.toContain("REASON_SENTINEL_INJECT");
+      // Round 1 (index 1) is the NEXT provider request after the bash tool_call/tool_result round.
+      const round1 = provider.requests[1];
+      expect(round1).toBeDefined();
+      // The denial message DOES legitimately carry the reason (it's the bash tool_result output) —
+      // but it must be there exactly once, via the tool_result item, never duplicated as a raw
+      // reviewer-verdict push into the turn context.
+      const toolResultItems = round1!.input.filter((i) => i.type === "tool_result");
+      expect(toolResultItems.length).toBe(1);
+      expect((toolResultItems[0] as any).output).toContain("REASON_SENTINEL_INJECT");
+      // No OTHER input item (message/function_call) carries the raw reason:
+      const nonToolResult = round1!.input.filter((i) => i.type !== "tool_result");
+      for (const item of nonToolResult) {
+        expect(JSON.stringify(item)).not.toContain("REASON_SENTINEL_INJECT");
+      }
+    } finally {
+      if (prev === undefined) delete process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS;
+      else process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS = prev;
     }
   });
 });

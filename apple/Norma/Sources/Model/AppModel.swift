@@ -35,13 +35,6 @@ final class AppModel: ObservableObject {
     /// harness without a token").
     static let missingTokenSentinel = "missing-token"
 
-    /// Finding-1 fix (gate 2): session ids the orb has already forced to `approvalPolicy: "auto"`
-    /// (see `forceAutoPolicyIfNeeded`). One flip per focused session id is enough — the daemon
-    /// persists the policy — so this keeps every subsequent send off the `session.setPolicy` wire.
-    /// A session created BY the orb (`ensureFocusedSession`, born `auto`) is pre-seeded here so it
-    /// never needs a redundant flip.
-    private var forcedAutoSessionIds: Set<String> = []
-
     init(makeTransport: @escaping @Sendable () -> NormaTransport, token: String, clientName: String = "orb") {
         self.makeTransport = makeTransport
         self.token = token
@@ -105,7 +98,6 @@ final class AppModel: ObservableObject {
     func ensureFocusedSession() async -> String? {
         if let sid = focusedSessionId { return sid }
         guard let created = try? await client.createSession(scope: "global", cwd: NSHomeDirectory(), approvalPolicy: "auto") else { return nil }
-        forcedAutoSessionIds.insert(created.sessionId) // born auto — no redundant setPolicy on first send
         // The daemon broadcasts session_created BEFORE the RPC response returns; the pump may
         // have already refocused us onto the new session. Idempotent skip — never double-attach.
         if focusedSessionId == created.sessionId { return focusedSessionId }
@@ -123,7 +115,6 @@ final class AppModel: ObservableObject {
     /// refocus onto a brand-new one regardless.
     func startFreshSessionAfterDetach() async {
         guard let created = try? await client.createSession(scope: "global", cwd: NSHomeDirectory(), approvalPolicy: "auto") else { return }
-        forcedAutoSessionIds.insert(created.sessionId) // born auto — no redundant setPolicy on first send
         // Same belt as ensureFocusedSession(): the daemon's session_created broadcast can arrive
         // (and refocus us) before this RPC response does — idempotent skip, never double-attach.
         if focusedSessionId == created.sessionId { return }
@@ -131,48 +122,79 @@ final class AppModel: ObservableObject {
         await refocus(onto: created.sessionId)
     }
 
-    /// Finding-1 fix (gate 2 — "the orb still asks approvals despite the auto default"). ROOT CAUSE:
-    /// `ensureFocusedSession()`'s create-with-`auto` path almost never runs, because the orb doesn't
-    /// usually create the session it DRIVES. At startup `focusNewestSession()` attaches to the
-    /// daemon's pre-existing global session (auto-created by the daemon in its DEFAULT "ask" policy),
-    /// and `handle(.sessionCreated)` follows every later broadcast onto whatever session appears — so
-    /// `focusedSessionId` is already set and the create path is skipped. The orb then sends into an
-    /// ASK-mode session; with no orb approval UI until 2d, the daemon's `approval_requested` hangs
-    /// until it times out (observed live in `s_4934f1323319`: a `bash` call sat 300s to the timeout).
-    ///
-    /// Per the user directive "the orb should NEVER require approval, always auto": force the focused
-    /// session to `auto` before the first send/steer we make to it. Idempotent + once-per-session id
-    /// (the daemon persists it) via `forcedAutoSessionIds`.
-    ///
-    /// HONEST NOTE: this also flips the policy for any OTHER harness attached to the same session
-    /// (e.g. the CLI). Accepted as an interim measure per the directive — revisit at 2d when the orb
-    /// grows its own approval UI. Note `auto ≠ unguarded`: the daemon's bash reviewer still gates
-    /// genuinely dangerous commands regardless of policy.
-    private func forceAutoPolicyIfNeeded(_ sessionId: String) async {
-        guard !forcedAutoSessionIds.contains(sessionId) else { return }
-        do {
-            try await client.setPolicy(sessionId: sessionId, policy: "auto")
-            forcedAutoSessionIds.insert(sessionId) // only mark on success — a failed flip retries next send
-            OrbDebug.log("forceAutoPolicy: session \(sessionId.prefix(10)) → auto")
-        } catch {
-            OrbDebug.log("forceAutoPolicy: setPolicy failed for \(sessionId.prefix(10)) — will retry next send")
-        }
-    }
-
     /// Field submit: steer a running turn, otherwise send (starts a turn). CLI parity.
+    ///
+    /// 2d-iii task 4 (force-auto removal): this used to force the focused session to
+    /// `approvalPolicy: "auto"` before the first send/steer (Finding-1, gate 2 — the orb had no
+    /// approval UI, so an "ask"-mode session it merely followed would hang forever on the first
+    /// approval). The orb now HAS approval UI (pending-interaction cards, task 3) — an attached
+    /// session keeps whatever policy its creator gave it, and any approval/question/plan it raises
+    /// simply surfaces as a card instead of being silently forced past. See `setSessionPolicy`
+    /// below for the new, EXPLICIT (user-driven, ⋯ menu) way to change a session's policy.
     func sendOrSteer(_ text: String) async -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let sid = await ensureFocusedSession() else { return false }
-        await forceAutoPolicyIfNeeded(sid) // Finding-1: the orb never drives an ask-mode session
         if session.state.turnRunning {
             return (try? await client.steer(sessionId: sid, text: trimmed)) != nil
         }
         return (try? await client.send(sessionId: sid, text: trimmed)) != nil
     }
 
+    /// Task 4 (2d-iii): the ⋯ menu's approval-mode picker — the orb's own focused-session surface
+    /// for an EXPLICIT, user-driven policy change (replaces the removed `forceAutoPolicyIfNeeded`).
+    /// Mirrors `sendOrSteer`'s shape: guard a focused session, `try?` the RPC, `nil`/throw means
+    /// failure. Does NOT update any local policy cache — `FieldStateAdapter.sessionPolicy` is
+    /// bumped by the WIRER (`GlassRootView`/`DetachedWindowController`) on a `true` return, same
+    /// convention as `interactionInFlight`/`interactionErrors`.
+    func setSessionPolicy(_ policy: String) async -> Bool {
+        guard let sid = focusedSessionId else { return false }
+        return (try? await client.setPolicy(sessionId: sid, policy: policy)) != nil
+    }
+
     func interruptTurn() async {
         guard let sid = focusedSessionId else { return }
         _ = try? await client.interrupt(sessionId: sid)
+    }
+
+    // MARK: - Task 3 (2d-iii): pending-interaction respond — the orb's own focused-session surface,
+    // mirroring `sendOrSteer`'s shape exactly (guard a focused session, `try?` the RPC, `nil` on
+    // throw means failure). Deliberately does NOT force-auto/create a session the way
+    // `sendOrSteer`/`ensureFocusedSession` do — a respond only ever targets a callId the daemon
+    // already asked THIS focused session about, so there is nothing to create here; no focused
+    // session simply means there is nothing to respond to (fails closed, `false`).
+    //
+    // `NormaClient`'s three respond methods each return `alreadyResolved` (a race indicator, not
+    // a success flag) — that's a different signal than "did the RPC succeed," so it's discarded
+    // here in favor of the same `!= nil` success convention `sendOrSteer` already uses.
+
+    // TASK-3 REVIEW FIX (silent false-success race): the callId is bound at click time, but
+    // these methods run in a deferred Task — a concurrent refocus (session_created follow)
+    // could swap `focusedSessionId` in between, shipping {NEW sessionId, OLD callId}. The
+    // daemon's brokers never throw on a miss (they return alreadyResolved: true), so that
+    // mismatch used to read as plain SUCCESS while the real pending interaction sat
+    // unresolved. The guard below closes it on the main actor: `refocus` swaps
+    // `focusedSessionId` and resets `session` state in the same synchronous run, so "callId
+    // still pending in the current session's state" proves the {sessionId, callId} pair is
+    // consistent. A stale click fails closed (false → the card's inline error line; after a
+    // refocus the card itself is already gone anyway).
+
+    private func pendingCallIdIsCurrent(_ callId: String) -> Bool {
+        session.state.pendingInteractions.contains { $0.callId == callId }
+    }
+
+    func respondApproval(callId: String, approved: Bool) async -> Bool {
+        guard let sid = focusedSessionId, pendingCallIdIsCurrent(callId) else { return false }
+        return (try? await client.approvalRespond(sessionId: sid, callId: callId, approved: approved)) != nil
+    }
+
+    func respondQuestion(callId: String, answers: [String: String]) async -> Bool {
+        guard let sid = focusedSessionId, pendingCallIdIsCurrent(callId) else { return false }
+        return (try? await client.askUserRespond(sessionId: sid, callId: callId, answers: answers)) != nil
+    }
+
+    func respondPlan(callId: String, approved: Bool, autoAccept: Bool, feedback: String?) async -> Bool {
+        guard let sid = focusedSessionId, pendingCallIdIsCurrent(callId) else { return false }
+        return (try? await client.planRespond(sessionId: sid, callId: callId, approved: approved, autoAccept: autoAccept, feedback: feedback)) != nil
     }
 
     private func handle(_ ev: NormaEvent) async {

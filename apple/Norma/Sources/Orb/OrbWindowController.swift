@@ -122,6 +122,20 @@ final class OrbWindowController: ObservableObject {
     /// Returns true when the key was consumed as an interrupt (turn running); false → collapse.
     var onEsc: (() -> Bool)?
 
+    /// Task 3 (2d-iii): the SAME seam as `onSubmit` above, threaded for the three pending-
+    /// interaction respond RPCs — `AppDelegate.boot()` wires these to `AppModel.respondApproval`/
+    /// `respondQuestion`/`respondPlan` (the focused-session surface), exactly mirroring the
+    /// `onSubmit` chain (`FieldStateAdapter.onXRespond` → `GlassRootView.wireCallbacks()` → these
+    /// closures → `AppDelegate` → `AppModel`) so this controller stays model-free.
+    var onApprovalRespond: ((String, Bool) async -> Bool)?
+    var onQuestionRespond: ((String, [String: String]) async -> Bool)?
+    var onPlanRespond: ((String, Bool, Bool, String?) async -> Bool)?
+
+    /// Task 4 (2d-iii): the ⋯ menu's approval-mode picker — SAME seam as `onApprovalRespond` et al
+    /// just above (`AppDelegate.boot()` wires this to `AppModel.setSessionPolicy`). New policy
+    /// string in, success out.
+    var onSetPolicy: ((String) async -> Bool)?
+
     /// Task 4: fired by `requestWindowDetach()` with the panel's CURRENT frame (spawn the detached
     /// window exactly there). AppDelegate's closure spawns the detached window SYNCHRONOUSLY
     /// (`DetachedWindowController.show()`'s `makeKeyAndOrderFront` runs before the closure
@@ -454,6 +468,21 @@ final class OrbWindowController: ObservableObject {
                     self.collapseWindowToOrb()
                     return nil
                 case nil:
+                    // Task 3 (2d-iii): y/n/digit card routing — ONLY reached once Esc handling
+                    // above has passed (not Esc, or Esc consumed nothing surface-relevant). Only
+                    // the WINDOW surface mounts `PendingCardsView` (`WindowContentView`, shared
+                    // with `DetachedWindowController`) — the small `.field` composer never shows
+                    // cards, so this routing is scoped to `.window` only, not `.field` above.
+                    let topmost = self.fieldAdapter.pendingInteractions.first
+                    if let action = cardKeyAction(
+                        keyCode: event.keyCode,
+                        chars: event.charactersIgnoringModifiers,
+                        topmost: topmost,
+                        composerDraft: self.fieldAdapter.composerDraft
+                    ) {
+                        self.dispatchCardKeyAction(action, topmost: topmost)
+                        return nil
+                    }
                     return event
                 }
             case .orb:
@@ -532,6 +561,26 @@ final class OrbWindowController: ObservableObject {
         }
 
         OrbDebug.log("expandToField: morphTarget=1")
+    }
+
+    /// Task 3 (2d-iii): turns a `cardKeyAction(...)` result into the matching `fieldAdapter`
+    /// respond call. `.selectOption` rebuilds its answers dict via the SAME pure `questionAnswers`
+    /// helper the card's own whole-card Submit button uses (`PendingCards.swift`) — a digit press
+    /// is "complete by construction" (the router only ever returns `.selectOption` for a single-
+    /// question single-select card, see `cardKeyAction`'s doc), so this single call both selects
+    /// AND submits, exactly like clicking that one option then Submit would. `topmost` is passed
+    /// in (not re-read) so this stays consistent with whichever card the router itself matched
+    /// against, in the same synchronous key-handling pass.
+    private func dispatchCardKeyAction(_ action: CardKeyAction, topmost: PendingInteraction?) {
+        switch action {
+        case .approve(let callId):
+            fieldAdapter.onApprovalRespond(callId, true)
+        case .deny(let callId):
+            fieldAdapter.onApprovalRespond(callId, false)
+        case .selectOption(let callId, let index):
+            guard case .question(_, let questions) = topmost else { return }
+            fieldAdapter.onQuestionRespond(callId, questionAnswers(for: questions, selections: [0: [index]], otherTexts: [:]))
+        }
     }
 
     /// Finding-2 fix (gate 2 — "Esc from the field is dead after a re-summon"). ROOT CAUSE: after an
@@ -1436,4 +1485,50 @@ enum WindowEscAction: Equatable { case interrupt, close }
 func windowEscAction(keyCode: UInt16, escConsumed: () -> Bool) -> WindowEscAction? {
     guard keyCode == 53 else { return nil }
     return escConsumed() ? .interrupt : .close
+}
+
+/// Task 3 (2d-iii): what a keyDown should do to the pending-interaction cards — extracted pure so
+/// it's table-tested (`CardWiringTests`), same convention as `escMonitorAction`/`windowEscAction`
+/// above. `y`/`n` approve/deny the OLDEST pending interaction (`topmost`, `pendingInteractions`'s
+/// own ordering — oldest-first) when it's an `.approval`; a digit 1-9 selects an option on a
+/// `.question` card ONLY when that card is both single-question AND single-select — see the
+/// `.question` branch below for why that's the only shape a bare digit can safely resolve.
+///
+/// `composerDraft` is threaded directly into this pure function — not just checked at the two call
+/// sites (`OrbWindowController`'s window-mode key monitor, `DetachedWindowController`'s monitor)
+/// — so the whole "typing 'yes' into the composer must never trigger a card" guard is itself
+/// unit-testable without a live `NSEvent` monitor. Checked FIRST, before even looking at
+/// `topmost`: cards capture a keystroke ONLY while the composer draft is empty, full stop.
+enum CardKeyAction: Equatable {
+    case approve(String)
+    case deny(String)
+    case selectOption(String, Int)
+}
+
+func cardKeyAction(
+    keyCode: UInt16, chars: String?, topmost: PendingInteraction?, composerDraft: String
+) -> CardKeyAction? {
+    guard composerDraft.isEmpty else { return nil }
+    guard let topmost, let chars, let ch = chars.lowercased().first else { return nil }
+    switch topmost {
+    case .approval(let callId, _, _):
+        if ch == "y" { return .approve(callId) }
+        if ch == "n" { return .deny(callId) }
+        return nil
+    case .question(let callId, let questions):
+        // Digit-select v1 (documented, per the task-3 brief): only a SINGLE-question, SINGLE-
+        // select card is "complete by construction" the instant one option is chosen, so a digit
+        // both SELECTS and SUBMITS in one press, via the same `questionAnswers` helper the card's
+        // own whole-card Submit button uses (see `dispatchCardKeyAction` at the call sites).
+        // multiSelect (more than one answer possible) or a multi-question ask (the daemon's
+        // `QuestionBroker.respond` is first-response-wins across the WHOLE ask — resolving it from
+        // a single digit would silently discard whatever the OTHER questions needed) both stay
+        // mouse-only; there's no half-answered state a digit could safely leave behind.
+        guard questions.count == 1, let question = questions.first, !question.multiSelect,
+              let digit = ch.wholeNumberValue, (1...9).contains(digit),
+              question.options.indices.contains(digit - 1) else { return nil }
+        return .selectOption(callId, digit - 1)
+    case .plan:
+        return nil // approve/deny/feedback all need more than one bare keystroke — mouse only.
+    }
 }

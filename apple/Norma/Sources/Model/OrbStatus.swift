@@ -16,7 +16,7 @@ enum OrbStatus: Equatable {
     /// doesn't carry. See `workingPillText(verb:hasActiveTask:done:total:)` below and
     /// `FieldStateAdapter.statusText`, which is the one place that combines the two. `.toolRunning`
     /// itself is UNCHANGED as a case — approval-gating logic (`SessionReducer`'s
-    /// `pendingApprovalIds.isEmpty` checks) still needs it — only its pill TEXT moved.
+    /// `pendingInteractions.isEmpty` checks) still needs it — only its pill TEXT moved.
     var pillText: String? {
         switch self {
         case .idle, .thinking, .toolRunning: return nil

@@ -105,6 +105,61 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
         // here: detached windows create one adapter per window, and the cycle kept adapter +
         // SessionModel + its Combine sinks alive after every close (once per open/close cycle).
         adapter.onClearMessage = { [weak adapter] in adapter?.composerDraft = "" }
+
+        // Task 3 (2d-iii): the three pending-interaction respond callbacks — wired DIRECTLY to
+        // this window's OWN `feed.client`/pinned `sessionId` (never through `AppModel`, same
+        // "harness-per-window" posture `submit(_:)` below already follows). `[weak adapter]` —
+        // same leak lesson as `onClearMessage` just above: a strong `[adapter]` capture (the
+        // `GlassRootView` idiom) forms an adapter→closure→adapter cycle that's harmless on the
+        // orb's single app-lifetime adapter but a REAL leak here (one adapter per detached
+        // window). `client`/`sid` are captured as plain locals (no cycle risk — neither holds a
+        // reference back to the adapter), so only the adapter capture itself needs to be weak.
+        let client = feed.client
+        let sid = self.sessionId
+        adapter.onApprovalRespond = { [weak adapter] callId, approved in
+            guard let adapter else { return }
+            adapter.interactionInFlight.insert(callId)
+            adapter.interactionErrors[callId] = nil
+            Task { @MainActor [weak adapter] in
+                let ok = (try? await client.approvalRespond(sessionId: sid, callId: callId, approved: approved)) != nil
+                adapter?.interactionInFlight.remove(callId)
+                if !ok { adapter?.interactionErrors[callId] = "couldn't send — try again" }
+            }
+        }
+        adapter.onQuestionRespond = { [weak adapter] callId, answers in
+            guard let adapter else { return }
+            adapter.interactionInFlight.insert(callId)
+            adapter.interactionErrors[callId] = nil
+            Task { @MainActor [weak adapter] in
+                let ok = (try? await client.askUserRespond(sessionId: sid, callId: callId, answers: answers)) != nil
+                adapter?.interactionInFlight.remove(callId)
+                if !ok { adapter?.interactionErrors[callId] = "couldn't send — try again" }
+            }
+        }
+        adapter.onPlanRespond = { [weak adapter] callId, approved, autoAccept, feedback in
+            guard let adapter else { return }
+            adapter.interactionInFlight.insert(callId)
+            adapter.interactionErrors[callId] = nil
+            Task { @MainActor [weak adapter] in
+                let ok = (try? await client.planRespond(sessionId: sid, callId: callId, approved: approved, autoAccept: autoAccept, feedback: feedback)) != nil
+                adapter?.interactionInFlight.remove(callId)
+                if !ok { adapter?.interactionErrors[callId] = "couldn't send — try again" }
+            }
+        }
+
+        // Task 4 (2d-iii): the ⋯ menu's approval-mode picker — wired DIRECTLY to this window's own
+        // `feed.client`/pinned `sessionId`, same posture as the three respond callbacks just above.
+        // `[weak adapter]` throughout for the same leak reason (one adapter per detached window).
+        adapter.onSetPolicy = { [weak adapter] policy in
+            guard let adapter else { return }
+            adapter.policyChangeInFlight = true
+            Task { @MainActor [weak adapter] in
+                let ok = (try? await client.setPolicy(sessionId: sid, policy: policy)) != nil
+                adapter?.policyChangeInFlight = false
+                if ok { adapter?.sessionPolicy = policy }
+            }
+        }
+
         window.contentView = NSHostingView(rootView: DetachedWindowRootView(adapter: adapter))
         window.setFrame(frame, display: true)
     }
@@ -128,12 +183,40 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
     private func installEscMonitor() {
         escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, event.window === self.window else { return event }
-            guard event.keyCode == 53 else { return event } // not Esc — pass through untouched
-            guard self.session.state.turnRunning else { return event } // idle: pass through — NEVER close on Esc
-            let client = self.feed.client
-            let sid = self.sessionId
-            Task { try? await client.interrupt(sessionId: sid) }
-            return nil // consumed
+            if event.keyCode == 53 { // Esc
+                guard self.session.state.turnRunning else { return event } // idle: pass through — NEVER close on Esc
+                let client = self.feed.client
+                let sid = self.sessionId
+                Task { try? await client.interrupt(sessionId: sid) }
+                return nil // consumed
+            }
+            // Task 3 (2d-iii): y/n/digit card routing — AFTER Esc handling above, per the brief's
+            // ordering (a stale card-key press must never fight the interrupt-only Esc contract).
+            let topmost = self.adapter.pendingInteractions.first
+            if let action = cardKeyAction(
+                keyCode: event.keyCode,
+                chars: event.charactersIgnoringModifiers,
+                topmost: topmost,
+                composerDraft: self.adapter.composerDraft
+            ) {
+                self.dispatchCardKeyAction(action, topmost: topmost)
+                return nil
+            }
+            return event
+        }
+    }
+
+    /// Task 3 (2d-iii): identical shape to `OrbWindowController.dispatchCardKeyAction` — see that
+    /// method's doc for why `.selectOption` both selects AND submits in one call.
+    private func dispatchCardKeyAction(_ action: CardKeyAction, topmost: PendingInteraction?) {
+        switch action {
+        case .approve(let callId):
+            adapter.onApprovalRespond(callId, true)
+        case .deny(let callId):
+            adapter.onApprovalRespond(callId, false)
+        case .selectOption(let callId, let index):
+            guard case .question(_, let questions) = topmost else { return }
+            adapter.onQuestionRespond(callId, questionAnswers(for: questions, selections: [0: [index]], otherTexts: [:]))
         }
     }
 

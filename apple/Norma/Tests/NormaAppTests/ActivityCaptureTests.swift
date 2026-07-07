@@ -195,8 +195,8 @@ final class ActivityCaptureTests: XCTestCase {
             ActivityItem(kind: .interaction("Which port?")),
             ActivityItem(kind: .interaction("plan presented")),
         ])
-        // Existing side effects preserved: approval/question/plan still manage pendingApprovalIds.
-        XCTAssertEqual(s.pendingApprovalIds, ["a1", "q1", "p1"])
+        // Existing side effects preserved: approval/question/plan still manage pendingInteractions.
+        XCTAssertEqual(s.pendingInteractions.map(\.callId), ["a1", "q1", "p1"])
         XCTAssertEqual(s.status, .approvalNeeded(count: 3))
     }
 
