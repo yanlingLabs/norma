@@ -136,6 +136,15 @@ final class OrbWindowController: ObservableObject {
     /// string in, success out.
     var onSetPolicy: ((String) async -> Bool)?
 
+    /// Task 6 (2e-iii): the morph window's width-responsive sidebar wiring — this controller exposes
+    /// it (it does NOT import `AppModel`), `AppDelegate.boot()` wires it to the app model's
+    /// `directory`/`focusSession`/create-primitive plus AppDelegate's own detached-window spawn.
+    /// `GlassRootView` reads it live and threads it down through `NormaFieldView` →
+    /// `WindowSurfaceView` → `WindowContentView`. A plain `var` set once at boot (like the callback
+    /// seams above); the window surface only ever renders long after boot, so it's always set by
+    /// then, and the `directory` inside drives its own updates independently.
+    var sidebars: SidebarWiring?
+
     /// Task 4: fired by `requestWindowDetach()` with the panel's CURRENT frame (spawn the detached
     /// window exactly there). AppDelegate's closure spawns the detached window SYNCHRONOUSLY
     /// (`DetachedWindowController.show()`'s `makeKeyAndOrderFront` runs before the closure

@@ -11,6 +11,11 @@ struct WindowContentView<Accessory: View>: View {
     @ObservedObject var adapter: FieldStateAdapter
     let tint: Color
     let topInset: CGFloat
+    /// 2e-iii Task 6: the width-responsive sidebar wiring. `nil` → today's exact zero-sidebar
+    /// layout (the `body` guard clause below); both window construction sites pass a value.
+    /// Declared BEFORE `headerAccessory` so the memberwise init keeps the `@ViewBuilder` accessory
+    /// last (the two call sites pass it as a trailing closure).
+    let sidebars: SidebarWiring?
     @ViewBuilder let headerAccessory: () -> Accessory
 
     /// Task 4 (2d-iii): the ⋯ menu's popover presentation state — local to this view (not the
@@ -24,7 +29,32 @@ struct WindowContentView<Accessory: View>: View {
     /// preserving about a stale expand/collapse choice across sessions.
     @State private var expandedCompleted = false
 
+    /// Task 6 (2e-iii): the outer container's measured width, fed by `.onGeometryChange` (2c lesson:
+    /// NEVER GeometryReader-in-ScrollView). `0` until the first layout pass — treated as "not yet
+    /// measured" (no sidebars resolved) so a stale zero never briefly opens the right overlay.
+    @State private var measuredWidth: CGFloat = 0
+    /// Task 6 (2e-iii): the raw expand flags the Task-4 width engine (`resolveSidebars`) resolves
+    /// against `measuredWidth`. Defaults per the brief: the left switcher collapsed, the right work
+    /// sidebar expanded (shown inline when it fits, as an overlay when it doesn't).
+    @State private var leftExpanded = false
+    @State private var rightExpanded = true
+
     var body: some View {
+        // `sidebars == nil` → today's exact layout, byte-identical: `contentColumn(rightVisible:
+        // false)` re-adds `&& !false` (== `&& true`) to the two relocation gates, a no-op.
+        if let sidebars {
+            sidebarLayout(sidebars)
+        } else {
+            contentColumn(rightVisible: false)
+        }
+    }
+
+    /// The chat window's content column (header → transcript → pending cards → pinned tasks →
+    /// queued line → composer → subagents). `rightVisible` is the RELOCATION gate: when the right
+    /// WorkSidebar is showing, the pinned-tasks and subagent sections move THERE — this column drops
+    /// them (`&& !rightVisible`) so they're never duplicated.
+    @ViewBuilder
+    private func contentColumn(rightVisible: Bool) -> some View {
         VStack(spacing: 10) {
             HStack(spacing: 12) {
                 headerAccessory()
@@ -54,7 +84,7 @@ struct WindowContentView<Accessory: View>: View {
                 )
             }
 
-            if !adapter.pinnedTasks.isEmpty {
+            if !adapter.pinnedTasks.isEmpty && !rightVisible {
                 pinnedTasksSection(adapter.pinnedTasks)
             }
 
@@ -70,13 +100,118 @@ struct WindowContentView<Accessory: View>: View {
             )
             .frame(height: 88)
 
-            if !adapter.liveSubagents.isEmpty {
+            if !adapter.liveSubagents.isEmpty && !rightVisible {
                 subagentSection(adapter.liveSubagents)
             }
         }
         .padding(.horizontal, 16)
         .padding(.top, topInset)
         .padding(.bottom, 16)
+    }
+
+    // MARK: - Task 6 (2e-iii): width-responsive sidebar layout
+
+    /// Wraps `contentColumn` in the HStack of inline sidebars + a ZStack of edge chevrons and
+    /// overlay panels. The Task-4 width engine (`resolveSidebars`) decides, off `measuredWidth`,
+    /// which sides are inline vs overlay vs hidden; below the both-fit width AT MOST ONE side shows
+    /// (mutual exclusion, right-first). `measuredWidth == 0` (pre-first-layout) resolves to nothing
+    /// visible so a stale zero never flashes the right overlay open.
+    @ViewBuilder
+    private func sidebarLayout(_ sidebars: SidebarWiring) -> some View {
+        let resolved = measuredWidth > 0
+            ? resolveSidebars(width: measuredWidth, leftExpanded: leftExpanded, rightExpanded: rightExpanded)
+            : EffectiveSidebars(leftVisible: false, rightVisible: false, leftOverlay: false, rightOverlay: false)
+        ZStack {
+            HStack(spacing: 0) {
+                if resolved.leftVisible && !resolved.leftOverlay {
+                    sessionSidebarColumn(sidebars)
+                    Divider()
+                }
+                contentColumn(rightVisible: resolved.rightVisible)
+                if resolved.rightVisible && !resolved.rightOverlay {
+                    Divider()
+                    workSidebarColumn
+                }
+            }
+
+            // Edge chevron affordances for the sides that are NOT effectively visible. Tapping one
+            // FORCE-OPENS its side in a single tap (CARRIED ITEM 1 — see `openLeftViaChevron`).
+            HStack(spacing: 0) {
+                if !resolved.leftVisible {
+                    sidebarChevron("chevron.right") {
+                        let r = openLeftViaChevron(rightExpanded: rightExpanded, width: measuredWidth)
+                        leftExpanded = r.left; rightExpanded = r.right
+                    }
+                }
+                Spacer(minLength: 0)
+                if !resolved.rightVisible {
+                    sidebarChevron("chevron.left") {
+                        let r = openRightViaChevron(leftExpanded: leftExpanded, width: measuredWidth)
+                        leftExpanded = r.left; rightExpanded = r.right
+                    }
+                }
+            }
+
+            // Overlay panels + a tap-to-dismiss scrim BEHIND each (the scrim is added first so the
+            // `.ultraThinMaterial` panel draws over it; the panel slides in from its edge).
+            if resolved.leftOverlay {
+                sidebarScrim { leftExpanded = false }
+                HStack(spacing: 0) {
+                    sessionSidebarColumn(sidebars).background(.ultraThinMaterial)
+                    Spacer(minLength: 0)
+                }
+                .transition(.move(edge: .leading))
+            }
+            if resolved.rightOverlay {
+                sidebarScrim { rightExpanded = false }
+                HStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    workSidebarColumn.background(.ultraThinMaterial)
+                }
+                .transition(.move(edge: .trailing))
+            }
+        }
+        .onGeometryChange(for: CGFloat.self, of: { $0.size.width }, action: { measuredWidth = $0 })
+        .animation(.easeInOut(duration: 0.18), value: resolved)
+    }
+
+    /// The left session-switcher column, aligned to the content's top inset. `SessionSidebar` owns
+    /// its own `.frame(width: sidebarLeftWidth)`.
+    private func sessionSidebarColumn(_ sidebars: SidebarWiring) -> some View {
+        SessionSidebar(
+            directory: sidebars.directory,
+            currentSessionId: sidebars.currentSessionId(),
+            onSelect: sidebars.onSelect,
+            onOpenDetached: sidebars.onOpenDetached,
+            onNewSession: sidebars.onNewSession
+        )
+        .padding(.top, topInset)
+    }
+
+    /// The right work column (`workSidebar` owns its own width). Top-inset-aligned like the left.
+    private var workSidebarColumn: some View {
+        workSidebar.padding(.top, topInset)
+    }
+
+    /// A full-height 16pt edge chevron (`.secondary`), the hit-target for opening a hidden side.
+    private func sidebarChevron(_ systemName: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+                .frame(maxHeight: .infinity)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Near-invisible full-frame tap catcher behind an open overlay — tapping outside the panel
+    /// dismisses it. `0.001` opacity so it hit-tests without visibly dimming the content.
+    private func sidebarScrim(_ dismiss: @escaping () -> Void) -> some View {
+        Color.black.opacity(0.001)
+            .contentShape(Rectangle())
+            .onTapGesture(perform: dismiss)
     }
 
     /// Task 4 (2d-iii): the header's trailing ⋯ button — opens `policyMenuContent`'s popover.
@@ -109,22 +244,10 @@ struct WindowContentView<Accessory: View>: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.secondary)
                 .padding(.bottom, 4)
+            // Task 6 (2e-iii): the row body is shared with the WorkSidebar's Options block via
+            // `policyPickerRow` (WorkSidebar.swift) — one implementation for both surfaces.
             ForEach(["auto", "ask", "plan"], id: \.self) { policy in
-                Button {
-                    adapter.onSetPolicy(policy)
-                } label: {
-                    HStack {
-                        Text(policy.capitalized)
-                        Spacer()
-                        if adapter.sessionPolicy == policy {
-                            Image(systemName: "checkmark")
-                        }
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .disabled(adapter.policyChangeInFlight)
-                .padding(.vertical, 4)
+                policyPickerRow(policy)
             }
         }
         .padding(12)

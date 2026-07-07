@@ -46,6 +46,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Task 5 (2e-iii): the shared spawn body BOTH detach paths use — construct, register, show.
     /// Callers own their OWN feed-creation guard above this (so each can log its own
     /// context-specific failure message) and hand the already-built feed/session in.
+    /// Task 6 (2e-iii, CARRIED ITEM 3): the MORPH window's left sidebar ⌘-click "open in a new
+    /// window" for an ARBITRARY session id — the mirror of `DetachedWindowController`'s
+    /// `onOpenSessionDetached`, reusing the SAME `makeDetachedFeed` + `spawnDetachedWindow`
+    /// machinery. The morph panel has no production frame accessor, so the new window spawns
+    /// centered on the main screen (the user can move it); a `nil` model or missing daemon token
+    /// aborts with a log, same posture as the yellow-light and detached-side spawns.
+    private func openSessionInNewDetachedWindow(_ sessionId: String) {
+        guard let model = appModel,
+              let (feed, session) = model.makeDetachedFeed(sessionId: sessionId) else {
+            OrbDebug.log("openSessionInNewDetachedWindow: no appModel or makeDetachedFeed nil — spawn aborted")
+            return
+        }
+        let size = chatWindowDefaultSize
+        let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let origin = NSPoint(x: visible.midX - size.width / 2, y: visible.midY - size.height / 2)
+        spawnDetachedWindow(feed: feed, session: session, frame: NSRect(origin: origin, size: size), title: "Norma")
+    }
+
     @discardableResult
     private func spawnDetachedWindow(feed: SessionFeed, session: SessionModel, frame: NSRect, title: String) -> DetachedWindowController {
         let detached = DetachedWindowController(feed: feed, session: session, frame: frame, title: title.isEmpty ? "Norma" : title)
@@ -157,6 +175,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { await model.startFreshSessionAfterDetach() } // orb's next summon = clean slate
             return true
         }
+
+        // Task 6 (2e-iii): the morph window's width-responsive sidebars. `onSelect` refocuses the
+        // orb's own follow-focus feed in place (`focusSession`); `onNewSession` creates+focuses a
+        // fresh session (the same create+focus primitive the detach path reuses); `onOpenDetached`
+        // spawns a NEW detached window for an arbitrary session id (CARRIED ITEM 3 — no such path
+        // existed before this task). `currentSessionId` reads `focusedSessionId` fresh each render.
+        orb.sidebars = SidebarWiring(
+            directory: model.directory,
+            currentSessionId: { [weak model] in model?.focusedSessionId },
+            onSelect: { [weak model] sid in Task { await model?.focusSession(sid) } },
+            onOpenDetached: { [weak self] sid in self?.openSessionInNewDetachedWindow(sid) },
+            onNewSession: { [weak model] in Task { await model?.startFreshSessionAfterDetach() } }
+        )
 
         let sticky = StickinessEngine(onTarget: { [weak orb] target in
             orb?.follower.setMagneticTarget(target)

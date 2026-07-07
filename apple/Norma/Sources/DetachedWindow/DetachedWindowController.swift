@@ -207,7 +207,18 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
             }
         }
 
-        window.contentView = NSHostingView(rootView: DetachedWindowRootView(adapter: adapter))
+        // Task 6 (2e-iii): this window's own sidebar wiring — its own `directory`, `selectSession`
+        // (switch in place), `newSession` (create+repin), and the AppDelegate-wired
+        // `onOpenSessionDetached` (⌘-click → a NEW detached window for that id). `currentSessionId`
+        // is read FRESH (`self.sessionId`) so it tracks `selectSession`'s repin.
+        let sidebars = SidebarWiring(
+            directory: directory,
+            currentSessionId: { [weak self] in self?.sessionId },
+            onSelect: { [weak self] sid in self?.selectSession(sid) },
+            onOpenDetached: { [weak self] sid in self?.onOpenSessionDetached?(sid) },
+            onNewSession: { [weak self] in self?.newSession() }
+        )
+        window.contentView = NSHostingView(rootView: DetachedWindowRootView(adapter: adapter, sidebars: sidebars))
         window.setFrame(frame, display: true)
     }
 
@@ -341,13 +352,16 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
 /// tune-at-gate constant).
 struct DetachedWindowRootView: View {
     @ObservedObject var adapter: FieldStateAdapter
+    /// Task 6 (2e-iii): the width-responsive sidebar wiring built in `DetachedWindowController.init`.
+    let sidebars: SidebarWiring
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         WindowContentView(
             adapter: adapter,
             tint: Color(red: 0.45, green: 0.75, blue: 1.0),
-            topInset: 52
+            topInset: 52,
+            sidebars: sidebars
         ) {
             EmptyView()
         }
