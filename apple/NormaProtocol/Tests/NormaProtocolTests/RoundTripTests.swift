@@ -26,4 +26,14 @@ final class RoundTripTests: XCTestCase {
         let bad = #"{"type":"mystery","seq":1,"sessionId":"s","ts":0}"#.data(using: .utf8)!
         XCTAssertThrowsError(try JSONDecoder().decode(SessionEvent.self, from: bad))
     }
+
+    func testThreadStartedDescriptionOptional() throws {
+        let with = #"{"type":"thread_started","seq":9,"sessionId":"s","ts":5,"threadId":"th_1","parentThreadId":"main","agentType":"general-purpose","prompt":"go","description":"explore auth module"}"#
+        guard case .threadStarted(let v) = try JSONDecoder().decode(SessionEvent.self, from: Data(with.utf8)) else { return XCTFail() }
+        XCTAssertEqual(v.description, "explore auth module")
+
+        let without = #"{"type":"thread_started","seq":9,"sessionId":"s","ts":5,"threadId":"th_1","parentThreadId":"main","agentType":"general-purpose","prompt":"go"}"#
+        guard case .threadStarted(let v2) = try JSONDecoder().decode(SessionEvent.self, from: Data(without.utf8)) else { return XCTFail() }
+        XCTAssertNil(v2.description)
+    }
 }

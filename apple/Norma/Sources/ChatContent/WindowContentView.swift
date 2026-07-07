@@ -69,6 +69,10 @@ struct WindowContentView<Accessory: View>: View {
                 usesAdaptiveColors: true
             )
             .frame(height: 88)
+
+            if !adapter.liveSubagents.isEmpty {
+                subagentSection(adapter.liveSubagents)
+            }
         }
         .padding(.horizontal, 16)
         .padding(.top, topInset)
@@ -200,6 +204,60 @@ struct WindowContentView<Accessory: View>: View {
         .lineLimit(1)
         .truncationMode(.middle)
     }
+
+    /// 2e-ii: the live subagent block — one row per child thread of the current turn, below the
+    /// composer (2e-iii relocates it into the right sidebar when the window is wide). Working rows
+    /// show a live active-time; queued rows show "waiting" (spawned but no SubagentManager slot
+    /// yet — the timer deliberately does NOT run); done rows show their final active time and stay
+    /// only while siblings are still alive (the adapter empties the list once ALL are done).
+    /// NO token arrows here — tokens are CLI-only (spec §3).
+    @ViewBuilder
+    func subagentSection(_ items: [SubagentItem]) -> some View {
+        let built = buildSubagentSection(items)
+        VStack(alignment: .leading, spacing: 4) {
+            Divider().opacity(0.5)
+            ForEach(built.rows, id: \.threadId) { row in
+                subagentRowView(row)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func subagentRowStyle(_ status: String) -> AnyShapeStyle {
+        switch status {
+        case "working": return AnyShapeStyle(taskInProgressBlue)
+        case "done": return AnyShapeStyle(.tertiary)
+        default: return AnyShapeStyle(.secondary) // queued
+        }
+    }
+
+    @ViewBuilder
+    private func subagentRowView(_ row: SubagentItem) -> some View {
+        HStack(spacing: 6) {
+            Text(subagentGlyph(row.status))
+                .foregroundStyle(row.status == "done" ? AnyShapeStyle(.green) : subagentRowStyle(row.status))
+            Text(row.label)
+            Text("(\(row.agentType))").foregroundStyle(.tertiary)
+            if row.status == "working", let since = row.activeSince {
+                // D9 twin: the 1s tick mounts ONLY on a working row with an open span.
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    Text("· " + formatElapsed(subagentActiveMs(activeMs: row.activeMs, activeSince: since, status: row.status, nowMs: Int(Date().timeIntervalSince1970 * 1000))))
+                }
+            } else if row.status == "queued" {
+                Text("· waiting")
+            } else if row.status == "done" {
+                Text("· " + formatElapsed(row.activeMs))
+            } else if row.status == "working" {
+                // working but no open span (between child turns) — banked time, static.
+                Text("· " + formatElapsed(row.activeMs))
+            }
+        }
+        .font(.system(size: 11))
+        .fontWeight(row.status == "working" ? .bold : nil)
+        .foregroundStyle(subagentRowStyle(row.status))
+        .lineLimit(1)
+        .truncationMode(.middle)
+    }
 }
 
 /// `TaskItem` (the session model's wire-shaped type) → Task 1's sorted `[TaskRow]`. Shared by
@@ -219,4 +277,10 @@ func buildTaskSection(_ tasks: [TaskItem]) -> (rows: [TaskRow], collapsedComplet
     let r = collapseCompleted(sorted)
     let active = sorted.first { $0.status == "in_progress" }
     return (r.rows, r.collapsedCompletedCount, active?.startedTs)
+}
+
+/// 2e-ii Task 4: pure decision behind `subagentSection` — rows in first-seen order; `anyWorking`
+/// is the tick-mount gate (WindowSubagentSectionTests drives this directly).
+func buildSubagentSection(_ items: [SubagentItem]) -> (rows: [SubagentItem], anyWorking: Bool) {
+    (items, items.contains { $0.status == "working" })
 }

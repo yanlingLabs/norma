@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { Task } from "@norma/protocol";
 import { taskGlyph } from "../src/task-display";
+import type { CliSubagent } from "../src/subagent-state";
 import {
   BLUE,
   BOLD,
@@ -10,6 +11,7 @@ import {
   SPINNER_FRAMES,
   TASK_ICONS,
   renderStatusLine,
+  renderSubagentBlock,
   renderTaskBlock,
   trackLineStart,
   truncateStatusLine,
@@ -194,5 +196,34 @@ describe("TASK_ICONS (unchanged — still used for the non-TTY one-line-per-upda
     expect(TASK_ICONS.pending).toBe("☐");
     expect(TASK_ICONS.in_progress).toBe("◐");
     expect(TASK_ICONS.completed).toBe("☑");
+  });
+});
+
+describe("renderSubagentBlock", () => {
+  const sub = (over: Partial<CliSubagent>): CliSubagent => ({
+    threadId: "th_a", agentType: "general-purpose", label: "explore auth module",
+    status: "working", outputTokens: 0, liveOutputChars: 0, ...over,
+  });
+
+  test("empty when no items or all done", () => {
+    expect(renderSubagentBlock([])).toEqual([]);
+    expect(renderSubagentBlock([sub({ status: "done" })])).toEqual([]);
+  });
+
+  test("working row: blue glyph, bold body, tokens suffix", () => {
+    const [line] = renderSubagentBlock([sub({ inputTokens: 12300, outputTokens: 4100 })]);
+    expect(line).toBe(`${BLUE}●${RESET}${BOLD} explore auth module (general-purpose) ↑ 12.3k ↓ 4.1k${RESET}`);
+  });
+
+  test("queued row dim with no token noise; done row keeps final tokens while siblings run", () => {
+    const lines = renderSubagentBlock([sub({ status: "queued" }), sub({ threadId: "th_b", status: "done", inputTokens: 1000, outputTokens: 100 })]);
+    expect(lines[0]).toBe(`${DIM}◌${RESET} explore auth module (general-purpose)`);
+    expect(lines[1]).toBe(`${GREEN}✓${RESET} explore auth module (general-purpose) ↑ 1.0k ↓ 100`);
+  });
+
+  test("width truncation happens on plain text before coloring", () => {
+    const [line] = renderSubagentBlock([sub({})], 20);
+    expect(line!.includes("…")).toBe(true);
+    expect(line!.endsWith(RESET)).toBe(true);
   });
 });

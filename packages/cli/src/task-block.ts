@@ -1,5 +1,7 @@
 import type { Task } from "@norma/protocol";
 import { collapseCompleted, formatElapsed, formatTokens, sortTasksForDisplay, taskGlyph } from "./task-display";
+import type { CliSubagent } from "./subagent-state";
+import { anySubagentAlive, subagentGlyph, subagentTokens } from "./subagent-display";
 
 /** Glyphs for each task status — used ONLY by the non-TTY one-line-per-update render now (Task 4:
  *  the TTY pinned block switched to task-display's shared `taskGlyph`/sort/collapse so it stays in
@@ -75,6 +77,29 @@ export function renderTaskBlock(tasks: Task[], columns?: number): string[] {
     lines.push(`${DIM}${truncatePlain(`… +${collapsedCompletedCount} completed`, columns)}${RESET}`);
   }
   return lines;
+}
+
+function subagentGlyphColor(status: string): string {
+  if (status === "working") return BLUE;
+  if (status === "done") return GREEN;
+  return DIM; // queued
+}
+
+/** Pure block content: the live subagent rows (2e-ii) — `● label (agentType) ↑ in ↓ out`, one per
+ *  child thread of the current turn, ABOVE the task tree. Empty when nothing is alive (the block
+ *  is "what's working now"; the ⌥/✓ transcript lines are the record). Done rows keep their final
+ *  tokens while siblings still run. Same truncate-plain-then-color discipline as renderTaskBlock —
+ *  NO time here (the active timer is window-only; tokens are the CLI's arrows). */
+export function renderSubagentBlock(items: CliSubagent[], columns?: number): string[] {
+  if (!anySubagentAlive(items.map((s) => s.status))) return [];
+  return items.map((s) => {
+    const tokens = subagentTokens(s.inputTokens, s.outputTokens, s.liveOutputChars);
+    const plain = truncatePlain(`${subagentGlyph(s.status)} ${s.label} (${s.agentType})${tokens ? ` ${tokens}` : ""}`, columns);
+    const glyph = plain.slice(0, 1);
+    const rest = plain.slice(1);
+    const body = s.status === "working" ? `${BOLD}${rest}${RESET}` : rest;
+    return `${subagentGlyphColor(s.status)}${glyph}${RESET}${body}`;
+  });
 }
 
 /** Pure "are we at a fresh line start" tracker. TTY-mode block erase/reprint must never happen

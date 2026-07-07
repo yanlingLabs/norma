@@ -283,6 +283,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         public let parentThreadId: String
         public let agentType: String
         public let prompt: String
+        public let description: String?
     }
 
     public struct ThreadCompleted: Codable, Equatable, Sendable {

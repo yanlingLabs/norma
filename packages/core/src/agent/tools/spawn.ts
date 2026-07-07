@@ -5,6 +5,7 @@ const SpawnArgs = z.object({
   prompt: z.string().min(1),
   agentType: z.string().optional(),
   model: z.string().optional(),
+  description: z.string().optional(),
 });
 
 /** Registers spawn_agent with a placeholder run(). The engine intercepts spawn_agent tool calls
@@ -20,7 +21,7 @@ export function registerSpawnAgentTool(r: ToolRegistry): void {
       "Launch a child agent to handle a task autonomously with its own fresh context. It runs its own tool loop and returns its final report. " +
       "Delegate multi-step work; run several in parallel by emitting multiple spawn_agent calls in one message. " +
       "The child does NOT see this conversation — put everything it needs in `prompt`. " +
-      "agentType: optional subagent type; model: optional model override.",
+      "agentType: optional subagent type; model: optional model override; description: a short (3-5 word) description of the task.",
     args: SpawnArgs,
     run(_args: z.infer<typeof SpawnArgs>) {
       return "subagents are not available in this session";
