@@ -22,12 +22,28 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
     private let window: NSWindow
     private let adapter: FieldStateAdapter
 
-    /// The pinned session id this window's feed talks to — read once, at construction, off
-    /// `feed.pinnedSessionId` (the only place that holds it; this controller's own init doesn't
-    /// carry a separate sessionId parameter). `feed` is ALWAYS constructed in `.pinned` mode for a
-    /// detached window (`AppModel.makeDetachedFeed`'s only mode) — an empty-string fallback with a
-    /// logged contract-violation warning is defensive, not an expected path.
-    private let sessionId: String
+    /// The pinned session id this window's feed talks to — read off `feed.pinnedSessionId` at
+    /// construction (the only place that holds it; this controller's own init doesn't carry a
+    /// separate sessionId parameter). `feed` is ALWAYS constructed in `.pinned` mode for a detached
+    /// window (`AppModel.makeDetachedFeed`'s only mode) — an empty-string fallback with a logged
+    /// contract-violation warning is defensive, not an expected path.
+    ///
+    /// `private(set) var`, not `let`: Task 5 (2e-iii)'s `selectSession(_:)` re-pins THIS window's
+    /// feed onto a different session in place (the sidebar's "switch in place" action) — every
+    /// submit/interrupt/respond/setPolicy closure below reads this property fresh at call time
+    /// (never a captured local), so they automatically target whatever session is CURRENTLY pinned.
+    private(set) var sessionId: String
+
+    /// Task 5 (2e-iii): this window's own live session directory (all sessions' title/createdAt),
+    /// used by the (Task-6-mounted) left sidebar. Lists via this window's OWN `feed.client` — same
+    /// socket, no second harness.
+    let directory: SessionDirectory
+
+    /// Task 5 (2e-iii): sidebar ⌘-click "open in a NEW detached window" — this window has no way to
+    /// spawn ANOTHER window itself (`AppDelegate` owns the `detachedWindows` registry), so it asks
+    /// upward via this closure, same "controller exposes a hook, AppDelegate wires it" convention
+    /// as `onClosed` (see `AppDelegate.registerDetachedWindow`).
+    var onOpenSessionDetached: ((String) -> Void)?
 
     private var escMonitor: Any?
     /// FINAL-REVIEW FIX (minor #3): the feed-start Task is stored so close can CANCEL it —
@@ -48,6 +64,11 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
     /// `OrbWindowController.panelFrameForTesting`/`windowForTesting`-style accessors elsewhere).
     var windowForTesting: NSWindow? { window }
 
+    /// Task 5 (2e-iii): this window's current on-screen frame — legitimate PRODUCTION use (unlike
+    /// `windowForTesting` above), read by `AppDelegate.registerDetachedWindow`'s
+    /// `onOpenSessionDetached` wiring to cascade a sidebar-spawned window off this one.
+    var currentFrame: NSRect { window.frame }
+
     /// Test-only read-through — lets tests drive `adapter.onSubmit`/inspect `composerDraft`
     /// directly (the real trigger, `ComposerTextView`'s `onSubmit`, isn't reachable from a unit
     /// test) without exposing the adapter as a general API surface on this controller.
@@ -65,6 +86,22 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
         } else {
             OrbDebug.log("DetachedWindowController: feed has no pinned session id — contract violation (submit/interrupt will target an empty id)")
             self.sessionId = ""
+        }
+        let feedClient = feed.client
+        let sessionDirectory = SessionDirectory(lister: {
+            try await feedClient.listSessions().map {
+                SessionSummary(sessionId: $0.sessionId, title: $0.title, createdAt: $0.createdAt, scope: $0.scope, cwd: $0.cwd)
+            }
+        })
+        directory = sessionDirectory
+        // Task 5 (2e-iii): forward session_created/session_titled to this window's OWN directory —
+        // returns false (this feed's `onEvent` was previously nil) so SessionFeed's default
+        // pinned-mode fallback (apply only events matching the pinned sessionId, plus every
+        // connection state) still runs unchanged; the directory is purely an ADDITIONAL observer,
+        // not a replacement for the existing event-application path.
+        feed.onEvent = { [sessionDirectory] ev in
+            if case .session(let e) = ev { sessionDirectory.handle(e) }
+            return false
         }
 
         let window = NSWindow(
@@ -112,36 +149,44 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
         // same leak lesson as `onClearMessage` just above: a strong `[adapter]` capture (the
         // `GlassRootView` idiom) forms an adapter→closure→adapter cycle that's harmless on the
         // orb's single app-lifetime adapter but a REAL leak here (one adapter per detached
-        // window). `client`/`sid` are captured as plain locals (no cycle risk — neither holds a
-        // reference back to the adapter), so only the adapter capture itself needs to be weak.
+        // window). `client` is captured as a plain local (no cycle risk — never changes, doesn't
+        // hold a reference back to the adapter).
+        //
+        // Task 5 (2e-iii) FIX: `sessionId` must be read FRESH (`self.sessionId`, `[weak self]`) at
+        // call time, not captured once as a local `sid` here — `selectSession(_:)`'s "switch in
+        // place" re-pins THIS controller's `sessionId` after construction, and these closures
+        // outlive that repin (they're stored on the adapter for the window's whole lifetime). A
+        // captured `sid` would keep targeting the OLD session forever after a repin.
         let client = feed.client
-        let sid = self.sessionId
-        adapter.onApprovalRespond = { [weak adapter] callId, approved in
+        adapter.onApprovalRespond = { [weak self, weak adapter] callId, approved in
             guard let adapter else { return }
             adapter.interactionInFlight.insert(callId)
             adapter.interactionErrors[callId] = nil
-            Task { @MainActor [weak adapter] in
-                let ok = (try? await client.approvalRespond(sessionId: sid, callId: callId, approved: approved)) != nil
+            Task { @MainActor [weak self, weak adapter] in
+                guard let self else { return }
+                let ok = (try? await client.approvalRespond(sessionId: self.sessionId, callId: callId, approved: approved)) != nil
                 adapter?.interactionInFlight.remove(callId)
                 if !ok { adapter?.interactionErrors[callId] = "couldn't send — try again" }
             }
         }
-        adapter.onQuestionRespond = { [weak adapter] callId, answers in
+        adapter.onQuestionRespond = { [weak self, weak adapter] callId, answers in
             guard let adapter else { return }
             adapter.interactionInFlight.insert(callId)
             adapter.interactionErrors[callId] = nil
-            Task { @MainActor [weak adapter] in
-                let ok = (try? await client.askUserRespond(sessionId: sid, callId: callId, answers: answers)) != nil
+            Task { @MainActor [weak self, weak adapter] in
+                guard let self else { return }
+                let ok = (try? await client.askUserRespond(sessionId: self.sessionId, callId: callId, answers: answers)) != nil
                 adapter?.interactionInFlight.remove(callId)
                 if !ok { adapter?.interactionErrors[callId] = "couldn't send — try again" }
             }
         }
-        adapter.onPlanRespond = { [weak adapter] callId, approved, autoAccept, feedback in
+        adapter.onPlanRespond = { [weak self, weak adapter] callId, approved, autoAccept, feedback in
             guard let adapter else { return }
             adapter.interactionInFlight.insert(callId)
             adapter.interactionErrors[callId] = nil
-            Task { @MainActor [weak adapter] in
-                let ok = (try? await client.planRespond(sessionId: sid, callId: callId, approved: approved, autoAccept: autoAccept, feedback: feedback)) != nil
+            Task { @MainActor [weak self, weak adapter] in
+                guard let self else { return }
+                let ok = (try? await client.planRespond(sessionId: self.sessionId, callId: callId, approved: approved, autoAccept: autoAccept, feedback: feedback)) != nil
                 adapter?.interactionInFlight.remove(callId)
                 if !ok { adapter?.interactionErrors[callId] = "couldn't send — try again" }
             }
@@ -149,12 +194,14 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
 
         // Task 4 (2d-iii): the ⋯ menu's approval-mode picker — wired DIRECTLY to this window's own
         // `feed.client`/pinned `sessionId`, same posture as the three respond callbacks just above.
-        // `[weak adapter]` throughout for the same leak reason (one adapter per detached window).
-        adapter.onSetPolicy = { [weak adapter] policy in
+        // `[weak adapter]` throughout for the same leak reason (one adapter per detached window);
+        // `[weak self]` for the same live-sessionId-read reason as those three callbacks.
+        adapter.onSetPolicy = { [weak self, weak adapter] policy in
             guard let adapter else { return }
             adapter.policyChangeInFlight = true
-            Task { @MainActor [weak adapter] in
-                let ok = (try? await client.setPolicy(sessionId: sid, policy: policy)) != nil
+            Task { @MainActor [weak self, weak adapter] in
+                guard let self else { return }
+                let ok = (try? await client.setPolicy(sessionId: self.sessionId, policy: policy)) != nil
                 adapter?.policyChangeInFlight = false
                 if ok { adapter?.sessionPolicy = policy }
             }
@@ -178,6 +225,32 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
     /// ever lives in one place.
     func close() {
         window.close()
+    }
+
+    /// Task 5 (2e-iii): the (Task-6-mounted) sidebar's plain-click "switch in place" action —
+    /// re-pins THIS window's own feed (same harness/socket) onto a different session instead of
+    /// opening a new detached window. `sessionId` flips FIRST, synchronously, so every closure that
+    /// reads it live (submit/interrupt/respond/setPolicy above) targets the new session immediately
+    /// — even before `feed.repin(to:)`'s attach round-trip completes.
+    func selectSession(_ sessionId: String) {
+        guard sessionId != self.sessionId else { return }
+        self.sessionId = sessionId
+        Task { @MainActor [weak self] in
+            await self?.feed.repin(to: sessionId)
+        }
+    }
+
+    /// Task 5 (2e-iii): the sidebar's "+ New session" action — create, then re-pin this window onto
+    /// the freshly created session (the "create+repin" shape the brief calls for; this window's own
+    /// `.pinned` feed ignores `session_created` broadcasts entirely — see
+    /// `SessionFeedTests.testPinnedFeedIgnoresSessionCreated` — so an explicit `selectSession` call
+    /// is the only way this controller ever re-targets itself).
+    func newSession() {
+        let client = feed.client
+        Task { @MainActor [weak self] in
+            guard let created = try? await client.createSession(scope: "global", cwd: NSHomeDirectory(), approvalPolicy: "auto") else { return }
+            self?.selectSession(created.sessionId)
+        }
     }
 
     private func installEscMonitor() {

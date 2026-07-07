@@ -27,7 +27,10 @@ final class SessionFeed {
 
     /// send/steer/interrupt/setPolicy/attach callers (AppModel, later DetachedWindowController).
     let client: NormaClient
-    private let mode: Mode
+    /// `var`, not `let`: Task 5 (2e-iii)'s `repin(to:)` flips a `.pinned` feed onto a DIFFERENT
+    /// session id in place (the detached window's sidebar "switch in place" action) — everything
+    /// else about the feed (client/socket, session, hooks) stays the same across a repin.
+    private var mode: Mode
     private let session: SessionModel
     private var pumpTask: Task<Void, Never>?
 
@@ -107,6 +110,21 @@ final class SessionFeed {
     func stop() {
         pumpTask?.cancel()
         Task { await client.close() }
+    }
+
+    /// Task 5 (2e-iii): the detached window's sidebar "switch in place" action — re-pins an
+    /// ALREADY-RUNNING `.pinned` feed onto a different session, reusing the exact attach path
+    /// `start()`'s pinned branch uses (`client.attach(sessionId:fromSeq:)` from 0), so the reducer
+    /// rebuilds entirely from the new session's own event history. `session.reset()` first, same
+    /// as `AppModel.refocus`'s own reset-before-replay — a stale reply/task/pending-interaction
+    /// from the OLD session must never bleed into the newly-attached one. No-op in `.followFocus`
+    /// mode (no caller re-pins the orb's own feed — `AppModel.focusSession` calls `refocus`
+    /// directly instead, since that machinery already lives on `AppModel`, not here).
+    func repin(to sessionId: String) async {
+        guard case .pinned = mode else { return }
+        mode = .pinned(sessionId: sessionId)
+        session.reset()
+        _ = try? await client.attach(sessionId: sessionId, fromSeq: 0)
     }
 
     private func handle(_ ev: NormaEvent) async {

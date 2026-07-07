@@ -13,6 +13,10 @@ final class AppModel: ObservableObject {
     /// it.
     private let feed: SessionFeed
     private var client: NormaClient { feed.client }
+    /// Task 5 (2e-iii): the left sidebar's live session list (`SessionSidebar`, not yet mounted —
+    /// Task 6 does that). Lists via this AppModel's own `client`, same socket the orb's focus-follow
+    /// feed already uses — no second harness for the directory.
+    let directory: SessionDirectory
     /// Task 4: `private(set)` (was fully `private`) so AppDelegate's detach closure can capture the
     /// currently-focused session id BEFORE `startFreshSessionAfterDetach()` flips it — the
     /// detached window needs the OLD id (via `makeDetachedFeed(sessionId:)`), the orb needs a NEW
@@ -40,6 +44,12 @@ final class AppModel: ObservableObject {
         self.token = token
         self.clientName = clientName
         feed = SessionFeed(makeTransport: makeTransport, token: token, clientName: clientName, mode: .followFocus, session: session)
+        let feedClient = feed.client
+        directory = SessionDirectory(lister: {
+            try await feedClient.listSessions().map {
+                SessionSummary(sessionId: $0.sessionId, title: $0.title, createdAt: $0.createdAt, scope: $0.scope, cwd: $0.cwd)
+            }
+        })
         // Hook composition (see SessionFeed's doc comment for why): these four closures are the
         // ONLY seam between the extracted mechanics and AppModel's focus-follow behavior, each
         // firing at the exact point the original monolithic start()/handle() touched app state.
@@ -50,6 +60,11 @@ final class AppModel: ObservableObject {
             self.connectionSummary = self.summaryLine()
         }
         feed.onEvent = { [weak self] ev in
+            // Task 5 (2e-iii): forward session_created/session_titled to the directory FIRST —
+            // composed at the top of the existing closure, not a replacement of it (the hook
+            // contract's "return true consumes the event" doesn't apply here: `handle(ev)` below
+            // still fully owns event application in followFocus mode, same as before this task).
+            if case .session(let e) = ev { self?.directory.handle(e) }
             await self?.handle(ev)
             return true // AppModel's handle() fully owns event application in followFocus mode.
         }
@@ -215,6 +230,15 @@ final class AppModel: ObservableObject {
         case .unknown:
             break // newer daemon event — orb has nothing to render for it
         }
+    }
+
+    /// Task 5 (2e-iii): the left sidebar's "switch in place" action for the morph window (a plain
+    /// click on a `SessionSidebar` row) — the EXACT same refocus machinery `focusNewestSession()`
+    /// already uses below, just parameterized to an explicit id instead of always picking the
+    /// newest. `refocus(onto:)` is already idempotent (a no-op if already focused+attached there),
+    /// so re-selecting the current row is safe.
+    func focusSession(_ sessionId: String) async {
+        await refocus(onto: sessionId)
     }
 
     private func focusNewestSession() async {

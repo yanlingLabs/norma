@@ -20,12 +20,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Registers a freshly spawned detached window and wires its one-shot `onClosed` to remove it
     /// from `detachedWindows` again. Called by `orb.onWindowDetach`'s closure below (Task 4's
-    /// detach choreography — yellow on the morph window).
+    /// detach choreography — yellow on the morph window) and by `spawnDetachedWindow` (Task 5,
+    /// 2e-iii — the sidebar's own "open in a new window" spawn).
     func registerDetachedWindow(_ controller: DetachedWindowController) {
         detachedWindows.append(controller)
         controller.onClosed = { [weak self] closed in
             self?.detachedWindows.removeAll { $0 === closed }
         }
+        // Task 5 (2e-iii): the (Task-6-mounted) sidebar's ⌘-click "open in a new window" — spawns
+        // ANOTHER detached window pinned to an explicit sessionId, via the SAME construction path
+        // `onWindowDetach`'s yellow-light spawn below uses, just parameterized by an id instead of
+        // the currently-focused session. Every detached window (including ones spawned this way)
+        // gets this same hook wired, so its OWN sidebar can keep opening further windows too.
+        controller.onOpenSessionDetached = { [weak self, weak controller] sessionId in
+            guard let self, let model = self.appModel,
+                  let (feed, session) = model.makeDetachedFeed(sessionId: sessionId) else {
+                OrbDebug.log("onOpenSessionDetached: no appModel or makeDetachedFeed nil — spawn aborted")
+                return
+            }
+            let sourceFrame = controller?.currentFrame ?? NSRect(origin: .zero, size: chatWindowDefaultSize)
+            self.spawnDetachedWindow(feed: feed, session: session, frame: sourceFrame.offsetBy(dx: 24, dy: -24), title: "Norma")
+        }
+    }
+
+    /// Task 5 (2e-iii): the shared spawn body BOTH detach paths use — construct, register, show.
+    /// Callers own their OWN feed-creation guard above this (so each can log its own
+    /// context-specific failure message) and hand the already-built feed/session in.
+    @discardableResult
+    private func spawnDetachedWindow(feed: SessionFeed, session: SessionModel, frame: NSRect, title: String) -> DetachedWindowController {
+        let detached = DetachedWindowController(feed: feed, session: session, frame: frame, title: title.isEmpty ? "Norma" : title)
+        registerDetachedWindow(detached)
+        detached.show()
+        return detached
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -126,11 +152,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return false
             }
             let title = model.session.state.exchanges.first.map { String($0.prompt.prefix(40)) } ?? "Norma"
-            let detached = DetachedWindowController(
-                feed: feed, session: session, frame: frame, title: title.isEmpty ? "Norma" : title
-            )
-            self.registerDetachedWindow(detached)
-            detached.show() // detached window VISIBLE first — the orb panel is still `.window` here
+            // detached window VISIBLE first — the orb panel is still `.window` here
+            self.spawnDetachedWindow(feed: feed, session: session, frame: frame, title: title)
             Task { await model.startFreshSessionAfterDetach() } // orb's next summon = clean slate
             return true
         }
