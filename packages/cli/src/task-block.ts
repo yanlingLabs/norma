@@ -10,6 +10,22 @@ import { anySubagentAlive, subagentElapsedMs, subagentTokens } from "./subagent-
  *  `.status` field (typed `any` at the wire boundary) without fighting TS7053. */
 export const TASK_ICONS: Record<string, string> = { pending: "☐", in_progress: "◐", completed: "☑" };
 
+/** Non-TTY (piped/`-p`) one-line-per-update literals (2e-iii-b Task 6). Headless consumers parse
+ *  these, so they are byte-frozen: `nontty-bytes.test.ts` pins each output exactly, and main.ts's
+ *  non-TTY branches call these SAME functions — any drift in either place breaks the test. Kept
+ *  here beside DIM/RESET/TASK_ICONS (their only inputs) so the format and its colors live together.
+ *  The TTY renders are the separate, freely-evolving `renderTaskBlock`/`agentSpawnLine`/
+ *  `agentFinishLines` above; these three are the frozen non-TTY twins. */
+export function NONTTY_TASK_LINE(status: string, subject: string): string {
+  return `${DIM}${TASK_ICONS[status]} ${subject}${RESET}\n`;
+}
+export function NONTTY_SPAWN_LINE(agentType: string): string {
+  return `${DIM}⌥ spawned ${agentType} subagent${RESET}\n`;
+}
+export function NONTTY_FINISH_LINE(stopReason: string): string {
+  return `${DIM}✓ subagent done${stopReason !== "end_turn" ? ` (${stopReason})` : ""}${RESET}\n`;
+}
+
 // ANSI — Norma blue for the live/in-progress state (status line + in_progress glyph), green for
 // completed, dim for pending/idle text, bold for the single active row's subject. Co-located here
 // (rather than main.ts's own AQUA/DIM/RESET) since task-block.ts is the pure-rendering module both
