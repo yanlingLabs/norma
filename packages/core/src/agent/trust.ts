@@ -35,5 +35,18 @@ export class TrustStore {
     }
   }
 
+  /** Revoke trust for a directory (exact canonicalized match — does not cascade to
+   *  subdirectories that were never independently trusted). Same atomic rewrite-the-whole-file
+   *  style as `trust()`. Returns whether anything was actually removed (idempotent: removing an
+   *  already-untrusted dir is a no-op that returns false, not an error). */
+  remove(dir: string): boolean {
+    const c = this.canon(dir);
+    const idx = this.trusted.indexOf(c);
+    if (idx === -1) return false;
+    this.trusted.splice(idx, 1);
+    writeFileSync(this.path, JSON.stringify({ version: 1, trustedDirs: this.trusted }, null, 2) + "\n");
+    return true;
+  }
+
   list(): string[] { return [...this.trusted]; }
 }

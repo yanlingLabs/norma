@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, realpathSync, existsSync, mkdirSync, writeFi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LineDecoder, encodeLine, METHODS, PROTOCOL_VERSION, ConnWriter, ERR, type WritableSocket } from "@norma/protocol";
-import { startDaemon, type RunningDaemon } from "../src/daemon";
+import { startDaemon, type RunningDaemon, CORE_VERSION } from "../src/daemon";
 import { startIpcServer } from "../src/ipc/server";
 import { SessionStore } from "../src/sessions/store";
 import { FileSecretStore } from "../src/auth/secret-store";
@@ -964,6 +964,474 @@ describe("daemon IPC", () => {
     expect(mcp.servers.find((s: any) => s.name === "demo:fake")).toBeUndefined();
     const plugins = (await c.request(METHODS.pluginsList, {})).result;
     expect(plugins.plugins[0]).toMatchObject({ name: "demo", hasMcp: true, mcpEnabled: false, disabled: true });
+    c.close();
+  });
+
+  // -----------------------------------------------------------------------------------------
+  // Peripheral lease v1 (Phase 2f). `boot()` wires the REAL PeripheralBroker/AuditLog/
+  // ProviderLink daemon.ts builds — these tests exercise the production wiring, not fakes.
+  // -----------------------------------------------------------------------------------------
+
+  test("peripheral.lease under auto policy grants immediately when a provider is connected", async () => {
+    await boot();
+    const provider = await TestClient.connect(daemon.socketPath);
+    await provider.hello(harnessToken, "peripheral-provider");
+    await provider.request(METHODS.peripheralAdvertise, { classes: [{ class: "noop", tccGranted: true }] });
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "leaser");
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", approvalPolicy: "auto" });
+    await c.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
+
+    const res = await c.request(METHODS.peripheralLease, { sessionId: created.sessionId, class: "noop" });
+    expect(res.result.leaseId).toBeTruthy();
+    expect(res.result.token).toBeTruthy();
+    expect(res.result.expiresAt).toBeGreaterThan(Date.now());
+
+    const granted = await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "lease_granted");
+    expect(granted.params.leaseId).toBe(res.result.leaseId);
+    expect(granted.params.holder).toEqual({ kind: "session", id: created.sessionId });
+
+    provider.close(); c.close();
+  });
+
+  test('peripheral.lease with no provider connected returns {code:"no_provider"}', async () => {
+    await boot();
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "no-provider-leaser");
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", approvalPolicy: "auto" });
+    const res = await c.request(METHODS.peripheralLease, { sessionId: created.sessionId, class: "noop" });
+    expect(res.result).toEqual({ code: "no_provider" });
+    c.close();
+  });
+
+  test("peripheral.lease under ask policy raises an approval card naming the class; approving grants", async () => {
+    await boot();
+    const provider = await TestClient.connect(daemon.socketPath);
+    await provider.hello(harnessToken, "ask-provider");
+    await provider.request(METHODS.peripheralAdvertise, { classes: [{ class: "noop", tccGranted: true }] });
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "ask-leaser");
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", approvalPolicy: "ask" });
+    await c.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
+
+    const leasePromise = c.request(METHODS.peripheralLease, { sessionId: created.sessionId, class: "noop" });
+    const ask = await c.waitForNotification((n) =>
+      n.method === METHODS.event && n.params.type === "approval_requested" && n.params.toolName === "peripheral.lease");
+    expect(ask.params.summary).toBe(`Session ${created.sessionId} requests noop`);
+
+    const respond = await c.request(METHODS.approvalRespond, { sessionId: created.sessionId, callId: ask.params.callId, approved: true });
+    expect(respond.result).toEqual({ ok: true, alreadyResolved: false });
+
+    const res = await leasePromise;
+    expect(res.result.leaseId).toBeTruthy();
+    await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "lease_granted");
+    provider.close(); c.close();
+  });
+
+  // Regression coverage for the deleted `peripheralClassHint` side-channel (a sessionId -> class
+  // map ipc/server.ts used to `set()` synchronously right before calling `broker.lease()`, read
+  // back by daemon.ts's ask-policy closure). That map was keyed ONLY by sessionId, so two
+  // near-simultaneous lease() calls from the SAME session for DIFFERENT classes could clobber
+  // each other's hint between the set() and the (possibly slow, ask-mode) policy read — a real
+  // future bug even though it was race-free the day it was written. The fix threads the class
+  // straight through as a policy(sessionId, cls) call argument, so each in-flight policy
+  // invocation closes over its OWN class with nothing shared to race on. This test drives BOTH
+  // approval cards into existence before resolving EITHER, so it would have caught the old
+  // mislabeling bug.
+  test("peripheral.lease concurrent same-session different-class requests under ask policy: each approval card names ITS OWN class", async () => {
+    await boot();
+    const provider = await TestClient.connect(daemon.socketPath);
+    await provider.hello(harnessToken, "concurrent-ask-provider");
+    await provider.request(METHODS.peripheralAdvertise, {
+      classes: [{ class: "noop", tccGranted: true }, { class: "screenshot", tccGranted: true }],
+    });
+
+    const watcher = await TestClient.connect(daemon.socketPath);
+    await watcher.hello(harnessToken, "concurrent-ask-watcher");
+    const { result: created } = await watcher.request(METHODS.sessionCreate, { scope: "global", approvalPolicy: "ask" });
+    await watcher.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
+
+    // Two SEPARATE connections issue the two lease requests — same session, different classes.
+    // (Deliberately not both on one connection: this server's per-connection `data()` handler
+    // awaits each RPC line's `handle()` before parsing the next line in the same read, so two
+    // blocking ask-policy calls queued back-to-back on ONE socket would serialize instead of
+    // actually overlapping — that would defeat the point of this test.)
+    const reqA = await TestClient.connect(daemon.socketPath);
+    await reqA.hello(harnessToken, "concurrent-ask-a");
+    const reqB = await TestClient.connect(daemon.socketPath);
+    await reqB.hello(harnessToken, "concurrent-ask-b");
+
+    // Fire both requests before awaiting either — both policy() invocations are in flight
+    // concurrently, parked on their own approvalBroker.wait().
+    const leaseNoop = reqA.request(METHODS.peripheralLease, { sessionId: created.sessionId, class: "noop" });
+    const leaseScreenshot = reqB.request(METHODS.peripheralLease, { sessionId: created.sessionId, class: "screenshot" });
+
+    // Collect BOTH approval_requested cards before resolving either — this is exactly the window
+    // where a shared sessionId-keyed hint could have been overwritten by the second request
+    // before the first card's summary was built.
+    const asks: any[] = [];
+    while (asks.length < 2) {
+      const n = await watcher.waitForNotification((notif) =>
+        notif.method === METHODS.event && notif.params.type === "approval_requested" &&
+        notif.params.toolName === "peripheral.lease" && !asks.some((a) => a.params.callId === notif.params.callId));
+      asks.push(n);
+    }
+
+    const askNoop = asks.find((a) => a.params.summary === `Session ${created.sessionId} requests noop`);
+    const askScreenshot = asks.find((a) => a.params.summary === `Session ${created.sessionId} requests screenshot`);
+    expect(askNoop).toBeDefined();
+    expect(askScreenshot).toBeDefined();
+
+    // Resolve screenshot's card first (reverse of request order) so a same-session ordering
+    // assumption can't accidentally paper over a mislabel.
+    await watcher.request(METHODS.approvalRespond, { sessionId: created.sessionId, callId: askScreenshot.params.callId, approved: true });
+    await watcher.request(METHODS.approvalRespond, { sessionId: created.sessionId, callId: askNoop.params.callId, approved: true });
+
+    const resNoop = await leaseNoop;
+    const resScreenshot = await leaseScreenshot;
+    expect(resNoop.result.leaseId).toBeTruthy();
+    expect(resScreenshot.result.leaseId).toBeTruthy();
+
+    provider.close(); watcher.close(); reqA.close(); reqB.close();
+  });
+
+  test("peripheral.lease under plan policy is denied immediately (no approval card)", async () => {
+    await boot();
+    const provider = await TestClient.connect(daemon.socketPath);
+    await provider.hello(harnessToken, "plan-provider");
+    await provider.request(METHODS.peripheralAdvertise, { classes: [{ class: "noop", tccGranted: true }] });
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "plan-leaser");
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", approvalPolicy: "plan" });
+    await c.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
+
+    const res = await c.request(METHODS.peripheralLease, { sessionId: created.sessionId, class: "noop" });
+    expect(res.result).toEqual({ code: "denied" });
+    await new Promise((r) => setTimeout(r, 100));
+    expect(c.notifications.some((n) => n.params?.type === "approval_requested")).toBe(false);
+    provider.close(); c.close();
+  });
+
+  test("peripheral.lease contention: the second requester gets lease_held with the first holder's identity", async () => {
+    await boot();
+    const provider = await TestClient.connect(daemon.socketPath);
+    await provider.hello(harnessToken, "contention-provider");
+    await provider.request(METHODS.peripheralAdvertise, { classes: [{ class: "noop", tccGranted: true }] });
+
+    const a = await TestClient.connect(daemon.socketPath);
+    await a.hello(harnessToken, "contender-a");
+    const sa = (await a.request(METHODS.sessionCreate, { scope: "global", approvalPolicy: "auto" })).result.sessionId;
+    const grantA = await a.request(METHODS.peripheralLease, { sessionId: sa, class: "noop" });
+    expect(grantA.result.leaseId).toBeTruthy();
+
+    const b = await TestClient.connect(daemon.socketPath);
+    await b.hello(harnessToken, "contender-b");
+    const sb = (await b.request(METHODS.sessionCreate, { scope: "global", approvalPolicy: "auto" })).result.sessionId;
+    const grantB = await b.request(METHODS.peripheralLease, { sessionId: sb, class: "noop" });
+    expect(grantB.result).toEqual({ code: "lease_held", holder: { kind: "session", id: sa } });
+
+    provider.close(); a.close(); b.close();
+  });
+
+  test("peripheral.lease/renew/release from a non-harness (plugin) role are typed denied, never touching the broker", async () => {
+    const home = mkdtempSync(join(tmpdir(), "norma-peripheral-plugin-"));
+    const store = new SessionStore(home);
+    const socketPath = join(home, "core.sock");
+    // No plugin auth exists yet (TokenAuthority.verify has no plugin token) — stub the token
+    // authority so a "plugin"-role hello can succeed, isolating the ROLE guard itself (carried
+    // item #4: "implement the guard as a defensive check on role !== 'harness'").
+    const stubTokens = { verify: async (_role: string, token: string) => token === "plugin-tok" } as any;
+    const server = startIpcServer({ socketPath, serverVersion: "test", tokens: stubTokens, store });
+    try {
+      const c = await TestClient.connect(socketPath);
+      const hello = await c.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: "plugin-tok", clientName: "plugin-client",
+      });
+      expect(hello.result.ok).toBe(true);
+
+      const lease = await c.request(METHODS.peripheralLease, { sessionId: "s_whatever", class: "noop" });
+      expect(lease.result).toEqual({ code: "denied", reason: "plugin-leasing-not-yet-available" });
+      const renew = await c.request(METHODS.peripheralRenew, { sessionId: "s_whatever", leaseId: "l1", token: "t1" });
+      expect(renew.result).toEqual({ code: "denied", reason: "plugin-leasing-not-yet-available" });
+      const release = await c.request(METHODS.peripheralRelease, { sessionId: "s_whatever", leaseId: "l1", token: "t1" });
+      expect(release.result).toEqual({ code: "denied", reason: "plugin-leasing-not-yet-available" });
+
+      c.close();
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("peripheral.advertise rejects a non-harness (admin) role", async () => {
+    await boot();
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.request(METHODS.hello, { protocolVersion: PROTOCOL_VERSION, role: "admin", token: daemon.tokens.admin, clientName: "admin-conn" });
+    const res = await c.request(METHODS.peripheralAdvertise, { classes: [{ class: "noop", tccGranted: true }] });
+    expect(res.error).toBeTruthy();
+    expect(res.error.code).toBe(ERR.UNAUTHORIZED);
+    c.close();
+  });
+
+  test("peripheral.revoke / peripheral.respond are rejected from a non-provider connection; the real provider can revoke", async () => {
+    await boot();
+    const provider = await TestClient.connect(daemon.socketPath);
+    await provider.hello(harnessToken, "real-provider");
+    await provider.request(METHODS.peripheralAdvertise, { classes: [{ class: "noop", tccGranted: true }] });
+
+    const impostor = await TestClient.connect(daemon.socketPath);
+    await impostor.hello(harnessToken, "impostor");
+    const revoke = await impostor.request(METHODS.peripheralRevoke, { all: true, reason: "panic" });
+    expect(revoke.error).toBeTruthy();
+    expect(revoke.error.code).toBe(ERR.UNAUTHORIZED);
+    const respond = await impostor.request(METHODS.peripheralRespond, { requestId: "req_whatever" });
+    expect(respond.error).toBeTruthy();
+    expect(respond.error.code).toBe(ERR.UNAUTHORIZED);
+
+    const okRevoke = await provider.request(METHODS.peripheralRevoke, { all: true, reason: "panic" });
+    expect(okRevoke.result).toEqual({ ok: true, revoked: 0 });
+
+    provider.close(); impostor.close();
+  });
+
+  test("peripheral.advertise: the most recently advertising connection becomes THE provider (identity replaces)", async () => {
+    await boot();
+    const first = await TestClient.connect(daemon.socketPath);
+    await first.hello(harnessToken, "first-provider");
+    await first.request(METHODS.peripheralAdvertise, { classes: [{ class: "noop", tccGranted: true }] });
+
+    const second = await TestClient.connect(daemon.socketPath);
+    await second.hello(harnessToken, "second-provider");
+    await second.request(METHODS.peripheralAdvertise, { classes: [{ class: "noop", tccGranted: true }] });
+
+    const rejected = await first.request(METHODS.peripheralRevoke, { all: true, reason: "panic" });
+    expect(rejected.error?.code).toBe(ERR.UNAUTHORIZED);
+
+    const ok = await second.request(METHODS.peripheralRevoke, { all: true, reason: "panic" });
+    expect(ok.result).toEqual({ ok: true, revoked: 0 });
+
+    first.close(); second.close();
+  });
+
+  test("provider disconnect revokes its leases (lease_lost provider-gone); a later lease sees no_provider until re-advertised", async () => {
+    await boot();
+    const provider = await TestClient.connect(daemon.socketPath);
+    await provider.hello(harnessToken, "disconnecting-provider");
+    await provider.request(METHODS.peripheralAdvertise, { classes: [{ class: "noop", tccGranted: true }] });
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "disc-leaser");
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", approvalPolicy: "auto" });
+    await c.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
+    const grant = await c.request(METHODS.peripheralLease, { sessionId: created.sessionId, class: "noop" });
+    expect(grant.result.leaseId).toBeTruthy();
+
+    provider.close();
+    const lost = await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "lease_lost");
+    expect(lost.params.reason).toBe("provider-gone");
+
+    const res2 = await c.request(METHODS.peripheralLease, { sessionId: created.sessionId, class: "noop" });
+    expect(res2.result).toEqual({ code: "no_provider" });
+
+    c.close();
+  });
+
+  test("peripheral.renew extends expiresAt; without renewal the lease eventually expires (short settings override)", async () => {
+    await boot({}, undefined, { peripheral: { expiryMs: 150, heartbeatMs: 20 } });
+    const provider = await TestClient.connect(daemon.socketPath);
+    await provider.hello(harnessToken, "expiry-provider");
+    await provider.request(METHODS.peripheralAdvertise, { classes: [{ class: "noop", tccGranted: true }] });
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "expiry-leaser");
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", approvalPolicy: "auto" });
+    await c.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
+    const grant = await c.request(METHODS.peripheralLease, { sessionId: created.sessionId, class: "noop" });
+    const { leaseId, token, expiresAt } = grant.result;
+
+    // Real elapsed time between grant and renew (rather than asserting strict inequality against
+    // two `Date.now() + expiryMs` reads that could tie within the same millisecond tick).
+    await new Promise((r) => setTimeout(r, 60));
+    const renew = await c.request(METHODS.peripheralRenew, { sessionId: created.sessionId, leaseId, token });
+    expect(renew.result.expiresAt).toBeGreaterThan(expiresAt);
+
+    const lost = await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "lease_lost", 3000);
+    expect(lost.params.reason).toBe("expired");
+    expect(lost.params.leaseId).toBe(leaseId);
+
+    provider.close(); c.close();
+  });
+
+  test("peripheral.release round-trip; renew after release sees not_found", async () => {
+    await boot();
+    const provider = await TestClient.connect(daemon.socketPath);
+    await provider.hello(harnessToken, "release-provider");
+    await provider.request(METHODS.peripheralAdvertise, { classes: [{ class: "noop", tccGranted: true }] });
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "releaser");
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", approvalPolicy: "auto" });
+    const grant = await c.request(METHODS.peripheralLease, { sessionId: created.sessionId, class: "noop" });
+    const { leaseId, token } = grant.result;
+
+    const release = await c.request(METHODS.peripheralRelease, { sessionId: created.sessionId, leaseId, token });
+    expect(release.result).toEqual({ ok: true });
+
+    const badRenew = await c.request(METHODS.peripheralRenew, { sessionId: created.sessionId, leaseId, token });
+    expect(badRenew.result).toEqual({ code: "not_found" });
+
+    provider.close(); c.close();
+  });
+
+  test("noop capability call round-trips through the real provider connection (call() -> peripheral_call_requested -> peripheral.respond)", async () => {
+    const { AuditLog } = await import("../src/peripheral/audit");
+    const { PeripheralBroker } = await import("../src/peripheral/broker");
+    const { ProviderLink } = await import("../src/peripheral/provider-link");
+
+    const home = mkdtempSync(join(tmpdir(), "norma-peripheral-call-"));
+    const audit = new AuditLog(join(home, "audit.jsonl"));
+    const providerLink = new ProviderLink();
+    const broker = new PeripheralBroker({
+      audit, heartbeatMs: 1000, expiryMs: 5000, callTimeoutMs: 2000,
+      policy: async () => "granted",
+      emitTransient: () => {},
+      pushToProvider: (e) => providerLink.push(e),
+    });
+
+    const store = new SessionStore(home);
+    const secrets = new FileSecretStore(join(home, "test-secrets"));
+    const authority = new TokenAuthority(secrets);
+    const tokens = await authority.ensureTokens();
+    const socketPath = join(home, "core.sock");
+    const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, peripheral: broker, providerLink });
+    try {
+      const p = await TestClient.connect(socketPath);
+      await p.hello(tokens.harness, "call-provider");
+      await p.request(METHODS.peripheralAdvertise, { classes: [{ class: "noop", tccGranted: true }] });
+
+      const grant = await broker.lease({ sessionId: "s_direct", class: "noop" });
+      if (!("leaseId" in grant)) throw new Error(`expected a grant, got ${JSON.stringify(grant)}`);
+
+      const callPromise = broker.call({ leaseId: grant.leaseId, token: grant.token, class: "noop", payloadJson: JSON.stringify({ ping: 1 }) });
+      const requested = await p.waitForNotification((n) => n.method === METHODS.event && n.params.type === "peripheral_call_requested");
+      expect(requested.params.leaseId).toBe(grant.leaseId);
+      expect(requested.params.token).toBe(grant.token);
+      expect(requested.params.class).toBe("noop");
+      expect(JSON.parse(requested.params.payloadJson)).toEqual({ ping: 1 });
+
+      await p.request(METHODS.peripheralRespond, {
+        requestId: requested.params.requestId,
+        resultJson: JSON.stringify({ echo: { ping: 1 } }),
+      });
+
+      const callResult = await callPromise;
+      expect("ok" in callResult && callResult.ok).toBe(true);
+      if (!("ok" in callResult) || !callResult.ok) throw new Error(`expected ok, got ${JSON.stringify(callResult)}`);
+      expect(JSON.parse(callResult.resultJson)).toEqual({ echo: { ping: 1 } });
+
+      p.close();
+    } finally {
+      server.stop();
+    }
+  });
+
+  // Regression coverage for the daemon.ts emitTransient fix (Task 4 context: the provider
+  // connection is rarely attached to the requester's session, so broadcastTransient's
+  // session-scoped fan-out alone would never reach it). The provider here deliberately never
+  // attaches to ANY session — it must still see lease_granted (on acquire) and lease_lost (on
+  // release) so it can track its own active-lease set purely from these pushed events.
+  test("provider connection receives lease_granted/lease_lost even when not attached to the leasing session", async () => {
+    await boot();
+    const provider = await TestClient.connect(daemon.socketPath);
+    await provider.hello(harnessToken, "unattached-provider");
+    await provider.request(METHODS.peripheralAdvertise, { classes: [{ class: "noop", tccGranted: true }] });
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "leaser-elsewhere");
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", approvalPolicy: "auto" });
+    // Deliberately no sessionAttach for either connection — the provider must still be told.
+
+    const res = await c.request(METHODS.peripheralLease, { sessionId: created.sessionId, class: "noop" });
+    expect(res.result.leaseId).toBeTruthy();
+
+    const granted = await provider.waitForNotification((n) => n.method === METHODS.event && n.params.type === "lease_granted");
+    expect(granted.params.leaseId).toBe(res.result.leaseId);
+    expect(granted.params.holder).toEqual({ kind: "session", id: created.sessionId });
+
+    const rel = await c.request(METHODS.peripheralRelease, { sessionId: created.sessionId, leaseId: res.result.leaseId, token: res.result.token });
+    expect(rel.result).toEqual({ ok: true });
+
+    const lost = await provider.waitForNotification((n) => n.method === METHODS.event && n.params.type === "lease_lost");
+    expect(lost.params.leaseId).toBe(res.result.leaseId);
+    expect(lost.params.reason).toBe("released");
+
+    provider.close(); c.close();
+  });
+
+  // -----------------------------------------------------------------------------------------
+  // Dashboard read methods (Phase 2f): daemon.status, quota.state, trust.list, trust.remove.
+  // -----------------------------------------------------------------------------------------
+
+  test("trust.list / trust.remove over the socket", async () => {
+    await boot();
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "trust-lister");
+    const dirA = realpathSync(mkdtempSync(join(tmpdir(), "norma-trust-a-")));
+    const dirB = realpathSync(mkdtempSync(join(tmpdir(), "norma-trust-b-")));
+    await c.request(METHODS.trustDir, { path: dirA });
+    await c.request(METHODS.trustDir, { path: dirB });
+
+    const list1 = (await c.request(METHODS.trustList, {})).result;
+    expect(list1.dirs).toContain(dirA);
+    expect(list1.dirs).toContain(dirB);
+
+    const removed = (await c.request(METHODS.trustRemove, { path: dirA })).result;
+    expect(removed).toEqual({ removed: true });
+
+    const list2 = (await c.request(METHODS.trustList, {})).result;
+    expect(list2.dirs).not.toContain(dirA);
+    expect(list2.dirs).toContain(dirB);
+
+    const removedAgain = (await c.request(METHODS.trustRemove, { path: dirA })).result;
+    expect(removedAgain).toEqual({ removed: false });
+
+    c.close();
+  });
+
+  test("daemon.status shape (no provider): version/uptimeMs/socketPath/provider:null/sessionsCount/pluginsCount", async () => {
+    await boot(); // no provider → no engine
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "status-checker");
+    await c.request(METHODS.sessionCreate, { scope: "global" });
+    const status = (await c.request(METHODS.daemonStatus, {})).result;
+    expect(status.version).toBe(CORE_VERSION);
+    expect(status.uptimeMs).toBeGreaterThanOrEqual(0);
+    expect(status.socketPath).toBe(daemon.socketPath);
+    expect(status.provider).toBeNull();
+    expect(status.sessionsCount).toBe(1);
+    expect(status.pluginsCount).toBe(0);
+    c.close();
+  });
+
+  test("daemon.status reports the active provider's id/model when an agent is configured", async () => {
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const fake = new FakeProvider([[{ type: "text_delta", delta: "hi" }, { type: "done", stopReason: "end_turn" }]]);
+    await boot({}, fake);
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "status-provider-checker");
+    const status = (await c.request(METHODS.daemonStatus, {})).result;
+    expect(status.provider).toEqual({ id: "fake", model: "fake-1" });
+    c.close();
+  });
+
+  test("quota.state shape: ok/zero usage when no real provider-wrapped QuotaManager is wired", async () => {
+    await boot();
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "quota-checker");
+    const q = (await c.request(METHODS.quotaState, {})).result;
+    expect(q).toEqual({ kind: "ok", inputTokens: 0, outputTokens: 0 });
     c.close();
   });
 });

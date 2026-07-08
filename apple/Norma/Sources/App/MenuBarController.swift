@@ -7,6 +7,8 @@ final class MenuBarController {
     private let summonField: () -> Void
     private let openCli: () -> Void
     private let openNormaApp: () -> Void
+    private let openDashboard: () -> Void
+    private let panicAction: () -> Void
     private let quitApplication: () -> Void
     // Task 3 (2e-iv): internal (not private), same stored-`let` pattern as `stateItem` below, so
     // `MenuBarEntryPointsTests` (`@testable import Norma`) can walk `statusItem`'s built menu for
@@ -17,6 +19,16 @@ final class MenuBarController {
     private let summonFieldItem = NSMenuItem(title: "Summon Field", action: #selector(didSummonField), keyEquivalent: "")
     let openCliItem = NSMenuItem(title: "Open CLI", action: #selector(didOpenCli), keyEquivalent: "")
     let openNormaAppItem = NSMenuItem(title: "Open Norma App", action: #selector(didOpenNormaApp), keyEquivalent: "")
+    // Task 5 (2f-ii): the Dashboard entry — same section/adjacency convention as `openCliItem`/
+    // `openNormaAppItem` (2e-iv), mirrored exactly.
+    let dashboardItem = NSMenuItem(title: "Dashboard…", action: #selector(didOpenDashboard), keyEquivalent: "")
+    // Task 4 (2f): the red "Stop Norma's Control" panic item — mounted/unmounted (not just
+    // shown/hidden, unlike `orbItem`'s title-flip via `setOrbVisible`) with the active-lease count.
+    // `internal`, same testability posture as `openCliItem`/`openNormaAppItem` above.
+    let panicItem = NSMenuItem(title: "Stop Norma's Control", action: #selector(didPanic), keyEquivalent: "")
+    private let preQuitSeparator = NSMenuItem.separator()
+    private let quitItem = NSMenuItem(title: "Quit Norma", action: #selector(didQuit), keyEquivalent: "q")
+    private var panicMounted = false
 
     init(
         statusLine: @escaping () -> String,
@@ -24,6 +36,8 @@ final class MenuBarController {
         summonField: @escaping () -> Void,
         openCli: @escaping () -> Void,
         openNormaApp: @escaping () -> Void,
+        openDashboard: @escaping () -> Void,
+        panic: @escaping () -> Void,
         quit: @escaping () -> Void
     ) {
         self.statusLine = statusLine
@@ -31,6 +45,8 @@ final class MenuBarController {
         self.summonField = summonField
         self.openCli = openCli
         self.openNormaApp = openNormaApp
+        self.openDashboard = openDashboard
+        self.panicAction = panic
         self.quitApplication = quit
     }
 
@@ -52,13 +68,18 @@ final class MenuBarController {
         menu.addItem(openCliItem)
         openNormaAppItem.target = self
         menu.addItem(openNormaAppItem)
-        menu.addItem(.separator())
-        let quitItem = NSMenuItem(title: "Quit Norma", action: #selector(didQuit), keyEquivalent: "q")
+        dashboardItem.target = self
+        menu.addItem(dashboardItem)
+        menu.addItem(preQuitSeparator)
         quitItem.target = self
         menu.addItem(quitItem)
 
         item.menu = menu
         statusItem = item
+        panicItem.target = self
+        panicItem.attributedTitle = NSAttributedString(
+            string: panicItem.title, attributes: [.foregroundColor: NSColor.systemRed]
+        )
         refresh()
     }
 
@@ -70,9 +91,30 @@ final class MenuBarController {
         orbItem.title = visible ? "Hide Orb" : "Show Orb"
     }
 
+    /// Task 4 (2f): mounts (inserts, right above the pre-Quit separator) or unmounts (removes) the
+    /// red panic item as the active-lease count crosses zero — a true add/remove, unlike
+    /// `setOrbVisible`'s title-flip, since the item must not exist at all while nothing is leased.
+    /// Idempotent (`panicMounted` guard) and safe to call before `install()` (no-op — nothing to
+    /// mount into yet; `install()` doesn't re-derive panic visibility, so a caller that flips this
+    /// before `install()` and expects it mounted would need to call `setPanicVisible` again after —
+    /// not a scenario any current caller hits, since `activeLeases` starts empty at boot).
+    func setPanicVisible(_ visible: Bool) {
+        guard visible != panicMounted else { return }
+        guard let menu = statusItem?.menu else { panicMounted = visible; return }
+        if visible {
+            let idx = menu.index(of: preQuitSeparator)
+            if idx >= 0 { menu.insertItem(panicItem, at: idx) }
+        } else {
+            menu.removeItem(panicItem)
+        }
+        panicMounted = visible
+    }
+
     @objc private func didToggleOrb() { toggleOrb() }
     @objc private func didSummonField() { summonField() }
     @objc private func didOpenCli() { openCli() }
     @objc private func didOpenNormaApp() { openNormaApp() }
+    @objc private func didOpenDashboard() { openDashboard() }
+    @objc private func didPanic() { panicAction() }
     @objc private func didQuit() { quitApplication() }
 }

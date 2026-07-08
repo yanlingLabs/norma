@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { SessionEvent, TaskSchema } from "./events";
+import { SessionEvent, TaskSchema, PeripheralClassSchema, HolderSchema } from "./events";
 
 export const PROTOCOL_VERSION = 0;
 
@@ -151,6 +151,93 @@ export const ThreadInfoSchema = z.object({
 export const ThreadListParams = z.object({ sessionId: z.string().min(1) });
 export const ThreadListResult = z.object({ ok: z.literal(true), threads: z.array(ThreadInfoSchema) });
 
+// ---------------------------------------------------------------------------------------------
+// Peripheral lease v1 (Phase 2f, spec §A2) + dashboard read methods (spec Part B).
+// ---------------------------------------------------------------------------------------------
+
+/** The 5-member reason union shared with `LeaseLostEvent` (events.ts) — kept as a separate
+ *  literal here (rather than importing the event schema's inner shape) since zod object shapes
+ *  don't expose their field schemas for reuse without reaching into `.shape`. */
+const LeaseLostReasonSchema = z.enum(["expired", "released", "panic", "revoked", "provider-gone"]);
+
+/** A `denied` result additionally carries an optional `reason` — used for the pinned
+ *  `{code:"denied", reason:"plugin-leasing-not-yet-available"}` typed error (spec §A2 requester
+ *  scope: sessions-only in v1) as well as the plain policy-denied case (`reason` omitted). */
+const PeripheralDeniedSchema = z.object({ code: z.literal("denied"), reason: z.string().optional() });
+
+export const PeripheralLeaseParams = z.object({ sessionId: z.string().min(1), class: PeripheralClassSchema });
+export const PeripheralLeaseResult = z.union([
+  z.object({ leaseId: z.string().min(1), token: z.string().min(1), expiresAt: z.number().int().nonnegative() }),
+  z.object({ code: z.literal("lease_held"), holder: HolderSchema }),
+  z.object({ code: z.literal("no_provider") }),
+  PeripheralDeniedSchema,
+]);
+
+export const PeripheralRenewParams = z.object({ sessionId: z.string().min(1), leaseId: z.string().min(1), token: z.string().min(1) });
+export const PeripheralRenewResult = z.union([
+  z.object({ ok: z.literal(true), expiresAt: z.number().int().nonnegative() }),
+  z.object({ code: z.literal("not_found") }),
+  z.object({ code: z.literal("token_mismatch") }),
+  // L1 fix: renew() now rejects a lease past its expiresAt but not yet swept, instead of
+  // silently resurrecting it — see PeripheralBroker.renew()'s RenewError union in broker.ts.
+  z.object({ code: z.literal("expired") }),
+  PeripheralDeniedSchema,
+]);
+
+export const PeripheralReleaseParams = z.object({ sessionId: z.string().min(1), leaseId: z.string().min(1), token: z.string().min(1) });
+export const PeripheralReleaseResult = z.union([
+  z.object({ ok: z.literal(true) }),
+  z.object({ code: z.literal("not_found") }),
+  z.object({ code: z.literal("token_mismatch") }),
+  PeripheralDeniedSchema,
+]);
+
+export const PeripheralAdvertiseParams = z.object({
+  classes: z.array(z.object({ class: PeripheralClassSchema, tccGranted: z.boolean() })),
+});
+export const PeripheralAdvertiseResult = z.object({ ok: z.literal(true) });
+
+export const PeripheralRevokeParams = z.object({
+  leaseId: z.string().min(1).optional(),
+  all: z.boolean().optional(),
+  reason: LeaseLostReasonSchema,
+});
+export const PeripheralRevokeResult = z.object({ ok: z.literal(true), revoked: z.number().int().nonnegative() });
+
+export const PeripheralRespondParams = z.object({
+  requestId: z.string().min(1),
+  resultJson: z.string().optional(),
+  error: z.string().optional(),
+});
+export const PeripheralRespondResult = z.object({ ok: z.literal(true), alreadyResolved: z.boolean() });
+
+export const DaemonStatusParams = z.object({});
+export const DaemonStatusResult = z.object({
+  version: z.string(),
+  uptimeMs: z.number().int().nonnegative(),
+  socketPath: z.string(),
+  provider: z.object({ id: z.string(), model: z.string() }).nullable(),
+  sessionsCount: z.number().int().nonnegative(),
+  pluginsCount: z.number().int().nonnegative(),
+});
+
+export const QuotaStateParams = z.object({});
+/** The FLAT merge of `QuotaManager.state()` ({kind:"ok"} | {kind:"limited", resumeAt}) and
+ *  `.usage()` ({inputTokens, outputTokens}) — matches NormaKit's `quotaState()` wrapper
+ *  field-for-field (apple/NormaKit/Sources/NormaKit/NormaClient+Methods.swift). */
+export const QuotaStateResult = z.object({
+  kind: z.enum(["ok", "limited"]),
+  resumeAt: z.number().int().nonnegative().optional(),
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+});
+
+export const TrustListParams = z.object({});
+export const TrustListResult = z.object({ dirs: z.array(z.string()) });
+
+export const TrustRemoveParams = z.object({ path: AbsoluteDirPath });
+export const TrustRemoveResult = z.object({ removed: z.boolean() });
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -177,4 +264,14 @@ export const METHODS = {
   planRespond: "plan.respond",
   sessionSetPolicy: "session.setPolicy",
   threadList: "thread.list",
+  peripheralLease: "peripheral.lease",
+  peripheralRenew: "peripheral.renew",
+  peripheralRelease: "peripheral.release",
+  peripheralAdvertise: "peripheral.advertise",
+  peripheralRevoke: "peripheral.revoke",
+  peripheralRespond: "peripheral.respond",
+  daemonStatus: "daemon.status",
+  quotaState: "quota.state",
+  trustList: "trust.list",
+  trustRemove: "trust.remove",
 } as const;

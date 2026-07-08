@@ -8,6 +8,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var menuBar: MenuBarController?
     private(set) var appModel: AppModel?
     private(set) var orbController: OrbWindowController?
+    /// Task 4 (2f): owns the peripheral capability provider, constructed against `appModel.client`
+    /// — the app's MAIN feed client/socket (the daemon rule: THE provider = the most-recent-
+    /// advertiser CONNECTION, so this must never be a second/detached-window client).
+    private(set) var peripheralProvider: PeripheralProvider?
+    /// Task 5 (2f-ii): the Dashboard's singleton window controller — `nil` until first opened,
+    /// nil'd again via `onClosed` (same one-shot-latch/registry-removal convention as
+    /// `registerDetachedWindow`'s `onClosed`). `openDashboard()` below is what enforces the
+    /// "second invocation focuses the existing window" contract off this single stored ref.
+    private(set) var dashboardWindow: DashboardWindowController?
     private var stickiness: StickinessEngine?
     private var startTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
@@ -116,6 +125,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Task 5 (2f-ii): the menu bar's "Dashboard…" entry — singleton behavior per the brief: a
+    /// second invocation while the window is already open just refocuses it (`show()` is
+    /// idempotent — `makeKeyAndOrderFront` on an already-front window is a no-op), never
+    /// constructing a second `DashboardWindowController`. Defensive, same posture as
+    /// `openSessionInNewDetachedWindow`'s guard: no `appModel`/`peripheralProvider` (never booted)
+    /// resolves to a log + no-op, never a crash or a half-wired window.
+    func openDashboard() {
+        if let dashboardWindow {
+            dashboardWindow.show()
+            return
+        }
+        guard let model = appModel, let peripheral = peripheralProvider else {
+            OrbDebug.log("openDashboard: no appModel/peripheralProvider — spawn aborted")
+            return
+        }
+        let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let controller = DashboardWindowController(
+            client: model.client,
+            directory: model.directory,
+            peripheral: peripheral,
+            onOpenSessionDetached: { [weak self] sid in self?.openSessionInNewDetachedWindow(sid) },
+            frame: centeredDashboardFrame(visibleFrame: visible)
+        )
+        controller.onClosed = { [weak self] _ in self?.dashboardWindow = nil }
+        dashboardWindow = controller
+        controller.show()
+    }
+
     @discardableResult
     private func spawnDetachedWindow(feed: SessionFeed, session: SessionModel, frame: NSRect, title: String) -> DetachedWindowController {
         let detached = DetachedWindowController(feed: feed, session: session, frame: frame, title: title.isEmpty ? "Norma" : title)
@@ -157,6 +194,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let tokenMissing = production == nil
         appModel = model
         OrbDebug.log("boot: axTrusted=\(axTrusted) tokenMissing=\(tokenMissing)")
+
+        // Task 4 (2f): the peripheral provider — constructed against `model.client`, the app's
+        // MAIN feed client/socket (NOT a detached window's own client — the daemon rule pins THE
+        // provider to the most-recent-advertiser CONNECTION). Wired into AppModel's feed hooks
+        // (`onPeripheralEvent`/`onClientConnected`) so lease/call events reach it regardless of
+        // what session the orb happens to be focused on.
+        let peripheral = PeripheralProvider(client: model.client)
+        peripheralProvider = peripheral
+        model.onPeripheralEvent = { [weak peripheral] event in await peripheral?.handle(event) }
+        model.onClientConnected = { [weak peripheral] in Task { await peripheral?.advertiseIfConnected() } }
 
         let orb = OrbWindowController(session: model.session)
         orbController = orb
@@ -258,6 +305,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             MultitouchTrigger.shared.start()
             HotkeyTrigger.shared.start()
 
+            // Task 4 (2f): the panic hotkey/screen-lock observer and the TCC-change poll are
+            // real Carbon/DistributedNotificationCenter/Timer registrations — same
+            // `!isRunningUnitTests` gate as the two triggers above, for the same reason (a real
+            // global hotkey grab and a real distributed-notification observer have no place in a
+            // unit-test process). `PeripheralProviderTests` exercises `handle`/`panic`/
+            // `shouldServe` directly against a scripted client instead.
+            peripheral.registerPanicSurfaces()
+            peripheral.startTCCPolling()
+
             TriggerHub.shared.didTrigger
                 .sink { [weak orb] in
                     Haptics.gestureRecognized()
@@ -298,10 +354,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             openCli: { [weak self] in self?.cliLauncher.openCli() },
             openNormaApp: { [weak self] in self?.openStandaloneNormaWindow() },
+            openDashboard: { [weak self] in self?.openDashboard() },
+            panic: { [weak peripheral] in peripheral?.panic() },
             quit: { NSApp.terminate(nil) }
         )
         mb.install()
         menuBar = mb
+
+        // Task 4 (2f): the red panic item mounts/unmounts as `activeLeases` crosses zero. Safe to
+        // wire unconditionally (not gated by `isRunningUnitTests`) — `activeLeases` only ever
+        // changes via real lease events, which never arrive in the degraded/no-socket test boot
+        // path, so this subscription simply never fires there.
+        peripheral.$activeLeases
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] leases in
+                self?.menuBar?.setPanicVisible(!leases.isEmpty)
+            }
+            .store(in: &cancellables)
 
         orb.show()
         mb.setOrbVisible(true)
@@ -321,10 +390,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         startTask?.cancel()
+        // Task 4 (2f): best-effort revoke-all BEFORE `appModel?.stop()` closes the socket below —
+        // `terminate()`'s revoke RPC is fired on an unstructured Task, so ordering it first gives
+        // it the best (still not guaranteed) chance to reach the daemon before the connection dies.
+        peripheralProvider?.terminate()
         appModel?.stop()
         // Best-effort: each detached window's own feed/socket must not survive the app (spec §5
         // D9 — a closed window leaves nothing running; termination is a harder stop than that).
         detachedWindows.forEach { $0.close() }
+        dashboardWindow?.close()
     }
 
     static var isRunningUnitTests: Bool {

@@ -1,0 +1,12 @@
+{
+  "type": "peripheral_call_requested",
+  "sessionId": "s_1",
+  "threadId": "main",
+  "seq": 21,
+  "ts": 1700000000011,
+  "requestId": "req_1",
+  "leaseId": "lease_1",
+  "token": "tok_9f3a7c2e1b",
+  "class": "noop",
+  "payloadJson": "{}"
+}

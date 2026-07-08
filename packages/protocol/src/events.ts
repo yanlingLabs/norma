@@ -116,6 +116,49 @@ export const SessionTitledEvent = ThreadBase.extend({
   type: z.literal("session_titled"), title: z.string().min(1),
 });
 
+/** Capability classes for the peripheral lease v1 stub (Phase 2f): the three real capabilities
+ *  (implemented at Phase 5g) plus `noop`, the v1 stub used to gate the lease machinery end-to-end. */
+export const PeripheralClassSchema = z.enum(["screenshot", "ax-read", "input-drive", "noop"]);
+export const HolderSchema = z.object({
+  kind: z.enum(["session", "plugin"]),
+  id: z.string().min(1),
+});
+export type Holder = z.infer<typeof HolderSchema>;
+
+/** TRANSIENT (broadcast-only via `broadcastTransient`, like `assistant_delta`): leases are
+ *  runtime state — replay must never resurrect one. The audit log is the durable record.
+ *
+ *  `tokenHash` (sha256 hex of the raw token) rides this event so the PROVIDER can validate
+ *  token+class+expiry on every `peripheral_call_requested` (spec §A1: "no token, no service") —
+ *  the raw token itself is NEVER broadcast; it goes solely to the requester in the
+ *  `peripheral.lease` RESPONSE and back from the requester in capability calls. */
+export const LeaseGrantedEvent = ThreadBase.extend({
+  type: z.literal("lease_granted"),
+  leaseId: z.string().min(1),
+  class: PeripheralClassSchema,
+  holder: HolderSchema,
+  expiresAt: z.number().int().nonnegative(),
+  tokenHash: z.string().min(1),
+});
+/** TRANSIENT — see LeaseGrantedEvent. */
+export const LeaseLostEvent = ThreadBase.extend({
+  type: z.literal("lease_lost"),
+  leaseId: z.string().min(1),
+  class: PeripheralClassSchema,
+  holder: HolderSchema,
+  reason: z.enum(["expired", "released", "panic", "revoked", "provider-gone"]),
+});
+/** TRANSIENT — core pushes this to the provider's connection (approval-broker request/response
+ *  pattern); the provider answers via `peripheral.respond {requestId, resultJson?, error?}`. */
+export const PeripheralCallRequestedEvent = ThreadBase.extend({
+  type: z.literal("peripheral_call_requested"),
+  requestId: z.string().min(1),
+  leaseId: z.string().min(1),
+  token: z.string().min(1),
+  class: PeripheralClassSchema,
+  payloadJson: z.string(),
+});
+
 export const SessionEvent = z.discriminatedUnion("type", [
   SessionCreatedEvent,
   HarnessAttachedEvent,
@@ -145,6 +188,9 @@ export const SessionEvent = z.discriminatedUnion("type", [
   ThreadStartedEvent,
   ThreadCompletedEvent,
   SessionTitledEvent,
+  LeaseGrantedEvent,
+  LeaseLostEvent,
+  PeripheralCallRequestedEvent,
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 

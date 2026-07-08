@@ -6,6 +6,7 @@ import {
   SessionSteerResult, SessionInterruptResult, SessionCompactResult, SkillsListResult,
   PluginsListResult, AskUserRespondResult, TaskListResult, ThreadListResult,
   PlanRespondResult, SessionSetPolicyResult, type ApprovalPolicy,
+  DaemonStatusResult, QuotaStateResult, TrustListResult, TrustRemoveResult,
   ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 
@@ -166,6 +167,22 @@ export class NormaClient {
    *  calls this. Thin positional-arg alias over `sessionSetPolicy` (same `session.setPolicy` RPC). */
   async setPolicy(sessionId: string, policy: ApprovalPolicy): Promise<void> {
     await this.sessionSetPolicy({ sessionId, policy });
+  }
+  /** Dashboard read methods (Phase 2f Task 6 — CLI riders over Task 3's new methods). */
+  async daemonStatus(): Promise<{
+    version: string; uptimeMs: number; socketPath: string;
+    provider: { id: string; model: string } | null; sessionsCount: number; pluginsCount: number;
+  }> {
+    return this.validated(DaemonStatusResult, await this.request(METHODS.daemonStatus, {}), METHODS.daemonStatus);
+  }
+  async quotaState(): Promise<{ kind: "ok" | "limited"; resumeAt?: number; inputTokens: number; outputTokens: number }> {
+    return this.validated(QuotaStateResult, await this.request(METHODS.quotaState, {}), METHODS.quotaState);
+  }
+  async trustList(): Promise<string[]> {
+    return this.validated(TrustListResult, await this.request(METHODS.trustList, {}), METHODS.trustList).dirs;
+  }
+  async trustRemove(path: string): Promise<boolean> {
+    return this.validated(TrustRemoveResult, await this.request(METHODS.trustRemove, { path }), METHODS.trustRemove).removed;
   }
   close(): void { this.socket.end(); }
 }

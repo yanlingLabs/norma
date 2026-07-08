@@ -44,6 +44,13 @@ export const Settings = z.object({
   subagents: z.object({
     maxConcurrent: z.number().int().positive().optional(),
   }).optional(),
+  /** Peripheral lease v1 (Phase 2f, spec §A1): "Heartbeat 5s / expiry 15s (user-confirmed;
+   *  settings-overridable peripheral.heartbeatMs/expiryMs)". Both optional — PeripheralBroker
+   *  falls back to the spec defaults (5000/15000) when omitted. */
+  peripheral: z.object({
+    heartbeatMs: z.number().int().positive().optional(),
+    expiryMs: z.number().int().positive().optional(),
+  }).optional(),
 });
 export type Settings = z.infer<typeof Settings>;
 

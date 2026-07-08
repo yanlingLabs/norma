@@ -160,6 +160,47 @@ describe("SessionEvent discriminated union", () => {
     expect(SessionEvent.safeParse({ ...t, type: "thread_started", parentThreadId: "", agentType: "researcher", prompt: "x" }).success).toBe(false);
     expect(SessionEvent.safeParse({ ...t, type: "thread_completed", stopReason: "bogus" }).success).toBe(false);
   });
+
+  test("lease_granted / lease_lost / peripheral_call_requested round-trip", () => {
+    const t = { sessionId: "s", threadId: "main", seq: 1, ts: 1 };
+    const holder = { kind: "session" as const, id: "s" };
+
+    const granted = { ...t, type: "lease_granted", leaseId: "lease_1", class: "screenshot", holder, expiresAt: 20, tokenHash: "a".repeat(64) } as const;
+    expect(SessionEvent.parse(granted)).toEqual(granted);
+
+    const lost = { ...t, type: "lease_lost", leaseId: "lease_1", class: "screenshot", holder, reason: "expired" } as const;
+    expect(SessionEvent.parse(lost)).toEqual(lost);
+
+    const called = { ...t, type: "peripheral_call_requested", requestId: "req_1", leaseId: "lease_1", token: "tok_1", class: "noop", payloadJson: "{}" } as const;
+    expect(SessionEvent.parse(called)).toEqual(called);
+  });
+
+  test("lease events reject unknown class, unknown holder kind, unknown lease_lost reason", () => {
+    const t = { sessionId: "s", threadId: "main", seq: 1, ts: 1 };
+    const holder = { kind: "session", id: "s" };
+    const tokenHash = "a".repeat(64);
+    expect(SessionEvent.safeParse({ ...t, type: "lease_granted", leaseId: "l", class: "bogus", holder, expiresAt: 1, tokenHash }).success).toBe(false);
+    expect(SessionEvent.safeParse({ ...t, type: "lease_granted", leaseId: "l", class: "noop", holder: { kind: "bogus", id: "s" }, expiresAt: 1, tokenHash }).success).toBe(false);
+    expect(SessionEvent.safeParse({ ...t, type: "lease_lost", leaseId: "l", class: "noop", holder, reason: "bogus" }).success).toBe(false);
+    for (const reason of ["expired", "released", "panic", "revoked", "provider-gone"]) {
+      expect(SessionEvent.safeParse({ ...t, type: "lease_lost", leaseId: "l", class: "noop", holder, reason }).success).toBe(true);
+    }
+  });
+
+  test("lease_granted rejects a missing/empty tokenHash (spec §A1: no token, no service)", () => {
+    const t = { sessionId: "s", threadId: "main", seq: 1, ts: 1 };
+    const holder = { kind: "session" as const, id: "s" };
+    expect(SessionEvent.safeParse({ ...t, type: "lease_granted", leaseId: "l", class: "noop", holder, expiresAt: 1 }).success).toBe(false);
+    expect(SessionEvent.safeParse({ ...t, type: "lease_granted", leaseId: "l", class: "noop", holder, expiresAt: 1, tokenHash: "" }).success).toBe(false);
+  });
+
+  test("all four peripheral classes accepted: screenshot, ax-read, input-drive, noop", () => {
+    const t = { sessionId: "s", threadId: "main", seq: 1, ts: 1 };
+    const holder = { kind: "plugin" as const, id: "p_1" };
+    for (const cls of ["screenshot", "ax-read", "input-drive", "noop"]) {
+      expect(SessionEvent.safeParse({ ...t, type: "lease_granted", leaseId: "l", class: cls, holder, expiresAt: 1, tokenHash: "a".repeat(64) }).success).toBe(true);
+    }
+  });
 });
 
 describe("hello method schemas", () => {

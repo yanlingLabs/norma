@@ -49,4 +49,40 @@ describe("TrustStore", () => {
     expect(() => new TrustStore(f).isTrusted(dir)).not.toThrow();
     expect(new TrustStore(f).isTrusted(dir)).toBe(false);
   });
+
+  test("remove() revokes a trusted dir, persists, and returns whether it removed anything", () => {
+    const f = storeFile();
+    const dir = realDir();
+    const ts = new TrustStore(f);
+    ts.trust(dir);
+    expect(ts.isTrusted(dir)).toBe(true);
+    expect(ts.remove(dir)).toBe(true);
+    expect(ts.isTrusted(dir)).toBe(false);
+    // persisted: reload from disk → still untrusted
+    expect(new TrustStore(f).isTrusted(dir)).toBe(false);
+    // idempotent: removing again is a no-op that reports false, not an error
+    expect(ts.remove(dir)).toBe(false);
+  });
+
+  test("remove() on a never-trusted dir is a no-op (false, no throw, no file created)", () => {
+    const f = storeFile();
+    const dir = realDir();
+    const ts = new TrustStore(f);
+    expect(() => ts.remove(dir)).not.toThrow();
+    expect(ts.remove(dir)).toBe(false);
+    expect(existsSync(f)).toBe(false); // trust() has never run — no file written yet
+  });
+
+  test("remove() only drops the exact dir — sibling/subdirectory trust is untouched", () => {
+    const f = storeFile();
+    const base = realDir();
+    const child = join(base, "sub"); mkdirSync(child);
+    const sibling = realDir();
+    const ts = new TrustStore(f);
+    ts.trust(base); ts.trust(sibling);
+    ts.remove(base);
+    expect(ts.isTrusted(base)).toBe(false);
+    expect(ts.isTrusted(child)).toBe(false); // no longer inherits — base was the only grant
+    expect(ts.isTrusted(sibling)).toBe(true); // untouched
+  });
 });

@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { randomBytes } from "node:crypto";
 import { bootstrapNormaDir, resolveNormaHome } from "./norma-dir";
 import { acquireLock, type Lock } from "./lock";
 import { TokenAuthority } from "./auth/tokens";
@@ -9,6 +10,7 @@ import { startIpcServer, type IpcServer, type IpcServerOptions } from "./ipc/ser
 import { loadSettings, loadPermissionDirs } from "./settings";
 import { createProvider } from "./providers/manager";
 import type { Provider } from "./providers/types";
+import { QuotaManager } from "./providers/quota";
 import { ToolRegistry } from "./agent/tools/registry";
 import { registerReadTools } from "./agent/tools/fs-read";
 import { registerWriteTools } from "./agent/tools/fs-write";
@@ -43,6 +45,10 @@ import { SkillStore } from "./agent/skills";
 import { BackgroundTaskRegistry } from "./agent/bg-registry";
 import { sessionTmpDir } from "./agent/session-tmp";
 import { PluginStore } from "./agent/plugins";
+import { AuditLog } from "./peripheral/audit";
+import { PeripheralBroker, type PeripheralClass } from "./peripheral/broker";
+import { ProviderLink } from "./peripheral/provider-link";
+import type { NewSessionEvent } from "@norma/protocol";
 
 export const CORE_VERSION = "0.0.1";
 
@@ -50,6 +56,55 @@ export interface RunningDaemon {
   socketPath: string;
   tokens: { harness: string; admin: string };
   stop(): void;
+}
+
+/** Builds the `policy(sessionId, cls)` dependency PeripheralBroker.lease() awaits (spec §A1:
+ *  "lease acquisition FOLLOWS THE SESSION APPROVAL POLICY for ALL classes" — plan→denied,
+ *  auto→granted, ask→a normal approval card). Reuses the SAME ApprovalBroker + approval_requested/
+ *  approval_resolved/approval.respond machinery the agent engine's tool-call approvals use (no
+ *  new wire method) — see engine.ts's `requestApproval` for the byte-identical
+ *  wait-before-emit pattern this mirrors.
+ *
+ *  `cls` is now a plain call argument — PeripheralBroker.lease() passes `req.class` straight
+ *  through, so the approval card's summary reads it off this closure's own parameter instead of
+ *  a synchronous set/get side-channel (the former `peripheralClassHint` map) that only stayed
+ *  race-safe because nothing ever awaited between the set and the card emit. */
+function buildLeasePolicy(deps: {
+  store: SessionStore;
+  approvals: ApprovalBroker;
+  hub: SessionHub;
+  timeoutMs?: number;
+}): (sessionId: string, cls: PeripheralClass) => Promise<"granted" | "denied"> {
+  return async (sessionId: string, cls: PeripheralClass): Promise<"granted" | "denied"> => {
+    let approvalPolicy: "ask" | "auto" | "plan";
+    try {
+      approvalPolicy = deps.store.meta(sessionId).approvalPolicy;
+    } catch {
+      return "denied"; // unknown session — fail closed (ipc/server.ts already validates first)
+    }
+    if (approvalPolicy === "plan") return "denied";
+    if (approvalPolicy === "auto") return "granted";
+
+    // ask: register the wait BEFORE emitting approval_requested (the append is synchronous, so a
+    // watcher that resolves as soon as it observes the event would otherwise race broker.wait()).
+    const callId = `lease_${randomBytes(6).toString("hex")}`;
+    const waiting = deps.approvals.wait(sessionId, callId, deps.timeoutMs ?? 5 * 60_000);
+    const event: NewSessionEvent = {
+      type: "approval_requested", sessionId, threadId: "main", callId,
+      toolName: "peripheral.lease", summary: `Session ${sessionId} requests ${cls}`,
+    };
+    try {
+      deps.hub.append(sessionId, event);
+    } catch (err) {
+      deps.approvals.resolve(sessionId, callId, false, "emit-failure");
+      throw err;
+    }
+    const res = await waiting;
+    deps.hub.append(sessionId, {
+      type: "approval_resolved", sessionId, threadId: "main", callId, approved: res.approved, by: res.by,
+    });
+    return res.approved ? "granted" : "denied";
+  };
 }
 
 export async function startDaemon(opts: {
@@ -60,6 +115,7 @@ export async function startDaemon(opts: {
    *  behavior). object: use this provider directly (tests inject FakeProvider). */
   agentProvider?: { provider: Provider; model: string } | null;
 } = {}): Promise<RunningDaemon> {
+  const startedAt = Date.now();
   const dirs = bootstrapNormaDir(opts.home ?? resolveNormaHome());
   const lock: Lock = await acquireLock(dirs.lockPath, dirs.socketPath);
 
@@ -105,12 +161,21 @@ export async function startDaemon(opts: {
     },
   });
 
+  // Unconditional (not gated on agentProvider): tool-call approvals need it only when the agent
+  // is enabled, but peripheral lease acquisition (below) follows the SAME approval-broker
+  // machinery under `ask` policy regardless of whether an LLM provider is configured — leasing is
+  // an independent feature (spec §A1). An unused, empty broker behaves identically to the
+  // previous `null` for approval.respond (nothing pending either way).
+  const approvalBroker = new ApprovalBroker();
+
   let agentProvider = opts.agentProvider;
+  let quota: QuotaManager | undefined;
   if (agentProvider === undefined) {
     if (settings) {
       try {
         const active = await createProvider(settings, secrets);
         agentProvider = { provider: active.provider, model: active.model };
+        quota = active.quota;
       } catch (err) {
         console.error(`agent disabled: ${(err as Error).message}`);
         agentProvider = null;
@@ -119,9 +184,12 @@ export async function startDaemon(opts: {
       agentProvider = null;
     }
   }
+  // Test-injected / disabled-agent paths never went through createProvider() (so never got a
+  // real QuotaManager wrapping the provider) — quota.state() still needs SOMETHING to read, so
+  // fall back to an inert manager that just reports the zero/ok defaults.
+  quota ??= new QuotaManager();
 
   let engine: AgentEngine | null = null;
-  let broker: ApprovalBroker | null = null;
   let mcp: McpManager | null = null;
   let questions: QuestionBroker | null = null;
   let taskStore: TaskStore | null = null;
@@ -156,9 +224,8 @@ export async function startDaemon(opts: {
       .filter((p) => p.mcpEnabled && !p.disabled && p.hasMcp)
       .map((p) => ({ name: p.name, dir: join(normaHome, "plugins", p.name) }));
     await mcp.startPlugins(enabledPlugins);
-    broker = new ApprovalBroker();
     registerRequestDirTool(registry, {
-      broker,
+      broker: approvalBroker,
       dirs: sessionDirs,
       emit: (sid, e) => hub.append(sid, e),
       projectDir: (sid) => store.meta(sid).cwd,
@@ -173,7 +240,7 @@ export async function startDaemon(opts: {
     const titler =
       titlesCfg?.enabled === false ? undefined : new SessionTitler({ provider: agentProvider, store, hub, model: titlesCfg?.model });
     engine = new AgentEngine({
-      store, hub, registry, broker,
+      store, hub, registry, broker: approvalBroker,
       gate: new PermissionGate(),
       dirs: sessionDirs,
       provider: agentProvider,
@@ -198,6 +265,31 @@ export async function startDaemon(opts: {
     });
   }
 
+  // Peripheral lease v1 (Phase 2f). Built unconditionally (like approvalBroker/quota above) —
+  // leasing has nothing to do with whether an LLM provider is configured.
+  const audit = new AuditLog(join(normaHome, "audit.jsonl"));
+  const providerLink = new ProviderLink();
+  const peripheral = new PeripheralBroker({
+    audit,
+    heartbeatMs: settings?.peripheral?.heartbeatMs,
+    expiryMs: settings?.peripheral?.expiryMs,
+    policy: buildLeasePolicy({ store, approvals: approvalBroker, hub }),
+    // lease_granted/lease_lost are emitted on the REQUESTER's session (broadcastTransient scopes
+    // fan-out to that session's attached harnesses), but the provider connection (Norma.app) is
+    // rarely attached to the requesting session — it needs its own copy of these two event types
+    // to track its active-lease set regardless of what it's attached to. peripheral_call_requested
+    // already reaches the provider via pushToProvider; lease_granted/lease_lost did not, which
+    // would have left the provider's lease-tracking silently blind whenever it wasn't attached to
+    // the leasing session. Pushed in addition to (not instead of) the session broadcast.
+    emitTransient: (sessionId, event) => {
+      hub.broadcastTransient(sessionId, event);
+      if (event.type === "lease_granted" || event.type === "lease_lost") providerLink.push(event);
+    },
+    pushToProvider: (event) => providerLink.push(event),
+  });
+
+  const providerInfo = agentProvider ? { id: agentProvider.provider.id, model: agentProvider.model } : null;
+
   const server: IpcServer = startIpcServer({
     socketPath: dirs.socketPath,
     serverVersion: CORE_VERSION,
@@ -205,7 +297,7 @@ export async function startDaemon(opts: {
     store,
     hub,
     engine,
-    broker,
+    broker: approvalBroker,
     dirs: sessionDirs,
     trust: trustStore,
     bg: bgRegistry,
@@ -215,6 +307,11 @@ export async function startDaemon(opts: {
     questions: questions ?? undefined,
     tasks: taskStore ?? undefined,
     plans: plans ?? undefined,
+    peripheral,
+    providerLink,
+    quota,
+    providerInfo,
+    startedAt,
     ...opts.server,
   });
 

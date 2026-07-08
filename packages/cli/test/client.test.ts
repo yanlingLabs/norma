@@ -10,12 +10,17 @@ describe("NormaClient", () => {
   let daemon: RunningDaemon;
   afterEach(() => daemon?.stop());
 
-  async function boot(provider?: FakeProvider): Promise<string> {
+  // `provider` left `undefined` (the default) preserves the pre-existing behavior of every
+  // caller below: daemon.ts auto-detects from real settings/secrets, which is a no-op on a fresh
+  // tmpdir `home` almost everywhere EXCEPT this may pick up real host-machine credentials in some
+  // dev environments. Pass explicit `null` (Task 6 tests) to force a deterministic no-provider
+  // daemon regardless of host state.
+  async function boot(provider?: FakeProvider | null): Promise<string> {
     const home = mkdtempSync(join(tmpdir(), "norma-cli-"));
     daemon = await startDaemon({
       home,
       secrets: new FileSecretStore(join(home, "test-secrets")),
-      ...(provider ? { agentProvider: { provider, model: "fake-1" } } : {}),
+      ...(provider !== undefined ? { agentProvider: provider ? { provider, model: "fake-1" } : null } : {}),
     });
     return home;
   }
@@ -150,6 +155,47 @@ describe("NormaClient", () => {
     const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "th", onEvent: () => {} });
     const { sessionId } = await client.createSession("global");
     expect(await client.threadList({ sessionId })).toEqual({ ok: true, threads: [{ threadId: "main", status: "running" }] });
+    client.close();
+  });
+
+  test("daemonStatus client method round-trip (no provider configured)", async () => {
+    await boot(null);
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "ds", onEvent: () => {} });
+    const before = await client.daemonStatus();
+    expect(before).toMatchObject({ socketPath: daemon.socketPath, provider: null, sessionsCount: 0, pluginsCount: 0 });
+    expect(typeof before.version).toBe("string");
+    expect(before.uptimeMs).toBeGreaterThanOrEqual(0);
+    await client.createSession("global");
+    const after = await client.daemonStatus();
+    expect(after.sessionsCount).toBe(1);
+    client.close();
+  });
+
+  test("daemonStatus reports the configured provider", async () => {
+    await boot(new FakeProvider([]));
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "dsp", onEvent: () => {} });
+    const status = await client.daemonStatus();
+    expect(status.provider).toEqual({ id: "fake", model: "fake-1" });
+    client.close();
+  });
+
+  test("quotaState client method round-trip (no provider → inert ok state)", async () => {
+    await boot(null);
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "qs", onEvent: () => {} });
+    expect(await client.quotaState()).toEqual({ kind: "ok", inputTokens: 0, outputTokens: 0 });
+    client.close();
+  });
+
+  test("trustList/trustRemove client methods round-trip", async () => {
+    await boot(null);
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "tr", onEvent: () => {} });
+    expect(await client.trustList()).toEqual([]);
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "norma-cli-trustlist-")));
+    await client.trustDir(dir);
+    expect(await client.trustList()).toEqual([dir]);
+    expect(await client.trustRemove(dir)).toBe(true);
+    expect(await client.trustList()).toEqual([]);
+    expect(await client.trustRemove(dir)).toBe(false); // idempotent — already untrusted
     client.close();
   });
 
