@@ -44,7 +44,7 @@ import { ContextAssembler } from "./agent/context";
 import { SkillStore } from "./agent/skills";
 import { BackgroundTaskRegistry } from "./agent/bg-registry";
 import { sessionTmpDir } from "./agent/session-tmp";
-import { PluginStore } from "./agent/plugins";
+import { PluginStore, pluginMcpEligible } from "./agent/plugins";
 import { AuditLog } from "./peripheral/audit";
 import { PeripheralBroker, type PeripheralClass } from "./peripheral/broker";
 import { ProviderLink } from "./peripheral/provider-link";
@@ -140,7 +140,9 @@ export async function startDaemon(opts: {
   }
 
   const trustStore = new TrustStore(join(normaHome, "trust.json"));
-  const pluginStore = new PluginStore({ normaHome, plugins: settings?.plugins, log: (m) => console.error(m) });
+  const pluginStore = new PluginStore({
+    normaHome, plugins: settings?.plugins, consents: settings?.plugins?.consents, log: (m) => console.error(m),
+  });
   const skillStore = new SkillStore({ normaHome, trust: trustStore, plugins: { disabled: settings?.plugins?.disabled ?? [] } });
   const assembler = new ContextAssembler({ normaHome, trust: trustStore, skills: skillStore });
   // Built unconditionally (needs only store, no provider) so the server's session.addDir /
@@ -211,18 +213,42 @@ export async function startDaemon(opts: {
     registerNotebookTool(registry);
     const worktrees = new WorktreeManager({ baseRef: settings?.worktree?.baseRef });
     registerWorktreeTools(registry);
-    const agents = new AgentStore({ normaHome, trust: trustStore, baseInstructions: SYSTEM_PROMPT });
+    const agents = new AgentStore({
+      normaHome, trust: trustStore, baseInstructions: SYSTEM_PROMPT,
+      plugins: { disabled: settings?.plugins?.disabled ?? [] },
+    });
     const subagents = new SubagentManager({ maxConcurrent: settings?.subagents?.maxConcurrent });
     registerSpawnAgentTool(registry);
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
     await mcp.startAll(settings?.mcpServers ?? {});
-    // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled && !disabled);
-    // a plugin's skills are always live (SkillStore above), but its MCP servers are the seam that
-    // needs the user opting in via settings.plugins.enabled.
-    const enabledPlugins = pluginStore
-      .list()
-      .filter((p) => p.mcpEnabled && !p.disabled && p.hasMcp)
-      .map((p) => ({ name: p.name, dir: join(normaHome, "plugins", p.name) }));
+    // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled &&
+    // !disabled); a plugin's skills are always live (SkillStore above), but its MCP/manifest
+    // content is the seam that needs the user opting in via settings.plugins.enabled AND,
+    // per-exec-class, a settings.plugins.consents record (pluginMcpEligible in agent/plugins.ts —
+    // legacy plugins have requiredConsents [] so this is unchanged for them; a manifest plugin
+    // with exec content that's enabled but unconsented is excluded here, logged below). The
+    // `!pluginMcpEligible(p)` on the right is the SAME eligibility predicate the enabledPlugins
+    // filter below uses — deriving it inline (e.g. hand-rolling !consentComplete(p)) would let the
+    // why-log drift out of sync with what actually gates MCP start; the left-hand guard just
+    // narrows the log to the "would be eligible if not for consent" case so we don't log for
+    // plugins that were never enabled or never carried MCP content in the first place.
+    const allPlugins = pluginStore.list();
+    for (const p of allPlugins) {
+      if (p.mcpEnabled && !p.disabled && (p.hasMcp || p.hasManifestMcp) && !pluginMcpEligible(p)) {
+        const missing = p.requiredConsents.filter((c) => !p.consented.includes(c));
+        console.error(`plugin ${p.name}: enabled but missing consent for ${missing.join(", ")} — MCP not started`);
+      }
+    }
+    // manifestServers (Task 4, spec §2: "mcpServers may now come from the manifest instead of
+    // .mcp.json ... manifest wins on conflict") comes straight off PluginInfo — PluginStore.list()
+    // already ran loadManifest once per plugin and carried contributes.mcpServers through as
+    // p.manifestServers (undefined for legacy plugins and manifest plugins with no mcpServers
+    // declared). Re-reading norma-plugin.json here would risk a manifest that read fine moments
+    // ago (hasManifestMcp true, gating eligibility) but fails to reparse on a second read —
+    // silently falling back to the legacy .mcp.json path without ever disclosing that switch.
+    const enabledPlugins = allPlugins
+      .filter(pluginMcpEligible)
+      .map((p) => ({ name: p.name, dir: join(normaHome, "plugins", p.name), manifestServers: p.manifestServers }));
     await mcp.startPlugins(enabledPlugins);
     registerRequestDirTool(registry, {
       broker: approvalBroker,

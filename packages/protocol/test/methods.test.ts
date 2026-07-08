@@ -228,6 +228,20 @@ describe("plugins.list schema", () => {
     expect(METHODS.pluginsList).toBe("plugins.list");
   });
 
+  test("Phase 4a Task 3: consent-flow fields (tier/requiredConsents/consented/legacy/execPayload/tccPermissions/hardwarePermissions) round-trip", () => {
+    const info = PluginInfoSchema.parse({
+      name: "demo", skills: [], hasMcp: false, mcpEnabled: true, disabled: false,
+      tier: "platform", requiredConsents: ["exec", "tcc", "hardware"], consented: ["exec"], legacy: false,
+      execPayload: ["mcp: node server.js", "entry: node index.js"],
+      tccPermissions: ["accessibility"], hardwarePermissions: ["battery"],
+    });
+    expect(info).toMatchObject({
+      tier: "platform", requiredConsents: ["exec", "tcc", "hardware"], consented: ["exec"], legacy: false,
+      execPayload: ["mcp: node server.js", "entry: node index.js"],
+      tccPermissions: ["accessibility"], hardwarePermissions: ["battery"],
+    });
+  });
+
   test("McpServerStatusSchema.source is widened to include \"plugin\"", () => {
     expect(McpServerStatusSchema.parse({ name: "x", status: "connected", toolNames: [], source: "plugin" }).source).toBe("plugin");
   });

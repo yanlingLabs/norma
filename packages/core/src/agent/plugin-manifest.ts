@@ -1,0 +1,104 @@
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { z } from "zod";
+
+/**
+ * norma-plugin.json — the Phase 4 superset manifest (design spec §1). Lives next to, and takes
+ * precedence over, the legacy `plugin.json` (metadata-only, Tier-1). Malformed norma-plugin.json
+ * never bricks a plugin: the loader falls back to the legacy path with a warning — see
+ * `loadManifest` below.
+ */
+export const NormaPluginManifest = z.object({
+  id: z.string().min(1),
+  name: z.string().optional(), description: z.string().optional(),
+  version: z.string().optional(), author: z.string().optional(),
+  tier: z.enum(["capability", "platform"]),
+  permissions: z.object({
+    exec: z.boolean().optional(),
+    tcc: z.array(z.enum(["accessibility", "screen-recording", "input-monitoring"])).optional(),
+    hardware: z.array(z.enum(["battery"])).optional(),
+  }).optional(),
+  contributes: z.object({
+    skills: z.literal(true).optional(),
+    mcpServers: z.array(z.object({ name: z.string().min(1), command: z.string().min(1), args: z.array(z.string()).optional(), env: z.record(z.string(), z.string()).optional() })).optional(),
+    agents: z.literal(true).optional(),
+    hooks: z.array(z.object({ event: z.enum(["session-start", "pre-tool", "post-tool", "turn-end"]), command: z.string().min(1), timeoutMs: z.number().int().positive().optional() })).optional(),
+    tools: z.literal(true).optional(),
+    shortcuts: z.array(z.object({ id: z.string().min(1), description: z.string().optional(), default: z.string().optional() })).optional(),
+    tile: z.literal(true).optional(),
+    provider: z.literal(true).optional(),
+  }).optional(),
+  entry: z.object({ command: z.string().min(1), args: z.array(z.string()).optional(), cwd: z.string().optional() }).optional(),
+  signature: z.string().optional(), // RESERVED — unenforced until Phase 6 PKI
+});
+export type NormaManifest = z.infer<typeof NormaPluginManifest>;
+
+/**
+ * Reads norma-plugin.json out of `dir` (a plugin directory whose canonical name is `dirName`).
+ * - valid norma-plugin.json → { manifest, legacy: false }. When manifest.id doesn't match
+ *   dirName, the directory wins (id is coerced) and a warning is logged — the directory name
+ *   stays canonical throughout Norma's plugin model.
+ * - missing norma-plugin.json → { legacy: true }, no manifest, no log (the caller falls back to
+ *   the legacy plugin.json metadata path — this is the common/expected case, not a warning).
+ * - present but malformed (bad JSON or schema failure) → { legacy: true } + a logged warning.
+ *   Never throws — a broken manifest degrades to legacy loading, it never bricks the plugin.
+ */
+export function loadManifest(dir: string, dirName: string, log?: (m: string) => void): { manifest?: NormaManifest; legacy: boolean } {
+  const path = join(dir, "norma-plugin.json");
+  if (!existsSync(path)) return { legacy: true };
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    log?.(`plugin ${dirName}: malformed norma-plugin.json (loading as legacy)`);
+    return { legacy: true };
+  }
+
+  const parsed = NormaPluginManifest.safeParse(raw);
+  if (!parsed.success) {
+    log?.(`plugin ${dirName}: invalid norma-plugin.json (loading as legacy)`);
+    return { legacy: true };
+  }
+
+  let manifest = parsed.data;
+  if (manifest.id !== dirName) {
+    log?.(`plugin ${dirName}: norma-plugin.json id "${manifest.id}" does not match directory name — using directory name`);
+    manifest = { ...manifest, id: dirName };
+  }
+  return { manifest, legacy: false };
+}
+
+/**
+ * Consent classes a manifest requires, in the order the spec/consent block lists them:
+ * exec (any code execution — mcpServers, hooks, a Tier-2 entry point, or an explicit
+ * permissions.exec), tcc (accessibility/screen-recording/input-monitoring), hardware (battery
+ * etc, routed through the XPC helper).
+ */
+export function requiredConsentClasses(m: NormaManifest): Array<"exec" | "tcc" | "hardware"> {
+  const classes: Array<"exec" | "tcc" | "hardware"> = [];
+  const execNeeded = Boolean(m.entry) || Boolean(m.contributes?.mcpServers?.length) || Boolean(m.contributes?.hooks?.length) || Boolean(m.permissions?.exec);
+  if (execNeeded) classes.push("exec");
+  if (m.permissions?.tcc?.length) classes.push("tcc");
+  if (m.permissions?.hardware?.length) classes.push("hardware");
+  return classes;
+}
+
+/**
+ * The verbatim exec-payload disclosure lines the consent block prints (design spec §1: "Consent
+ * text always shows the exec payload (commands to be run), never just a summary."). One line per
+ * mcpServer, then one line per hook, then the entry command (at most one) — in manifest order.
+ */
+export function execPayloadLines(m: NormaManifest): string[] {
+  const lines: string[] = [];
+  for (const server of m.contributes?.mcpServers ?? []) {
+    lines.push(`mcp: ${[server.command, ...(server.args ?? [])].join(" ")}`);
+  }
+  for (const hook of m.contributes?.hooks ?? []) {
+    lines.push(`hook(${hook.event}): ${hook.command}`);
+  }
+  if (m.entry) {
+    lines.push(`entry: ${[m.entry.command, ...(m.entry.args ?? [])].join(" ")}`);
+  }
+  return lines;
+}

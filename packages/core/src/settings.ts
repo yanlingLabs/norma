@@ -33,6 +33,16 @@ export const Settings = z.object({
   plugins: z.object({
     enabled: z.array(z.string()).optional(),
     disabled: z.array(z.string()).optional(),
+    /** Per-plugin per-permission-class consent records (design spec §1): { [pluginId]: { exec?:
+     *  ts, tcc?: ts, hardware?: ts } }, timestamp = Date.now() at grant time. A class's presence
+     *  (not its value) is what counts as consented — see plugins.ts#consentComplete. `disable`
+     *  deletes a plugin's whole record (fresh-consent semantics, generalized from today's
+     *  enabled-strip). */
+    consents: z.record(z.string(), z.object({
+      exec: z.number().optional(),
+      tcc: z.number().optional(),
+      hardware: z.number().optional(),
+    })).optional(),
   }).optional(),
   toolSearch: z.object({
     enabled: z.boolean().optional(),

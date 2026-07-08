@@ -190,4 +190,66 @@ describe.if(isMac)("McpManager.startPlugins", () => {
     expect((await registry.execute("mcp__demo_fake__echo", {}, ctx())).output).toBe("pre-existing");
     mgr.stopAll();
   });
+
+  // -------------------------------------------------------------------------------------------
+  // Task 4: manifest-declared mcpServers (design spec §2 — "mcpServers may now come from the
+  // manifest instead of .mcp.json (both accepted; manifest wins on conflict)"). `manifestServers`
+  // is passed by the daemon from norma-plugin.json's `contributes.mcpServers`.
+  // -------------------------------------------------------------------------------------------
+  test("manifestServers present + .mcp.json also present → manifest list used, .mcp.json ignored entirely", async () => {
+    const dir = pluginDir({ mcpServers: { legacy: { command: "/nonexistent-legacy-server" } } });
+    const registry = new ToolRegistry();
+    const trust = new TrustStore(join(realDir(), "trust.json"));
+    const mgr = new McpManager({ registry, trust });
+    await mgr.startPlugins([{ name: "demo", dir, manifestServers: [{ name: "fake", command: "bun", args: ["run", FIXTURE] }] }]);
+    expect(registry.has("mcp__demo_fake__echo")).toBe(true);
+    expect(mgr.list().find((s) => s.name === "demo:fake")?.status).toBe("connected");
+    // the .mcp.json-declared server was never even read/started:
+    expect(mgr.list().find((s) => s.name === "demo:legacy")).toBeUndefined();
+    mgr.stopAll();
+  });
+
+  test("manifest-only plugin (no .mcp.json at all) starts from manifestServers", async () => {
+    const dir = pluginDir(); // no .mcp.json
+    const registry = new ToolRegistry();
+    const trust = new TrustStore(join(realDir(), "trust.json"));
+    const logs: string[] = [];
+    const mgr = new McpManager({ registry, trust, log: (m) => logs.push(m) });
+    await mgr.startPlugins([{ name: "demo", dir, manifestServers: [{ name: "fake", command: "bun", args: ["run", FIXTURE] }] }]);
+    expect(registry.has("mcp__demo_fake__echo")).toBe(true);
+    expect(mgr.list().find((s) => s.name === "demo:fake")?.status).toBe("connected");
+    expect(logs.some((m) => m.includes(".mcp.json"))).toBe(false); // legacy path never consulted
+    mgr.stopAll();
+  });
+
+  test("manifestServers env/args passed through to the spawned server", async () => {
+    const dir = pluginDir(); // no .mcp.json — proves the config came from manifestServers
+    const registry = new ToolRegistry();
+    const trust = new TrustStore(join(realDir(), "trust.json"));
+    const logs: string[] = [];
+    const mgr = new McpManager({ registry, trust, log: (m) => logs.push(m) });
+    // NORMA_FAKE_DUP makes the fixture report two identically-named tools; observing the
+    // resulting collision-skip proves `env` reached the spawned process (args already proven by
+    // ["run", FIXTURE] resolving to a connected server across every other test in this file).
+    await mgr.startPlugins([{
+      name: "demo", dir,
+      manifestServers: [{ name: "dup", command: "bun", args: ["run", FIXTURE], env: { NORMA_FAKE_DUP: "1" } }],
+    }]);
+    const st = mgr.list().find((s) => s.name === "demo:dup");
+    expect(st?.status).toBe("connected");
+    expect(st?.toolNames).toEqual(["echo"]); // only one of the two duplicate tools registered
+    expect(logs.some((m) => m.includes("collide"))).toBe(true);
+    mgr.stopAll();
+  });
+
+  test("manifestServers absent → unchanged legacy .mcp.json path still works", async () => {
+    const dir = pluginDir({ mcpServers: { fake: { command: "bun", args: ["run", FIXTURE] } } });
+    const registry = new ToolRegistry();
+    const trust = new TrustStore(join(realDir(), "trust.json"));
+    const mgr = new McpManager({ registry, trust });
+    await mgr.startPlugins([{ name: "demo", dir }]); // no manifestServers key at all
+    expect(registry.has("mcp__demo_fake__echo")).toBe(true);
+    expect(mgr.list().find((s) => s.name === "demo:fake")?.status).toBe("connected");
+    mgr.stopAll();
+  });
 });

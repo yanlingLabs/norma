@@ -27,7 +27,17 @@ import {
   upsertTask,
   type FooterSelection,
 } from "./task-block";
-import { installPlugin, removePluginDir, removePluginFromSettings, setPluginEnabled } from "./plugin-cli";
+import {
+  applyFreshPluginConsent,
+  buildConsentBlock,
+  installNeedsConsentHint,
+  installPlugin,
+  missingConsents,
+  removePluginDir,
+  removePluginFromSettings,
+  setPluginEnabled,
+  stripPluginConsents,
+} from "./plugin-cli";
 import { formatElapsed, formatTokens } from "./task-display";
 import { isOtherChoice, parseQuestionAnswer } from "./questions";
 import { parsePlanResponse } from "./plan-response";
@@ -934,7 +944,13 @@ if (import.meta.main) {
       for (const p of res.plugins) {
         const mcp = !p.hasMcp ? "no mcp" : p.mcpEnabled ? "mcp: enabled" : `mcp: DISABLED (norma plugin enable ${p.name} to allow — code execution)`;
         const flags = p.disabled ? " [disabled]" : "";
-        console.log(`${AQUA}${p.name}${RESET}${p.version ? ` ${DIM}v${p.version}${RESET}` : ""}${flags}  skills: ${p.skills.join(", ") || "(none)"}  ${DIM}${mcp}${RESET}`);
+        const tierTag = p.tier ? ` ${DIM}[${p.tier}]${RESET}` : "";
+        // Task 3: tier + consent state — "consented" (every required class recorded), "needs
+        // consent: exec,tcc" (fixed exec/tcc/hardware order, only the classes still missing), or
+        // nothing at all for legacy plugins / manifest plugins that require no consent.
+        const missing = missingConsents(p.requiredConsents ?? [], p.consented ?? []);
+        const consentState = (p.requiredConsents?.length ?? 0) === 0 ? "" : missing.length > 0 ? `  ${DIM}needs consent: ${missing.join(",")}${RESET}` : `  ${DIM}consented${RESET}`;
+        console.log(`${AQUA}${p.name}${RESET}${p.version ? ` ${DIM}v${p.version}${RESET}` : ""}${tierTag}${flags}  skills: ${p.skills.join(", ") || "(none)"}  ${DIM}${mcp}${RESET}${consentState}`);
       }
       if (res.plugins.length === 0) console.log("no plugins installed");
       c.close();
@@ -954,17 +970,62 @@ if (import.meta.main) {
       const { PluginStore } = await import("@norma/core");
       const info = new PluginStore({ normaHome: home }).list().find((p) => p.name === installed.name);
       console.log(`${AQUA}installed ${installed.name}${RESET}  skills: ${info?.skills.join(", ") || "(none)"}`);
-      if (info?.hasMcp) console.log(`this plugin bundles MCP servers (code execution) — run ${AQUA}norma plugin enable ${installed.name}${RESET} to allow them`);
+      // hasMcp alone misses a manifest-only plugin (contributes.mcpServers, no .mcp.json) — that
+      // installs with hasMcp:false, so also check requiredConsents (installNeedsConsentHint).
+      if (info && installNeedsConsentHint(info)) console.log(`this plugin requests exec/etc — run ${AQUA}norma plugin enable ${installed.name}${RESET} to review and consent`);
       break; // NEVER touches settings
     }
 
-    if (sub === "enable" || sub === "disable") {
+    if (sub === "enable") {
       const name = process.argv[4];
-      if (!name) { console.error(`usage: norma plugin ${sub} <name>`); process.exit(1); }
+      if (!name) { console.error("usage: norma plugin enable <name>"); process.exit(1); }
+      if (!existsSync(join(pluginsRoot, name))) { console.error(`no such plugin: ${name}`); process.exit(1); }
+
+      // Direct PluginStore read (not the daemon RPC) — mirrors `install` above and keeps `enable`
+      // usable without a running daemon, exactly like it was pre-4a. `consents` comes straight
+      // from the settings file we're about to (maybe) write back to.
+      const { loadSettings, saveSettings, PluginStore } = await import("@norma/core");
+      const settings = loadSettings(settingsPath);
+      const info = new PluginStore({ normaHome: home, consents: settings.plugins?.consents }).list().find((p) => p.name === name);
+      if (!info) { console.error(`no such plugin: ${name}`); process.exit(1); }
+
+      const missing = missingConsents(info.requiredConsents, info.consented);
+      if (missing.length > 0) {
+        // No silent consent in scripts (design spec §1) — an unattended `enable` of a plugin with
+        // outstanding exec/tcc/hardware consent refuses rather than guessing.
+        if (!isTTY) {
+          console.error(`exec consent requires an interactive terminal — run: norma plugin enable ${name}`);
+          process.exit(1);
+        }
+        for (const line of buildConsentBlock(info)) console.log(line);
+        const answer = await readLine('type "yes" to consent: ');
+        if (answer !== "yes") {
+          console.log("aborted — no changes made");
+          process.exit(1);
+        }
+        // Full re-disclosure means a fresh consent covers every required class, not just the
+        // ones that were missing — matches the block just printed above. `settings` above was
+        // read BEFORE the `readLine` prompt; writing it back here would clobber any settings.json
+        // edit made during that human-scale wait, so re-read fresh at write time instead
+        // (applyFreshPluginConsent — final-review fix).
+        saveSettings(settingsPath, applyFreshPluginConsent(() => loadSettings(settingsPath), name, info.requiredConsents, Date.now()));
+        console.log(`${AQUA}${name} enabled${RESET} — restart the daemon to apply`);
+        process.exit(0);
+      }
+
+      saveSettings(settingsPath, setPluginEnabled(settings, name, true));
+      console.log(`${AQUA}${name} enabled${RESET} — restart the daemon to apply`);
+      process.exit(0);
+    }
+
+    if (sub === "disable") {
+      const name = process.argv[4];
+      if (!name) { console.error("usage: norma plugin disable <name>"); process.exit(1); }
       if (!existsSync(join(pluginsRoot, name))) { console.error(`no such plugin: ${name}`); process.exit(1); }
       const { loadSettings, saveSettings } = await import("@norma/core");
-      saveSettings(settingsPath, setPluginEnabled(loadSettings(settingsPath), name, sub === "enable"));
-      console.log(`${AQUA}${name} ${sub}d${RESET} — restart the daemon to apply`);
+      const settings = stripPluginConsents(setPluginEnabled(loadSettings(settingsPath), name, false), name);
+      saveSettings(settingsPath, settings);
+      console.log(`${AQUA}${name} disabled${RESET} — restart the daemon to apply`);
       break;
     }
 

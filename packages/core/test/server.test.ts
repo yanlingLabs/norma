@@ -968,6 +968,173 @@ describe("daemon IPC", () => {
   });
 
   // -----------------------------------------------------------------------------------------
+  // Task 2: per-class consent records enforce exec-gated plugin content, end-to-end through the
+  // REAL daemon wiring (startDaemon → PluginStore(consents) → pluginMcpEligible filter →
+  // McpManager.startPlugins). A manifest plugin declaring contributes.mcpServers requires "exec"
+  // consent (plugin-manifest.ts#requiredConsentClasses); the legacy CONSENT tests above already
+  // pin that a plugin.json-only plugin needs no consent record at all — this is the new gate.
+  // -----------------------------------------------------------------------------------------
+  function seedManifestPlugin(home: string, fixture: string): void {
+    mkdirSync(join(home, "plugins", "demo", "skills", "greet"), { recursive: true });
+    writeFileSync(join(home, "plugins", "demo", "skills", "greet", "SKILL.md"), "---\nname: greet\ndescription: hi\n---\nbody");
+    writeFileSync(join(home, "plugins", "demo", ".mcp.json"), JSON.stringify({ mcpServers: { fake: { command: "bun", args: ["run", fixture] } } }));
+    writeFileSync(join(home, "plugins", "demo", "norma-plugin.json"), JSON.stringify({
+      id: "demo", tier: "capability",
+      contributes: { mcpServers: [{ name: "fake", command: "bun", args: ["run", fixture] }] },
+    }));
+  }
+
+  test("CONSENT (Task 2): manifest plugin enabled but unconsented — MCP not started + a log line names the missing class", async () => {
+    if (process.platform !== "darwin") return; // spawns a child process
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const fixture = join(import.meta.dir, "agent", "mcp", "fake-mcp-server.ts");
+    const home = mkdtempSync(join(tmpdir(), "norma-plugin-consent-"));
+    seedManifestPlugin(home, fixture);
+    writeFileSync(join(home, "settings.json"), JSON.stringify({
+      schemaVersion: 2,
+      provider: { type: "codex-oauth", model: "gpt-5.4" },
+      plugins: { enabled: ["demo"] }, // enabled, but no consents record at all
+    }));
+    const secrets = new FileSecretStore(join(home, "test-secrets"));
+    const fake = new FakeProvider([[{ type: "text_delta", delta: "hi" }, { type: "done", stopReason: "end_turn" }]]);
+
+    const origError = console.error;
+    const captured: string[] = [];
+    console.error = (...args: unknown[]) => { captured.push(String(args[0])); };
+    try {
+      daemon = await startDaemon({ home, secrets, agentProvider: { provider: fake, model: "fake-1" } });
+    } finally {
+      console.error = origError;
+    }
+    harnessToken = daemon.tokens.harness;
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "consent-unconsented");
+    const skills = (await c.request(METHODS.skillsList, {})).result;
+    expect(skills.skills.map((s: any) => s.name)).toContain("demo:greet"); // skills stay always-live
+    const mcp = (await c.request(METHODS.mcpList, {})).result;
+    expect(mcp.servers.find((s: any) => s.name === "demo:fake")).toBeUndefined(); // exec unconsented → no server
+    const plugins = (await c.request(METHODS.pluginsList, {})).result;
+    expect(plugins.plugins[0]).toMatchObject({
+      name: "demo", hasMcp: true, mcpEnabled: true, disabled: false,
+      requiredConsents: ["exec"], consented: [],
+      // Task 3: the CLI consent flow's display data reaches the wire too (core → ipc passthrough
+      // — no transform strips these; the protocol schema round-trip itself is covered by
+      // packages/protocol/test/methods.test.ts).
+      tier: "capability", legacy: false,
+      execPayload: [`mcp: bun run ${fixture}`], tccPermissions: [], hardwarePermissions: [],
+    });
+    expect(captured.some((m) => m.includes("demo") && m.includes("exec"))).toBe(true); // the "why" log line
+    c.close();
+  });
+
+  test("CONSENT (Task 2): manifest plugin enabled + exec consent recorded — MCP starts (source plugin)", async () => {
+    if (process.platform !== "darwin") return; // spawns a child process
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const fixture = join(import.meta.dir, "agent", "mcp", "fake-mcp-server.ts");
+    const home = mkdtempSync(join(tmpdir(), "norma-plugin-consent-"));
+    seedManifestPlugin(home, fixture);
+    writeFileSync(join(home, "settings.json"), JSON.stringify({
+      schemaVersion: 2,
+      provider: { type: "codex-oauth", model: "gpt-5.4" },
+      plugins: { enabled: ["demo"], consents: { demo: { exec: Date.now() } } },
+    }));
+    const secrets = new FileSecretStore(join(home, "test-secrets"));
+    const fake = new FakeProvider([[{ type: "text_delta", delta: "hi" }, { type: "done", stopReason: "end_turn" }]]);
+    daemon = await startDaemon({ home, secrets, agentProvider: { provider: fake, model: "fake-1" } });
+    harnessToken = daemon.tokens.harness;
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "consent-granted");
+    const mcp = (await c.request(METHODS.mcpList, {})).result;
+    const st = mcp.servers.find((s: any) => s.name === "demo:fake");
+    expect(st?.source).toBe("plugin");
+    expect(st?.status).toBe("connected");
+    expect(st?.toolNames).toEqual(["echo"]);
+    const plugins = (await c.request(METHODS.pluginsList, {})).result;
+    expect(plugins.plugins[0]).toMatchObject({
+      name: "demo", mcpEnabled: true, requiredConsents: ["exec"], consented: ["exec"],
+    });
+    c.close();
+  });
+
+  // -----------------------------------------------------------------------------------------
+  // Task 4: manifest-declared mcpServers through the REAL daemon wiring (startDaemon →
+  // PluginStore → pluginMcpEligible → loadManifest → McpManager.startPlugins(manifestServers)).
+  // The first test below is the T2 interim gap this task closes: T2/T3 could already GATE a
+  // manifest-only plugin's eligibility, but nothing actually started its servers because
+  // McpManager.startPlugins only ever read .mcp.json — a manifest-only plugin (no .mcp.json) was
+  // eligible yet inert. Task 4 wires the manifest's contributes.mcpServers through so eligible
+  // manifest-only plugins actually start.
+  // -----------------------------------------------------------------------------------------
+  function seedManifestOnlyPlugin(home: string, fixture: string): void {
+    // Deliberately NO .mcp.json anywhere in this plugin dir.
+    mkdirSync(join(home, "plugins", "demo"), { recursive: true });
+    writeFileSync(join(home, "plugins", "demo", "norma-plugin.json"), JSON.stringify({
+      id: "demo", tier: "capability",
+      contributes: { mcpServers: [{ name: "fake", command: "bun", args: ["run", fixture] }] },
+    }));
+  }
+
+  test("Task 4: manifest-only plugin (no .mcp.json) enabled + consented — MCP starts from the manifest (closes T2 interim gap)", async () => {
+    if (process.platform !== "darwin") return; // spawns a child process
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const fixture = join(import.meta.dir, "agent", "mcp", "fake-mcp-server.ts");
+    const home = mkdtempSync(join(tmpdir(), "norma-plugin-consent-"));
+    seedManifestOnlyPlugin(home, fixture);
+    writeFileSync(join(home, "settings.json"), JSON.stringify({
+      schemaVersion: 2,
+      provider: { type: "codex-oauth", model: "gpt-5.4" },
+      plugins: { enabled: ["demo"], consents: { demo: { exec: Date.now() } } },
+    }));
+    const secrets = new FileSecretStore(join(home, "test-secrets"));
+    const fake = new FakeProvider([[{ type: "text_delta", delta: "hi" }, { type: "done", stopReason: "end_turn" }]]);
+    daemon = await startDaemon({ home, secrets, agentProvider: { provider: fake, model: "fake-1" } });
+    harnessToken = daemon.tokens.harness;
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "manifest-only-mcp");
+    const mcp = (await c.request(METHODS.mcpList, {})).result;
+    const st = mcp.servers.find((s: any) => s.name === "demo:fake");
+    expect(st?.source).toBe("plugin");
+    expect(st?.status).toBe("connected");
+    expect(st?.toolNames).toEqual(["echo"]);
+    c.close();
+  });
+
+  test("Task 4: manifest + .mcp.json both present — manifest wins, .mcp.json server is NOT started", async () => {
+    if (process.platform !== "darwin") return; // spawns a child process
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const fixture = join(import.meta.dir, "agent", "mcp", "fake-mcp-server.ts");
+    const home = mkdtempSync(join(tmpdir(), "norma-plugin-consent-"));
+    mkdirSync(join(home, "plugins", "demo"), { recursive: true });
+    // .mcp.json declares a DIFFERENT server name than the manifest, so precedence is unambiguous.
+    writeFileSync(join(home, "plugins", "demo", ".mcp.json"), JSON.stringify({
+      mcpServers: { legacy: { command: "/nonexistent-legacy-server" } },
+    }));
+    writeFileSync(join(home, "plugins", "demo", "norma-plugin.json"), JSON.stringify({
+      id: "demo", tier: "capability",
+      contributes: { mcpServers: [{ name: "fake", command: "bun", args: ["run", fixture] }] },
+    }));
+    writeFileSync(join(home, "settings.json"), JSON.stringify({
+      schemaVersion: 2,
+      provider: { type: "codex-oauth", model: "gpt-5.4" },
+      plugins: { enabled: ["demo"], consents: { demo: { exec: Date.now() } } },
+    }));
+    const secrets = new FileSecretStore(join(home, "test-secrets"));
+    const fake = new FakeProvider([[{ type: "text_delta", delta: "hi" }, { type: "done", stopReason: "end_turn" }]]);
+    daemon = await startDaemon({ home, secrets, agentProvider: { provider: fake, model: "fake-1" } });
+    harnessToken = daemon.tokens.harness;
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "manifest-wins-mcp");
+    const mcp = (await c.request(METHODS.mcpList, {})).result;
+    expect(mcp.servers.find((s: any) => s.name === "demo:fake")?.status).toBe("connected");
+    expect(mcp.servers.find((s: any) => s.name === "demo:legacy")).toBeUndefined(); // .mcp.json ignored entirely
+    c.close();
+  });
+
+  // -----------------------------------------------------------------------------------------
   // Peripheral lease v1 (Phase 2f). `boot()` wires the REAL PeripheralBroker/AuditLog/
   // ProviderLink daemon.ts builds — these tests exercise the production wiring, not fakes.
   // -----------------------------------------------------------------------------------------

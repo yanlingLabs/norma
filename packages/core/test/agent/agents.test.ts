@@ -135,4 +135,85 @@ describe("AgentStore", () => {
     expect(trusted.find((d) => d.name === "reviewer")!.source).toBe("project");
     expect(trusted.find((d) => d.name === "researcher")!.source).toBe("user");
   });
+
+  // ---------------------------------------------------------------------------------------------
+  // Task 4: plugin-contributed agents (design spec §2 — "agents/ dirs feed AgentStore, same
+  // pattern as skills"). Namespaced `<plugin>:<agent>`, mirroring SkillStore's plugin namespacing
+  // (agent/skills.ts:100). Always live (not gated on settings.plugins.enabled), disabled beats it.
+  // ---------------------------------------------------------------------------------------------
+  describe("AgentStore + plugin agents (Task 4)", () => {
+    test("plugin agent discovered + namespaced <plugin>:<agent> + resolvable", () => {
+      const { home, trust } = setup();
+      writeAgentDef(
+        join(home, "plugins", "demo", "agents"),
+        "greet.md",
+        { name: "greet", description: "Greets people" },
+        "PLUGIN_GREET_BODY",
+      );
+      const a = new AgentStore({ normaHome: home, trust, baseInstructions: "BASE" });
+
+      const listed = a.list(null);
+      expect(listed.map((d) => d.name)).toEqual(["demo:greet"]);
+      expect(listed[0]!.source).toBe("plugin");
+
+      const r = a.resolve("demo:greet", null);
+      expect(r.instructions).toContain("BASE");
+      expect(r.instructions).toContain("PLUGIN_GREET_BODY");
+    });
+
+    test("disabled plugin's agents absent from list() and unresolvable", () => {
+      const { home, trust } = setup();
+      writeAgentDef(
+        join(home, "plugins", "demo", "agents"),
+        "greet.md",
+        { name: "greet", description: "Greets people" },
+        "PLUGIN_GREET_BODY",
+      );
+      const a = new AgentStore({ normaHome: home, trust, baseInstructions: "BASE", plugins: { disabled: ["demo"] } });
+
+      expect(a.list(null)).toEqual([]);
+      const r = a.resolve("demo:greet", null);
+      expect(r.instructions).not.toContain("PLUGIN_GREET_BODY");
+      expect(r.instructions).toContain("You are a capable autonomous subagent"); // falls back to general-purpose
+    });
+
+    test("multiple non-disabled plugins all contribute; only the disabled one is excluded", () => {
+      const { home, trust } = setup();
+      writeAgentDef(join(home, "plugins", "a", "agents"), "x.md", { name: "x", description: "d" }, "A_X_BODY");
+      writeAgentDef(join(home, "plugins", "b", "agents"), "y.md", { name: "y", description: "d" }, "B_Y_BODY");
+      const a = new AgentStore({ normaHome: home, trust, plugins: { disabled: ["b"] } });
+      expect(a.list(null).map((d) => d.name)).toEqual(["a:x"]);
+    });
+
+    test("precedence project > user > plugin on a namespaced name collision (plugin scanned last)", () => {
+      const { home, trust } = setup();
+      // A plugin "demo" contributing an agent whose bare name is "dup" namespaces to "demo:dup".
+      writeAgentDef(join(home, "plugins", "demo", "agents"), "dup.md", { name: "dup", description: "d" }, "PLUGIN_DUP");
+      // The user store directly defines an agent already named "demo:dup" (frontmatter name, not filename-derived).
+      writeAgentDef(join(home, "agents"), "userdup.md", { name: "demo:dup", description: "d" }, "USER_DUP");
+      const cwd = realDir();
+      writeAgentDef(join(cwd, ".norma", "agents"), "projdup.md", { name: "demo:dup", description: "d" }, "PROJECT_DUP");
+      trust.trust(cwd);
+
+      // user beats plugin when cwd has no project def at all (untrusted cwd → no project entries).
+      const aNoProject = new AgentStore({ normaHome: home, trust, baseInstructions: "BASE" });
+      const untrusted = aNoProject.resolve("demo:dup", realDir());
+      expect(untrusted.instructions).toContain("USER_DUP");
+      expect(untrusted.instructions).not.toContain("PLUGIN_DUP");
+
+      // project beats user (and plugin) once trusted.
+      const trusted = aNoProject.resolve("demo:dup", cwd);
+      expect(trusted.instructions).toContain("PROJECT_DUP");
+      expect(trusted.instructions).not.toContain("USER_DUP");
+      expect(trusted.instructions).not.toContain("PLUGIN_DUP");
+    });
+
+    test("missing plugins dir → no throw, list() unaffected", () => {
+      const { home, trust } = setup();
+      writeAgentDef(join(home, "agents"), "researcher.md", { name: "researcher", description: "d" }, "BODY");
+      const a = new AgentStore({ normaHome: home, trust });
+      expect(() => a.list(null)).not.toThrow();
+      expect(a.list(null).map((d) => d.name)).toEqual(["researcher"]);
+    });
+  });
 });
