@@ -178,6 +178,13 @@ describe("startAll / spawn", () => {
     expect(calls[0]!.opts.cwd).toBe(join("/plugins/demo", "sub"));
   });
 
+  test("NORMA_PLUGIN_DIR is always set to the plugin's directory (entry.cwd-safe)", () => {
+    const { supervisor, calls } = makeSupervisor();
+    const p = fakePlugin({ dir: "/plugins/demo", entry: { command: "bun", args: ["i.ts"], cwd: "sub" } });
+    supervisor.startAll([p]);
+    expect(calls[0]!.opts.env.NORMA_PLUGIN_DIR).toBe("/plugins/demo");
+  });
+
   test("startAll is idempotent — a second call for an already-tracked id does not spawn again", () => {
     const { supervisor, calls } = makeSupervisor();
     const p = fakePlugin();

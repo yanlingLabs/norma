@@ -310,6 +310,53 @@ describe("createPlugin().serve()", () => {
     expect(server.order).not.toContain(METHODS.shortcutRegister);
     expect(server.shortcuts()).toBeNull();
   });
+
+  test("NORMA_PLUGIN_DIR env var: manifest read from env var, not cwd, when set", async () => {
+    // Create manifest in a separate directory
+    const pluginDir = mkdtempSync(join(tmpdir(), "norma-plugin-env-"));
+    cleanups.push(() => {
+      try { unlinkSync(join(pluginDir, "norma-plugin.json")); } catch {}
+    });
+    writeFileSync(join(pluginDir, "norma-plugin.json"), JSON.stringify({
+      id: "sample", tier: "platform",
+      contributes: { shortcuts: [{ id: "cmd-a", description: "Command A" }, { id: "cmd-b" }] },
+    }));
+
+    const server = startFakeServer(sockPath);
+    cleanups.push(() => server.stop());
+
+    const plugin = createPlugin({ onShortcut: () => {} });
+    cleanups.push(() => plugin.close());
+
+    // Serve with NORMA_PLUGIN_DIR pointing to the manifest, while cwd is tmpDir (which is empty)
+    const savedEnv = process.env.NORMA_PLUGIN_DIR;
+    process.env.NORMA_PLUGIN_DIR = pluginDir;
+    cleanups.push(() => {
+      if (savedEnv !== undefined) process.env.NORMA_PLUGIN_DIR = savedEnv;
+      else delete process.env.NORMA_PLUGIN_DIR;
+    });
+
+    await plugin.serve({ socketPath: sockPath, token: "tok", pluginId: "sample" });
+
+    expect(server.order).toContain(METHODS.shortcutRegister);
+    expect(server.shortcuts()).toEqual([
+      { id: "cmd-a", description: "Command A" },
+      { id: "cmd-b" },
+    ]);
+  });
+
+  test("double serve() rejects with clear error", async () => {
+    const server = startFakeServer(sockPath);
+    cleanups.push(() => server.stop());
+
+    const plugin = createPlugin({ tools: {} });
+    cleanups.push(() => plugin.close());
+
+    await plugin.serve({ socketPath: sockPath, token: "tok", pluginId: "sample" });
+
+    await expect(plugin.serve({ socketPath: sockPath, token: "tok", pluginId: "sample" }))
+      .rejects.toThrow(/already serving/);
+  });
 });
 
 describe("backoffDelayMs", () => {

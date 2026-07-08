@@ -583,6 +583,7 @@ export class PluginSupervisor {
         NORMA_PLUGIN_TOKEN: token,
         NORMA_SOCKET: this.deps.socketPath,
         NORMA_PLUGIN_ID: config.id,
+        NORMA_PLUGIN_DIR: config.dir,
       };
       proc = this.spawnFn(cmd, { cwd, env });
     } catch (err) {

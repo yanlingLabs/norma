@@ -100,7 +100,8 @@ interface DeclaredShortcut { id: string; description?: string; default?: string 
 
 function readDeclaredShortcuts(): DeclaredShortcut[] {
   try {
-    const raw = readFileSync(join(process.cwd(), "norma-plugin.json"), "utf8");
+    const pluginDir = process.env.NORMA_PLUGIN_DIR ?? process.cwd();
+    const raw = readFileSync(join(pluginDir, "norma-plugin.json"), "utf8");
     const parsed = JSON.parse(raw) as { contributes?: { shortcuts?: unknown } };
     const shortcuts = parsed.contributes?.shortcuts;
     if (!Array.isArray(shortcuts)) return [];
@@ -140,6 +141,7 @@ export function createPlugin(def: PluginDefinition): Plugin {
   const pending = new Map<number, PendingEntry>();
 
   let closed = false;
+  let serving = false;
   let reconnectAttempt = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let firstConnectResolve: (() => void) | null = null;
@@ -290,6 +292,10 @@ export function createPlugin(def: PluginDefinition): Plugin {
   }
 
   function serve(opts?: ServeOptions): Promise<void> {
+    if (serving) {
+      return Promise.reject(new Error("createPlugin().serve(): already serving"));
+    }
+
     socketPath = opts?.socketPath ?? process.env.NORMA_SOCKET;
     token = opts?.token ?? process.env.NORMA_PLUGIN_TOKEN;
     pluginId = opts?.pluginId ?? process.env.NORMA_PLUGIN_ID;
@@ -302,6 +308,7 @@ export function createPlugin(def: PluginDefinition): Plugin {
       return Promise.reject(new Error(`createPlugin().serve(): missing ${missing.join(", ")}`));
     }
 
+    serving = true;
     closed = false;
     installSignalHandlers();
 
@@ -313,6 +320,7 @@ export function createPlugin(def: PluginDefinition): Plugin {
 
   function close(): void {
     closed = true;
+    serving = false;
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     removeSignalHandlers();
     const s = socket;
