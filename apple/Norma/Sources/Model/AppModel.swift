@@ -125,6 +125,39 @@ final class AppModel: ObservableObject {
         return focusedSessionId
     }
 
+    /// DEFECT FIX (reviewed defect, 2e-iv): the fresh-session identity, EXPLICIT — returns the
+    /// newly created session's id, or `nil` on an RPC failure. `startFreshSessionAfterDetach()`
+    /// below used to be the ONLY entry point, and a caller needing to know "did this actually
+    /// succeed" had no choice but to infer it from `focusedSessionId` afterward — which silently
+    /// stays whatever it already was (a STALE pre-existing focus, if one existed) when the create
+    /// RPC fails, since nothing here ever clears it on failure. `openStandaloneNormaWindow()` used
+    /// to read `focusedSessionId` that way and could spawn its standalone window on a stale prior
+    /// session when the create failed. Returning the id makes success/failure the return value's
+    /// job instead: `nil` unambiguously means "nothing was created," regardless of whatever
+    /// `focusedSessionId` happened to be already — the caller no longer needs (or is tempted) to
+    /// re-derive that from focus state.
+    @discardableResult
+    func startFreshSession() async -> String? {
+        guard let created = try? await client.createSession(scope: "global", cwd: NSHomeDirectory(), approvalPolicy: "auto") else { return nil }
+        // Same belt as ensureFocusedSession(): the daemon's session_created broadcast can arrive
+        // (and refocus us) before this RPC response does — idempotent skip, never double-attach.
+        if focusedSessionId == created.sessionId { return focusedSessionId }
+        selfCreatedSessionId = created.sessionId // suppress the broadcast if it arrives AFTER us
+        await refocus(onto: created.sessionId)
+        // DEFECT FIX (residual leg, final-review Medium): `createSession` can succeed while the
+        // follow-up `refocus`'s `session.attach` then fails. `NormaClient.attach` rolls
+        // `attachedSessionId` back to its pre-call value on throw, and `refocus`'s catch
+        // reconciles `focusedSessionId` to that same rolled-back (STALE, pre-existing) session —
+        // never to `created.sessionId`. Returning `focusedSessionId` unconditionally here would
+        // then hand the caller that stale id as if it were the fresh one; only return success
+        // when focus actually landed on the session we just created.
+        guard focusedSessionId == created.sessionId else {
+            OrbDebug.log("startFreshSession: post-refocus focus (\(focusedSessionId ?? "nil")) != created session (\(created.sessionId)) — attach must have failed; returning nil instead of a stale id")
+            return nil
+        }
+        return focusedSessionId
+    }
+
     /// The generic "create a brand-new session and focus onto it" primitive — despite the name it is
     /// NOT detach-specific. Two callers: (1) Task 4 detach choreography, the orb's "clean slate" step
     /// after a detach (the session it was just focused on now belongs to a standalone detached window
@@ -135,13 +168,11 @@ final class AppModel: ObservableObject {
     /// Exact `ensureFocusedSession()` creation body above, but UNCONDITIONAL: skips the
     /// `if let sid = focusedSessionId { return sid }` early-out on purpose — a focus almost always
     /// exists at these call sites, and this must create+refocus onto a brand-new one regardless.
+    ///
+    /// DEFECT FIX: now a thin delegation to `startFreshSession()` above — same create+focus
+    /// behavior for these two void-returning callers, unchanged.
     func startFreshSessionAfterDetach() async {
-        guard let created = try? await client.createSession(scope: "global", cwd: NSHomeDirectory(), approvalPolicy: "auto") else { return }
-        // Same belt as ensureFocusedSession(): the daemon's session_created broadcast can arrive
-        // (and refocus us) before this RPC response does — idempotent skip, never double-attach.
-        if focusedSessionId == created.sessionId { return }
-        selfCreatedSessionId = created.sessionId // suppress the broadcast if it arrives AFTER us
-        await refocus(onto: created.sessionId)
+        await startFreshSession()
     }
 
     /// Field submit: steer a running turn, otherwise send (starts a turn). CLI parity.

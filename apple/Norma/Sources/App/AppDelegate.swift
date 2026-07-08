@@ -11,12 +11,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var stickiness: StickinessEngine?
     private var startTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
+    /// Task 3 (2e-iv): owns the CLI launcher the menu bar's "Open CLI" item drives.
+    private let cliLauncher = CliLauncher()
 
     /// Task 3 (2d-ii-b) registry: every currently-open detached window. Task 4's detach
     /// choreography appends via `registerDetachedWindow` on spawn; `onClosed` (wired there) removes
     /// it again on either a programmatic `close()` or the user's own red traffic light — the list
     /// never accumulates closed controllers.
     private(set) var detachedWindows: [DetachedWindowController] = []
+
+    /// Test-only seam (DEFECT FIX regression, `StandaloneWindowTests`): `boot()`'s unit-test path
+    /// always constructs a degraded (no-token) `AppModel` whose transport never opens — every RPC,
+    /// including the very FIRST `createSession`, fails immediately. That makes it impossible to
+    /// reach a state with a REAL prior focused session before a LATER createSession failure, which
+    /// is exactly the scenario the defect fix targets. This wires in a scripted-transport
+    /// `AppModel` (already focused on a real session) directly, bypassing `boot()` entirely — same
+    /// "expose a narrow seam, don't fake the whole app" posture as `SessionModel.applyForTesting`/
+    /// `OrbWindowController.setSurfaceForTesting`.
+    func setAppModelForTesting(_ model: AppModel) {
+        appModel = model
+    }
 
     /// Registers a freshly spawned detached window and wires its one-shot `onClosed` to remove it
     /// from `detachedWindows` again. Called by `orb.onWindowDetach`'s closure below (Task 4's
@@ -52,16 +66,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// machinery. The morph panel has no production frame accessor, so the new window spawns
     /// centered on the main screen (the user can move it); a `nil` model or missing daemon token
     /// aborts with a log, same posture as the yellow-light and detached-side spawns.
-    private func openSessionInNewDetachedWindow(_ sessionId: String) {
+    /// Task 2 (2e-iv): `frame` override lets `openStandaloneNormaWindow()` below reuse this exact
+    /// body instead of duplicating it. `nil` (every pre-existing caller) keeps the original
+    /// behavior — centered on the main screen — now computed via the shared pure
+    /// `centeredStandaloneFrame` instead of the inline midX/midY math this method used before.
+    private func openSessionInNewDetachedWindow(_ sessionId: String, frame: NSRect? = nil) {
         guard let model = appModel,
               let (feed, session) = model.makeDetachedFeed(sessionId: sessionId) else {
             OrbDebug.log("openSessionInNewDetachedWindow: no appModel or makeDetachedFeed nil — spawn aborted")
             return
         }
-        let size = chatWindowDefaultSize
         let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let origin = NSPoint(x: visible.midX - size.width / 2, y: visible.midY - size.height / 2)
-        spawnDetachedWindow(feed: feed, session: session, frame: NSRect(origin: origin, size: size), title: "Norma")
+        let resolvedFrame = frame ?? centeredStandaloneFrame(visibleFrame: visible)
+        spawnDetachedWindow(feed: feed, session: session, frame: resolvedFrame, title: "Norma")
+    }
+
+    /// Task 2 (2e-iv): the menu bar's "Open Norma App" entry (`NSMenuItem` wiring is Task 3) — a
+    /// brand-new session via the SAME create+focus primitive the detach choreography and sidebar's
+    /// "+ New session" already reuse (`AppModel.startFreshSession`). Its orb-focus side effect
+    /// isn't separable from the create here, and is harmless: the orb's next summon simply lands on
+    /// this same fresh session too. Then a detached window on that id, centered on the main screen
+    /// via `centeredStandaloneFrame` — unlike the other two spawn paths (yellow-light detach,
+    /// sidebar's ⌘-click), this one is never offset from an existing window/orb frame.
+    ///
+    /// Defensive, same posture as `openSessionInNewDetachedWindow`'s own guard (line 58 precedent):
+    /// no `appModel`, `startFreshSession` returning `nil` (RPC failure), or `makeDetachedFeed` nil
+    /// (missing token, checked inside `openSessionInNewDetachedWindow`) all resolve to
+    /// `OrbDebug.log` + no-op, never a crash or a half-open window.
+    ///
+    /// DEFECT FIX (reviewed defect): this used to await the void `startFreshSessionAfterDetach()`
+    /// and then read `model.focusedSessionId` — which, on a `createSession` RPC failure, silently
+    /// stayed whatever it already was (a STALE PRIOR session, in the orb's normal running state),
+    /// so the guard below wrongly passed and spawned the standalone window on that stale session
+    /// instead of no-op-ing. Reading `startFreshSession()`'s RETURN VALUE instead — never
+    /// `focusedSessionId` — closes that: `nil` on failure is unambiguous regardless of any prior
+    /// focus, so a failed create can no longer be mistaken for a fresh one.
+    func openStandaloneNormaWindow() {
+        guard let model = appModel else {
+            OrbDebug.log("openStandaloneNormaWindow: no appModel — spawn aborted")
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self, let sid = await model.startFreshSession() else {
+                OrbDebug.log("openStandaloneNormaWindow: startFreshSession produced no session (RPC failure) — spawn aborted")
+                return
+            }
+            let visible = NSScreen.main?.visibleFrame ?? .zero
+            self.openSessionInNewDetachedWindow(sid, frame: centeredStandaloneFrame(visibleFrame: visible))
+        }
     }
 
     @discardableResult
@@ -244,6 +296,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             summonField: {
                 TriggerHub.shared.fire(from: "menu")
             },
+            openCli: { [weak self] in self?.cliLauncher.openCli() },
+            openNormaApp: { [weak self] in self?.openStandaloneNormaWindow() },
             quit: { NSApp.terminate(nil) }
         )
         mb.install()
