@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { Settings } from "@norma/core";
 import {
+  applyFreshPluginConsent,
   buildConsentBlock,
   deriveInstallName,
   grantPluginConsents,
+  installNeedsConsentHint,
   installPlugin,
   missingConsents,
   removePluginDir,
@@ -138,6 +140,57 @@ describe("missingConsents", () => {
   });
   test("unrelated extra consented classes don't matter", () => {
     expect(missingConsents(["tcc"], ["exec", "tcc", "hardware"])).toEqual([]);
+  });
+});
+
+describe("installNeedsConsentHint (final-review fix: manifest-only install disclosure)", () => {
+  test("neither hasMcp nor requiredConsents → no hint (legacy plugin, no MCP at all)", () => {
+    expect(installNeedsConsentHint({ hasMcp: false, requiredConsents: [] })).toBe(false);
+  });
+  test("legacy .mcp.json plugin (hasMcp true, no manifest) → hint", () => {
+    expect(installNeedsConsentHint({ hasMcp: true, requiredConsents: [] })).toBe(true);
+  });
+  test("manifest-only plugin (contributes.mcpServers, no .mcp.json) → hasMcp false but requiredConsents non-empty → hint", () => {
+    // This is exactly the gap the fix closes: a manifest plugin with contributes.mcpServers and
+    // no .mcp.json file has hasMcp:false, so checking hasMcp alone (the pre-fix behavior) printed
+    // nothing — the plugin installed with zero mention of the code it can execute.
+    expect(installNeedsConsentHint({ hasMcp: false, requiredConsents: ["exec"] })).toBe(true);
+  });
+  test("manifest requiring only tcc/hardware (no exec) still hints — any consent-gated content counts", () => {
+    expect(installNeedsConsentHint({ hasMcp: false, requiredConsents: ["tcc"] })).toBe(true);
+    expect(installNeedsConsentHint({ hasMcp: false, requiredConsents: ["hardware"] })).toBe(true);
+  });
+  test("both hasMcp and requiredConsents present → still just true (no double-counting concern)", () => {
+    expect(installNeedsConsentHint({ hasMcp: true, requiredConsents: ["exec"] })).toBe(true);
+  });
+});
+
+describe("applyFreshPluginConsent (final-review fix: consent write reads settings fresh, not the pre-prompt snapshot)", () => {
+  test("applies grant + enable to whatever readSettings() returns at call time — a concurrent edit survives", () => {
+    // Simulates the real bug's shape: the CLI's pre-prompt `loadSettings()` result is never passed
+    // to this function at all — the ONLY settings source is readSettings(), invoked after "yes".
+    // Here readSettings() stands in for a settings.json that picked up a concurrent edit (a
+    // DIFFERENT plugin, `other`, got enabled + consented) during the prompt's human-scale wait.
+    const freshAtWriteTime = baseSettings({
+      plugins: { enabled: ["other"], consents: { other: { exec: 111 } } },
+    });
+    let reads = 0;
+    const readSettings = () => { reads++; return freshAtWriteTime; };
+
+    const result = applyFreshPluginConsent(readSettings, "demo", ["exec"], 999);
+
+    expect(reads).toBe(1); // read exactly once, at write time
+    // The concurrent edit (other's enabled state + consent) survives in the result — proving the
+    // write was built on the fresh read, not on some snapshot taken before the prompt.
+    expect(result.plugins?.enabled?.sort()).toEqual(["demo", "other"]);
+    expect(result.plugins?.consents).toEqual({ other: { exec: 111 }, demo: { exec: 999 } });
+  });
+
+  test("grants every listed class and flips mcpEnabled, same as grantPluginConsents + setPluginEnabled composed directly", () => {
+    const settings = baseSettings({ plugins: { consents: { demo: { exec: 1000 } } } });
+    const result = applyFreshPluginConsent(() => settings, "demo", ["exec", "tcc"], 5000);
+    expect(result.plugins?.consents).toEqual({ demo: { exec: 5000, tcc: 5000 } });
+    expect(result.plugins?.enabled).toEqual(["demo"]);
   });
 });
 

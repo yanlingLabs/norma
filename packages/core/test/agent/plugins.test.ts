@@ -101,6 +101,26 @@ describe("PluginStore + norma-plugin.json", () => {
     expect(p.execPayload).toEqual(["mcp: node server.js", "entry: node index.js"]);
     expect(p.tccPermissions).toEqual(["accessibility"]);
     expect(p.hardwarePermissions).toEqual([]);
+    // manifestServers is filled from the SAME loadManifest call — daemon.ts reads this directly
+    // instead of re-parsing norma-plugin.json a second time (final-review fix).
+    expect(p.manifestServers).toEqual([{ name: "srv", command: "node", args: ["server.js"] }]);
+  });
+
+  test("no contributes.mcpServers → hasManifestMcp false, manifestServers undefined", () => {
+    const h = home();
+    normaPlugin(h, "demo", { id: "demo", tier: "capability", contributes: { skills: true } });
+    const [p] = new PluginStore({ normaHome: h }).list();
+    if (!p) throw new Error("expected one plugin");
+    expect(p.hasManifestMcp).toBe(false);
+    expect(p.manifestServers).toBeUndefined();
+  });
+
+  test("legacy plugin (no norma-plugin.json) → manifestServers undefined", () => {
+    const h = home(); plugin(h, "demo", { mcp: true });
+    const [p] = new PluginStore({ normaHome: h }).list();
+    if (!p) throw new Error("expected one plugin");
+    expect(p.legacy).toBe(true);
+    expect(p.manifestServers).toBeUndefined();
   });
 
   test("id mismatch → directory name wins + warning logged", () => {

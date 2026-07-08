@@ -44,8 +44,7 @@ import { ContextAssembler } from "./agent/context";
 import { SkillStore } from "./agent/skills";
 import { BackgroundTaskRegistry } from "./agent/bg-registry";
 import { sessionTmpDir } from "./agent/session-tmp";
-import { PluginStore, consentComplete, pluginMcpEligible } from "./agent/plugins";
-import { loadManifest } from "./agent/plugin-manifest";
+import { PluginStore, pluginMcpEligible } from "./agent/plugins";
 import { AuditLog } from "./peripheral/audit";
 import { PeripheralBroker, type PeripheralClass } from "./peripheral/broker";
 import { ProviderLink } from "./peripheral/provider-link";
@@ -227,27 +226,29 @@ export async function startDaemon(opts: {
     // content is the seam that needs the user opting in via settings.plugins.enabled AND,
     // per-exec-class, a settings.plugins.consents record (pluginMcpEligible in agent/plugins.ts —
     // legacy plugins have requiredConsents [] so this is unchanged for them; a manifest plugin
-    // with exec content that's enabled but unconsented is excluded here, logged below).
+    // with exec content that's enabled but unconsented is excluded here, logged below). The
+    // `!pluginMcpEligible(p)` on the right is the SAME eligibility predicate the enabledPlugins
+    // filter below uses — deriving it inline (e.g. hand-rolling !consentComplete(p)) would let the
+    // why-log drift out of sync with what actually gates MCP start; the left-hand guard just
+    // narrows the log to the "would be eligible if not for consent" case so we don't log for
+    // plugins that were never enabled or never carried MCP content in the first place.
     const allPlugins = pluginStore.list();
     for (const p of allPlugins) {
-      if (p.mcpEnabled && !p.disabled && (p.hasMcp || p.hasManifestMcp) && !consentComplete(p)) {
+      if (p.mcpEnabled && !p.disabled && (p.hasMcp || p.hasManifestMcp) && !pluginMcpEligible(p)) {
         const missing = p.requiredConsents.filter((c) => !p.consented.includes(c));
         console.error(`plugin ${p.name}: enabled but missing consent for ${missing.join(", ")} — MCP not started`);
       }
     }
     // manifestServers (Task 4, spec §2: "mcpServers may now come from the manifest instead of
-    // .mcp.json ... manifest wins on conflict") is looked up ONLY for plugins whose manifest
-    // actually declares contributes.mcpServers (hasManifestMcp) — legacy plugins keep going
-    // through McpManager's unchanged .mcp.json path (manifestServers undefined). This also
-    // closes the T2 interim gap: a manifest-only plugin (no .mcp.json at all) that's enabled and
-    // consented now actually gets its servers started, not just eligibility-checked.
+    // .mcp.json ... manifest wins on conflict") comes straight off PluginInfo — PluginStore.list()
+    // already ran loadManifest once per plugin and carried contributes.mcpServers through as
+    // p.manifestServers (undefined for legacy plugins and manifest plugins with no mcpServers
+    // declared). Re-reading norma-plugin.json here would risk a manifest that read fine moments
+    // ago (hasManifestMcp true, gating eligibility) but fails to reparse on a second read —
+    // silently falling back to the legacy .mcp.json path without ever disclosing that switch.
     const enabledPlugins = allPlugins
       .filter(pluginMcpEligible)
-      .map((p) => {
-        const dir = join(normaHome, "plugins", p.name);
-        const manifestServers = p.hasManifestMcp ? loadManifest(dir, p.name).manifest?.contributes?.mcpServers : undefined;
-        return { name: p.name, dir, manifestServers };
-      });
+      .map((p) => ({ name: p.name, dir: join(normaHome, "plugins", p.name), manifestServers: p.manifestServers }));
     await mcp.startPlugins(enabledPlugins);
     registerRequestDirTool(registry, {
       broker: approvalBroker,

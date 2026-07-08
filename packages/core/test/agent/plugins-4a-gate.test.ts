@@ -3,7 +3,6 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PluginStore, pluginMcpEligible, type PluginConsentRecord } from "../../src/agent/plugins";
-import { loadManifest } from "../../src/agent/plugin-manifest";
 
 /**
  * Phase 4a gate (design spec §9): "legacy plugin untouched; a manifest plugin with exec consents
@@ -21,27 +20,25 @@ import { loadManifest } from "../../src/agent/plugin-manifest";
  *   (3) a plugin shipping a malformed norma-plugin.json — falls back to the legacy load path with
  *       a warning logged, and still loads (never bricks).
  *
- * This file pins the PluginStore / pluginMcpEligible / loadManifest CONTRACT the daemon's real
- * wiring runs on top of. Full daemon-boot coverage (a real child-process McpManager.startPlugins,
+ * This file pins the PluginStore / pluginMcpEligible CONTRACT the daemon's real wiring runs on
+ * top of. Full daemon-boot coverage (a real child-process McpManager.startPlugins,
  * .mcp.json-vs-manifest precedence, the "missing consent" log line) already lives in
  * server.test.ts's Task 2 ("CONSENT (Task 2): ...") and Task 4 ("Task 4: ...") tests — this gate
- * re-derives the daemon's enabledPlugins filter (daemon.ts ~lines 244-249: `allPlugins.filter
- * (pluginMcpEligible).map(p => ({ name, dir, manifestServers: ... }))`) directly against
- * pluginMcpEligible + loadManifest so the same claim is pinned without paying for a daemon boot.
+ * re-derives the daemon's enabledPlugins filter (daemon.ts's `allPlugins.filter(pluginMcpEligible)
+ * .map(p => ({ name, dir, manifestServers: p.manifestServers }))`) directly against
+ * pluginMcpEligible so the same claim is pinned without paying for a daemon boot. manifestServers
+ * comes straight off PluginInfo (filled by PluginStore.list()'s single loadManifest call) — no
+ * second manifest read here, matching daemon.ts (final-review fix: single manifest read).
  */
 
 function home(): string {
   return mkdtempSync(join(tmpdir(), "norma-4a-gate-"));
 }
 
-/** Mirrors daemon.ts's enabledPlugins derivation exactly (source of truth: daemon.ts ~244-249) —
- *  the list of { name, manifestServers } McpManager.startPlugins would actually receive. */
+/** Mirrors daemon.ts's enabledPlugins derivation exactly (source of truth: daemon.ts) — the list
+ *  of { name, manifestServers } McpManager.startPlugins would actually receive. */
 function wouldStartPlugins(normaHome: string, plugins: ReturnType<PluginStore["list"]>) {
-  return plugins.filter(pluginMcpEligible).map((p) => {
-    const dir = join(normaHome, "plugins", p.name);
-    const manifestServers = p.hasManifestMcp ? loadManifest(dir, p.name).manifest?.contributes?.mcpServers : undefined;
-    return { name: p.name, manifestServers };
-  });
+  return plugins.filter(pluginMcpEligible).map((p) => ({ name: p.name, manifestServers: p.manifestServers }));
 }
 
 describe("4a gate (spec §9): legacy plugin untouched; manifest plugin consent lifecycle", () => {

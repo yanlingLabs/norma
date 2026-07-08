@@ -28,8 +28,9 @@ import {
   type FooterSelection,
 } from "./task-block";
 import {
+  applyFreshPluginConsent,
   buildConsentBlock,
-  grantPluginConsents,
+  installNeedsConsentHint,
   installPlugin,
   missingConsents,
   removePluginDir,
@@ -969,7 +970,9 @@ if (import.meta.main) {
       const { PluginStore } = await import("@norma/core");
       const info = new PluginStore({ normaHome: home }).list().find((p) => p.name === installed.name);
       console.log(`${AQUA}installed ${installed.name}${RESET}  skills: ${info?.skills.join(", ") || "(none)"}`);
-      if (info?.hasMcp) console.log(`this plugin bundles MCP servers (code execution) — run ${AQUA}norma plugin enable ${installed.name}${RESET} to allow them`);
+      // hasMcp alone misses a manifest-only plugin (contributes.mcpServers, no .mcp.json) — that
+      // installs with hasMcp:false, so also check requiredConsents (installNeedsConsentHint).
+      if (info && installNeedsConsentHint(info)) console.log(`this plugin requests exec/etc — run ${AQUA}norma plugin enable ${installed.name}${RESET} to review and consent`);
       break; // NEVER touches settings
     }
 
@@ -1001,8 +1004,11 @@ if (import.meta.main) {
           process.exit(1);
         }
         // Full re-disclosure means a fresh consent covers every required class, not just the
-        // ones that were missing — matches the block just printed above.
-        saveSettings(settingsPath, setPluginEnabled(grantPluginConsents(settings, name, info.requiredConsents, Date.now()), name, true));
+        // ones that were missing — matches the block just printed above. `settings` above was
+        // read BEFORE the `readLine` prompt; writing it back here would clobber any settings.json
+        // edit made during that human-scale wait, so re-read fresh at write time instead
+        // (applyFreshPluginConsent — final-review fix).
+        saveSettings(settingsPath, applyFreshPluginConsent(() => loadSettings(settingsPath), name, info.requiredConsents, Date.now()));
         console.log(`${AQUA}${name} enabled${RESET} — restart the daemon to apply`);
         process.exit(0);
       }

@@ -62,6 +62,20 @@ export function missingConsents(requiredConsents: string[], consented: string[])
   return requiredConsents.filter((c) => !consented.includes(c));
 }
 
+/** True when `norma plugin install`'s post-install message should print the "review and consent"
+ *  hint. Two independent ways a freshly installed plugin can bring in something that needs a
+ *  human's consent before it runs: `hasMcp` (a legacy `.mcp.json` file) or
+ *  `requiredConsents.length > 0` (a norma-plugin.json manifest declaring ANY exec/tcc/hardware
+ *  content — contributes.mcpServers, contributes.hooks, an entry point, or explicit
+ *  permissions.exec/tcc/hardware). requiredConsentClasses (plugin-manifest.ts) always derives
+ *  "exec" whenever contributes.mcpServers is non-empty, so this subsumes a manifest-only plugin
+ *  (contributes.mcpServers, no .mcp.json) — hasMcp:false but requiredConsents:["exec"] — which
+ *  checking hasMcp alone missed entirely: the plugin installed with zero mention of the code it
+ *  can execute (final-review fix). */
+export function installNeedsConsentHint(info: { hasMcp: boolean; requiredConsents: string[] }): boolean {
+  return info.hasMcp || info.requiredConsents.length > 0;
+}
+
 /** The shape `buildConsentBlock` needs — a structural subset of core's `PluginInfo` (and of the
  *  `plugins.list` RPC result), so callers can pass either directly. */
 export interface ConsentBlockPlugin {
@@ -110,6 +124,20 @@ export function grantPluginConsents(settings: Settings, name: string, classes: s
   }
   consents[name] = record;
   return { ...settings, plugins: { ...settings.plugins, consents } };
+}
+
+/**
+ * grantPluginConsents + setPluginEnabled, composed against a FRESHLY read settings snapshot
+ * rather than one captured before an interactive prompt. `enable`'s consent flow reads settings
+ * once just to decide whether the consent block is even needed, then waits on a human-scale
+ * `readLine` for "yes" — a settings.json edit landing during that wait (e.g. `norma plugin
+ * disable` run concurrently from another shell) would otherwise be silently clobbered by writing
+ * back whatever object the pre-prompt read produced. `readSettings` is injected (this function
+ * never opens the file itself) so the caller controls read timing — call it AFTER the prompt
+ * resolves — and tests can simulate a concurrent edit without a real settings file.
+ */
+export function applyFreshPluginConsent(readSettings: () => Settings, name: string, classes: string[], ts: number): Settings {
+  return setPluginEnabled(grantPluginConsents(readSettings(), name, classes, ts), name, true);
 }
 
 /** Delete `name`'s whole consent record (design spec: `disable` = fresh-consent semantics,
