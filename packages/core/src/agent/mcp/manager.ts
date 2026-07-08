@@ -159,25 +159,44 @@ export class McpManager {
   }
 
   /**
-   * Start the `.mcp.json` servers of EXPLICITLY ENABLED plugins. Boot-time, like user servers —
-   * the daemon passes only consented plugins (consent is `settings.plugins.enabled`, checked by
-   * the caller); this method does not itself consult any consent/trust store. Tools are
-   * namespaced per-plugin-per-server as `mcp__<plugin>_<server>__<tool>` (GLOBAL scope — no
-   * `scope` field — unlike project servers, which are cwd-scoped). A missing/malformed
-   * `<dir>/.mcp.json` is defensive: logged and skipped, never throws. Each server is started via
-   * the shared `startOne` helper in "skip" collision mode, so one bad/colliding server never
-   * blocks its siblings or the rest of the plugin list.
+   * Start the MCP servers of EXPLICITLY ENABLED plugins. Boot-time, like user servers — the
+   * daemon passes only consented plugins (consent is `settings.plugins.enabled` +, per-exec-class,
+   * `pluginMcpEligible`, checked by the caller); this method does not itself consult any
+   * consent/trust store. Tools are namespaced per-plugin-per-server as
+   * `mcp__<plugin>_<server>__<tool>` (GLOBAL scope — no `scope` field — unlike project servers,
+   * which are cwd-scoped). Each server is started via the shared `startOne` helper in "skip"
+   * collision mode, so one bad/colliding server never blocks its siblings or the rest of the
+   * plugin list.
+   *
+   * Two sources per plugin (design spec §2 — "mcpServers may now come from the manifest instead
+   * of .mcp.json (both accepted; manifest wins on conflict)"):
+   *  - `manifestServers` present (norma-plugin.json `contributes.mcpServers`, passed by the
+   *    caller): those servers are started and `<dir>/.mcp.json` is IGNORED entirely for this
+   *    plugin — manifest wins, no merge.
+   *  - `manifestServers` absent: falls back to the legacy `<dir>/.mcp.json` path, unchanged. A
+   *    missing/malformed file there is defensive: logged and skipped, never throws.
    */
-  async startPlugins(plugins: Array<{ name: string; dir: string }>): Promise<void> {
-    for (const { name, dir } of plugins) {
-      let cfg: z.infer<typeof ProjectMcpConfig>;
-      try {
-        cfg = ProjectMcpConfig.parse(JSON.parse(readFileSync(join(dir, ".mcp.json"), "utf8")));
-      } catch {
-        this.deps.log?.(`plugin ${name}: no/invalid .mcp.json — no servers started`);
-        continue;
+  async startPlugins(
+    plugins: Array<{
+      name: string; dir: string;
+      manifestServers?: Array<{ name: string; command: string; args?: string[]; env?: Record<string, string> }>;
+    }>,
+  ): Promise<void> {
+    for (const { name, dir, manifestServers } of plugins) {
+      let servers: Array<[string, McpServerConfig]>;
+      if (manifestServers) {
+        servers = manifestServers.map((s): [string, McpServerConfig] => [s.name, { command: s.command, args: s.args, env: s.env }]);
+      } else {
+        let cfg: z.infer<typeof ProjectMcpConfig>;
+        try {
+          cfg = ProjectMcpConfig.parse(JSON.parse(readFileSync(join(dir, ".mcp.json"), "utf8")));
+        } catch {
+          this.deps.log?.(`plugin ${name}: no/invalid .mcp.json — no servers started`);
+          continue;
+        }
+        servers = Object.entries(cfg.mcpServers ?? {});
       }
-      await Promise.all(Object.entries(cfg.mcpServers ?? {}).map(async ([server, sc]) => {
+      await Promise.all(servers.map(async ([server, sc]) => {
         // serverKey namespaces the tools per-plugin: mcp__<plugin>_<server>__<tool>
         const serverKey = `${name}_${server}`;
         const entry = await this.startOne(serverKey, sc, { onCollision: "skip", label: "plugin" });

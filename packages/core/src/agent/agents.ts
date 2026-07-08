@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { TrustStore } from "./trust";
 
 export interface ResolvedAgent { instructions: string; model?: string; allowTools?: Set<string> }
-export interface AgentMeta { name: string; description: string; source: "user" | "project" }
+export interface AgentMeta { name: string; description: string; source: "user" | "project" | "plugin" }
 interface ParsedAgentDef { name: string; description: string; model?: string; tools?: string; body: string }
 interface ScannedAgentDef extends ParsedAgentDef { source: AgentMeta["source"] }
 
@@ -65,6 +65,10 @@ function scanAgentDir(root: string, source: AgentMeta["source"]): ScannedAgentDe
  * Discovers agent defs from:
  *  - project: `<cwd>/.norma/agents/*.md` — TRUST-GATED (only when `trust.isTrusted(cwd)`)
  *  - user:    `<normaHome>/agents/*.md`  — always
+ *  - plugin:  `<normaHome>/plugins/<plugin>/agents/*.md` — always (excluding disabled plugins),
+ *    namespaced `<plugin>:<agent>`, same pattern as SkillStore's plugin skills (design spec §2:
+ *    "same trust posture as skills" — always live, not gated on `settings.plugins.enabled`).
+ * Precedence: project > user > plugin (plugin scanned last).
  * Unknown / omitted agentType resolves to a general-purpose fallback (no model, no tool restriction).
  * Defensive throughout: malformed/missing/permission-denied defs are skipped, never thrown.
  * Mirrors SkillStore's discovery + frontmatter-parse pattern.
@@ -73,20 +77,34 @@ export class AgentStore {
   private readonly normaHome: string;
   private readonly trust: TrustStore;
   private readonly baseInstructions: string;
+  private readonly disabledPlugins: string[];
 
-  constructor(deps: { normaHome: string; trust: TrustStore; baseInstructions?: string }) {
+  constructor(deps: { normaHome: string; trust: TrustStore; baseInstructions?: string; plugins?: { disabled?: string[] } }) {
     this.normaHome = deps.normaHome;
     this.trust = deps.trust;
     this.baseInstructions = deps.baseInstructions ?? DEFAULT_BASE_INSTRUCTIONS;
+    this.disabledPlugins = deps.plugins?.disabled ?? [];
   }
 
-  /** All discovered agent defs (parsed, unfiltered by name), in precedence order: project, user. */
+  /** All discovered agent defs (parsed, unfiltered by name), in precedence order: project, user, plugin. */
   private discover(cwd: string | null): ScannedAgentDef[] {
     const all: ScannedAgentDef[] = [];
     if (cwd && this.trust.isTrusted(cwd)) {
       all.push(...scanAgentDir(join(cwd, ".norma", "agents"), "project"));
     }
     all.push(...scanAgentDir(join(this.normaHome, "agents"), "user"));
+
+    let plugins: string[] = [];
+    try {
+      plugins = readdirSync(join(this.normaHome, "plugins"), { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
+    } catch { /* no plugins dir */ }
+    for (const plugin of plugins) {
+      if (this.disabledPlugins.includes(plugin)) continue;
+      for (const a of scanAgentDir(join(this.normaHome, "plugins", plugin, "agents"), "plugin")) {
+        all.push({ ...a, name: `${plugin}:${a.name}` }); // the one place plugin agent names get namespaced
+      }
+    }
+
     return all;
   }
 
@@ -107,9 +125,9 @@ export class AgentStore {
   }
 
   /** Lists all visible agent defs for `cwd` (project defs only when trusted). First occurrence wins on name collisions. */
-  list(cwd?: string | null): Array<{ name: string; description: string; source: "user" | "project" }> {
+  list(cwd?: string | null): Array<{ name: string; description: string; source: AgentMeta["source"] }> {
     const seen = new Set<string>();
-    const out: Array<{ name: string; description: string; source: "user" | "project" }> = [];
+    const out: Array<{ name: string; description: string; source: AgentMeta["source"] }> = [];
     for (const d of this.discover(cwd ?? null)) {
       if (seen.has(d.name)) continue;
       seen.add(d.name);

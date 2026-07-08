@@ -45,6 +45,7 @@ import { SkillStore } from "./agent/skills";
 import { BackgroundTaskRegistry } from "./agent/bg-registry";
 import { sessionTmpDir } from "./agent/session-tmp";
 import { PluginStore, consentComplete, pluginMcpEligible } from "./agent/plugins";
+import { loadManifest } from "./agent/plugin-manifest";
 import { AuditLog } from "./peripheral/audit";
 import { PeripheralBroker, type PeripheralClass } from "./peripheral/broker";
 import { ProviderLink } from "./peripheral/provider-link";
@@ -213,7 +214,10 @@ export async function startDaemon(opts: {
     registerNotebookTool(registry);
     const worktrees = new WorktreeManager({ baseRef: settings?.worktree?.baseRef });
     registerWorktreeTools(registry);
-    const agents = new AgentStore({ normaHome, trust: trustStore, baseInstructions: SYSTEM_PROMPT });
+    const agents = new AgentStore({
+      normaHome, trust: trustStore, baseInstructions: SYSTEM_PROMPT,
+      plugins: { disabled: settings?.plugins?.disabled ?? [] },
+    });
     const subagents = new SubagentManager({ maxConcurrent: settings?.subagents?.maxConcurrent });
     registerSpawnAgentTool(registry);
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
@@ -231,9 +235,19 @@ export async function startDaemon(opts: {
         console.error(`plugin ${p.name}: enabled but missing consent for ${missing.join(", ")} — MCP not started`);
       }
     }
+    // manifestServers (Task 4, spec §2: "mcpServers may now come from the manifest instead of
+    // .mcp.json ... manifest wins on conflict") is looked up ONLY for plugins whose manifest
+    // actually declares contributes.mcpServers (hasManifestMcp) — legacy plugins keep going
+    // through McpManager's unchanged .mcp.json path (manifestServers undefined). This also
+    // closes the T2 interim gap: a manifest-only plugin (no .mcp.json at all) that's enabled and
+    // consented now actually gets its servers started, not just eligibility-checked.
     const enabledPlugins = allPlugins
       .filter(pluginMcpEligible)
-      .map((p) => ({ name: p.name, dir: join(normaHome, "plugins", p.name) }));
+      .map((p) => {
+        const dir = join(normaHome, "plugins", p.name);
+        const manifestServers = p.hasManifestMcp ? loadManifest(dir, p.name).manifest?.contributes?.mcpServers : undefined;
+        return { name: p.name, dir, manifestServers };
+      });
     await mcp.startPlugins(enabledPlugins);
     registerRequestDirTool(registry, {
       broker: approvalBroker,
