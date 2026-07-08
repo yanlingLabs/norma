@@ -109,4 +109,24 @@ describe("ToolSearch", () => {
     expect(out.output).not.toContain('"name":"read"'); // built-in — never part of the deferred index
     expect(out.output).toContain('"name":"mcp__jira__read"'); // still-deferred match
   });
+
+  // Phase 4b Task 4 (spec §3): plugin__ tools ride the exact same deferral/ToolSearch machinery as
+  // mcp__ (isExternalToolName, registry.ts) — ToolSearch itself has no prefix-specific logic, but
+  // this pins that fact against a regression rather than trusting it by inference.
+  test("plugin__ tools defer and load identically to mcp__ (isExternalToolName widening)", async () => {
+    const r = buildRegistry();
+    for (let i = 1; i <= 13; i++) {
+      r.register({ name: `plugin__demo__t${i}`, description: `plugin tool ${i}`, args: z.object({}).passthrough(), run: () => "ok" });
+    }
+    const marks: string[] = [];
+    const out = await r.execute(
+      "ToolSearch",
+      { query: "select:plugin__demo__t1,plugin__demo__t2" },
+      ctxWith({ loadedTools: new Set(), deferThreshold: 12, markToolLoaded: (n) => { marks.push(n); } }),
+    );
+    expect(out.isError).toBe(false);
+    expect(marks.sort()).toEqual(["plugin__demo__t1", "plugin__demo__t2"]);
+    expect(out.output).toContain('"name":"plugin__demo__t1"');
+    expect(out.output).toContain('"name":"plugin__demo__t2"');
+  });
 });

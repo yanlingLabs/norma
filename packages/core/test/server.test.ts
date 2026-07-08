@@ -9,6 +9,9 @@ import { SessionStore } from "../src/sessions/store";
 import { FileSecretStore } from "../src/auth/secret-store";
 import { TokenAuthority } from "../src/auth/tokens";
 import { PluginStore } from "../src/agent/plugins";
+import { ToolRegistry } from "../src/agent/tools/registry";
+import { PluginSupervisor } from "../src/plugins/supervisor";
+import { PluginContribRegistry } from "../src/plugins/contrib";
 import type { Provider } from "../src/providers/types";
 
 /** Minimal raw test client speaking NDJSON JSON-RPC. */
@@ -1692,7 +1695,7 @@ describe("daemon IPC", () => {
       return { srv, plugin };
     }
 
-    test("the six allowed verbs pass the role gate — never role-rejected, even though most handlers aren't wired until Task 4 (METHOD_NOT_FOUND instead)", async () => {
+    test("the six allowed verbs pass the role gate — never role-rejected (Task 4's handlers reject empty {} params as INVALID_PARAMS instead, which proves dispatch reached the handler, not the allowlist)", async () => {
       const { srv, plugin } = await setup();
       for (const method of [
         METHODS.pluginRegister, METHODS.toolRegister, METHODS.shortcutRegister,
@@ -1727,12 +1730,21 @@ describe("daemon IPC", () => {
       plugin.close(); srv.stop();
     });
 
-    test("plugin.register from a HARNESS connection is not role-rejected (allowlist is per-role) but still hits METHOD_NOT_FOUND (unwired until Task 4)", async () => {
+    // Phase 4b Task 4: now that plugin.register is wired, a harness connection reaching it is
+    // rejected for a DIFFERENT reason than an allowlist rejection — the allowlist only restricts
+    // plugin-role connections (never widens who else may call these six), so dispatch reaches the
+    // handler; the handler's OWN identity check then fails closed because a harness connection's
+    // `socket.data.pluginId` is always null (only a role:"plugin" hello ever sets it), which can
+    // never match any wire `pluginId`. The message text (not just the code) distinguishes this from
+    // the allowlist's own UNAUTHORIZED rejection, proving it's the handler, not the gate above it.
+    test("plugin.register from a HARNESS connection is not role-rejected by the allowlist — it fails the handler's own pluginId-match check instead", async () => {
       const srv = await bootPluginTestServer();
       const c = await TestClient.connect(srv.socketPath);
       await c.hello(srv.harnessToken, "harness-trying-plugin-verb");
       const res = await c.request(METHODS.pluginRegister, { pluginId: "sample-echo" });
-      expect(res.error?.code).toBe(ERR.METHOD_NOT_FOUND);
+      expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      expect(res.error?.message).not.toMatch(/plugin role may not call/); // proves it wasn't the allowlist gate
+      expect(res.error?.message).toContain("pluginId does not match");
       c.close(); srv.stop();
     });
   });
@@ -1782,6 +1794,216 @@ describe("daemon IPC", () => {
       const res = await admin.request(METHODS.pluginRevokeToken, { pluginId: "sample-echo" });
       expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
       admin.close(); srv.stop();
+    });
+  });
+
+  // -----------------------------------------------------------------------------------------
+  // Plugin tool bridge (Phase 4b Task 4, spec §3): plugin.register/tool.register/
+  // plugin.toolResult wired to a real PluginSupervisor + ToolRegistry (constructed directly here,
+  // mirroring daemon.ts's own wiring, exactly like the "noop capability call round-trips..." test
+  // above constructs PeripheralBroker/ProviderLink directly instead of going through startDaemon);
+  // shortcut.register/tile.update/provider.register wired to PluginContribRegistry.
+  // -----------------------------------------------------------------------------------------
+  describe("plugin tool bridge (Task 4)", () => {
+    async function bootBridgeServer(): Promise<{
+      store: SessionStore; socketPath: string; harnessToken: string;
+      registry: ToolRegistry; supervisor: PluginSupervisor; contrib: PluginContribRegistry;
+      stop: () => void;
+    }> {
+      const home = mkdtempSync(join(tmpdir(), "norma-plugin-bridge-"));
+      const store = new SessionStore(home);
+      const socketPath = join(home, "core.sock");
+      const authority = new TokenAuthority(new FileSecretStore(join(home, "secrets.json")));
+      const tokens = await authority.ensureTokens();
+      const registry = new ToolRegistry();
+      let nextPid = 9000;
+      // Injected spawn/isAlivePid/signalPid — mirrors test/plugins/supervisor.test.ts's fixtures
+      // (fakeProc/makeSpawnFn) so the supervisor's bookkeeping (PID files, backoff/circuit
+      // failAttempt path) runs for real, but never touches an actual OS process. The "plugin
+      // process" in every test below is really a scripted TestClient connecting over the real
+      // socket — the fake spawn just gives the supervisor a runtime entry ("starting" status) for
+      // plugin.register to transition out of.
+      const supervisor = new PluginSupervisor({
+        runDir: join(home, "run"),
+        socketPath,
+        mintToken: (id) => store.mintPluginToken(id),
+        spawn: () => ({ pid: nextPid++, kill: () => {}, exited: new Promise<number>(() => {}) }),
+        isAlivePid: () => false,
+        signalPid: () => {},
+        settings: { registrationTimeoutMs: 5000, backoffCapMs: 100, circuitFailures: 5, circuitWindowMs: 600_000 },
+      });
+      const contrib = new PluginContribRegistry();
+      const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, registry, supervisor, contrib });
+      return {
+        store, socketPath, harnessToken: tokens.harness, registry, supervisor, contrib,
+        stop: () => { supervisor.stopAll(); server.stop(); store.close(); },
+      };
+    }
+
+    /** Spawns (fake) + hellos + plugin.registers a plugin connection — every test below starts
+     *  from here, exactly mirroring the SDK's own hello → plugin.register sequence (Task 5). */
+    async function registerAndHello(srv: Awaited<ReturnType<typeof bootBridgeServer>>, pluginId: string): Promise<TestClient> {
+      srv.supervisor.startAll([{ id: pluginId, dir: `/plugins/${pluginId}`, entry: { command: "bun", args: ["index.ts"] } }]);
+      const raw = srv.store.mintPluginToken(pluginId);
+      const plugin = await TestClient.connect(srv.socketPath);
+      const hello = await plugin.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: pluginId, pluginId,
+      });
+      if (!hello.result?.ok) throw new Error(`test setup: plugin hello failed: ${JSON.stringify(hello.error)}`);
+      const reg = await plugin.request(METHODS.pluginRegister, { pluginId });
+      expect(reg.result).toEqual({ ok: true });
+      expect(srv.supervisor.status(pluginId)).toBe("running");
+      return plugin;
+    }
+
+    test("register -> tool callable through registry.execute: round-trips to the plugin conn's plugin_tool_invoke and resolves via plugin.toolResult", async () => {
+      const srv = await bootBridgeServer();
+      const pluginId = "sample-echo";
+      const plugin = await registerAndHello(srv, pluginId);
+
+      const toolReg = await plugin.request(METHODS.toolRegister, { name: "echo", description: "echoes text back" });
+      expect(toolReg.result.ok).toBe(true);
+      expect(toolReg.result.registeredAs).toBe(`plugin__${pluginId}__echo`);
+      expect(srv.registry.has(toolReg.result.registeredAs)).toBe(true);
+
+      const execPromise = srv.registry.execute(
+        toolReg.result.registeredAs,
+        { text: "hi" },
+        { cwd: "/", roots: ["/"], sessionId: "s1" },
+      );
+
+      const invoked = await plugin.waitForNotification((n) => n.method === METHODS.event && n.params.type === "plugin_tool_invoke");
+      expect(invoked.params.tool).toBe("echo");
+      expect(JSON.parse(invoked.params.argsJson)).toEqual({ text: "hi" });
+
+      const resolved = await plugin.request(METHODS.pluginToolResult, {
+        requestId: invoked.params.requestId,
+        resultJson: JSON.stringify({ echo: "hi" }),
+      });
+      expect(resolved.result).toEqual({ ok: true });
+
+      const outcome = await execPromise;
+      expect(outcome.isError).toBe(false);
+      expect(JSON.parse(outcome.output)).toEqual({ echo: "hi" });
+
+      plugin.close(); srv.stop();
+    });
+
+    test("a plugin's raw JSON schema rides verbatim as rawParameters (like MCP)", async () => {
+      const srv = await bootBridgeServer();
+      const plugin = await registerAndHello(srv, "sample-echo");
+      const schema = { type: "object", properties: { ms: { type: "number" } }, required: ["ms"] };
+      const toolReg = await plugin.request(METHODS.toolRegister, { name: "sleep", description: "sleeps", parameters: schema });
+      const spec = srv.registry.specFor(toolReg.result.registeredAs);
+      expect(spec?.parameters).toEqual(schema);
+      plugin.close(); srv.stop();
+    });
+
+    test("plugin crash mid-invoke (connection drop) -> the in-flight call resolves as a typed isError naming the plugin+tool, and its tools are unregistered", async () => {
+      const srv = await bootBridgeServer();
+      const pluginId = "sample-echo";
+      const plugin = await registerAndHello(srv, pluginId);
+      const toolReg = await plugin.request(METHODS.toolRegister, { name: "sleep", description: "sleeps" });
+      const registeredAs = toolReg.result.registeredAs;
+      expect(srv.registry.has(registeredAs)).toBe(true);
+
+      const execPromise = srv.registry.execute(registeredAs, {}, { cwd: "/", roots: ["/"], sessionId: "s1" });
+      await plugin.waitForNotification((n) => n.method === METHODS.event && n.params.type === "plugin_tool_invoke");
+
+      plugin.close(); // simulate the plugin process disappearing mid-call
+
+      const outcome = await execPromise;
+      expect(outcome.isError).toBe(true);
+      expect(outcome.output).toBe(`plugin ${pluginId} crashed during sleep`);
+
+      // the socket close() handler's unregister is synchronous with the close event, but give the
+      // event loop a beat to be safe against any scheduling jitter.
+      await new Promise((r) => setTimeout(r, 20));
+      expect(srv.registry.has(registeredAs)).toBe(false);
+      expect(srv.supervisor.status(pluginId)).not.toBe("running");
+
+      srv.stop();
+    });
+
+    test("plugin.register requires the wire pluginId to match the authenticated connection", async () => {
+      const srv = await bootBridgeServer();
+      srv.supervisor.startAll([{ id: "sample-echo", dir: "/plugins/sample-echo", entry: { command: "bun" } }]);
+      const raw = srv.store.mintPluginToken("sample-echo");
+      const plugin = await TestClient.connect(srv.socketPath);
+      await plugin.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: "sample-echo", pluginId: "sample-echo",
+      });
+      const res = await plugin.request(METHODS.pluginRegister, { pluginId: "someone-else" });
+      expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      expect(srv.supervisor.status("sample-echo")).toBe("starting"); // never flipped to running
+      plugin.close(); srv.stop();
+    });
+
+    test("tool.register rejects a duplicate tool name with a typed error, not a crash", async () => {
+      const srv = await bootBridgeServer();
+      const plugin = await registerAndHello(srv, "sample-echo");
+      const first = await plugin.request(METHODS.toolRegister, { name: "dup", description: "d" });
+      expect(first.result.ok).toBe(true);
+      const second = await plugin.request(METHODS.toolRegister, { name: "dup", description: "d" });
+      expect(second.error).toBeTruthy();
+      expect(second.error.message).toContain("duplicate tool");
+      plugin.close(); srv.stop();
+    });
+
+    test("shortcut.register/tile.update/provider.register land in PluginContribRegistry (latest write wins)", async () => {
+      const srv = await bootBridgeServer();
+      const plugin = await registerAndHello(srv, "sample-echo");
+
+      await plugin.request(METHODS.shortcutRegister, { shortcuts: [{ id: "toggle", description: "toggle it" }] });
+      await plugin.request(METHODS.tileUpdate, { tile: { title: "Sample", value: "1" } });
+      await plugin.request(METHODS.providerRegister, { info: { kind: "noop" } });
+
+      const state = srv.contrib.get("sample-echo");
+      expect(state?.shortcuts).toEqual([{ id: "toggle", description: "toggle it" }]);
+      expect(state?.tile).toEqual({ title: "Sample", value: "1" });
+      expect(state?.provider).toEqual({ kind: "noop" });
+
+      await plugin.request(METHODS.tileUpdate, { tile: { title: "Sample", value: "2" } }); // latest write wins
+      expect(srv.contrib.get("sample-echo")?.tile).toEqual({ title: "Sample", value: "2" });
+
+      plugin.close(); srv.stop();
+    });
+
+    test("disconnect unregisters every plugin__<id>__* tool and calls notifyDisconnected", async () => {
+      const srv = await bootBridgeServer();
+      const pluginId = "sample-echo";
+      const plugin = await registerAndHello(srv, pluginId);
+      await plugin.request(METHODS.toolRegister, { name: "a", description: "d" });
+      await plugin.request(METHODS.toolRegister, { name: "b", description: "d" });
+      expect(srv.registry.has(`plugin__${pluginId}__a`)).toBe(true);
+      expect(srv.registry.has(`plugin__${pluginId}__b`)).toBe(true);
+      expect(srv.supervisor.status(pluginId)).toBe("running");
+
+      plugin.close();
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(srv.registry.has(`plugin__${pluginId}__a`)).toBe(false);
+      expect(srv.registry.has(`plugin__${pluginId}__b`)).toBe(false);
+      expect(srv.supervisor.status(pluginId)).not.toBe("running"); // notifyDisconnected ran
+
+      srv.stop();
+    });
+
+    test("tool.register/shortcut.register/tile.update/provider.register all require an authenticated plugin connection (defensive — unreachable from a plugin conn, but not role-gated for other roles)", async () => {
+      const srv = await bootBridgeServer();
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "harness-trying-plugin-verbs");
+      const attempts: Array<[string, unknown]> = [
+        [METHODS.toolRegister, { name: "x", description: "d" }],
+        [METHODS.shortcutRegister, { shortcuts: [] }],
+        [METHODS.tileUpdate, { tile: {} }],
+        [METHODS.providerRegister, { info: {} }],
+      ];
+      for (const [method, params] of attempts) {
+        const res = await c.request(method, params);
+        expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      }
+      c.close(); srv.stop();
     });
   });
 });

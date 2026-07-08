@@ -170,6 +170,16 @@ export interface PluginSupervisorDeps {
   mintToken: (pluginId: string) => string;
   settings?: PluginSupervisorSettings;
   onLog?: (m: string) => void;
+  /** Called synchronously right after a plugin's circuit breaker opens (status transitions to
+   *  "circuit-open" — 5 failures in the rolling window, spec §3). Task 4's ipc/server.ts owns the
+   *  ToolRegistry, not this class, so it can't unregister that plugin's `plugin__<id>__*` tools
+   *  itself — the daemon wires this callback (built alongside `deps.onLog` above, in the SAME
+   *  deps object literal `new PluginSupervisor(...)` closes over) to do exactly that. Optional:
+   *  tests that don't care about tool-registry cleanup never need to set it. A disconnect that
+   *  does NOT trip the circuit is NOT covered by this hook — that path is ipc/server.ts's socket
+   *  `close()` handler, which unregisters unconditionally on every plugin disconnect regardless of
+   *  supervisor status. */
+  onCircuitOpen?: (pluginId: string) => void;
   /** Testability seams — see `defaultIsAlive`/`defaultSignal` above. Real OS semantics by default;
    *  never need overriding outside tests. */
   isAlivePid?: (pid: number) => boolean;
@@ -635,6 +645,7 @@ export class PluginSupervisor {
     if (open) {
       rt.status = "circuit-open";
       this.log(`plugin ${pluginId}: circuit open (${failures.length} failures within ${this.circuitWindowMs}ms) — manual restart required`);
+      this.deps.onCircuitOpen?.(pluginId);
       return;
     }
 

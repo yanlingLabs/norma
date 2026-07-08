@@ -56,6 +56,16 @@ describe("PermissionGate v1", () => {
     expect(g.evaluate("read", "ask")).toBe("allow"); // READ_ONLY unchanged
   });
 
+  // Phase 4b Task 4 (spec §3): "plugin.register/tool.register supplies name + one-liner ...
+  // registered into ToolRegistry as plugin__<id>__<tool>, gated like MCP (approval per policy,
+  // never READ_ONLY)". Byte-identical to the mcp__ test above — plugin__ must hit the SAME branch.
+  test("plugin__ tools are gated EXACTLY like mcp__ tools: approval-per-policy (never READ_ONLY), allow under auto, ask under ask", () => {
+    const g = new PermissionGate();
+    expect(g.evaluate("plugin__sample-echo__echo", "auto")).toBe("allow");
+    expect(g.evaluate("plugin__sample-echo__echo", "ask")).toBe("ask");
+    expect(g.evaluate("read", "ask")).toBe("allow"); // READ_ONLY unchanged
+  });
+
   test("ToolSearch is read-only: always allowed (loading a deferred tool's schema must not require approval)", () => {
     expect(gate.evaluate("ToolSearch", "ask")).toBe("allow");
     expect(gate.evaluate("ToolSearch", "auto")).toBe("allow");
@@ -73,6 +83,7 @@ describe("PermissionGate v1", () => {
         ["write", p === "auto" ? "allow" : "ask"],
         ["bash", p === "auto" ? "allow" : "ask"],
         ["mcp__x__y", p === "auto" ? "allow" : "ask"],
+        ["plugin__x__y", p === "auto" ? "allow" : "ask"],
         ["frobnicate", "ask"],
       ] as const) {
         expect(g.evaluate(t, p)).toBe(exp);
@@ -80,12 +91,12 @@ describe("PermissionGate v1", () => {
     }
   });
 
-  test("plan matrix: read-only + exit_plan_mode + ask_user + task_* allow; write/edit/bash/bash_kill/mcp deny; unclassified deny", () => {
+  test("plan matrix: read-only + exit_plan_mode + ask_user + task_* allow; write/edit/bash/bash_kill/mcp/plugin deny; unclassified deny", () => {
     const g = new PermissionGate();
     for (const t of ["read", "glob", "grep", "ls", "Skill", "ToolSearch", "ask_user", "task_create", "task_list", "exit_plan_mode", "request_directory"]) {
       expect(g.evaluate(t, "plan")).toBe("allow");
     }
-    for (const t of ["write", "edit", "bash", "bash_kill", "mcp__x__y", "frobnicate"]) {
+    for (const t of ["write", "edit", "bash", "bash_kill", "mcp__x__y", "plugin__x__y", "frobnicate"]) {
       expect(g.evaluate(t, "plan")).toBe("deny");
     }
   });

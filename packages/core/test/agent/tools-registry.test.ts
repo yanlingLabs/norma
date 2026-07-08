@@ -152,3 +152,122 @@ describe("deferral", () => {
     expect(runsWithoutThreshold.isError).toBe(false);
   });
 });
+
+// -------------------------------------------------------------------------------------------
+// Phase 4b Task 4 (spec §3): `plugin__<pluginId>__<tool>` tools ride the SAME deferral machinery
+// as `mcp__` tools (isExternalToolName, registry.ts) — every test below mirrors a "deferral"
+// describe-block test above 1:1, substituting plugin__ names, plus a mixed-namespace test proving
+// they share ONE combined count/threshold (not two independent pools).
+// -------------------------------------------------------------------------------------------
+describe("plugin__ tool deferral parity with mcp__", () => {
+  function registerPlugin(r: ToolRegistry, pluginId: string, count: number): void {
+    for (let i = 1; i <= count; i++) {
+      r.register({ name: `plugin__${pluginId}__t${i}`, description: `d${i}`, args: z.object({}), run: () => "ok" });
+    }
+  }
+
+  test("no opts → all tools (byte-identical to today)", () => {
+    const r = new ToolRegistry();
+    registerPlugin(r, "demo", 15);
+    r.register({ name: "read", description: "read a file", args: z.object({}), run: () => "ok" });
+    const specs = r.specs(null);
+    expect(specs.length).toBe(16);
+    for (let i = 1; i <= 15; i++) expect(specs.some((s) => s.name === `plugin__demo__t${i}`)).toBe(true);
+  });
+
+  test("above threshold → plugin__ absent unless loaded; built-ins present; ToolSearch present", () => {
+    const r = new ToolRegistry();
+    registerPlugin(r, "demo", 13);
+    r.register({ name: "read", description: "read a file", args: z.object({}), run: () => "ok" });
+    r.register({ name: "ToolSearch", description: "search deferred tools", args: z.object({}), run: () => "ok" });
+    const specs = r.specs(null, { deferThreshold: 12, loaded: new Set(["plugin__demo__t3"]) });
+    const names = specs.map((s) => s.name);
+    expect(names).toContain("read");
+    expect(names).toContain("ToolSearch");
+    expect(names).toContain("plugin__demo__t3");
+    expect(names).not.toContain("plugin__demo__t1");
+  });
+
+  test("at/below threshold → all plugin__ + NO ToolSearch in specs (byte-identical to no-opts)", () => {
+    const r = new ToolRegistry();
+    registerPlugin(r, "demo", 12);
+    r.register({ name: "ToolSearch", description: "search deferred tools", args: z.object({}), run: () => "ok" });
+    const withThreshold = r.specs(null, { deferThreshold: 12 }).map((s) => s.name).sort();
+    for (let i = 1; i <= 12; i++) expect(withThreshold).toContain(`plugin__demo__t${i}`);
+    expect(withThreshold).not.toContain("ToolSearch");
+    const withoutThreshold = r.specs(null).map((s) => s.name).sort();
+    expect(withThreshold).toEqual(withoutThreshold); // deferral inactive either way — byte-identical
+  });
+
+  test("deferredIndex lists not-loaded plugin__ with capped descriptions; [] when inactive", () => {
+    const r = new ToolRegistry();
+    registerPlugin(r, "demo", 12);
+    r.unregister("plugin__demo__t12");
+    const longDesc = "x".repeat(200);
+    r.register({ name: "plugin__demo__t12", description: longDesc, args: z.object({}), run: () => "ok" });
+    expect(r.deferredIndex(null)).toEqual([]); // inactive: no threshold provided
+    r.register({ name: "plugin__demo__t13", description: "d13", args: z.object({}), run: () => "ok" });
+    const idx = r.deferredIndex(null, new Set(["plugin__demo__t1"]), 12);
+    expect(idx.some((e) => e.name === "plugin__demo__t1")).toBe(false); // loaded, excluded
+    const entry = idx.find((e) => e.name === "plugin__demo__t12")!;
+    expect(entry.description.length).toBe(150);
+  });
+
+  test("execute rejects a deferred-not-loaded plugin__ tool (run NOT called); loaded runs", async () => {
+    const r = new ToolRegistry();
+    registerPlugin(r, "demo", 13);
+    let ran = false;
+    r.unregister("plugin__demo__t1");
+    r.register({ name: "plugin__demo__t1", description: "d1", args: z.object({}), run: () => { ran = true; return "ran"; } });
+
+    const ctx = { cwd: "/", roots: ["/"], sessionId: "s", deferThreshold: 12, loadedTools: new Set<string>() };
+    const denied = await r.execute("plugin__demo__t1", {}, ctx);
+    expect(denied.isError).toBe(true);
+    expect(denied.output).toContain("deferred — load its schema via ToolSearch first");
+    expect(ran).toBe(false);
+
+    ctx.loadedTools.add("plugin__demo__t1");
+    const ok = await r.execute("plugin__demo__t1", {}, ctx);
+    expect(ok.isError).toBe(false);
+    expect(ran).toBe(true);
+  });
+
+  test("mcp__ and plugin__ tools share ONE combined threshold count, not two independent pools", () => {
+    const r = new ToolRegistry();
+    registerPlugin(r, "demo", 6);
+    for (let i = 1; i <= 6; i++) {
+      r.register({ name: `mcp__s__t${i}`, description: `d${i}`, args: z.object({}), run: () => "ok" });
+    }
+    // Exactly 12 external tools total (6 mcp__ + 6 plugin__) — AT threshold 12, not above it.
+    expect(r.specs(null, { deferThreshold: 12 }).length).toBe(12);
+    r.register({ name: "plugin__demo__t7", description: "d7", args: z.object({}), run: () => "ok" });
+    // 13 > 12 now → deferral active, and it defers BOTH namespaces identically.
+    const specs = r.specs(null, { deferThreshold: 12, loaded: new Set(["plugin__demo__t1"]) });
+    const names = specs.map((s) => s.name);
+    expect(names).toContain("plugin__demo__t1"); // loaded, rides along
+    expect(names).not.toContain("plugin__demo__t2"); // deferred plugin__ tool
+    expect(names).not.toContain("mcp__s__t1"); // deferred mcp__ tool — same predicate, same pass
+  });
+});
+
+describe("unregisterByPrefix", () => {
+  test("removes every tool whose name starts with the given prefix; leaves other plugins/tools untouched", () => {
+    const r = new ToolRegistry();
+    r.register({ name: "plugin__demo__a", description: "a", args: z.object({}), run: () => "a" });
+    r.register({ name: "plugin__demo__b", description: "b", args: z.object({}), run: () => "b" });
+    r.register({ name: "plugin__other__c", description: "c", args: z.object({}), run: () => "c" });
+    r.register({ name: "read", description: "r", args: z.object({}), run: () => "r" });
+    r.unregisterByPrefix("plugin__demo__");
+    expect(r.has("plugin__demo__a")).toBe(false);
+    expect(r.has("plugin__demo__b")).toBe(false);
+    expect(r.has("plugin__other__c")).toBe(true);
+    expect(r.has("read")).toBe(true);
+  });
+
+  test("no-op when nothing matches (never throws)", () => {
+    const r = new ToolRegistry();
+    r.register({ name: "read", description: "r", args: z.object({}), run: () => "r" });
+    expect(() => r.unregisterByPrefix("plugin__nope__")).not.toThrow();
+    expect(r.has("read")).toBe(true);
+  });
+});

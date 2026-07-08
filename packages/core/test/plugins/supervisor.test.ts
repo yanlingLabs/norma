@@ -459,6 +459,37 @@ describe("circuit breaker (integration)", () => {
     expect(calls.length).toBe(countAtOpen); // circuit-open never schedules another attempt
   });
 
+  // Phase 4b Task 4: ipc/server.ts has no way to learn "this plugin's circuit just opened" on its
+  // own (it only reacts to socket close events) — `onCircuitOpen` is the seam the daemon wires to
+  // unregister that plugin's `plugin__<id>__*` tools out of the ToolRegistry the instant the
+  // breaker trips, independent of whatever the underlying socket connection happens to be doing.
+  test("onCircuitOpen fires exactly once, with the pluginId, the moment the circuit opens — not on earlier (non-opening) failures", async () => {
+    const opened: string[] = [];
+    const { supervisor } = makeSupervisor({
+      settings: { registrationTimeoutMs: 10, backoffCapMs: 10, circuitFailures: 3, circuitWindowMs: 600_000 },
+      onCircuitOpen: (id) => opened.push(id),
+    });
+    const p = fakePlugin();
+    supervisor.startAll([p]);
+    await sleep(250);
+    expect(supervisor.status(p.id)).toBe("circuit-open");
+    expect(opened).toEqual(["demo"]); // fired exactly once, not once per failure (3 failures preceded it)
+  });
+
+  test("a disconnect that does NOT trip the circuit never fires onCircuitOpen", () => {
+    const opened: string[] = [];
+    const { supervisor } = makeSupervisor({
+      settings: { registrationTimeoutMs: 5000, backoffCapMs: 10, circuitFailures: 5, circuitWindowMs: 600_000 },
+      onCircuitOpen: (id) => opened.push(id),
+    });
+    const p = fakePlugin();
+    supervisor.startAll([p]);
+    supervisor.notifyRegistered(p.id, fakeConn());
+    supervisor.notifyDisconnected(p.id); // 1 failure, threshold 5 — never opens
+    expect(supervisor.status(p.id)).toBe("backoff");
+    expect(opened).toEqual([]);
+  });
+
   test("failures outside the circuit window don't accumulate (class-level, injected now())", async () => {
     // registrationTimeoutMs is deliberately long (never fires in this test) — failures are driven
     // directly via notifyDisconnected so this test races exactly ONE real timer (the short backoff
