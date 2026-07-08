@@ -144,6 +144,17 @@ final class AppModel: ObservableObject {
         if focusedSessionId == created.sessionId { return focusedSessionId }
         selfCreatedSessionId = created.sessionId // suppress the broadcast if it arrives AFTER us
         await refocus(onto: created.sessionId)
+        // DEFECT FIX (residual leg, final-review Medium): `createSession` can succeed while the
+        // follow-up `refocus`'s `session.attach` then fails. `NormaClient.attach` rolls
+        // `attachedSessionId` back to its pre-call value on throw, and `refocus`'s catch
+        // reconciles `focusedSessionId` to that same rolled-back (STALE, pre-existing) session —
+        // never to `created.sessionId`. Returning `focusedSessionId` unconditionally here would
+        // then hand the caller that stale id as if it were the fresh one; only return success
+        // when focus actually landed on the session we just created.
+        guard focusedSessionId == created.sessionId else {
+            OrbDebug.log("startFreshSession: post-refocus focus (\(focusedSessionId ?? "nil")) != created session (\(created.sessionId)) — attach must have failed; returning nil instead of a stale id")
+            return nil
+        }
         return focusedSessionId
     }
 

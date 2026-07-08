@@ -141,4 +141,77 @@ final class StandaloneWindowTests: XCTestCase {
         XCTAssertTrue(delegate.detachedWindows.isEmpty, "a failed session-create must never spawn a window on a STALE prior focus")
         XCTAssertEqual(model.focusedSessionId, "s_old", "the failed create must not silently corrupt the existing focus either")
     }
+
+    /// DEFECT FIX (residual leg, final-review Medium): `AppModel.startFreshSession()` used to
+    /// return `focusedSessionId` unconditionally after `refocus(onto: created.sessionId)` — but
+    /// if `session.create` SUCCEEDS and the FOLLOW-UP `session.attach` then fails, `refocus`'s
+    /// catch reconciles focus back to the PREVIOUS session (`NormaClient.attach` rolls
+    /// `attachedSessionId` back to its pre-call value on throw). The old code then returned that
+    /// stale, non-nil PREVIOUS session id as if it were the fresh one, and
+    /// `openStandaloneNormaWindow()` spawned its standalone window on the OLD session — the same
+    /// "Open Norma App = always fresh session" violation `testOpenStandaloneNormaWindowNoOpsWhenPriorFocusExistsAndSessionCreateFails`
+    /// above closes for a failed CREATE, but for a failed ATTACH after a successful create.
+    ///
+    /// This test establishes a real prior focus ("s_old"), then scripts `session.create` to
+    /// SUCCEED (returning "s_new") while the following `session.attach("s_new")` FAILS. The
+    /// fix (`startFreshSession()` returning `created.sessionId` only when the post-refocus
+    /// `focusedSessionId` actually landed on it, `nil` otherwise) must produce NO spawned window
+    /// and must leave `focusedSessionId` on "s_old" — the pre-fix code spawns a window on "s_old"
+    /// instead.
+    func testOpenStandaloneNormaWindowNoOpsWhenSessionCreateSucceedsButAttachFails() async throws {
+        let factory = RecordingTransportFactory()
+        let model = AppModel(makeTransport: { factory.make() }, token: "tok")
+        let startTask = Task { await model.start() }
+        defer { startTask.cancel(); model.stop() }
+
+        await waitUntil { !factory.made.isEmpty }
+        let t = factory.made[0]
+
+        // hello
+        await waitUntilSent(t, 1)
+        t.feed(#"{"jsonrpc":"2.0","id":\#(lineJSON(t.sent[0])["id"] as! Int),"result":{"ok":true}}"#)
+        // session.list: ONE prior session already exists
+        await waitUntilSent(t, 2)
+        let list = lineJSON(t.sent[1])
+        XCTAssertEqual(list["method"] as? String, "session.list")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(list["id"] as! Int),"result":{"sessions":[{"sessionId":"s_old","scope":"global","createdAt":1,"lastSeq":0}]}}"#)
+        // session.attach(s_old) — establishes the REAL prior focus
+        await waitUntilSent(t, 3)
+        let attachOld = lineJSON(t.sent[2])
+        XCTAssertEqual(attachOld["method"] as? String, "session.attach")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(attachOld["id"] as! Int),"result":{"ok":true,"lastSeq":0}}"#)
+        await waitUntil { model.focusedSessionId == "s_old" }
+        XCTAssertEqual(model.focusedSessionId, "s_old", "a prior focused session exists going into the spawn attempt — this is the normal running orb state")
+
+        let delegate = AppDelegate()
+        delegate.setAppModelForTesting(model)
+        defer { delegate.detachedWindows.forEach { $0.close() } }
+
+        delegate.openStandaloneNormaWindow()
+        await waitUntilSent(t, 4)
+        let create = lineJSON(t.sent[3])
+        XCTAssertEqual(create["method"] as? String, "session.create")
+        // session.create SUCCEEDS this time — a brand-new session really is created server-side.
+        t.feed(#"{"jsonrpc":"2.0","id":\#(create["id"] as! Int),"result":{"sessionId":"s_new","trusted":true}}"#)
+
+        // refocus(onto: "s_new") now fires session.attach("s_new") — THIS is the RPC that fails.
+        await waitUntilSent(t, 5)
+        let attachNew = lineJSON(t.sent[4])
+        XCTAssertEqual(attachNew["method"] as? String, "session.attach")
+        XCTAssertEqual((attachNew["params"] as? [String: Any])?["sessionId"] as? String, "s_new")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(attachNew["id"] as! Int),"error":{"code":1,"message":"boom"}}"#)
+
+        // refocus's catch reconciles focus to attachedSessionId (rolled back to "s_old" by
+        // NormaClient.attach's own throw handling), then calls listSessions() to look for a
+        // newer survivor to retry onto. "s_new" (the just-failed target) IS the newest — the
+        // create really did succeed server-side — so the retry is correctly skipped.
+        await waitUntilSent(t, 6)
+        let relist = lineJSON(t.sent[5])
+        XCTAssertEqual(relist["method"] as? String, "session.list")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(relist["id"] as! Int),"result":{"sessions":[{"sessionId":"s_old","scope":"global","createdAt":1,"lastSeq":0},{"sessionId":"s_new","scope":"global","createdAt":2,"lastSeq":0}]}}"#)
+
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertTrue(delegate.detachedWindows.isEmpty, "a successful create whose follow-up attach fails must never spawn a window on the reverted-to prior session")
+        XCTAssertEqual(model.focusedSessionId, "s_old", "reconciled focus after the failed attach must be the rolled-back prior session, not the never-attached new one")
+    }
 }
