@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -190,6 +191,11 @@ describe("PeripheralBroker", () => {
       type: "lease_granted", sessionId: "s1", threadId: "main",
       leaseId: g.leaseId, class: "noop", holder: { kind: "session", id: "s1" }, expiresAt: g.expiresAt,
     });
+    // Spec §A1 ("no token, no service"): lease_granted carries the RAW token's sha256 hash (never
+    // the raw token itself) so the provider can validate it on every call — assert the emitted
+    // hash actually matches the token the requester got back, not just that SOME string is present.
+    const emittedTokenHash = (granted!.event as { tokenHash?: string }).tokenHash;
+    expect(emittedTokenHash).toBe(createHash("sha256").update(g.token).digest("hex"));
   });
 
   test("policy denial → {code:'denied'}, no entry created", async () => {

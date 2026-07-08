@@ -10,5 +10,6 @@
     "kind": "session",
     "id": "s_1"
   },
-  "expiresAt": 1700000000024
+  "expiresAt": 1700000000024,
+  "tokenHash": "9aefbca72caebab86c15bc0c60c8b7c3de90040152b1be9d9ada3769dedde18d"
 }

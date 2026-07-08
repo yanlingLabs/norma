@@ -194,14 +194,18 @@ export class PeripheralBroker {
 
     const leaseId = `lease_${randomBytes(6).toString("hex")}`;
     const token = `tok_${randomBytes(24).toString("hex")}`;
+    const tokenHash = hashToken(token);
     const expiresAt = Date.now() + this.expiryMs;
-    this.entries.set(req.class, { leaseId, class: req.class, holder, tokenHash: hashToken(token), expiresAt });
+    this.entries.set(req.class, { leaseId, class: req.class, holder, tokenHash, expiresAt });
     this.armSweep();
 
     this.auditLease("lease_grant", { class: req.class, leaseId, holder });
+    // tokenHash rides the event (spec §A1: "no token, no service") so the PROVIDER can validate
+    // token+class+expiry on every call — the raw token itself is NEVER broadcast; it goes solely
+    // to the requester in this method's return value and back from the requester on calls.
     this.deps.emitTransient(req.sessionId, {
       type: "lease_granted", sessionId: req.sessionId, threadId: "main",
-      leaseId, class: req.class, holder, expiresAt,
+      leaseId, class: req.class, holder, expiresAt, tokenHash,
     });
     return { leaseId, token, expiresAt };
   }

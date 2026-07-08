@@ -208,7 +208,7 @@ final class MethodWrapperTests: XCTestCase {
 
         var iter = client.events.makeAsyncIterator()
         let holder = #"{"kind":"session","id":"s_1"}"#
-        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"lease_granted","seq":8,"sessionId":"s_1","ts":1,"threadId":"main","leaseId":"lease_1","class":"noop","holder":\#(holder),"expiresAt":20}}"#)
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"lease_granted","seq":8,"sessionId":"s_1","ts":1,"threadId":"main","leaseId":"lease_1","class":"noop","holder":\#(holder),"expiresAt":20,"tokenHash":"\#(String(repeating: "a", count: 64))"}}"#)
         guard case .session(.leaseGranted(let g)) = await iter.next() else { return XCTFail("lease_granted wrongly deduped") }
         XCTAssertEqual(g.leaseId, "lease_1")
 

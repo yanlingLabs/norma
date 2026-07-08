@@ -27,8 +27,15 @@ final class PeripheralProviderTests: XCTestCase {
     // ~2001: a real bug caught by running these tests, left as a comment so it isn't reintroduced).
     private static let farFutureMs = 4_102_444_800_000
 
-    private func leaseGrantedEvent(leaseId: String = "lease_1", class cls: String = "noop", expiresAt: Int = PeripheralProviderTests.farFutureMs) -> SessionEvent {
-        sessionEvent(#"{"type":"lease_granted","seq":1,"sessionId":"s_1","ts":0,"threadId":"main","leaseId":"\#(leaseId)","class":"\#(cls)","holder":{"kind":"session","id":"s_1"},"expiresAt":\#(expiresAt)}"#)
+    /// The default token every test's `callRequestedEvent()` uses ("tok_1") hashed — kept as a
+    /// single source of truth so `leaseGrantedEvent()`'s default `tokenHash` and
+    /// `callRequestedEvent()`'s default `token` stay a matching pair without hardcoding the hex
+    /// digest twice. `sha256Hex` is the SAME function `shouldServe` uses in production
+    /// (`@testable import Norma`), so this doubles as a light round-trip check of that helper.
+    private static let defaultTokenHash = sha256Hex("tok_1")
+
+    private func leaseGrantedEvent(leaseId: String = "lease_1", class cls: String = "noop", expiresAt: Int = PeripheralProviderTests.farFutureMs, tokenHash: String = PeripheralProviderTests.defaultTokenHash) -> SessionEvent {
+        sessionEvent(#"{"type":"lease_granted","seq":1,"sessionId":"s_1","ts":0,"threadId":"main","leaseId":"\#(leaseId)","class":"\#(cls)","holder":{"kind":"session","id":"s_1"},"expiresAt":\#(expiresAt),"tokenHash":"\#(tokenHash)"}"#)
     }
 
     private func leaseLostEvent(leaseId: String = "lease_1", class cls: String = "noop", reason: String = "released") -> SessionEvent {
@@ -64,34 +71,56 @@ final class PeripheralProviderTests: XCTestCase {
     // MARK: - Pure decision core: shouldServe
 
     func testShouldServeServesNoopWhenLeaseValid() {
-        let lease = PeripheralLeaseInfo(leaseId: "lease_1", class: "noop", holder: holder(), expiresAt: 1000)
+        // Also exercises the "valid-token serve" path (spec §A1): the call's token hashes to
+        // exactly the lease's tokenHash.
+        let lease = PeripheralLeaseInfo(leaseId: "lease_1", class: "noop", holder: holder(), expiresAt: 1000, tokenHash: Self.defaultTokenHash)
         let call = PeripheralCallRequest(requestId: "req_1", leaseId: "lease_1", token: "tok_1", class: "noop", payloadJson: "{}")
         XCTAssertEqual(shouldServe(call, leases: [lease], nowMs: 500), .serve)
     }
 
     func testShouldServeDeniesUnknownLease() {
-        let lease = PeripheralLeaseInfo(leaseId: "lease_1", class: "noop", holder: holder(), expiresAt: 1000)
+        let lease = PeripheralLeaseInfo(leaseId: "lease_1", class: "noop", holder: holder(), expiresAt: 1000, tokenHash: Self.defaultTokenHash)
         let call = PeripheralCallRequest(requestId: "req_1", leaseId: "lease_ghost", token: "tok_1", class: "noop", payloadJson: "{}")
         XCTAssertEqual(shouldServe(call, leases: [lease], nowMs: 500), .deny("lease_not_found"))
     }
 
+    func testShouldServeDeniesTokenMismatchWithAGarbageToken() {
+        // Spec §A1 defect fix: a garbage token with a VALID leaseId must be rejected, not served
+        // — a right leaseId alone is not enough, per "no token, no service."
+        let lease = PeripheralLeaseInfo(leaseId: "lease_1", class: "noop", holder: holder(), expiresAt: 1000, tokenHash: Self.defaultTokenHash)
+        let call = PeripheralCallRequest(requestId: "req_1", leaseId: "lease_1", token: "tok_garbage_totally_wrong", class: "noop", payloadJson: "{}")
+        XCTAssertEqual(shouldServe(call, leases: [lease], nowMs: 500), .deny("token_mismatch"))
+    }
+
+    func testShouldServeDeniesEmptyToken() {
+        // An empty token must not accidentally satisfy the hash comparison (sha256("") is itself
+        // a valid-looking 64-char hex digest — this asserts it still doesn't match a real lease's
+        // tokenHash).
+        let lease = PeripheralLeaseInfo(leaseId: "lease_1", class: "noop", holder: holder(), expiresAt: 1000, tokenHash: Self.defaultTokenHash)
+        let call = PeripheralCallRequest(requestId: "req_1", leaseId: "lease_1", token: "", class: "noop", payloadJson: "{}")
+        XCTAssertEqual(shouldServe(call, leases: [lease], nowMs: 500), .deny("token_mismatch"))
+    }
+
     func testShouldServeDeniesClassMismatchAgainstTheGrantedLease() {
-        // Granted for "noop"; the call claims a different class for the SAME leaseId.
-        let lease = PeripheralLeaseInfo(leaseId: "lease_1", class: "noop", holder: holder(), expiresAt: 1000)
+        // Granted for "noop"; the call claims a different class for the SAME leaseId. Token
+        // matches the lease so this exercises class_mismatch specifically, not token_mismatch.
+        let lease = PeripheralLeaseInfo(leaseId: "lease_1", class: "noop", holder: holder(), expiresAt: 1000, tokenHash: Self.defaultTokenHash)
         let call = PeripheralCallRequest(requestId: "req_1", leaseId: "lease_1", token: "tok_1", class: "screenshot", payloadJson: "{}")
         XCTAssertEqual(shouldServe(call, leases: [lease], nowMs: 500), .deny("class_mismatch"))
     }
 
     func testShouldServeDeniesExpiredLeaseInclusiveBoundary() {
         // nowMs == expiresAt counts as expired (matches core's expiredLeases inclusive boundary).
-        let lease = PeripheralLeaseInfo(leaseId: "lease_1", class: "noop", holder: holder(), expiresAt: 500)
+        // Token matches so this exercises the expiry check specifically.
+        let lease = PeripheralLeaseInfo(leaseId: "lease_1", class: "noop", holder: holder(), expiresAt: 500, tokenHash: Self.defaultTokenHash)
         let call = PeripheralCallRequest(requestId: "req_1", leaseId: "lease_1", token: "tok_1", class: "noop", payloadJson: "{}")
         XCTAssertEqual(shouldServe(call, leases: [lease], nowMs: 500), .deny("expired"))
     }
 
     func testShouldServeDeniesUnsupportedClassEvenWithAValidLease() {
-        // v1 only serves noop — a real, valid, unexpired lease for "screenshot" is still denied.
-        let lease = PeripheralLeaseInfo(leaseId: "lease_1", class: "screenshot", holder: holder(), expiresAt: 1000)
+        // v1 only serves noop — a real, valid, unexpired, correctly-tokened lease for
+        // "screenshot" is still denied.
+        let lease = PeripheralLeaseInfo(leaseId: "lease_1", class: "screenshot", holder: holder(), expiresAt: 1000, tokenHash: Self.defaultTokenHash)
         let call = PeripheralCallRequest(requestId: "req_1", leaseId: "lease_1", token: "tok_1", class: "screenshot", payloadJson: "{}")
         XCTAssertEqual(shouldServe(call, leases: [lease], nowMs: 500), .deny("unsupported_class"))
     }
@@ -178,6 +207,25 @@ final class PeripheralProviderTests: XCTestCase {
         XCTAssertEqual(respond["method"] as? String, "peripheral.respond")
         let params = respond["params"] as? [String: Any]
         XCTAssertEqual(params?["error"] as? String, "lease_not_found")
+        XCTAssertNil(params?["resultJson"])
+
+        ackLastSent(t, index: 1)
+        await handled
+    }
+
+    func testPeripheralCallRequestedDeniesTokenMismatchOverTheWire() async throws {
+        // End-to-end version of testShouldServeDeniesTokenMismatchWithAGarbageToken: a real
+        // lease_granted lands (tokenHash for "tok_1"), then a peripheral_call_requested carries a
+        // DIFFERENT token for the same, otherwise-valid leaseId — must be denied, not served.
+        let (provider, t) = try await connectedProvider()
+        await provider.handle(leaseGrantedEvent())
+
+        async let handled: Void = provider.handle(callRequestedEvent(token: "tok_wrong_guess"))
+
+        await feedWaitUntil { t.sent.count >= 2 }
+        let respond = feedLineJSON(t.sent[1])
+        let params = respond["params"] as? [String: Any]
+        XCTAssertEqual(params?["error"] as? String, "token_mismatch")
         XCTAssertNil(params?["resultJson"])
 
         ackLastSent(t, index: 1)

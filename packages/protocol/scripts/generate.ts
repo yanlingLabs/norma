@@ -44,7 +44,7 @@ const fixtures: Record<string, unknown> = {
   thread_started: { type: "thread_started", sessionId: "s_1", threadId: "th_child1", seq: 17, ts: 1700000000007, parentThreadId: "main", agentType: "researcher", prompt: "Summarize the auth module" },
   thread_completed: { type: "thread_completed", sessionId: "s_1", threadId: "th_child1", seq: 18, ts: 1700000000008, stopReason: "end_turn" },
   session_titled: { type: "session_titled", seq: 9, sessionId: "s_1", ts: 5, threadId: "main", title: "Fixing the login flow" },
-  lease_granted: { type: "lease_granted", sessionId: "s_1", threadId: "main", seq: 19, ts: 1700000000009, leaseId: "lease_1", class: "screenshot", holder: { kind: "session", id: "s_1" }, expiresAt: 1700000000024 },
+  lease_granted: { type: "lease_granted", sessionId: "s_1", threadId: "main", seq: 19, ts: 1700000000009, leaseId: "lease_1", class: "screenshot", holder: { kind: "session", id: "s_1" }, expiresAt: 1700000000024, tokenHash: "9aefbca72caebab86c15bc0c60c8b7c3de90040152b1be9d9ada3769dedde18d" },
   lease_lost: { type: "lease_lost", sessionId: "s_1", threadId: "main", seq: 20, ts: 1700000000010, leaseId: "lease_1", class: "screenshot", holder: { kind: "session", id: "s_1" }, reason: "expired" },
   peripheral_call_requested: { type: "peripheral_call_requested", sessionId: "s_1", threadId: "main", seq: 21, ts: 1700000000011, requestId: "req_1", leaseId: "lease_1", token: "tok_9f3a7c2e1b", class: "noop", payloadJson: "{}" },
 };

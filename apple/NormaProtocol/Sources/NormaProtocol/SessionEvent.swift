@@ -314,6 +314,11 @@ public enum SessionEvent: Codable, Equatable, Sendable {
 
     /// TRANSIENT (broadcast-only, like `assistant_delta`) — leases are runtime state; replay
     /// must never resurrect one. The audit log is the durable record.
+    ///
+    /// `tokenHash` (sha256 hex of the raw token) lets the PROVIDER validate token+class+expiry
+    /// on every `peripheral_call_requested` (spec §A1: "no token, no service") — see
+    /// `PeripheralProvider.shouldServe` in the app target. The raw token itself never rides this
+    /// event.
     public struct LeaseGranted: Codable, Equatable, Sendable {
         public let seq: Int
         public let sessionId: String
@@ -323,6 +328,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         public let `class`: String
         public let holder: Holder
         public let expiresAt: Int
+        public let tokenHash: String
     }
 
     /// TRANSIENT — see LeaseGranted.

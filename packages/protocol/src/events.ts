@@ -126,13 +126,19 @@ export const HolderSchema = z.object({
 export type Holder = z.infer<typeof HolderSchema>;
 
 /** TRANSIENT (broadcast-only via `broadcastTransient`, like `assistant_delta`): leases are
- *  runtime state — replay must never resurrect one. The audit log is the durable record. */
+ *  runtime state — replay must never resurrect one. The audit log is the durable record.
+ *
+ *  `tokenHash` (sha256 hex of the raw token) rides this event so the PROVIDER can validate
+ *  token+class+expiry on every `peripheral_call_requested` (spec §A1: "no token, no service") —
+ *  the raw token itself is NEVER broadcast; it goes solely to the requester in the
+ *  `peripheral.lease` RESPONSE and back from the requester in capability calls. */
 export const LeaseGrantedEvent = ThreadBase.extend({
   type: z.literal("lease_granted"),
   leaseId: z.string().min(1),
   class: PeripheralClassSchema,
   holder: HolderSchema,
   expiresAt: z.number().int().nonnegative(),
+  tokenHash: z.string().min(1),
 });
 /** TRANSIENT — see LeaseGrantedEvent. */
 export const LeaseLostEvent = ThreadBase.extend({

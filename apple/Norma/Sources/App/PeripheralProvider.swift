@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
 import CoreGraphics
+import CryptoKit
 import Foundation
 import NormaKit
 import NormaProtocol
@@ -16,12 +17,17 @@ import NormaProtocol
 /// The provider's own local view of one active lease — built entirely from `lease_granted`/
 /// `lease_lost` events (`PeripheralProvider.handle`). Drives both `shouldServe`'s validation and
 /// (later, Task 5) the dashboard's Peripheral pane (class/holder/age).
+///
+/// `tokenHash` (sha256 hex of the raw token, carried by `lease_granted` — spec §A1: "no token, no
+/// service") is what `shouldServe` compares `sha256(call.token)` against; the raw token itself is
+/// never stored here or anywhere else provider-side.
 struct PeripheralLeaseInfo: Identifiable, Equatable {
     var id: String { leaseId }
     let leaseId: String
     let `class`: String
     let holder: SessionEvent.Holder
     let expiresAt: Int
+    let tokenHash: String
 }
 
 /// A `peripheral_call_requested` event narrowed to exactly the fields `shouldServe` needs —
@@ -44,16 +50,29 @@ enum PeripheralServeDecision: Equatable {
     case deny(String)
 }
 
+/// sha256 hex digest of `token`, lowercase — matches `hashToken()` in
+/// `packages/core/src/peripheral/broker.ts` (`createHash("sha256").update(token).digest("hex")`)
+/// byte-for-byte, so a token minted by core hashes to the same string here.
+func sha256Hex(_ token: String) -> String {
+    SHA256.hash(data: Data(token.utf8)).map { String(format: "%02x", $0) }.joined()
+}
+
 /// Validates `call` against the provider's locally-tracked `leases` (from `lease_granted`/
-/// `lease_lost`) at `nowMs`. Core has ALREADY validated leaseId+token+class+expiry server-side
-/// before `peripheral_call_requested` is ever pushed to the provider (`PeripheralBroker.call()`
-/// in `packages/core/src/peripheral/broker.ts`) — this is defense-in-depth against the PROVIDER's
-/// own local tracking drifting from core's ground truth (a missed/duplicated event, a race at
-/// startup), not the authoritative check. The provider never trusts `call.class` over what it was
-/// actually granted for `call.leaseId`: a mismatch is `class_mismatch`, not a silent reclassification.
+/// `lease_lost`) at `nowMs`. Spec §A1: "the provider validates token+class+expiry on EVERY call —
+/// no token, no service" — this function IS that check; core validating the same triple in
+/// `PeripheralBroker.call()` (`packages/core/src/peripheral/broker.ts`) before ever pushing
+/// `peripheral_call_requested` does not make this optional here, since a leaseId alone (with a
+/// garbage/guessed token) must never be served. `call.token` is hashed and compared against
+/// `lease.tokenHash` (carried by `lease_granted`, never the raw token) — the two hashing
+/// implementations must stay byte-identical (see `sha256Hex` above). The provider never trusts
+/// `call.class` over what it was actually granted for `call.leaseId`: a mismatch is
+/// `class_mismatch`, not a silent reclassification.
 func shouldServe(_ call: PeripheralCallRequest, leases: [PeripheralLeaseInfo], nowMs: Int) -> PeripheralServeDecision {
     guard let lease = leases.first(where: { $0.leaseId == call.leaseId }) else {
         return .deny("lease_not_found")
+    }
+    guard sha256Hex(call.token) == lease.tokenHash else {
+        return .deny("token_mismatch")
     }
     guard lease.class == call.class else {
         return .deny("class_mismatch")
@@ -184,7 +203,7 @@ final class PeripheralProvider: ObservableObject {
             // session — broadcastTransient's fan-out and the provider-direct push can both land
             // the same grant): drop any existing entry for this leaseId before appending.
             activeLeases.removeAll { $0.leaseId == g.leaseId }
-            activeLeases.append(PeripheralLeaseInfo(leaseId: g.leaseId, class: g.class, holder: g.holder, expiresAt: g.expiresAt))
+            activeLeases.append(PeripheralLeaseInfo(leaseId: g.leaseId, class: g.class, holder: g.holder, expiresAt: g.expiresAt, tokenHash: g.tokenHash))
             updatePanicRegistration()
         case .leaseLost(let l):
             activeLeases.removeAll { $0.leaseId == l.leaseId }
