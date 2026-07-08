@@ -44,6 +44,19 @@ export type NormaManifest = z.infer<typeof NormaPluginManifest>;
  *   Never throws — a broken manifest degrades to legacy loading, it never bricks the plugin.
  */
 export function loadManifest(dir: string, dirName: string, log?: (m: string) => void): { manifest?: NormaManifest; legacy: boolean } {
+  // Final-review Fix 3 (id/name charset): tool.register's own wire schema (protocol/methods.ts)
+  // now REJECTS a `__` in a tool NAME outright, but a pluginId is a raw directory name — user/
+  // filesystem-controlled, so it's a WARNING here, not a hard reject (a plugin someone already
+  // installed under a `__`-bearing directory name must keep loading). The risk: ipc/server.ts's
+  // `tool.register` handler namespaces every tool as `plugin__<pluginId>__<name>`, and
+  // `ToolRegistry.unregisterByPrefix("plugin__<id>__")` matches that by plain string prefix — a
+  // pluginId containing `__` can make its own unregister prefix collide with a DIFFERENT,
+  // unrelated plugin's registered tool names (e.g. pluginId "foo" unregistering
+  // "plugin__foo__" also matches "plugin__foo__evil__bar", a tool actually owned by a sibling
+  // plugin literally named "foo__evil"), silently dropping that sibling's tools out from under it.
+  if (dirName.includes("__")) {
+    log?.(`plugin ${dirName}: directory name contains "__" — this can collide with another plugin's tool-unregister prefix (plugin__<id>__); consider renaming the plugin directory`);
+  }
   const path = join(dir, "norma-plugin.json");
   if (!existsSync(path)) return { legacy: true };
 

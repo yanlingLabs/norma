@@ -75,6 +75,8 @@ import {
   PluginToolResultResult,
   PluginRevokeTokenParams,
   PluginRevokeTokenResult,
+  PluginRestartParams,
+  PluginRestartResult,
   METHODS,
 } from "../src/methods";
 
@@ -435,6 +437,15 @@ describe("plugin verbs (Phase 4b Task 1, spec §3)", () => {
     expect(() => ToolRegisterResult.parse({ ok: true, registeredAs: "" })).toThrow();
   });
 
+  test("tool.register name charset (final-review Fix 3): alphanumeric + single -/_ separators only — no __, no leading/trailing _, no other punctuation", () => {
+    for (const ok of ["echo", "read-file", "read_file", "a1-b2_c3", "UPPER", "123"]) {
+      expect(ToolRegisterParams.parse({ name: ok, description: "d" }).name).toBe(ok);
+    }
+    for (const bad of ["read__file", "_leading", "trailing_", "__", "has space", "has.dot", "has/slash", "emoji🎉"]) {
+      expect(() => ToolRegisterParams.parse({ name: bad, description: "d" })).toThrow();
+    }
+  });
+
   test("shortcut.register params/result: description/default optional, id required", () => {
     const p = ShortcutRegisterParams.parse({
       shortcuts: [{ id: "toggle-limiter" }, { id: "boost", description: "Boost charging", default: "cmd+shift+b" }],
@@ -474,5 +485,15 @@ describe("plugin.revokeToken (Phase 4b Task 2, spec §3 — harness-role admin v
     expect(() => PluginRevokeTokenParams.parse({ pluginId: "" })).toThrow();
     expect(() => PluginRevokeTokenParams.parse({})).toThrow();
     expect(PluginRevokeTokenResult.parse({ ok: true })).toEqual({ ok: true });
+  });
+});
+
+describe("plugin.restart (final-review Fix 1 — restart rider, recovers a circuit-open plugin; harness/admin role like plugins.list, NOT one of the six plugin verbs)", () => {
+  test("METHODS carries it; params require a non-empty pluginId; result is a plain ok", () => {
+    expect(METHODS.pluginRestart).toBe("plugin.restart");
+    expect(PluginRestartParams.parse({ pluginId: "sample-echo" }).pluginId).toBe("sample-echo");
+    expect(() => PluginRestartParams.parse({ pluginId: "" })).toThrow();
+    expect(() => PluginRestartParams.parse({})).toThrow();
+    expect(PluginRestartResult.parse({ ok: true })).toEqual({ ok: true });
   });
 });

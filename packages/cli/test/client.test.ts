@@ -210,6 +210,20 @@ describe("NormaClient", () => {
     client.close();
   });
 
+  // Final-review Fix 1: the CLI-facing wrapper over the harness/admin-role plugin.restart RPC
+  // (used by `norma plugin restart <id>`). A `FakeProvider` daemon DOES wire a real
+  // PluginSupervisor (daemon.ts only builds one `if (agentProvider)`) but this fixture home has no
+  // plugins directory, so the supervisor tracks nothing — restarting an id it never saw is exactly
+  // `plugin.restart`'s typed NOT_FOUND path (ipc/server.ts), fully exercisable without a real
+  // spawned plugin process. The deeper "restarts a circuit-open plugin and it re-spawns" behavior
+  // is covered at the ipc/server.ts level (core/test/server.test.ts) with an injected fake spawn.
+  test("restartPlugin client method rejects a plugin id the supervisor has never tracked", async () => {
+    await boot(new FakeProvider([]));
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "rsp", onEvent: () => {} });
+    await expect(client.restartPlugin("never-existed")).rejects.toThrow(/unknown plugin/);
+    client.close();
+  });
+
   test("init prompt reaches the session (canned NORMA.md-generation prompt)", async () => {
     const { INIT_PROMPT } = await import("../src/main");
     expect(INIT_PROMPT).toMatch(/NORMA\.md/i);

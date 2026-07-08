@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { encodeLine, LineDecoder, METHODS, PROTOCOL_VERSION } from "@norma/protocol";
+import { encodeLine, LineDecoder, METHODS, PROTOCOL_VERSION, ERR } from "@norma/protocol";
 import { backoffDelayMs, createPlugin } from "../src/index";
 
 // -------------------------------------------------------------------------------------------
@@ -25,15 +25,33 @@ interface FakeServer {
   tiles: Array<Record<string, unknown>>;
   toolResults: ToolResultParams[];
   connectionCount(): number;
+  /** High-water mark of CONCURRENTLY open connections (final-review Fix B1) — distinct from
+   *  `connectionCount()`'s running total: a legitimate reconnect cycle (old socket fully closed,
+   *  THEN a new one opens) grows the total without ever exceeding 1 live at a time. A double-armed
+   *  reconnect loop (the bug B1 fixes) briefly holds TWO live sockets at once, which this catches
+   *  and `connectionCount()` alone cannot. */
+  peakConcurrentConnections(): number;
   pushEvent(params: unknown): void;
   stop(): void;
 }
+
+/** Controls how the fake server answers `hello`, for exercising the two disconnect-during-
+ *  handshake / fatal-auth scenarios (final-review Fix B1) the happy-path tests above don't touch. */
+type HelloMode =
+  | { kind: "ok" }
+  /** The FIRST connection's hello is received but never answered — the socket is torn down
+   *  instead, simulating "disconnect while a handshake request is in flight". Every later
+   *  connection (a reconnect) gets a normal ok response. */
+  | { kind: "drop-first" }
+  /** Every hello is answered with a JSON-RPC error at ERR.UNAUTHORIZED — simulates a rotated/
+   *  revoked token. */
+  | { kind: "unauthorized" };
 
 function safeUnlink(path: string): void {
   try { unlinkSync(path); } catch { /* nothing to remove */ }
 }
 
-function startFakeServer(path: string): FakeServer {
+function startFakeServer(path: string, helloMode: HelloMode = { kind: "ok" }): FakeServer {
   safeUnlink(path); // a prior listener's socket file may still be on disk (restart tests)
 
   const order: string[] = [];
@@ -42,6 +60,8 @@ function startFakeServer(path: string): FakeServer {
   const tiles: Array<Record<string, unknown>> = [];
   const toolResults: ToolResultParams[] = [];
   let connections = 0;
+  let liveNow = 0;
+  let peakLive = 0;
   let active: Bun.Socket<ConnState> | null = null;
 
   const server = Bun.listen<ConnState>({
@@ -49,6 +69,8 @@ function startFakeServer(path: string): FakeServer {
     socket: {
       open(socket) {
         connections++;
+        liveNow++;
+        peakLive = Math.max(peakLive, liveNow);
         active = socket;
         socket.data = { decoder: new LineDecoder() };
       },
@@ -58,6 +80,17 @@ function startFakeServer(path: string): FakeServer {
           switch (msg.method) {
             case METHODS.hello:
               order.push(METHODS.hello);
+              if (helloMode.kind === "drop-first" && connections === 1) {
+                socket.end(); // never respond — simulates a disconnect mid-handshake
+                break;
+              }
+              if (helloMode.kind === "unauthorized") {
+                socket.write(encodeLine({
+                  jsonrpc: "2.0", id: msg.id,
+                  error: { code: ERR.UNAUTHORIZED, message: "invalid token for role" },
+                }));
+                break;
+              }
               socket.write(encodeLine({
                 jsonrpc: "2.0", id: msg.id,
                 result: { ok: true, serverVersion: "fake", protocolVersion: PROTOCOL_VERSION },
@@ -96,6 +129,7 @@ function startFakeServer(path: string): FakeServer {
         }
       },
       close(socket) {
+        liveNow--;
         if (active === socket) active = null;
       },
     },
@@ -105,6 +139,7 @@ function startFakeServer(path: string): FakeServer {
     order, registeredTools, tiles, toolResults,
     shortcuts: () => shortcuts,
     connectionCount: () => connections,
+    peakConcurrentConnections: () => peakLive,
     pushEvent(params: unknown) {
       active?.write(encodeLine({ jsonrpc: "2.0", method: METHODS.event, params }));
     },
@@ -235,6 +270,60 @@ describe("createPlugin().serve()", () => {
 
     await new Promise((r) => setTimeout(r, 1800)); // longer than the 1s base backoff
     expect(server2.connectionCount()).toBe(0);
+  }, 5000);
+
+  // Final-review Fix B1: a disconnect while `hello`'s response is still in flight used to arm TWO
+  // independent reconnect loops (the socket's own close() callback, AND connectOnce()'s rejected
+  // `await request(hello...)` propagating up through attemptConnect's own `.catch`) — the loser
+  // loop shared this instance's mutable decoder/pending/writer state with the winner, corrupting
+  // both, and leaked whichever socket its own failure path never end()'d.
+  test("disconnect during in-flight hello -> exactly ONE reconnect loop, no leaked/overlapping socket", async () => {
+    const server = startFakeServer(sockPath, { kind: "drop-first" });
+    cleanups.push(() => server.stop());
+
+    const plugin = createPlugin({ tools: { ping: { description: "ping", run: () => "pong" } } });
+    cleanups.push(() => plugin.close());
+
+    // The first connection's hello is dropped (no response, socket torn down) — serve() only
+    // resolves once a LATER reconnect completes the full handshake for real.
+    await plugin.serve({ socketPath: sockPath, token: "tok", pluginId: "sample" });
+    expect(server.order).toEqual([METHODS.hello, METHODS.hello, METHODS.pluginRegister, METHODS.toolRegister]);
+
+    // Exactly 2 connections total (1 aborted + 1 successful) — a double-armed reconnect loop would
+    // eventually produce a 3rd (the leaked loop's own independent retry). Give it a beat past the
+    // base 1s backoff to prove no further connection shows up.
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(server.connectionCount()).toBe(2);
+    // Never more than 1 socket open at once — no overlapping/leaked connection at any point.
+    expect(server.peakConcurrentConnections()).toBe(1);
+  }, 10_000);
+
+  test("hello UNAUTHORIZED is fatal: exits without scheduling a reconnect", async () => {
+    const server = startFakeServer(sockPath, { kind: "unauthorized" });
+    cleanups.push(() => server.stop());
+
+    const plugin = createPlugin({ tools: {} });
+    cleanups.push(() => plugin.close());
+
+    let exitCode: number | undefined;
+    const originalExit = process.exit;
+    // Swallow process.exit — real usage kills the process, but that can't happen inside the test
+    // runner. `attemptConnect`'s fatal branch does `close(); process.exit(1); return;` in that
+    // order, so cleanup already ran by the time this fires; a real exit would just never come back
+    // here, which is what the plain `return` after the call already assumes.
+    process.exit = ((code?: number) => { exitCode = code; }) as unknown as typeof process.exit;
+    cleanups.push(() => { process.exit = originalExit; });
+
+    void plugin.serve({ socketPath: sockPath, token: "tok", pluginId: "sample" }); // never resolves — the fatal path never calls firstConnectResolve
+
+    await waitFor(() => exitCode !== undefined, 2000);
+    expect(exitCode).toBe(1);
+    expect(server.order).toEqual([METHODS.hello]);
+
+    // No reconnect scheduled: wait past the base 1s backoff and confirm no second attempt.
+    const before = server.connectionCount();
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(server.connectionCount()).toBe(before);
   }, 5000);
 
   test("serve() installs SIGTERM/SIGINT handlers; close() removes them", async () => {

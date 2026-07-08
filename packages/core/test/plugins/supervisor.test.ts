@@ -393,6 +393,32 @@ describe("invoke()", () => {
     expect(res).toEqual({ code: "timeout" });
   });
 
+  test("repeated invoke timeouts count as failures toward the circuit breaker, same as repeated crashes (final-review Fix B2)", async () => {
+    const { supervisor } = makeSupervisor({
+      settings: { registrationTimeoutMs: 5000, invokeTimeoutMs: 10, backoffCapMs: 10, circuitFailures: 2, circuitWindowMs: 600_000 },
+    });
+    const p = fakePlugin();
+    supervisor.startAll([p]);
+    supervisor.notifyRegistered(p.id, fakeConn());
+
+    const first = await supervisor.invoke(p.id, "tool", "{}");
+    expect(first).toEqual({ code: "timeout" });
+    expect(supervisor.status(p.id)).toBe("backoff"); // 1 failure < circuitFailures(2) — not open yet
+
+    await sleep(30); // past backoffCapMs(10ms) — restartFromBackoff respawns automatically
+    expect(supervisor.status(p.id)).toBe("starting");
+    supervisor.notifyRegistered(p.id, fakeConn());
+    expect(supervisor.status(p.id)).toBe("running");
+
+    const second = await supervisor.invoke(p.id, "tool", "{}");
+    expect(second).toEqual({ code: "timeout" });
+    expect(supervisor.status(p.id)).toBe("circuit-open"); // 2nd failure within the window trips it
+
+    // "no further invoke attempts": circuit-open fails fast, never pushes another plugin_tool_invoke.
+    const third = await supervisor.invoke(p.id, "tool", "{}");
+    expect(third).toEqual({ code: "not_running" });
+  });
+
   test("a plugin.toolResult error -> typed plugin_error carrying the message", async () => {
     const { supervisor } = makeSupervisor();
     const p = fakePlugin();
@@ -401,7 +427,7 @@ describe("invoke()", () => {
     supervisor.notifyRegistered(p.id, conn);
     const invokePromise = supervisor.invoke(p.id, "tool", "{}");
     const requestId = conn.pushed[0]!.requestId as string;
-    supervisor.resolveToolResult({ requestId, error: "boom" });
+    supervisor.resolveToolResult({ requestId, error: "boom" }, p.id);
     expect(await invokePromise).toEqual({ code: "plugin_error", message: "boom" });
   });
 
@@ -413,7 +439,7 @@ describe("invoke()", () => {
     supervisor.notifyRegistered(p.id, conn);
     const invokePromise = supervisor.invoke(p.id, "tool", "{}");
     const requestId = conn.pushed[0]!.requestId as string;
-    supervisor.resolveToolResult({ requestId, resultJson: "\"hi\"" });
+    supervisor.resolveToolResult({ requestId, resultJson: "\"hi\"" }, p.id);
     expect(await invokePromise).toEqual({ ok: true, resultJson: "\"hi\"" });
   });
 });
@@ -432,9 +458,9 @@ describe("resolveToolResult() double-settle-proof", () => {
     const invokePromise = supervisor.invoke(p.id, "echo", "{}");
     const requestId = conn.pushed[0]!.requestId as string;
 
-    const first = supervisor.resolveToolResult({ requestId, resultJson: "\"first\"" });
+    const first = supervisor.resolveToolResult({ requestId, resultJson: "\"first\"" }, p.id);
     expect(first).toEqual({ ok: true });
-    const second = supervisor.resolveToolResult({ requestId, resultJson: "\"second\"" });
+    const second = supervisor.resolveToolResult({ requestId, resultJson: "\"second\"" }, p.id);
     expect(second).toEqual({ ok: true }); // never throws, no alreadyResolved on the wire shape
 
     const result = await invokePromise;
@@ -443,7 +469,53 @@ describe("resolveToolResult() double-settle-proof", () => {
 
   test("resolveToolResult for an unknown requestId is a safe no-op", () => {
     const { supervisor } = makeSupervisor();
-    expect(supervisor.resolveToolResult({ requestId: "never-existed" })).toEqual({ ok: true });
+    expect(supervisor.resolveToolResult({ requestId: "never-existed" }, "anyone")).toEqual({ ok: true });
+  });
+});
+
+// -------------------------------------------------------------------------------------------
+// resolveToolResult() — caller-bound (final-review Fix 2): the responding CONNECTION's own
+// authenticated pluginId must match the pending invoke's pluginId, or the settle is ignored.
+// -------------------------------------------------------------------------------------------
+
+describe("resolveToolResult() caller-bound (final-review Fix 2)", () => {
+  test("plugin B answering plugin A's requestId is a no-op — A's invoke keeps waiting", async () => {
+    const { supervisor } = makeSupervisor();
+    const a = fakePlugin({ id: "plugin-a" });
+    const b = fakePlugin({ id: "plugin-b" });
+    supervisor.startAll([a, b]);
+    const connA = fakeConn();
+    const connB = fakeConn();
+    supervisor.notifyRegistered(a.id, connA);
+    supervisor.notifyRegistered(b.id, connB);
+
+    const invokePromise = supervisor.invoke(a.id, "tool", "{}");
+    const requestId = connA.pushed[0]!.requestId as string;
+
+    // Plugin B (a different, correctly-authenticated connection) tries to settle A's requestId —
+    // rejected: the pending entry is untouched, A's own invoke is still outstanding.
+    const fromB = supervisor.resolveToolResult({ requestId, resultJson: "\"hijacked\"" }, b.id);
+    expect(fromB).toEqual({ ok: true }); // never throws — same "safe no-op" wire contract
+
+    // A's own answer still works — the mismatch above never consumed/settled the pending entry.
+    const fromA = supervisor.resolveToolResult({ requestId, resultJson: "\"legit\"" }, a.id);
+    expect(fromA).toEqual({ ok: true });
+
+    expect(await invokePromise).toEqual({ ok: true, resultJson: "\"legit\"" });
+  });
+
+  test("a harness/admin connection (callerPluginId null) can never settle a plugin's pending invoke", async () => {
+    const { supervisor } = makeSupervisor();
+    const p = fakePlugin();
+    supervisor.startAll([p]);
+    const conn = fakeConn();
+    supervisor.notifyRegistered(p.id, conn);
+    const invokePromise = supervisor.invoke(p.id, "tool", "{}");
+    const requestId = conn.pushed[0]!.requestId as string;
+
+    expect(supervisor.resolveToolResult({ requestId, resultJson: "\"nope\"" }, null)).toEqual({ ok: true });
+    expect(supervisor.resolveToolResult({ requestId, resultJson: "\"yes\"" }, p.id)).toEqual({ ok: true });
+    expect(await invokePromise).toEqual({ ok: true, resultJson: "\"yes\"" });
   });
 });
 

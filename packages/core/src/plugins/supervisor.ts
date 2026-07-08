@@ -458,6 +458,19 @@ export class PluginSupervisor {
     this.spawnFresh(config);
   }
 
+  /** The spawn config the supervisor currently has on record for a TRACKED plugin — set by
+   *  `startAll`/`reclaimOrphans`/`restart` itself, held on `PluginRuntime.config`. Lets the
+   *  `plugin.restart` IPC handler (final-review Fix 1: ipc/server.ts) restart a known plugin by id
+   *  alone, without the ipc layer re-deriving `EligiblePlugin.dir/entry` itself (that derivation —
+   *  reading `dir`/`entry.command` off a fresh `PluginStore.list()` — is exactly what `daemon.ts`
+   *  already does once at boot to build the `startAll` list; duplicating it in the ipc layer would
+   *  just be a second, driftable copy). `undefined` for a plugin the supervisor has never tracked —
+   *  restarting a never-before-seen id still requires the caller to supply a fresh config directly
+   *  to `restart()` (see its own doc comment above). */
+  configFor(pluginId: string): EligiblePlugin | undefined {
+    return this.runtimes.get(pluginId)?.config;
+  }
+
   // -----------------------------------------------------------------------------------------
   // Registration / connection lifecycle (Task 4 calls these from ipc/server.ts).
   // -----------------------------------------------------------------------------------------
@@ -512,6 +525,11 @@ export class PluginSupervisor {
     const rt = this.runtimes.get(pluginId);
     if (!rt || rt.status !== "running" || !rt.conn) return { code: "not_running" };
     const conn = rt.conn;
+    // Captured now (not read off `rt.generation` inside the timer below) so a timeout that fires
+    // after a NEWER spawn attempt has already superseded this one (e.g. the process crashed and
+    // was already respawned before this call's timer fired) can't misattribute a failure to the
+    // wrong attempt — same discipline `failAttempt`'s own generation check already relies on.
+    const generation = rt.generation;
 
     const requestId = `pinv_${randomBytes(6).toString("hex")}`;
     const event: NewSessionEvent = {
@@ -522,6 +540,13 @@ export class PluginSupervisor {
       const timer = setTimeout(() => {
         this.pending.delete(requestId);
         resolve({ code: "timeout" });
+        // Final-review Fix B2 (spec §3): a timeout is a wedged-connection failure, not a tolerated
+        // no-op — without this, a plugin that stays connected but stops answering tool calls would
+        // time out every invoke forever and never trip the circuit breaker. Routes through the
+        // SAME failure-accounting path a crash/disconnect uses (kills the process, backs off or
+        // opens the circuit), so repeated timeouts count toward `circuitFailures` exactly like
+        // repeated crashes do.
+        this.failAttempt(pluginId, generation, `plugin ${pluginId} tool ${tool} invoke timed out`);
       }, this.invokeTimeoutMs);
       timer.unref?.();
       this.pending.set(requestId, { pluginId, tool, resolve, timer });
@@ -545,10 +570,24 @@ export class PluginSupervisor {
    *  wire result (`PluginToolResultResult`, protocol/methods.ts) is deliberately just `{ok:true}`
    *  (no `alreadyResolved`, unlike `peripheral.respond`) — the supervisor's pending map is the
    *  single source of truth for double-settle guarding, not the wire shape, so there is nothing
-   *  more useful to return here. */
-  resolveToolResult(req: { requestId: string; resultJson?: string; error?: string }): { ok: true } {
+   *  more useful to return here.
+   *
+   *  `callerPluginId` (final-review Fix 2) is `socket.data.pluginId` off the CONNECTION that sent
+   *  this `plugin.toolResult` — the identity that connection actually authenticated as via hello,
+   *  never trusted off any wire param. It must match the pending invoke's OWN `pluginId` (recorded
+   *  at `invoke()` time, PendingInvoke.pluginId) or the settle is REJECTED (ignored + logged, the
+   *  pending entry left untouched for its real owner or its own timeout to resolve) — otherwise any
+   *  authed connection that learns a live `requestId` (a plugin watching its own traffic, a stray
+   *  log line, …) could settle a DIFFERENT plugin's in-flight tool call. `null` (a harness/admin
+   *  connection, which never sets `socket.data.pluginId`) can never match a real pluginId, so it's
+   *  rejected the same way. */
+  resolveToolResult(req: { requestId: string; resultJson?: string; error?: string }, callerPluginId: string | null): { ok: true } {
     const p = this.pending.get(req.requestId);
     if (!p) return { ok: true };
+    if (p.pluginId !== callerPluginId) {
+      this.log(`plugin.toolResult: requestId ${req.requestId} belongs to plugin ${p.pluginId}, not ${callerPluginId ?? "(unauthenticated as a plugin)"} — ignored`);
+      return { ok: true };
+    }
     this.pending.delete(req.requestId);
     clearTimeout(p.timer);
     if (req.error !== undefined) p.resolve({ code: "plugin_error", message: req.error });

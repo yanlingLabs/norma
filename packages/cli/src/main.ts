@@ -1066,7 +1066,23 @@ if (import.meta.main) {
       break;
     }
 
-    console.error("usage: norma plugin list | install <git-url> [name] | enable <name> | disable <name> | remove <name>");
+    if (sub === "restart") {
+      const name = process.argv[4];
+      if (!name) { console.error("usage: norma plugin restart <name>"); process.exit(1); }
+      const c = await connect(`cli-plugin-restart-${name}`);
+      try {
+        await c.restartPlugin(name);
+      } catch (err) {
+        console.error((err as Error).message);
+        c.close();
+        process.exit(1);
+      }
+      console.log(`${AQUA}${name} restart requested${RESET}`);
+      c.close();
+      process.exit(0);
+    }
+
+    console.error("usage: norma plugin list | install <git-url> [name] | enable <name> | disable <name> | remove <name> | restart <name>");
     process.exit(1);
   }
   case "bg": {
@@ -1230,7 +1246,7 @@ if (import.meta.main) {
   trust <dir> [--list] | trust list | trust remove <path>
   skills                                          list discovered skills for this directory
   mcp                                              list configured MCP servers and their tools
-  plugin list | install <git-url> [name] | enable <name> | disable <name> | remove <name>
+  plugin list | install <git-url> [name] | enable <name> | disable <name> | remove <name> | restart <name>
   bg list <session> | bg peek <session> <taskId> | bg kill <session> <taskId>
   login [--api-key] | logout | provider | provider-smoke [--prompt <text>]
   init                                            generate/update NORMA.md by surveying the project

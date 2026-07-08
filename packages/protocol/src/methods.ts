@@ -272,12 +272,25 @@ export const TrustRemoveResult = z.object({ removed: z.boolean() });
 export const PluginRegisterParams = z.object({ pluginId: z.string().min(1) });
 export const PluginRegisterResult = z.object({ ok: z.literal(true) });
 
+/** Safe tool-name charset (final-review Fix 3): the wire `name` becomes the last segment of the
+ *  namespaced tool `plugin__<pluginId>__<name>` (ipc/server.ts's `tool.register` handler), and
+ *  `ToolRegistry.unregisterByPrefix("plugin__<id>__")` (agent/tools/registry.ts) matches by plain
+ *  STRING PREFIX on that namespaced name. A `__` inside a tool name (or a pluginId — warned about
+ *  separately at plugin load time, agent/plugin-manifest.ts#loadManifest) can make one plugin's
+ *  registeredAs collide with a DIFFERENT plugin's unregister prefix, so a sibling plugin loses
+ *  tools it never registered when the wrong plugin disconnects or its circuit trips. Alphanumeric
+ *  plus single `-`/`_` separators only — no leading/trailing/double underscore, no other
+ *  punctuation. */
+const SAFE_TOOL_NAME = /^[A-Za-z0-9-]+(?:_[A-Za-z0-9-]+)*$/;
+
 /** `parameters` is a raw JSON-schema-shaped record (mirrors ToolDef.rawParameters in
  *  agent/tools/registry.ts) — the plugin author supplies whatever `z.toJSONSchema` would've
  *  produced; core does not re-validate its shape beyond "is an object". Optional: a schema-less
  *  tool is still registrable (deferred-detail case — spec §3 "optionally deferred JSON schema"). */
 export const ToolRegisterParams = z.object({
-  name: z.string().min(1),
+  name: z.string().min(1).regex(SAFE_TOOL_NAME, {
+    message: "tool name must be alphanumeric with single - or _ separators (no leading/trailing/double underscore)",
+  }),
   description: z.string().min(1),
   parameters: z.record(z.string(), z.unknown()).optional(),
 });
@@ -326,6 +339,14 @@ export const PluginToolResultResult = z.object({ ok: z.literal(true) });
 export const PluginRevokeTokenParams = z.object({ pluginId: z.string().min(1) });
 export const PluginRevokeTokenResult = z.object({ ok: z.literal(true) });
 
+/** Final-review Fix 1: the manual-restart rider (`PluginSupervisor.restart`, plugins/supervisor.ts
+ *  — existed and was tested but had no caller) exposed over the wire so `norma plugin restart
+ *  <id>` can recover a plugin stuck "circuit-open" (nothing else ever clears that state short of
+ *  a daemon restart). Same role precedent as `plugins.list` — harness OR admin, NOT one of the six
+ *  plugin-role verbs (a plugin can never restart itself or another plugin). */
+export const PluginRestartParams = z.object({ pluginId: z.string().min(1) });
+export const PluginRestartResult = z.object({ ok: z.literal(true) });
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -369,4 +390,5 @@ export const METHODS = {
   providerRegister: "provider.register",
   pluginToolResult: "plugin.toolResult",
   pluginRevokeToken: "plugin.revokeToken",
+  pluginRestart: "plugin.restart",
 } as const;

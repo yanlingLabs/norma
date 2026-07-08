@@ -415,6 +415,30 @@ describe("loadManifest", () => {
     const r = loadManifest(dir, "x", () => {});
     expect(r.manifest?.id).toBe("x");
   });
+
+  test("final-review Fix 3: a pluginId (dirName) containing \"__\" logs a warning — legacy plugin, no manifest required", () => {
+    const h = home(); const dir = join(h, "plugins", "foo__evil"); mkdirSync(dir, { recursive: true });
+    const logs: string[] = [];
+    const r = loadManifest(dir, "foo__evil", (m) => logs.push(m));
+    expect(r).toEqual({ legacy: true }); // "__" is a warning, never a hard reject — never bricks the plugin
+    expect(logs.some((m) => m.includes("foo__evil") && m.includes("__"))).toBe(true);
+  });
+
+  test("final-review Fix 3: a pluginId (dirName) containing \"__\" logs a warning even with a valid manifest", () => {
+    const h = home();
+    const dir = normaPlugin(h, "foo__evil", { id: "foo__evil", tier: "capability" });
+    const logs: string[] = [];
+    const r = loadManifest(dir, "foo__evil", (m) => logs.push(m));
+    expect(r.legacy).toBe(false);
+    expect(logs.some((m) => m.includes("foo__evil"))).toBe(true);
+  });
+
+  test("a pluginId (dirName) without \"__\" never logs the collision warning", () => {
+    const h = home(); const dir = join(h, "plugins", "sample-echo"); mkdirSync(dir, { recursive: true });
+    const logs: string[] = [];
+    loadManifest(dir, "sample-echo", (m) => logs.push(m));
+    expect(logs).toEqual([]);
+  });
 });
 
 describe("requiredConsentClasses", () => {

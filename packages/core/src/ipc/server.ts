@@ -10,7 +10,7 @@ import {
   ThreadListParams,
   PeripheralLeaseParams, PeripheralRenewParams, PeripheralReleaseParams, PeripheralAdvertiseParams,
   PeripheralRevokeParams, PeripheralRespondParams, DaemonStatusParams, QuotaStateParams,
-  TrustListParams, TrustRemoveParams, PluginRevokeTokenParams,
+  TrustListParams, TrustRemoveParams, PluginRevokeTokenParams, PluginRestartParams,
   PluginRegisterParams, ToolRegisterParams, ShortcutRegisterParams, TileUpdateParams,
   ProviderRegisterParams, PluginToolResultParams,
   type SessionEvent, ConnWriter, type WritableSocket,
@@ -554,6 +554,27 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       }
 
       // -----------------------------------------------------------------------------------------
+      // plugin.restart (final-review Fix 1): the `PluginSupervisor.restart()` manual-restart rider
+      // existed and was tested (supervisor.ts) but had no caller — this wires it up so `norma
+      // plugin restart <id>` can recover a plugin stuck "circuit-open" (nothing else ever clears
+      // that state short of a daemon restart). harness OR admin role, same precedent as
+      // `plugins.list` above (no extra role check here) — NOT one of the six plugin-role verbs, so
+      // a plugin connection never reaches this case at all (rejected by the allowlist gate first).
+      // `configFor` looks up the spawn config the supervisor already has on record for a TRACKED
+      // plugin (set at `startAll`/`reclaimOrphans`/an earlier `restart`) — a plugin id the
+      // supervisor has never seen has nothing to restart FROM, so that's a typed NOT_FOUND rather
+      // than silently no-op'ing.
+      // -----------------------------------------------------------------------------------------
+      case METHODS.pluginRestart: {
+        const p = parseParams(PluginRestartParams, params);
+        if (!opts.supervisor) throw new RpcFailure(ERR.INTERNAL, "plugin supervisor is not available on this server");
+        const config = opts.supervisor.configFor(p.pluginId);
+        if (!config) throw new RpcFailure(ERR.NOT_FOUND, `unknown plugin: ${p.pluginId}`);
+        opts.supervisor.restart(config);
+        return { ok: true };
+      }
+
+      // -----------------------------------------------------------------------------------------
       // Plugin tool bridge (Phase 4b Task 4, spec §3): wires the six plugin-role verbs (Task 1's
       // wire shapes, Task 2's role allowlist) into PluginSupervisor (Task 3) and the SAME
       // ToolRegistry the agent engine executes every other tool call against. The
@@ -619,7 +640,10 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       }
       case METHODS.pluginToolResult: {
         const p = parseParams(PluginToolResultParams, params);
-        return opts.supervisor?.resolveToolResult(p) ?? { ok: true };
+        // Final-review Fix 2: caller-bound — settle only goes through if THIS connection's own
+        // authenticated pluginId (never a wire param) matches the pending invoke's pluginId. See
+        // resolveToolResult's doc comment (plugins/supervisor.ts).
+        return opts.supervisor?.resolveToolResult(p, socket.data.pluginId) ?? { ok: true };
       }
       case METHODS.shortcutRegister: {
         const p = parseParams(ShortcutRegisterParams, params);

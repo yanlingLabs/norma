@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  LineDecoder, encodeLine, METHODS, PROTOCOL_VERSION, ConnWriter, type WritableSocket,
+  LineDecoder, encodeLine, METHODS, PROTOCOL_VERSION, ConnWriter, ERR, type WritableSocket,
 } from "@norma/protocol";
 
 /**
@@ -90,6 +90,26 @@ const RECONNECT_CAP_MS = 30_000;
 
 export function backoffDelayMs(attempt: number): number {
   return Math.min(RECONNECT_BASE_MS * 2 ** attempt, RECONNECT_CAP_MS);
+}
+
+// -------------------------------------------------------------------------------------------
+// Final-review Fix B1: a `hello` that comes back UNAUTHORIZED (a rotated/revoked token for this
+// pluginId) means this process incarnation is permanently superseded — reconnecting forever would
+// just hammer the server with credentials that will never become valid again. `FatalAuthError` is
+// thrown ONLY from the hello step inside `connectOnce` (never from register/tool.register/etc —
+// those failures, e.g. "duplicate tool", stay ordinary reconnect-with-backoff cases) so
+// `attemptConnect`'s catch can tell "give up and exit" apart from "retry" by `instanceof`, not by
+// sniffing error message text at the call site.
+// -------------------------------------------------------------------------------------------
+
+class FatalAuthError extends Error {}
+
+/** True when `err` is a `request()` rejection whose JSON-RPC error code was ERR.UNAUTHORIZED —
+ *  `request()`'s rejection message is `${message} (code ${code})` (see below), so this is a plain
+ *  substring check rather than a structured field; nothing else constructs a rejection in that
+ *  exact shape. */
+function isUnauthorizedRpcError(err: unknown): boolean {
+  return err instanceof Error && err.message.includes(`(code ${ERR.UNAUTHORIZED})`);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -222,6 +242,14 @@ export function createPlugin(def: PluginDefinition): Plugin {
           writer?.onDrain();
         },
         close() {
+          // Final-review Fix B1 (stale-callback guard): `sock` is THIS connectOnce() call's own
+          // socket, captured by closure. If it's no longer the one `socket` currently tracks — a
+          // newer connectOnce() already took over, most likely because attemptConnect's catch
+          // below already end()'d this exact socket in its failure-path cleanup and this is that
+          // end() completing asynchronously afterward — resetting shared state / scheduling
+          // another reconnect here would be wrong (it could clobber a newer, live connection's
+          // state, or double-arm a reconnect for a cycle that's already moved on).
+          if (socket !== sock) return;
           writer = null;
           socket = null;
           for (const p of pending.values()) p.reject(new Error("connection closed"));
@@ -234,13 +262,18 @@ export function createPlugin(def: PluginDefinition): Plugin {
     socket = sock;
     writer = new ConnWriter(sock as unknown as WritableSocket);
 
-    await request(METHODS.hello, {
-      protocolVersion: PROTOCOL_VERSION,
-      role: "plugin",
-      token,
-      pluginId,
-      clientName: `plugin:${pluginId}`,
-    });
+    try {
+      await request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION,
+        role: "plugin",
+        token,
+        pluginId,
+        clientName: `plugin:${pluginId}`,
+      });
+    } catch (err) {
+      if (isUnauthorizedRpcError(err)) throw new FatalAuthError((err as Error).message);
+      throw err;
+    }
     await request(METHODS.pluginRegister, { pluginId });
     for (const [name, toolDef] of Object.entries(def.tools ?? {})) {
       await request(METHODS.toolRegister, {
@@ -260,6 +293,15 @@ export function createPlugin(def: PluginDefinition): Plugin {
 
   function scheduleReconnect(): void {
     if (closed) return;
+    // Final-review Fix B1 (idempotent): a single disconnect can trigger scheduleReconnect from
+    // TWO independent places in the same tick — the socket's own `close()` callback above, AND
+    // `attemptConnect`'s `.catch` below (when the in-flight `request()` a hello/register was
+    // awaiting gets rejected BY that same close() callback, connectOnce()'s promise rejects too).
+    // Without this guard the second call would overwrite `reconnectTimer` without clearing the
+    // first, leaking an uncleared timer that fires a SECOND, fully independent reconnect cycle
+    // later — two concurrent connections sharing this closure's mutable state (decoder/pending/
+    // writer), corrupting both. Already-armed means already-handled: no-op.
+    if (reconnectTimer !== null) return;
     const delay = backoffDelayMs(reconnectAttempt);
     reconnectAttempt++;
     // Deliberately NOT unref'd: staying connected (or reconnecting) IS this process's entire
@@ -281,7 +323,28 @@ export function createPlugin(def: PluginDefinition): Plugin {
         firstConnectResolve?.();
         firstConnectResolve = null;
       })
-      .catch(() => scheduleReconnect());
+      .catch((err) => {
+        if (err instanceof FatalAuthError) {
+          // A rotated/revoked token: this incarnation is permanently superseded. `close()` does
+          // the full teardown (clears the reconnect timer, removes signal handlers, ends the
+          // socket) — reuse it rather than duplicating that cleanup, then exit instead of
+          // reconnecting.
+          close();
+          process.exit(1);
+          return;
+        }
+        // Final-review Fix B1 (leak-proof): a failure during hello/register can leave the socket
+        // genuinely still open — e.g. a business-logic rejection like "duplicate tool" never
+        // tears down the TCP/unix connection itself, only the socket's own `close()` callback
+        // (which didn't fire) would have nulled out `socket`/`writer`. end() it here so a failed
+        // cycle never leaks an authenticated connection the server counts against its connection
+        // cap forever. A no-op if `close()` already ran for real (socket already null).
+        const leaked = socket;
+        socket = null;
+        writer = null;
+        try { leaked?.end(); } catch { /* already gone */ }
+        scheduleReconnect();
+      });
   }
 
   function installSignalHandlers(): void {

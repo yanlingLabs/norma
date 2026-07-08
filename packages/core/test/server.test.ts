@@ -1798,6 +1798,97 @@ describe("daemon IPC", () => {
   });
 
   // -----------------------------------------------------------------------------------------
+  // plugin.restart (final-review Fix 1): PluginSupervisor.restart() existed and was unit-tested
+  // (test/plugins/supervisor.test.ts) but had no IPC caller — wired here against a REAL supervisor
+  // (fake spawn/isAlivePid/signalPid, same injection precedent as "plugin tool bridge (Task 4)"
+  // below) so a circuit-open plugin can actually be driven and observed re-spawning through the
+  // wire, not just through the supervisor's own direct API.
+  // -----------------------------------------------------------------------------------------
+  describe("plugin.restart", () => {
+    async function bootRestartServer(): Promise<{
+      store: SessionStore; socketPath: string; harnessToken: string; adminToken: string;
+      supervisor: PluginSupervisor; stop: () => void;
+    }> {
+      const home = mkdtempSync(join(tmpdir(), "norma-plugin-restart-"));
+      const store = new SessionStore(home);
+      const socketPath = join(home, "core.sock");
+      const authority = new TokenAuthority(new FileSecretStore(join(home, "secrets.json")));
+      const tokens = await authority.ensureTokens();
+      let nextPid = 7000;
+      const supervisor = new PluginSupervisor({
+        runDir: join(home, "run"),
+        socketPath,
+        mintToken: (id) => store.mintPluginToken(id),
+        spawn: () => ({ pid: nextPid++, kill: () => {}, exited: new Promise<number>(() => {}) }),
+        isAlivePid: () => false,
+        signalPid: () => {},
+        // registrationTimeoutMs + circuitFailures:1 drives a fresh spawn straight to circuit-open
+        // (the fake process never registers) fast — same recipe as
+        // supervisor.test.ts's "restart() (manual restart rider)" describe block.
+        settings: { registrationTimeoutMs: 10, backoffCapMs: 10, circuitFailures: 1, circuitWindowMs: 600_000 },
+      });
+      const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, supervisor });
+      return {
+        store, socketPath, harnessToken: tokens.harness, adminToken: tokens.admin, supervisor,
+        stop: () => { supervisor.stopAll(); server.stop(); store.close(); },
+      };
+    }
+
+    test("harness role restarts a circuit-open plugin — it respawns", async () => {
+      const srv = await bootRestartServer();
+      const pluginId = "sample-echo";
+      srv.supervisor.startAll([{ id: pluginId, dir: `/plugins/${pluginId}`, entry: { command: "bun" } }]);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(srv.supervisor.status(pluginId)).toBe("circuit-open");
+
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "cli-plugin-restart");
+      const res = await harness.request(METHODS.pluginRestart, { pluginId });
+      expect(res.result).toEqual({ ok: true });
+      expect(srv.supervisor.status(pluginId)).toBe("starting"); // respawned — no longer stuck
+
+      harness.close(); srv.stop();
+    });
+
+    test("an admin-role connection may also restart (harness/admin, like plugins.list — unlike plugin.revokeToken's harness-only gate)", async () => {
+      const srv = await bootRestartServer();
+      const pluginId = "sample-echo";
+      srv.supervisor.startAll([{ id: pluginId, dir: `/plugins/${pluginId}`, entry: { command: "bun" } }]);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(srv.supervisor.status(pluginId)).toBe("circuit-open");
+
+      const admin = await TestClient.connect(srv.socketPath);
+      await admin.hello(srv.adminToken, "admin-restart", "admin");
+      const res = await admin.request(METHODS.pluginRestart, { pluginId });
+      expect(res.result).toEqual({ ok: true });
+      expect(srv.supervisor.status(pluginId)).toBe("starting");
+
+      admin.close(); srv.stop();
+    });
+
+    test("restarting an unknown plugin id -> typed NOT_FOUND, never a crash", async () => {
+      const srv = await bootRestartServer();
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "cli-plugin-restart");
+      const res = await harness.request(METHODS.pluginRestart, { pluginId: "never-existed" });
+      expect(res.error?.code).toBe(ERR.NOT_FOUND);
+      harness.close(); srv.stop();
+    });
+
+    test("plugin.restart is not one of the six plugin-role verbs — a plugin connection is role-rejected before dispatch", async () => {
+      const srv = await bootRestartServer();
+      const raw = srv.store.mintPluginToken("sample-echo");
+      const c = await TestClient.connect(srv.socketPath);
+      await c.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: "sample-echo", pluginId: "sample-echo",
+      });
+      const res = await c.request(METHODS.pluginRestart, { pluginId: "sample-echo" });
+      expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      c.close(); srv.stop();
+    });
+  });
+
+  // -----------------------------------------------------------------------------------------
   // Plugin tool bridge (Phase 4b Task 4, spec §3): plugin.register/tool.register/
   // plugin.toolResult wired to a real PluginSupervisor + ToolRegistry (constructed directly here,
   // mirroring daemon.ts's own wiring, exactly like the "noop capability call round-trips..." test
@@ -1950,6 +2041,19 @@ describe("daemon IPC", () => {
       plugin.close(); srv.stop();
     });
 
+    test("tool.register rejects a \"__\"-bearing (or otherwise unsafe-charset) name with INVALID_PARAMS (final-review Fix 3)", async () => {
+      const srv = await bootBridgeServer();
+      const plugin = await registerAndHello(srv, "sample-echo");
+      const collateral = await plugin.request(METHODS.toolRegister, { name: "evil__collateral", description: "d" });
+      expect(collateral.error?.code).toBe(ERR.INVALID_PARAMS);
+      const spacey = await plugin.request(METHODS.toolRegister, { name: "has space", description: "d" });
+      expect(spacey.error?.code).toBe(ERR.INVALID_PARAMS);
+      // a safe name still registers fine — this isn't a blanket tool.register regression.
+      const ok = await plugin.request(METHODS.toolRegister, { name: "safe-name_ok", description: "d" });
+      expect(ok.result?.ok).toBe(true);
+      plugin.close(); srv.stop();
+    });
+
     test("shortcut.register/tile.update/provider.register land in PluginContribRegistry (latest write wins)", async () => {
       const srv = await bootBridgeServer();
       const plugin = await registerAndHello(srv, "sample-echo");
@@ -1987,6 +2091,35 @@ describe("daemon IPC", () => {
       expect(srv.supervisor.status(pluginId)).not.toBe("running"); // notifyDisconnected ran
 
       srv.stop();
+    });
+
+    test("plugin.toolResult is caller-bound (final-review Fix 2): plugin B answering plugin A's requestId is a no-op; A's own answer works", async () => {
+      const srv = await bootBridgeServer();
+      const pluginA = "sample-echo";
+      const pluginB = "sample-echo-2";
+      const a = await registerAndHello(srv, pluginA);
+      const b = await registerAndHello(srv, pluginB);
+
+      await a.request(METHODS.toolRegister, { name: "echo", description: "d" });
+      const registeredAs = `plugin__${pluginA}__echo`;
+
+      const execPromise = srv.registry.execute(registeredAs, {}, { cwd: "/", roots: ["/"], sessionId: "s1" });
+      const invoked = await a.waitForNotification((n) => n.method === METHODS.event && n.params.type === "plugin_tool_invoke");
+      const requestId = invoked.params.requestId as string;
+
+      // Plugin B — a DIFFERENT, correctly-authenticated connection — tries to answer A's requestId.
+      const hijack = await b.request(METHODS.pluginToolResult, { requestId, resultJson: "\"hijacked\"" });
+      expect(hijack.result).toEqual({ ok: true }); // never throws either way (safe-no-op wire contract)
+
+      // A's own answer still works — B's attempt above never consumed/settled the pending entry.
+      const legit = await a.request(METHODS.pluginToolResult, { requestId, resultJson: "\"legit\"" });
+      expect(legit.result).toEqual({ ok: true });
+
+      const outcome = await execPromise;
+      expect(outcome.isError).toBe(false);
+      expect(JSON.parse(outcome.output)).toBe("legit");
+
+      a.close(); b.close(); srv.stop();
     });
 
     test("tool.register/shortcut.register/tile.update/provider.register all require an authenticated plugin connection (defensive — unreachable from a plugin conn, but not role-gated for other roles)", async () => {
