@@ -18,12 +18,15 @@ interface ConnState { decoder: LineDecoder }
 interface ToolResultParams { requestId: string; resultJson?: string; error?: string }
 interface ShortcutEntry { id: string; description?: string; default?: string }
 
+interface HardwareRequestRecord { verb: string; argsJson?: string }
+
 interface FakeServer {
   order: string[];
   registeredTools: string[];
   shortcuts(): ShortcutEntry[] | null;
   tiles: Array<Record<string, unknown>>;
   toolResults: ToolResultParams[];
+  hardwareRequests: HardwareRequestRecord[];
   connectionCount(): number;
   /** High-water mark of CONCURRENTLY open connections (final-review Fix B1) — distinct from
    *  `connectionCount()`'s running total: a legitimate reconnect cycle (old socket fully closed,
@@ -51,7 +54,16 @@ function safeUnlink(path: string): void {
   try { unlinkSync(path); } catch { /* nothing to remove */ }
 }
 
-function startFakeServer(path: string, helloMode: HelloMode = { kind: "ok" }): FakeServer {
+/** `hardwareHandler`, when given, is consulted for every `hardware.request` the fake server
+ *  receives and its return value is written back verbatim as the JSON-RPC `result` (the SDK-side
+ *  `ctx.hardware()` under test never sees these as an `msg.error` — Task 2's `HardwareRequestResult`
+ *  is a RESOLVED result union, success and every typed failure alike; see methods.ts). Omitted ->
+ *  every hardware.request gets `{code: "unknown_verb"}` (not exercised by tests that don't pass it). */
+function startFakeServer(
+  path: string,
+  helloMode: HelloMode = { kind: "ok" },
+  hardwareHandler?: (params: HardwareRequestRecord) => unknown,
+): FakeServer {
   safeUnlink(path); // a prior listener's socket file may still be on disk (restart tests)
 
   const order: string[] = [];
@@ -59,6 +71,7 @@ function startFakeServer(path: string, helloMode: HelloMode = { kind: "ok" }): F
   let shortcuts: ShortcutEntry[] | null = null;
   const tiles: Array<Record<string, unknown>> = [];
   const toolResults: ToolResultParams[] = [];
+  const hardwareRequests: HardwareRequestRecord[] = [];
   let connections = 0;
   let liveNow = 0;
   let peakLive = 0;
@@ -122,6 +135,13 @@ function startFakeServer(path: string, helloMode: HelloMode = { kind: "ok" }): F
               toolResults.push(msg.params);
               socket.write(encodeLine({ jsonrpc: "2.0", id: msg.id, result: { ok: true } }));
               break;
+            case METHODS.hardwareRequest:
+              hardwareRequests.push(msg.params);
+              socket.write(encodeLine({
+                jsonrpc: "2.0", id: msg.id,
+                result: hardwareHandler ? hardwareHandler(msg.params) : { code: "unknown_verb" },
+              }));
+              break;
             default:
               // never answered — not exercised by these tests
               break;
@@ -136,7 +156,7 @@ function startFakeServer(path: string, helloMode: HelloMode = { kind: "ok" }): F
   });
 
   return {
-    order, registeredTools, tiles, toolResults,
+    order, registeredTools, tiles, toolResults, hardwareRequests,
     shortcuts: () => shortcuts,
     connectionCount: () => connections,
     peakConcurrentConnections: () => peakLive,
@@ -445,6 +465,134 @@ describe("createPlugin().serve()", () => {
 
     await expect(plugin.serve({ socketPath: sockPath, token: "tok", pluginId: "sample" }))
       .rejects.toThrow(/already serving/);
+  });
+});
+
+// -------------------------------------------------------------------------------------------
+// ctx.hardware (Phase 4c Task 5, spec §5) — `run(args, ctx)`'s second arg. Every case here drives
+// a real tool `run` handler through the SAME `plugin_tool_invoke` -> `plugin.toolResult` dispatch
+// path the tests above exercise, so a throw from `ctx.hardware()` is proven to surface exactly the
+// way any other thrown error in a handler already does (`handleInvoke`'s catch), not asserted
+// against `ctx.hardware()` in isolation. `startFakeServer`'s `hardwareHandler` answers
+// `hardware.request` with a SCRIPTED RESULT (msg.result, never msg.error) — Task 2's
+// `HardwareRequestResult` (methods.ts) is a resolved union for success AND every typed failure
+// alike, so `{code:"timeout"}` here is a scripted reply, deliberately never the SDK's own 10s
+// transport-level `request()` timeout (a completely different failure mode, already covered by
+// this file's reconnect/hello tests).
+// -------------------------------------------------------------------------------------------
+
+describe("ctx.hardware (Phase 4c Task 5, spec §5)", () => {
+  let cleanups: Array<() => void>;
+  let tmpDir: string;
+  let sockPath: string;
+
+  beforeEach(() => {
+    cleanups = [];
+    tmpDir = mkdtempSync(join(tmpdir(), "norma-plugin-sdk-hw-"));
+    sockPath = join(tmpDir, "plugin.sock");
+  });
+  afterEach(() => {
+    for (const fn of cleanups.reverse()) {
+      try { fn(); } catch { /* best-effort teardown */ }
+    }
+  });
+
+  /** Boots a plugin with a single tool, `call`, whose `run` invokes `ctx.hardware(verb, args)` and
+   *  either returns its resolved value or lets a thrown error propagate — i.e. exactly what a real
+   *  tool author writes, nothing test-specific in the handler itself. */
+  async function bootCallTool(
+    hardwareHandler: (params: HardwareRequestRecord) => unknown,
+  ): Promise<{ server: FakeServer; plugin: ReturnType<typeof createPlugin>; invoke: (verb: string, args?: unknown) => Promise<ToolResultParams> }> {
+    const server = startFakeServer(sockPath, { kind: "ok" }, hardwareHandler);
+    cleanups.push(() => server.stop());
+
+    const plugin = createPlugin({
+      tools: {
+        call: {
+          description: "calls ctx.hardware with whatever the test asks",
+          run: async (args, ctx) => {
+            const { verb, hwArgs } = args as { verb: string; hwArgs?: unknown };
+            return ctx.hardware(verb, hwArgs);
+          },
+        },
+      },
+    });
+    cleanups.push(() => plugin.close());
+    await plugin.serve({ socketPath: sockPath, token: "tok", pluginId: "sample" });
+
+    let seq = 0;
+    return {
+      server, plugin,
+      async invoke(verb: string, hwArgs?: unknown): Promise<ToolResultParams> {
+        const requestId = `r${++seq}`;
+        server.pushEvent({ type: "plugin_tool_invoke", requestId, tool: "call", argsJson: JSON.stringify({ verb, hwArgs }) });
+        await waitFor(() => server.toolResults.some((r) => r.requestId === requestId));
+        return server.toolResults.find((r) => r.requestId === requestId)!;
+      },
+    };
+  }
+
+  test("success: sends {verb, argsJson} and resolves with JSON.parse(resultJson)", async () => {
+    const { server, invoke } = await bootCallTool((params) => {
+      expect(params.verb).toBe("setChargeLimit");
+      expect(params.argsJson).toBe(JSON.stringify({ percent: 80 }));
+      return { resultJson: JSON.stringify({ percent: 80 }) };
+    });
+
+    const res = await invoke("setChargeLimit", { percent: 80 });
+    expect(res.error).toBeUndefined();
+    expect(JSON.parse(res.resultJson!)).toEqual({ percent: 80 });
+    expect(server.hardwareRequests).toEqual([{ verb: "setChargeLimit", argsJson: JSON.stringify({ percent: 80 }) }]);
+  });
+
+  test("success with no args: argsJson defaults to \"{}\" (never left undefined)", async () => {
+    const { server, invoke } = await bootCallTool((params) => {
+      expect(params.argsJson).toBe("{}");
+      return { resultJson: JSON.stringify({ percent: 42 }) };
+    });
+
+    const res = await invoke("getChargeLimit"); // hwArgs omitted
+    expect(res.error).toBeUndefined();
+    expect(JSON.parse(res.resultJson!)).toEqual({ percent: 42 });
+    expect(server.hardwareRequests).toEqual([{ verb: "getChargeLimit", argsJson: "{}" }]);
+  });
+
+  test("typed failure: unknown_verb -> throws, tool result carries the code", async () => {
+    const { invoke } = await bootCallTool(() => ({ code: "unknown_verb" }));
+    const res = await invoke("setFanSpeed");
+    expect(res.resultJson).toBeUndefined();
+    expect(res.error).toContain("unknown_verb");
+  });
+
+  test("typed failure: consent_denied -> throws, tool result carries the code and missing class", async () => {
+    const { invoke } = await bootCallTool(() => ({ code: "consent_denied", missing: "hardware" }));
+    const res = await invoke("getChargeLimit");
+    expect(res.resultJson).toBeUndefined();
+    expect(res.error).toContain("consent_denied");
+    expect(res.error).toContain("hardware");
+  });
+
+  test("typed failure: no_provider -> throws, tool result carries the code and message", async () => {
+    const { invoke } = await bootCallTool(() => ({ code: "no_provider", message: "hardware features require Norma.app" }));
+    const res = await invoke("getChargeLimit");
+    expect(res.resultJson).toBeUndefined();
+    expect(res.error).toContain("no_provider");
+    expect(res.error).toContain("hardware features require Norma.app");
+  });
+
+  test("typed failure: timeout (scripted RESULT, not the SDK's own transport timeout) -> throws, tool result carries the code", async () => {
+    const { invoke } = await bootCallTool(() => ({ code: "timeout" }));
+    const res = await invoke("getChargeLimit");
+    expect(res.resultJson).toBeUndefined();
+    expect(res.error).toContain("timeout");
+  });
+
+  test("typed failure: provider_error -> throws, tool result carries the code and message", async () => {
+    const { invoke } = await bootCallTool(() => ({ code: "provider_error", message: "SMC write failed" }));
+    const res = await invoke("setChargeLimit", { percent: 80 });
+    expect(res.resultJson).toBeUndefined();
+    expect(res.error).toContain("provider_error");
+    expect(res.error).toContain("SMC write failed");
   });
 });
 

@@ -77,6 +77,10 @@ import {
   PluginRevokeTokenResult,
   PluginRestartParams,
   PluginRestartResult,
+  HardwareRequestParams,
+  HardwareRequestResult,
+  HardwareRespondParams,
+  HardwareRespondResult,
   METHODS,
 } from "../src/methods";
 
@@ -495,5 +499,56 @@ describe("plugin.restart (final-review Fix 1 — restart rider, recovers a circu
     expect(() => PluginRestartParams.parse({ pluginId: "" })).toThrow();
     expect(() => PluginRestartParams.parse({})).toThrow();
     expect(PluginRestartResult.parse({ ok: true })).toEqual({ ok: true });
+  });
+});
+
+describe("hardware.request / hardware.respond (Phase 4c Task 1, spec §5)", () => {
+  test("METHODS carries both verbs", () => {
+    expect(METHODS.hardwareRequest).toBe("hardware.request");
+    expect(METHODS.hardwareRespond).toBe("hardware.respond");
+  });
+
+  test("hardware.request params: verb required, argsJson optional", () => {
+    expect(HardwareRequestParams.parse({ verb: "setChargeLimit", argsJson: '{"percent":80}' }).verb).toBe("setChargeLimit");
+    const bare = HardwareRequestParams.parse({ verb: "getChargeLimit" });
+    expect(bare.argsJson).toBeUndefined();
+    expect(() => HardwareRequestParams.parse({ verb: "" })).toThrow();
+    expect(() => HardwareRequestParams.parse({})).toThrow();
+  });
+
+  // Task 2 review pin (binding): widened from a bare {resultJson} object to a success|error-code
+  // union mirroring PeripheralLeaseResult — see methods.ts's HardwareRequestResult doc comment.
+  test("hardware.request result: success|unknown_verb|consent_denied|no_provider|timeout|provider_error union", () => {
+    const success = HardwareRequestResult.parse({ resultJson: "{\"percent\":80}" });
+    expect("resultJson" in success && success.resultJson).toBe("{\"percent\":80}");
+    expect(() => HardwareRequestResult.parse({})).toThrow();
+
+    expect(HardwareRequestResult.parse({ code: "unknown_verb" })).toEqual({ code: "unknown_verb" });
+
+    expect(HardwareRequestResult.parse({ code: "consent_denied" })).toEqual({ code: "consent_denied" });
+    expect(HardwareRequestResult.parse({ code: "consent_denied", missing: "battery" })).toEqual({
+      code: "consent_denied", missing: "battery",
+    });
+
+    expect(HardwareRequestResult.parse({ code: "no_provider", message: "hardware features require Norma.app" })).toEqual({
+      code: "no_provider", message: "hardware features require Norma.app",
+    });
+    expect(() => HardwareRequestResult.parse({ code: "no_provider" })).toThrow(); // message is required
+
+    expect(HardwareRequestResult.parse({ code: "timeout" })).toEqual({ code: "timeout" });
+
+    expect(HardwareRequestResult.parse({ code: "provider_error", message: "unsupported_value" })).toEqual({
+      code: "provider_error", message: "unsupported_value",
+    });
+    expect(() => HardwareRequestResult.parse({ code: "provider_error" })).toThrow(); // message is required
+
+    expect(() => HardwareRequestResult.parse({ code: "bogus" })).toThrow();
+  });
+
+  test("hardware.respond params/result: mirrors peripheral.respond's shape minus alreadyResolved, same precedent as plugin.toolResult", () => {
+    expect(HardwareRespondParams.parse({ requestId: "req_1", resultJson: "{\"percent\":80}" }).requestId).toBe("req_1");
+    expect(HardwareRespondParams.parse({ requestId: "req_1", error: "unsupported_value" }).error).toBe("unsupported_value");
+    expect(() => HardwareRespondParams.parse({ requestId: "" })).toThrow();
+    expect(HardwareRespondResult.parse({ ok: true })).toEqual({ ok: true });
   });
 });

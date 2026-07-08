@@ -12,7 +12,7 @@ import {
   PeripheralRevokeParams, PeripheralRespondParams, DaemonStatusParams, QuotaStateParams,
   TrustListParams, TrustRemoveParams, PluginRevokeTokenParams, PluginRestartParams,
   PluginRegisterParams, ToolRegisterParams, ShortcutRegisterParams, TileUpdateParams,
-  ProviderRegisterParams, PluginToolResultParams,
+  ProviderRegisterParams, PluginToolResultParams, HardwareRequestParams, HardwareRespondParams,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
@@ -34,6 +34,8 @@ import type { PluginSupervisor, PluginConn, InvokeError } from "../plugins/super
 import type { PluginContribRegistry } from "../plugins/contrib";
 import type { PeripheralBroker } from "../peripheral/broker";
 import type { ProviderLink } from "../peripheral/provider-link";
+import type { HardwareBroker } from "../peripheral/hardware";
+import { verbClass } from "../peripheral/hardware";
 import type { QuotaManager } from "../providers/quota";
 import { addLocalDir } from "../settings";
 
@@ -83,6 +85,12 @@ export interface IpcServerOptions {
   peripheral?: PeripheralBroker; // lease machinery; peripheral.* verbs (Phase 2f)
   providerLink?: ProviderLink;   // bridges PeripheralBroker.call()'s pushToProvider to the live
                                   // provider connection this server tracks (Phase 2f)
+  // Phase 4c Task 2 (spec §5): plugin (or harness, dev/testing) → Norma.app's XPC helper.
+  // `hardware` is constructed with the SAME `providerLink` as `peripheral` above (daemon.ts) — the
+  // app's one provider connection doubles as the hardware provider. `hardware.respond` reuses
+  // `peripheral.isProvider()` to gate on that SAME connection identity (see the hardware.respond
+  // case below) rather than tracking its own.
+  hardware?: HardwareBroker;
   quota?: QuotaManager;      // token/rate-limit snapshot; quota.state (dashboard read)
   providerInfo?: { id: string; model: string } | null; // active LLM provider identity; daemon.status
   startedAt?: number;        // daemon process start time (Date.now()); daemon.status uptimeMs
@@ -97,11 +105,18 @@ class RpcFailure extends Error { constructor(public code: number, message: strin
 
 // Phase 4b Task 2 (spec §3): the table-driven role→methods gate for plugin connections. A plugin
 // authenticates as a SPECIFIC installed plugin id (hello role "plugin") and may ONLY ever call
-// these six wire verbs — everything else (session.*, approval.*, peripheral.*, daemon.*, trust.*,
+// these wire verbs — everything else (session.*, approval.*, peripheral.*, daemon.*, trust.*,
 // plugins.*, ask_user.*, etc.) is role-rejected BEFORE dispatch, never reaching a handler. Task 4
-// wires all six handlers (plugin.register/tool.register/shortcut.register/tile.update/
+// wires the original six handlers (plugin.register/tool.register/shortcut.register/tile.update/
 // provider.register/plugin.toolResult) into PluginSupervisor + ToolRegistry + PluginContribRegistry
 // below.
+//
+// Phase 4c Task 1 (spec §5) adds a seventh: `hardware.request` — a plugin's own tool may need to
+// ask Norma.app's XPC helper to do something (e.g. set the battery charge limit). `hardware.respond`
+// is DELIBERATELY NOT here: only the active provider connection (Norma.app) may answer a
+// `hardware_requested` push, same precedent as `peripheral.respond` staying off this list — a
+// plugin connection calling it is role-rejected before dispatch, never reaching the handler.
+// Task 2 wires `hardware.request`'s handler (consent gate + HardwareBroker) below.
 const PLUGIN_ALLOWED_METHODS = new Set<string>([
   METHODS.pluginRegister,
   METHODS.toolRegister,
@@ -109,6 +124,7 @@ const PLUGIN_ALLOWED_METHODS = new Set<string>([
   METHODS.tileUpdate,
   METHODS.providerRegister,
   METHODS.pluginToolResult,
+  METHODS.hardwareRequest,
 ]);
 
 /** Maps a failed `PluginSupervisor.invoke()` result to the message a `throw new Error(...)` in
@@ -499,6 +515,52 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
           throw new RpcFailure(ERR.UNAUTHORIZED, "peripheral.respond requires the active provider connection");
         }
         return opts.peripheral.respond({ requestId: p.requestId, resultJson: p.resultJson, error: p.error });
+      }
+
+      // -----------------------------------------------------------------------------------------
+      // Hardware helper (Phase 4c Task 2, spec §5): plugin (or harness, dev/testing) → core →
+      // Norma.app's XPC helper. Consent gating lives HERE, not in HardwareBroker — the broker has
+      // no PluginStore access, only `verbClass` (this file's `hardware.request` case is the one
+      // place that has BOTH the requesting plugin's PluginInfo and the verb's class at once). A
+      // plugin-role caller must have the verb's class in its manifest's `permissions.hardware`
+      // AND a "hardware" consent record on file; an unknown verb (`verbClass` returns null) skips
+      // straight past this gate — the broker's own `request()` typed-rejects it as
+      // `{code:"unknown_verb"}` (same check, reused, so a plugin can never learn "not consented"
+      // for a verb that isn't even real). A harness (or admin) caller skips consent entirely —
+      // dev/testing precedent, same as peripheral.lease's non-plugin paths — but is still audited,
+      // as a `{kind:"harness"}` requester, by the broker itself.
+      // -----------------------------------------------------------------------------------------
+      case METHODS.hardwareRequest: {
+        const p = parseParams(HardwareRequestParams, params);
+        if (!opts.hardware) throw new RpcFailure(ERR.NOT_FOUND, "hardware broker unavailable");
+        let requester: { kind: "plugin" | "harness"; id: string };
+        if (socket.data.authedRole === "plugin") {
+          const pluginId = socket.data.pluginId;
+          if (!pluginId) throw new RpcFailure(ERR.UNAUTHORIZED, "hardware.request requires an authenticated plugin connection");
+          requester = { kind: "plugin", id: pluginId };
+          const cls = verbClass(p.verb);
+          if (cls) {
+            const info = opts.plugins?.list().find((pl) => pl.name === pluginId);
+            if (!info?.hardwarePermissions.includes(cls)) {
+              opts.hardware.auditDenied({ requester, verb: p.verb, code: "consent_denied", missing: cls });
+              return { code: "consent_denied", missing: cls };
+            }
+            if (!info.consented.includes("hardware")) {
+              opts.hardware.auditDenied({ requester, verb: p.verb, code: "consent_denied", missing: "hardware" });
+              return { code: "consent_denied", missing: "hardware" };
+            }
+          }
+        } else {
+          requester = { kind: "harness", id: socket.data.clientName };
+        }
+        return await opts.hardware.request({ requester, verb: p.verb, argsJson: p.argsJson });
+      }
+      case METHODS.hardwareRespond: {
+        const p = parseParams(HardwareRespondParams, params);
+        if (!opts.peripheral?.isProvider(socket.data)) {
+          throw new RpcFailure(ERR.UNAUTHORIZED, "hardware.respond requires the active provider connection");
+        }
+        return opts.hardware?.respond({ requestId: p.requestId, resultJson: p.resultJson, error: p.error }) ?? { ok: true };
       }
 
       // -----------------------------------------------------------------------------------------

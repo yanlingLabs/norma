@@ -33,6 +33,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
     case leaseLost(LeaseLost)
     case peripheralCallRequested(PeripheralCallRequested)
     case pluginToolInvoke(PluginToolInvoke)
+    case hardwareRequested(HardwareRequested)
 
     public struct SessionCreated: Codable, Equatable, Sendable {
         public let seq: Int
@@ -372,6 +373,20 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         public let argsJson: String
     }
 
+    /// TRANSIENT (broadcast-only, like `assistant_delta`/the lease events/`PluginToolInvoke`
+    /// above) — core pushes this to the active provider's connection (Norma.app, spec §5) when a
+    /// plugin (or the harness) calls `hardware.request`; the provider answers via
+    /// `hardware.respond` {requestId, resultJson?, error?}.
+    public struct HardwareRequested: Codable, Equatable, Sendable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let requestId: String
+        public let verb: String
+        public let argsJson: String
+    }
+
     private enum Discriminator: String, Codable {
         case session_created
         case harness_attached
@@ -405,6 +420,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         case lease_lost
         case peripheral_call_requested
         case plugin_tool_invoke
+        case hardware_requested
     }
 
     private enum TypeKey: String, CodingKey { case type }
@@ -444,6 +460,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         case .lease_lost:           self = .leaseLost(try LeaseLost(from: decoder))
         case .peripheral_call_requested: self = .peripheralCallRequested(try PeripheralCallRequested(from: decoder))
         case .plugin_tool_invoke:   self = .pluginToolInvoke(try PluginToolInvoke(from: decoder))
+        case .hardware_requested:   self = .hardwareRequested(try HardwareRequested(from: decoder))
         }
     }
 
@@ -577,6 +594,10 @@ public enum SessionEvent: Codable, Equatable, Sendable {
             try v.encode(to: encoder)
             var c = encoder.container(keyedBy: TypeKey.self)
             try c.encode(Discriminator.plugin_tool_invoke.rawValue, forKey: .type)
+        case .hardwareRequested(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.hardware_requested.rawValue, forKey: .type)
         }
     }
 }

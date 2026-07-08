@@ -16,9 +16,22 @@ targets:
     sources:
       - path: Sources
       - path: Support/AppIcon.icns
+      - path: HelperShared
     dependencies:
       - package: NormaKit
       - package: NormaProtocol
+      - target: NormaHelper
+        embed: false
+    postCompileScripts:
+      - name: Embed NormaHelper
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          DEST_MACOS="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/MacOS"
+          DEST_LAUNCHD="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchDaemons"
+          mkdir -p "${DEST_MACOS}" "${DEST_LAUNCHD}"
+          cp "${BUILT_PRODUCTS_DIR}/NormaHelper" "${DEST_MACOS}/NormaHelper"
+          cp "${SRCROOT}/HelperResources/com.norma.helper.plist" "${DEST_LAUNCHD}/com.norma.helper.plist"
     info:
       path: Support/Info.plist
       properties:
@@ -46,7 +59,9 @@ targets:
   NormaAppTests:
     type: bundle.unit-test
     platform: macOS
-    sources: [Tests/NormaAppTests]
+    sources:
+      - path: Tests/NormaAppTests
+      - path: HelperSources/SMCController.swift
     dependencies:
       - target: Norma
     settings:
@@ -54,11 +69,35 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Norma.app/Contents/MacOS/Norma"
         BUNDLE_LOADER: "$(TEST_HOST)"
+  NormaHelper:
+    type: tool
+    platform: macOS
+    sources:
+      - path: HelperSources
+      - path: HelperShared
+    settings:
+      base:
+        PRODUCT_NAME: NormaHelper
+        PRODUCT_BUNDLE_IDENTIFIER: com.norma.helper
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_IDENTITY: "Apple Development"
+        DEVELOPMENT_TEAM: 37N77U9RSZ
+        CODE_SIGN_STYLE: Manual
+        SWIFT_VERSION: "5.9"
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
+        # Task 4 (4c) rider (T3 review): without this, codesign identifies the embedded helper
+        # binary as "NormaHelper" (the PRODUCT_NAME) rather than its bundle id/plist Label
+        # (com.norma.helper) — SMAppService/launchd match the daemon by that Label, and
+        # HelperServiceDelegate's code-signing requirement pins the CONNECTING peer's team, not
+        # this identifier, but keeping the signed identifier in sync with the Label/mach-service
+        # name avoids a needless mismatch. `-i com.norma.helper` explicitly sets it.
+        OTHER_CODE_SIGN_FLAGS: -i com.norma.helper
 schemes:
   Norma:
     build:
       targets:
         Norma: all
+        NormaHelper: all
         NormaAppTests: [test]
     test:
       targets: [NormaAppTests]

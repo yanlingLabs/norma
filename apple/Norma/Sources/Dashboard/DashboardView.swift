@@ -56,6 +56,10 @@ struct DashboardWiring {
     let trustList: () async throws -> [String]
     let trustRemove: (String) async throws -> Bool
     let peripheral: PeripheralProvider
+    /// Task 4 (4c): the Peripheral pane's helper-approval row reads this directly
+    /// (`@ObservedObject`) — same "hand the pane an already-decoupled view-model" posture as
+    /// `peripheral` above, not a `NormaClient`/XPC connection of its own.
+    let helperClient: HelperClient
 }
 
 /// The Dashboard window's root content: a fixed-width left pane list + the selected pane's
@@ -123,7 +127,7 @@ struct DashboardView: View {
         case .trust:
             TrustPane(list: wiring.trustList, remove: wiring.trustRemove)
         case .peripheral:
-            PeripheralPane(provider: wiring.peripheral)
+            PeripheralPane(provider: wiring.peripheral, helperClient: wiring.helperClient)
         }
     }
 }

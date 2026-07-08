@@ -32,8 +32,37 @@ export interface PluginToolDef {
   parameters?: Record<string, unknown>;
   /** Handler for a `plugin_tool_invoke` dispatch. Sync or async; a thrown error (or a rejected
    *  promise) becomes `plugin.toolResult {error: message}`; a returned value is JSON.stringified
-   *  into `plugin.toolResult {resultJson}`. */
-  run: (args: unknown) => unknown | Promise<unknown>;
+   *  into `plugin.toolResult {resultJson}`. The second arg, `ctx`, is a fixed-shape helper bag
+   *  (currently just `hardware`) — additive-only over the original single-arg `run(args)` shape:
+   *  a handler that ignores it (`(args) => ...` or `() => ...`) keeps compiling and running
+   *  unchanged, since a function expecting fewer parameters is assignable wherever one expecting
+   *  more is (TS's structural function-type variance) — see examples/sample-echo/index.ts, which
+   *  never touches `ctx` and still typechecks. */
+  run: (args: unknown, ctx: PluginContext) => unknown | Promise<unknown>;
+}
+
+/** Phase 4c Task 5 (design spec §5): the helper bag every tool `run` handler receives as its
+ *  second argument. Today this is just `hardware` — a plugin's own escape hatch into core's
+ *  `hardware.request` broker (Phase 4c Task 2) for verbs like `setChargeLimit`/`getChargeLimit`,
+ *  routed through Norma.app's privileged XPC helper. Kept as its own named interface (not inlined
+ *  into `PluginToolDef.run`'s signature) because it's public surface a plugin author imports and
+ *  destructures directly. */
+export interface PluginContext {
+  /** Calls one hardware verb through core's `hardware.request` JSON-RPC method (wraps this
+   *  module's own `request()` seam — same socket, same pending-map correlation, nothing new on
+   *  the wire). `args` is JSON.stringified into `argsJson` (`{}` when omitted, never left
+   *  undefined — core's `HardwareRequestParams.argsJson` is optional but a plugin author calling
+   *  `ctx.hardware("getChargeLimit")` with no args shouldn't have to think about that). On success
+   *  (`{resultJson}`), JSON.parses `resultJson` and resolves with the parsed value. On any of the
+   *  five typed-failure variants (`unknown_verb`, `consent_denied`, `no_provider`, `timeout`,
+   *  `provider_error` — packages/protocol/src/methods.ts's `HardwareRequestResult` union), THROWS
+   *  an `Error` whose message names the `code` (plus `missing`/`message` when the variant carries
+   *  one) rather than resolving with an error-shaped value — a thrown error is exactly what
+   *  `handleInvoke` below already turns into a typed `plugin.toolResult {error}` for every other
+   *  tool failure, so a `run` handler that doesn't itself catch this propagates the SAME way a
+   *  plain `throw new Error(...)` inside its own body would. Never swallows a failure into a
+   *  success-shaped return. */
+  hardware(verb: string, args?: unknown): Promise<unknown>;
 }
 
 export interface PluginDefinition {
@@ -149,6 +178,23 @@ function readDeclaredShortcuts(): DeclaredShortcut[] {
 
 type PendingEntry = { resolve: (v: unknown) => void; reject: (e: Error) => void };
 
+// -------------------------------------------------------------------------------------------
+// `hardware.request`'s wire result union — a local TS type kept independent of
+// `@norma/protocol`'s `HardwareRequestResult` zod schema (methods.ts), same precedent as core's
+// own `packages/core/src/peripheral/hardware.ts` (`HardwareRequestResult` there): coverage that
+// the two stay in sync lives in tests (this package's + core's), not the type system. This SDK
+// never zod-parses ANY RPC result (see `request()` above, `Promise<unknown>` throughout) — adding
+// a zod dependency just for this one wire shape would be inconsistent with that.
+// -------------------------------------------------------------------------------------------
+
+type HardwareRequestWireResult =
+  | { resultJson: string }
+  | { code: "unknown_verb" }
+  | { code: "consent_denied"; missing?: string }
+  | { code: "no_provider"; message: string }
+  | { code: "timeout" }
+  | { code: "provider_error"; message: string };
+
 export function createPlugin(def: PluginDefinition): Plugin {
   let socketPath: string | undefined;
   let token: string | undefined;
@@ -192,6 +238,28 @@ export function createPlugin(def: PluginDefinition): Plugin {
     });
   }
 
+  /** `PluginContext.hardware` — see that interface's doc comment for the full contract. Uses the
+   *  SAME `request()` seam every other outbound RPC in this file uses, so it automatically gets
+   *  "not connected" rejection, the 10s default timeout, and reconnect-safe pending-map cleanup
+   *  for free; nothing hardware-specific needed there. */
+  async function hardwareRequest(verb: string, args?: unknown): Promise<unknown> {
+    const result = (await request(METHODS.hardwareRequest, {
+      verb, argsJson: JSON.stringify(args ?? {}),
+    })) as HardwareRequestWireResult;
+    if ("resultJson" in result) return JSON.parse(result.resultJson);
+    const detail = [
+      ("missing" in result && result.missing) ? `missing: ${result.missing}` : null,
+      ("message" in result && result.message) ? result.message : null,
+    ].filter((s): s is string => s !== null);
+    throw new Error(
+      detail.length > 0
+        ? `hardware.request failed: ${result.code} (${detail.join("; ")})`
+        : `hardware.request failed: ${result.code}`,
+    );
+  }
+
+  const ctx: PluginContext = { hardware: hardwareRequest };
+
   async function handleInvoke(ev: { requestId: string; tool: string; argsJson: string }): Promise<void> {
     const toolDef = def.tools?.[ev.tool];
     if (!toolDef) {
@@ -200,7 +268,7 @@ export function createPlugin(def: PluginDefinition): Plugin {
     }
     try {
       const args: unknown = JSON.parse(ev.argsJson);
-      const result = await toolDef.run(args);
+      const result = await toolDef.run(args, ctx);
       sendToolResult({ requestId: ev.requestId, resultJson: JSON.stringify(result === undefined ? null : result) });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
