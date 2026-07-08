@@ -44,7 +44,8 @@ import { ContextAssembler } from "./agent/context";
 import { SkillStore } from "./agent/skills";
 import { BackgroundTaskRegistry } from "./agent/bg-registry";
 import { sessionTmpDir } from "./agent/session-tmp";
-import { PluginStore, pluginMcpEligible } from "./agent/plugins";
+import { PluginStore, pluginMcpEligible, pluginSpawnEligible } from "./agent/plugins";
+import { PluginSupervisor } from "./plugins/supervisor";
 import { AuditLog } from "./peripheral/audit";
 import { PeripheralBroker, type PeripheralClass } from "./peripheral/broker";
 import { ProviderLink } from "./peripheral/provider-link";
@@ -196,6 +197,7 @@ export async function startDaemon(opts: {
   let questions: QuestionBroker | null = null;
   let taskStore: TaskStore | null = null;
   let plans: PlanBroker | null = null;
+  let pluginSupervisor: PluginSupervisor | null = null;
   if (agentProvider) {
     const registry = new ToolRegistry();
     registerReadTools(registry);
@@ -250,6 +252,28 @@ export async function startDaemon(opts: {
       .filter(pluginMcpEligible)
       .map((p) => ({ name: p.name, dir: join(normaHome, "plugins", p.name), manifestServers: p.manifestServers }));
     await mcp.startPlugins(enabledPlugins);
+
+    // Tier-2 platform plugins (Phase 4b Task 3, spec §3): PluginSupervisor owns process lifecycle
+    // (spawn/registration timeout/crash backoff/circuit breaker/PID-file orphan reclaim) for every
+    // spawn-eligible plugin (pluginSpawnEligible — tier "platform" + entry present + enabled +
+    // consented, the same enabled/disabled/consent shape as pluginMcpEligible above). Built right
+    // after mcp.startPlugins, unconditionally for the eligible set — startAll() is non-blocking
+    // (orphan reclaim/registration waits are timer-driven, never awaited here). Task 4 wires the
+    // actual tool.register/plugin_tool_invoke bridge into `registry` and the ipc handlers that
+    // call notifyRegistered/notifyDisconnected/resolveToolResult; this task only owns the process
+    // lifecycle contract.
+    pluginSupervisor = new PluginSupervisor({
+      runDir: dirs.runDir,
+      socketPath: dirs.socketPath,
+      mintToken: (id) => store.mintPluginToken(id),
+      settings: settings?.plugins?.supervisor,
+      onLog: (m) => console.error(m),
+    });
+    const spawnablePlugins = allPlugins
+      .filter(pluginSpawnEligible)
+      .map((p) => ({ id: p.name, dir: join(normaHome, "plugins", p.name), entry: p.entry! }));
+    pluginSupervisor.startAll(spawnablePlugins);
+
     registerRequestDirTool(registry, {
       broker: approvalBroker,
       dirs: sessionDirs,
@@ -345,7 +369,7 @@ export async function startDaemon(opts: {
   return {
     socketPath: dirs.socketPath,
     tokens,
-    stop() { server.stop(); mcp?.stopAll(); bgRegistry.killAll(); store.close(); lock.release(); },
+    stop() { server.stop(); mcp?.stopAll(); pluginSupervisor?.stopAll(); bgRegistry.killAll(); store.close(); lock.release(); },
   };
 }
 

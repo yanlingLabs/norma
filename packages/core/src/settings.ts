@@ -43,6 +43,17 @@ export const Settings = z.object({
       tcc: z.number().optional(),
       hardware: z.number().optional(),
     })).optional(),
+    /** PluginSupervisor lifecycle overrides (Phase 4b Task 3, spec §3 — all four values are
+     *  spec-defaulted when omitted: registration timeout 10s, backoff cap 60s, circuit 5
+     *  failures/10min). The invoke timeout (default 60s) and the SIGTERM→SIGKILL kill grace (5s)
+     *  are deliberately NOT here — spec pins the former to the `NORMA_PLUGIN_TOOL_TIMEOUT_MS` env
+     *  var and the latter isn't settings-overridable at all. */
+    supervisor: z.object({
+      registrationTimeoutMs: z.number().int().positive().optional(),
+      backoffCapMs: z.number().int().positive().optional(),
+      circuitFailures: z.number().int().positive().optional(),
+      circuitWindowMs: z.number().int().positive().optional(),
+    }).optional(),
   }).optional(),
   toolSearch: z.object({
     enabled: z.boolean().optional(),

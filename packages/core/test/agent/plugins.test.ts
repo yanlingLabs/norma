@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PluginStore, consentComplete, pluginMcpEligible, type PluginInfo } from "../../src/agent/plugins";
+import { PluginStore, consentComplete, pluginMcpEligible, pluginSpawnEligible, type PluginInfo } from "../../src/agent/plugins";
 import { execPayloadLines, loadManifest, requiredConsentClasses, type NormaManifest } from "../../src/agent/plugin-manifest";
 
 function home(): string { return mkdtempSync(join(tmpdir(), "norma-plugins-")); }
@@ -104,6 +104,24 @@ describe("PluginStore + norma-plugin.json", () => {
     // manifestServers is filled from the SAME loadManifest call — daemon.ts reads this directly
     // instead of re-parsing norma-plugin.json a second time (final-review fix).
     expect(p.manifestServers).toEqual([{ name: "srv", command: "node", args: ["server.js"] }]);
+    // Phase 4b Task 3 addition — entry carried the same way (daemon.ts's PluginSupervisor wiring
+    // reads p.entry directly, no second manifest read).
+    expect(p.entry).toEqual({ command: "node", args: ["index.js"] });
+  });
+
+  test("no entry declared → PluginInfo.entry undefined (capability-tier / skills-only plugins)", () => {
+    const h = home();
+    normaPlugin(h, "demo", { id: "demo", tier: "capability", contributes: { skills: true } });
+    const [p] = new PluginStore({ normaHome: h }).list();
+    if (!p) throw new Error("expected one plugin");
+    expect(p.entry).toBeUndefined();
+  });
+
+  test("legacy plugin (no norma-plugin.json) → entry undefined", () => {
+    const h = home(); plugin(h, "demo", { mcp: true });
+    const [p] = new PluginStore({ normaHome: h }).list();
+    if (!p) throw new Error("expected one plugin");
+    expect(p.entry).toBeUndefined();
   });
 
   test("no contributes.mcpServers → hasManifestMcp false, manifestServers undefined", () => {
@@ -314,6 +332,62 @@ describe("pluginMcpEligible", () => {
     }).list();
     if (!p) throw new Error("expected one plugin");
     expect(pluginMcpEligible(p)).toBe(true);
+  });
+});
+
+describe("pluginSpawnEligible (Phase 4b Task 3 — PluginSupervisor eligibility)", () => {
+  const platformWithEntry = { tier: "platform" as const, entry: { command: "bun", args: ["index.ts"] } };
+
+  test("platform + entry + enabled + consented → eligible", () => {
+    expect(pluginSpawnEligible(mkPluginInfo({ ...platformWithEntry, mcpEnabled: true, legacy: false }))).toBe(true);
+  });
+  test("not enabled → not eligible", () => {
+    expect(pluginSpawnEligible(mkPluginInfo({ ...platformWithEntry, mcpEnabled: false, legacy: false }))).toBe(false);
+  });
+  test("disabled beats enabled → not eligible", () => {
+    expect(pluginSpawnEligible(mkPluginInfo({ ...platformWithEntry, mcpEnabled: true, disabled: true, legacy: false }))).toBe(false);
+  });
+  test("capability tier, even with entry+enabled → not eligible (Tier-2 supervision is platform-only)", () => {
+    expect(pluginSpawnEligible(mkPluginInfo({
+      tier: "capability", entry: { command: "bun" }, mcpEnabled: true, legacy: false,
+    }))).toBe(false);
+  });
+  test("no tier at all (legacy plugin) → not eligible", () => {
+    expect(pluginSpawnEligible(mkPluginInfo({ entry: { command: "bun" }, mcpEnabled: true, legacy: true }))).toBe(false);
+  });
+  test("platform tier but no entry declared → not eligible (nothing to spawn)", () => {
+    expect(pluginSpawnEligible(mkPluginInfo({ tier: "platform", mcpEnabled: true, legacy: false }))).toBe(false);
+  });
+  test("platform + entry + enabled but unconsented (requiredConsents exec) → not eligible", () => {
+    expect(pluginSpawnEligible(mkPluginInfo({
+      ...platformWithEntry, mcpEnabled: true, legacy: false, requiredConsents: ["exec"], consented: [],
+    }))).toBe(false);
+  });
+  test("platform + entry + enabled + exec-consented → eligible", () => {
+    expect(pluginSpawnEligible(mkPluginInfo({
+      ...platformWithEntry, mcpEnabled: true, legacy: false, requiredConsents: ["exec"], consented: ["exec"],
+    }))).toBe(true);
+  });
+
+  test("end-to-end through a real PluginStore fixture: entry+tier from norma-plugin.json, enable+consent flip eligibility", () => {
+    const h = home();
+    normaPlugin(h, "demo", {
+      id: "demo", tier: "platform",
+      permissions: { exec: true },
+      entry: { command: "bun", args: ["index.ts"] },
+    });
+    const notEnabled = new PluginStore({ normaHome: h }).list()[0]!;
+    expect(pluginSpawnEligible(notEnabled)).toBe(false); // not enabled yet
+
+    const enabledUnconsented = new PluginStore({ normaHome: h, plugins: { enabled: ["demo"] } }).list()[0]!;
+    expect(enabledUnconsented.requiredConsents).toEqual(["exec"]);
+    expect(pluginSpawnEligible(enabledUnconsented)).toBe(false); // enabled but missing exec consent
+
+    const consented = new PluginStore({
+      normaHome: h, plugins: { enabled: ["demo"] }, consents: { demo: { exec: Date.now() } },
+    }).list()[0]!;
+    expect(pluginSpawnEligible(consented)).toBe(true);
+    expect(consented.entry).toEqual({ command: "bun", args: ["index.ts"] });
   });
 });
 

@@ -36,6 +36,11 @@ export interface PluginInfo {
   tccPermissions: string[];
   /** manifest.permissions.hardware verbatim (e.g. "battery") — one consent-block line per entry. [] when hardware isn't required. */
   hardwarePermissions: string[];
+  /** norma-plugin.json's `entry` verbatim (Phase 4b Task 3, spec §3: what the PluginSupervisor
+   *  spawns for a Tier-2 platform plugin) — filled from the SAME single loadManifest call list()
+   *  already makes, same precedent as manifestServers above. undefined for legacy plugins and for
+   *  manifest plugins that declare no entry point (e.g. capability-tier / skills-only plugins). */
+  entry?: NonNullable<NormaManifest["entry"]>;
 }
 
 /** Consent record shape for one plugin: settings.plugins.consents[id] (settings.ts). */
@@ -97,6 +102,7 @@ export class PluginStore {
           execPayload: execPayloadLines(manifest),
           tccPermissions: manifest.permissions?.tcc ?? [],
           hardwarePermissions: manifest.permissions?.hardware ?? [],
+          entry: manifest.entry,
         };
       }
 
@@ -140,4 +146,19 @@ export function consentComplete(p: PluginInfo): boolean {
  */
 export function pluginMcpEligible(p: PluginInfo): boolean {
   return p.mcpEnabled && !p.disabled && (p.hasMcp || p.hasManifestMcp) && consentComplete(p);
+}
+
+/**
+ * The daemon's Tier-2 process-supervision eligibility filter (Phase 4b Task 3, spec §3): a
+ * platform-tier manifest plugin with a declared `entry` point, explicitly enabled, not disabled,
+ * and fully consented — the SAME enabled/disabled/consent shape as `pluginMcpEligible` above
+ * (mcpEnabled already encodes "explicitly enabled AND not disabled" — see PluginStore#list), plus
+ * the two checks that are specific to spawning a process rather than starting an MCP server:
+ * `tier === "platform"` (capability-tier plugins are never spawned, regardless of what else they
+ * declare) and `entry` present (nothing to spawn without one). Legacy plugins have no `tier`, so
+ * this is always false for them — Tier-2 supervision is a manifest-only concept, unlike MCP
+ * eligibility which legacy plugins can satisfy via the old `.mcp.json` path.
+ */
+export function pluginSpawnEligible(p: PluginInfo): boolean {
+  return p.tier === "platform" && p.entry !== undefined && p.mcpEnabled && !p.disabled && consentComplete(p);
 }
