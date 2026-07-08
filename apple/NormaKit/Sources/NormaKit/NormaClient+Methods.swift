@@ -171,4 +171,63 @@ extension NormaClient {
                     p["hasMcp"]?.boolValue ?? false, p["mcpEnabled"]?.boolValue ?? false, p["disabled"]?.boolValue ?? false)
         }
     }
+
+    // MARK: - Peripheral lease (provider side) + dashboard reads (Phase 2f)
+
+    /// Provider-side: advertise which capability classes this connection can serve (with current
+    /// TCC-grant state per class). Sent on attach and again whenever TCC state changes.
+    public func peripheralAdvertise(classes: [(class: String, tccGranted: Bool)]) async throws {
+        let arr: [JSONValue] = classes.map { .object(["class": .string($0.class), "tccGranted": .bool($0.tccGranted)]) }
+        _ = try await request("peripheral.advertise", params: obj(["classes": .array(arr)]))
+    }
+
+    /// Provider-side: revoke a single lease (`leaseId`) or every active lease (`leaseId == nil`,
+    /// wire `all: true`) — panic uses the latter. `reason` is one of the `lease_lost` reasons.
+    public func peripheralRevoke(leaseId: String?, reason: String) async throws {
+        var params: [String: JSONValue?] = ["reason": .string(reason)]
+        if let leaseId { params["leaseId"] = .string(leaseId) } else { params["all"] = .bool(true) }
+        _ = try await request("peripheral.revoke", params: obj(params))
+    }
+
+    /// Provider-side: answer a `peripheral_call_requested` event with either a JSON-encoded
+    /// result or an error message (mutually exclusive; follows the approval-broker response shape).
+    public func peripheralRespond(requestId: String, resultJson: String?, error: String?) async throws {
+        _ = try await request("peripheral.respond", params: obj([
+            "requestId": .string(requestId),
+            "resultJson": resultJson.map { .string($0) },
+            "error": error.map { .string($0) },
+        ]))
+    }
+
+    /// Dashboard read: daemon identity/uptime + the current peripheral provider (if any).
+    public func daemonStatus() async throws -> (version: String, uptimeMs: Int, socketPath: String, providerId: String?, providerModel: String?, sessionsCount: Int, pluginsCount: Int) {
+        let r = try await request("daemon.status", params: nil)
+        let provider = r["provider"]
+        return (
+            r["version"]?.stringValue ?? "",
+            r["uptimeMs"]?.intValue ?? 0,
+            r["socketPath"]?.stringValue ?? "",
+            provider?["id"]?.stringValue,
+            provider?["model"]?.stringValue,
+            r["sessionsCount"]?.intValue ?? 0,
+            r["pluginsCount"]?.intValue ?? 0
+        )
+    }
+
+    /// Dashboard read: rate-limit state (`kind: "ok"|"limited"`, `resumeAt` when limited) + token usage.
+    public func quotaState() async throws -> (kind: String, resumeAt: Int?, inputTokens: Int, outputTokens: Int) {
+        let r = try await request("quota.state", params: nil)
+        return (r["kind"]?.stringValue ?? "ok", r["resumeAt"]?.intValue, r["inputTokens"]?.intValue ?? 0, r["outputTokens"]?.intValue ?? 0)
+    }
+
+    /// Dashboard read: trusted working directories.
+    public func trustList() async throws -> [String] {
+        let r = try await request("trust.list", params: nil)
+        return (r["dirs"]?.arrayValue ?? []).compactMap { $0.stringValue }
+    }
+
+    /// Dashboard write: revoke trust for a directory; returns whether it was actually removed.
+    public func trustRemove(path: String) async throws -> Bool {
+        try await request("trust.remove", params: obj(["path": .string(path)]))["removed"]?.boolValue ?? false
+    }
 }

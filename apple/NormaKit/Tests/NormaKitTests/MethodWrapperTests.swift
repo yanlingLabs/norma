@@ -93,6 +93,89 @@ final class MethodWrapperTests: XCTestCase {
         XCTAssertNil(threads[0].agentType)
     }
 
+    func testPeripheralAndDashboardWrappers() async throws {
+        let (client, t) = try await connected()
+        let cases: [(String, String, () async throws -> Void)] = [
+            ("peripheral.advertise", #"{"ok":true}"#, { try await client.peripheralAdvertise(classes: [(class: "noop", tccGranted: true)]) }),
+            ("peripheral.revoke", #"{"ok":true}"#, { try await client.peripheralRevoke(leaseId: "lease_1", reason: "panic") }),
+            ("peripheral.revoke", #"{"ok":true}"#, { try await client.peripheralRevoke(leaseId: nil, reason: "panic") }),
+            ("peripheral.respond", #"{"ok":true}"#, { try await client.peripheralRespond(requestId: "req_1", resultJson: "{}", error: nil) }),
+        ]
+        var idx = 1
+        for (method, result, call) in cases {
+            let (req, _) = try await roundTrip(t, sentIndex: idx, result: result) { try await call() }
+            XCTAssertEqual(req["method"] as? String, method, "wrong wire method for \(method)")
+            idx += 1
+        }
+    }
+
+    func testPeripheralAdvertiseAndRevokeEncodeParamsCorrectly() async throws {
+        let (client, t) = try await connected()
+
+        let (advertiseReq, _) = try await roundTrip(t, sentIndex: 1, result: #"{"ok":true}"#) {
+            try await client.peripheralAdvertise(classes: [(class: "screenshot", tccGranted: true), (class: "noop", tccGranted: false)])
+        }
+        let advertiseClasses = (advertiseReq["params"] as? [String: Any])?["classes"] as? [[String: Any]]
+        XCTAssertEqual(advertiseClasses?[0]["class"] as? String, "screenshot")
+        XCTAssertEqual(advertiseClasses?[0]["tccGranted"] as? Bool, true)
+        XCTAssertEqual(advertiseClasses?[1]["class"] as? String, "noop")
+        XCTAssertEqual(advertiseClasses?[1]["tccGranted"] as? Bool, false)
+
+        let (revokeOneReq, _) = try await roundTrip(t, sentIndex: 2, result: #"{"ok":true}"#) {
+            try await client.peripheralRevoke(leaseId: "lease_1", reason: "expired")
+        }
+        let revokeOneParams = revokeOneReq["params"] as? [String: Any]
+        XCTAssertEqual(revokeOneParams?["leaseId"] as? String, "lease_1")
+        XCTAssertEqual(revokeOneParams?["reason"] as? String, "expired")
+        XCTAssertNil(revokeOneParams?["all"])
+
+        let (revokeAllReq, _) = try await roundTrip(t, sentIndex: 3, result: #"{"ok":true}"#) {
+            try await client.peripheralRevoke(leaseId: nil, reason: "panic")
+        }
+        let revokeAllParams = revokeAllReq["params"] as? [String: Any]
+        XCTAssertEqual(revokeAllParams?["all"] as? Bool, true)
+        XCTAssertEqual(revokeAllParams?["reason"] as? String, "panic")
+        XCTAssertNil(revokeAllParams?["leaseId"])
+    }
+
+    func testDashboardReadWrappers() async throws {
+        let (client, t) = try await connected()
+
+        let (statusReq, status) = try await roundTrip(t, sentIndex: 1,
+            result: #"{"version":"0.1.0","uptimeMs":42,"socketPath":"/tmp/norma.sock","provider":{"id":"c_1","model":"orb"},"sessionsCount":2,"pluginsCount":0}"#
+        ) { try await client.daemonStatus() }
+        XCTAssertEqual(statusReq["method"] as? String, "daemon.status")
+        XCTAssertEqual(status.version, "0.1.0")
+        XCTAssertEqual(status.uptimeMs, 42)
+        XCTAssertEqual(status.socketPath, "/tmp/norma.sock")
+        XCTAssertEqual(status.providerId, "c_1")
+        XCTAssertEqual(status.providerModel, "orb")
+        XCTAssertEqual(status.sessionsCount, 2)
+        XCTAssertEqual(status.pluginsCount, 0)
+
+        let (quotaReq, quota) = try await roundTrip(t, sentIndex: 2,
+            result: #"{"kind":"limited","resumeAt":1700000000000,"inputTokens":10,"outputTokens":5}"#
+        ) { try await client.quotaState() }
+        XCTAssertEqual(quotaReq["method"] as? String, "quota.state")
+        XCTAssertEqual(quota.kind, "limited")
+        XCTAssertEqual(quota.resumeAt, 1700000000000)
+        XCTAssertEqual(quota.inputTokens, 10)
+        XCTAssertEqual(quota.outputTokens, 5)
+
+        let (trustListReq, dirs) = try await roundTrip(t, sentIndex: 3,
+            result: #"{"dirs":["/Users/x/proj","/Users/x/other"]}"#
+        ) { try await client.trustList() }
+        XCTAssertEqual(trustListReq["method"] as? String, "trust.list")
+        XCTAssertEqual(dirs, ["/Users/x/proj", "/Users/x/other"])
+
+        let (trustRemoveReq, removed) = try await roundTrip(t, sentIndex: 4,
+            result: #"{"removed":true}"#
+        ) { try await client.trustRemove(path: "/Users/x/proj") }
+        XCTAssertEqual(trustRemoveReq["method"] as? String, "trust.remove")
+        XCTAssertEqual((trustRemoveReq["params"] as? [String: Any])?["path"] as? String, "/Users/x/proj")
+        XCTAssertTrue(removed)
+    }
+
     func testAttachSeedsDedupeSoReplayIsNotDropped() async throws {
         let (client, t) = try await connected()
         // attach fromSeq 5: events with seq > 5 must flow, seq <= 5 must be dropped
@@ -111,6 +194,31 @@ final class MethodWrapperTests: XCTestCase {
         // transient delta with seq == lastSeq still flows (dedupe exemption)
         t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"assistant_delta","seq":6,"sessionId":"s_1","ts":3,"threadId":"main","delta":"x"}}"#)
         guard case .session(.assistantDelta) = await iter.next() else { return XCTFail("delta wrongly deduped") }
+    }
+
+    /// Phase 2f: lease_granted/lease_lost/peripheral_call_requested are TRANSIENT exactly like
+    /// assistant_delta (broadcastTransient stamps them with the store's current lastSeq, not their
+    /// own) — they must bypass the seq<=lastSeq dedupe gate too, or they'd be silently dropped.
+    func testPeripheralLeaseEventsAreTransientLikeAssistantDelta() async throws {
+        let (client, t) = try await connected()
+        async let attached = client.attach(sessionId: "s_1", fromSeq: 5)
+        let sent = try await waitForSent(t, count: 2)
+        t.feed(#"{"jsonrpc":"2.0","id":\#(decodeLine(sent[1])["id"] as! Int),"result":{"ok":true,"lastSeq":8}}"#)
+        _ = try await attached
+
+        var iter = client.events.makeAsyncIterator()
+        let holder = #"{"kind":"session","id":"s_1"}"#
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"lease_granted","seq":8,"sessionId":"s_1","ts":1,"threadId":"main","leaseId":"lease_1","class":"noop","holder":\#(holder),"expiresAt":20}}"#)
+        guard case .session(.leaseGranted(let g)) = await iter.next() else { return XCTFail("lease_granted wrongly deduped") }
+        XCTAssertEqual(g.leaseId, "lease_1")
+
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"lease_lost","seq":8,"sessionId":"s_1","ts":2,"threadId":"main","leaseId":"lease_1","class":"noop","holder":\#(holder),"reason":"expired"}}"#)
+        guard case .session(.leaseLost(let l)) = await iter.next() else { return XCTFail("lease_lost wrongly deduped") }
+        XCTAssertEqual(l.reason, "expired")
+
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"peripheral_call_requested","seq":8,"sessionId":"s_1","ts":3,"threadId":"main","requestId":"req_1","leaseId":"lease_1","token":"tok_1","class":"noop","payloadJson":"{}"}}"#)
+        guard case .session(.peripheralCallRequested(let c)) = await iter.next() else { return XCTFail("peripheral_call_requested wrongly deduped") }
+        XCTAssertEqual(c.requestId, "req_1")
     }
 
     /// G2 live-gate fix: the seq<=lastSeq dedupe/lastSeq bookkeeping is scoped to the attached

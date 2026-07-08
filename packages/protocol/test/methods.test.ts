@@ -252,6 +252,21 @@ describe("plan.respond / session.setPolicy schemas", () => {
   });
 });
 
+describe("peripheral lease + dashboard read methods", () => {
+  test("METHODS carries the six peripheral verbs + four dashboard read methods", () => {
+    expect(METHODS.peripheralLease).toBe("peripheral.lease");
+    expect(METHODS.peripheralRenew).toBe("peripheral.renew");
+    expect(METHODS.peripheralRelease).toBe("peripheral.release");
+    expect(METHODS.peripheralAdvertise).toBe("peripheral.advertise");
+    expect(METHODS.peripheralRevoke).toBe("peripheral.revoke");
+    expect(METHODS.peripheralRespond).toBe("peripheral.respond");
+    expect(METHODS.daemonStatus).toBe("daemon.status");
+    expect(METHODS.quotaState).toBe("quota.state");
+    expect(METHODS.trustList).toBe("trust.list");
+    expect(METHODS.trustRemove).toBe("trust.remove");
+  });
+});
+
 describe("thread.list schema", () => {
   test("thread.list params/result + method string", () => {
     expect(ThreadListParams.parse({ sessionId: "s1" }).sessionId).toBe("s1");

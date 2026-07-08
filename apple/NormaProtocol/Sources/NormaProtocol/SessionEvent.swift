@@ -29,6 +29,9 @@ public enum SessionEvent: Codable, Equatable, Sendable {
     case threadStarted(ThreadStarted)
     case threadCompleted(ThreadCompleted)
     case sessionTitled(SessionTitled)
+    case leaseGranted(LeaseGranted)
+    case leaseLost(LeaseLost)
+    case peripheralCallRequested(PeripheralCallRequested)
 
     public struct SessionCreated: Codable, Equatable, Sendable {
         public let seq: Int
@@ -303,6 +306,51 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         public let title: String
     }
 
+    /// `{kind: "session"|"plugin", id}` — identifies the holder of a peripheral lease.
+    public struct Holder: Codable, Equatable, Sendable {
+        public let kind: String
+        public let id: String
+    }
+
+    /// TRANSIENT (broadcast-only, like `assistant_delta`) — leases are runtime state; replay
+    /// must never resurrect one. The audit log is the durable record.
+    public struct LeaseGranted: Codable, Equatable, Sendable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let leaseId: String
+        public let `class`: String
+        public let holder: Holder
+        public let expiresAt: Int
+    }
+
+    /// TRANSIENT — see LeaseGranted.
+    public struct LeaseLost: Codable, Equatable, Sendable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let leaseId: String
+        public let `class`: String
+        public let holder: Holder
+        public let reason: String
+    }
+
+    /// TRANSIENT — core pushes this to the provider's connection (approval-broker request/
+    /// response pattern); the provider answers via `peripheral.respond`.
+    public struct PeripheralCallRequested: Codable, Equatable, Sendable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let requestId: String
+        public let leaseId: String
+        public let token: String
+        public let `class`: String
+        public let payloadJson: String
+    }
+
     private enum Discriminator: String, Codable {
         case session_created
         case harness_attached
@@ -332,6 +380,9 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         case thread_started
         case thread_completed
         case session_titled
+        case lease_granted
+        case lease_lost
+        case peripheral_call_requested
     }
 
     private enum TypeKey: String, CodingKey { case type }
@@ -367,6 +418,9 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         case .thread_started:       self = .threadStarted(try ThreadStarted(from: decoder))
         case .thread_completed:     self = .threadCompleted(try ThreadCompleted(from: decoder))
         case .session_titled:       self = .sessionTitled(try SessionTitled(from: decoder))
+        case .lease_granted:        self = .leaseGranted(try LeaseGranted(from: decoder))
+        case .lease_lost:           self = .leaseLost(try LeaseLost(from: decoder))
+        case .peripheral_call_requested: self = .peripheralCallRequested(try PeripheralCallRequested(from: decoder))
         }
     }
 
@@ -484,6 +538,18 @@ public enum SessionEvent: Codable, Equatable, Sendable {
             try v.encode(to: encoder)
             var c = encoder.container(keyedBy: TypeKey.self)
             try c.encode(Discriminator.session_titled.rawValue, forKey: .type)
+        case .leaseGranted(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.lease_granted.rawValue, forKey: .type)
+        case .leaseLost(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.lease_lost.rawValue, forKey: .type)
+        case .peripheralCallRequested(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.peripheral_call_requested.rawValue, forKey: .type)
         }
     }
 }

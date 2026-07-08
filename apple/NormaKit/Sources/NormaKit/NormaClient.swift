@@ -124,9 +124,17 @@ public actor NormaClient {
             case .failure(let e): cont.resume(throwing: e)
             }
         case .event(let e):
-            // Transient deltas bypass dedupe/lastSeq entirely (their seq = server lastSeq;
-            // a naive `seq <= lastSeq` drop would kill every delta).
-            if case .assistantDelta = e { eventsCont.yield(.session(e)); return }
+            // Transient events bypass dedupe/lastSeq entirely (their seq = server lastSeq at
+            // broadcast time, not their own; a naive `seq <= lastSeq` drop would kill every one
+            // of these — assistant_delta streaming AND the peripheral-lease v1 events, which are
+            // runtime-only and must never be resurrected by replay).
+            switch e {
+            case .assistantDelta, .leaseGranted, .leaseLost, .peripheralCallRequested:
+                eventsCont.yield(.session(e))
+                return
+            default:
+                break
+            }
             // The seq dedupe/lastSeq bookkeeping is scoped to the currently attached session
             // ONLY. `lastSeq` is a per-session cursor; applying it globally would drop a
             // cross-session event (e.g. a new session's session_created, seq 1, broadcast while
@@ -222,6 +230,9 @@ extension SessionEvent {
         case .threadStarted(let v): return v.seq
         case .threadCompleted(let v): return v.seq
         case .sessionTitled(let v): return v.seq
+        case .leaseGranted(let v): return v.seq
+        case .leaseLost(let v): return v.seq
+        case .peripheralCallRequested(let v): return v.seq
         }
     }
 
@@ -256,6 +267,9 @@ extension SessionEvent {
         case .threadStarted(let v): return v.sessionId
         case .threadCompleted(let v): return v.sessionId
         case .sessionTitled(let v): return v.sessionId
+        case .leaseGranted(let v): return v.sessionId
+        case .leaseLost(let v): return v.sessionId
+        case .peripheralCallRequested(let v): return v.sessionId
         }
     }
 }
