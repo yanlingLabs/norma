@@ -44,7 +44,7 @@ import { ContextAssembler } from "./agent/context";
 import { SkillStore } from "./agent/skills";
 import { BackgroundTaskRegistry } from "./agent/bg-registry";
 import { sessionTmpDir } from "./agent/session-tmp";
-import { PluginStore } from "./agent/plugins";
+import { PluginStore, consentComplete, pluginMcpEligible } from "./agent/plugins";
 import { AuditLog } from "./peripheral/audit";
 import { PeripheralBroker, type PeripheralClass } from "./peripheral/broker";
 import { ProviderLink } from "./peripheral/provider-link";
@@ -140,7 +140,9 @@ export async function startDaemon(opts: {
   }
 
   const trustStore = new TrustStore(join(normaHome, "trust.json"));
-  const pluginStore = new PluginStore({ normaHome, plugins: settings?.plugins, log: (m) => console.error(m) });
+  const pluginStore = new PluginStore({
+    normaHome, plugins: settings?.plugins, consents: settings?.plugins?.consents, log: (m) => console.error(m),
+  });
   const skillStore = new SkillStore({ normaHome, trust: trustStore, plugins: { disabled: settings?.plugins?.disabled ?? [] } });
   const assembler = new ContextAssembler({ normaHome, trust: trustStore, skills: skillStore });
   // Built unconditionally (needs only store, no provider) so the server's session.addDir /
@@ -216,12 +218,21 @@ export async function startDaemon(opts: {
     registerSpawnAgentTool(registry);
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
     await mcp.startAll(settings?.mcpServers ?? {});
-    // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled && !disabled);
-    // a plugin's skills are always live (SkillStore above), but its MCP servers are the seam that
-    // needs the user opting in via settings.plugins.enabled.
-    const enabledPlugins = pluginStore
-      .list()
-      .filter((p) => p.mcpEnabled && !p.disabled && p.hasMcp)
+    // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled &&
+    // !disabled); a plugin's skills are always live (SkillStore above), but its MCP/manifest
+    // content is the seam that needs the user opting in via settings.plugins.enabled AND,
+    // per-exec-class, a settings.plugins.consents record (pluginMcpEligible in agent/plugins.ts —
+    // legacy plugins have requiredConsents [] so this is unchanged for them; a manifest plugin
+    // with exec content that's enabled but unconsented is excluded here, logged below).
+    const allPlugins = pluginStore.list();
+    for (const p of allPlugins) {
+      if (p.mcpEnabled && !p.disabled && (p.hasMcp || p.hasManifestMcp) && !consentComplete(p)) {
+        const missing = p.requiredConsents.filter((c) => !p.consented.includes(c));
+        console.error(`plugin ${p.name}: enabled but missing consent for ${missing.join(", ")} — MCP not started`);
+      }
+    }
+    const enabledPlugins = allPlugins
+      .filter(pluginMcpEligible)
       .map((p) => ({ name: p.name, dir: join(normaHome, "plugins", p.name) }));
     await mcp.startPlugins(enabledPlugins);
     registerRequestDirTool(registry, {

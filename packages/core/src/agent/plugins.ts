@@ -14,13 +14,20 @@ export interface PluginInfo {
   tier?: "capability" | "platform";
   /** Consent classes ("exec"|"tcc"|"hardware") the manifest requires, per plugin-manifest.ts#requiredConsentClasses. [] for legacy plugins. */
   requiredConsents: string[];
-  /** Consent classes actually granted (from settings.plugins.consents). ALWAYS [] in this task — Task 2 fills this from settings records. */
+  /** Consent classes actually granted, filled from settings.plugins.consents[name] (a class counts
+   *  as consented when its key is present in the record, regardless of the timestamp value). []
+   *  when there's no consents dep or no record for this plugin. See consentComplete/pluginMcpEligible below. */
   consented: string[];
   /** true when no valid norma-plugin.json was found (missing OR present-but-malformed) and the plugin loaded via the legacy plugin.json path. */
   legacy: boolean;
   /** true when norma-plugin.json declares contributes.mcpServers. Distinct from hasMcp, which reflects the legacy .mcp.json file. */
   hasManifestMcp: boolean;
 }
+
+/** Consent record shape for one plugin: settings.plugins.consents[id] (settings.ts). */
+export type PluginConsentRecord = { exec?: number; tcc?: number; hardware?: number };
+
+const CONSENT_CLASSES = ["exec", "tcc", "hardware"] as const;
 
 /**
  * Reads ~/.norma/plugins/<name>/. The DIRECTORY NAME is the canonical plugin name.
@@ -30,7 +37,22 @@ export interface PluginInfo {
  * ignored, the plugin still loads).
  */
 export class PluginStore {
-  constructor(private readonly deps: { normaHome: string; plugins?: { enabled?: string[]; disabled?: string[] }; log?: (m: string) => void }) {}
+  constructor(
+    private readonly deps: {
+      normaHome: string;
+      plugins?: { enabled?: string[]; disabled?: string[] };
+      /** settings.plugins.consents — per-plugin-id consent records. Kept as a sibling dep (not
+       *  nested under `plugins`) so callers/tests can wire it independently of enabled/disabled. */
+      consents?: Record<string, PluginConsentRecord>;
+      log?: (m: string) => void;
+    },
+  ) {}
+
+  private consentedClasses(name: string): string[] {
+    const record = this.deps.consents?.[name];
+    if (!record) return [];
+    return CONSENT_CLASSES.filter((c) => record[c] !== undefined);
+  }
 
   list(): PluginInfo[] {
     const root = join(this.deps.normaHome, "plugins");
@@ -44,6 +66,7 @@ export class PluginStore {
       try { skills = readdirSync(join(dir, "skills"), { withFileTypes: true }).filter((e) => e.isDirectory() && existsSync(join(dir, "skills", e.name, "SKILL.md"))).map((e) => e.name); } catch { /* no skills dir */ }
       const isDisabled = disabled.includes(name);
       const shared = { name, skills, hasMcp: existsSync(join(dir, ".mcp.json")), mcpEnabled: enabled.includes(name) && !isDisabled, disabled: isDisabled };
+      const consented = this.consentedClasses(name);
 
       const { manifest } = loadManifest(dir, name, this.deps.log);
       if (manifest) {
@@ -53,7 +76,7 @@ export class PluginStore {
           version: manifest.version,
           tier: manifest.tier,
           requiredConsents: requiredConsentClasses(manifest),
-          consented: [],
+          consented,
           legacy: false,
           hasManifestMcp: Boolean(manifest.contributes?.mcpServers?.length),
         };
@@ -67,10 +90,33 @@ export class PluginStore {
         description: meta.description,
         version: meta.version,
         requiredConsents: [],
-        consented: [],
+        consented,
         legacy: true,
         hasManifestMcp: false,
       };
     });
   }
+}
+
+/**
+ * True when every consent class a plugin's manifest requires (`requiredConsents`) has a matching
+ * record in `consented`. Legacy plugins have `requiredConsents === []`, so this is vacuously true
+ * for them — consent never gates legacy plugin content (spec: "everything above keeps working
+ * unchanged").
+ */
+export function consentComplete(p: PluginInfo): boolean {
+  return p.requiredConsents.every((c) => p.consented.includes(c));
+}
+
+/**
+ * The daemon's plugin-MCP eligibility filter (design spec §9(4a) enforcement), extracted as a
+ * pure predicate so it's unit-testable without booting a daemon: explicitly enabled, not
+ * disabled, some MCP content declared (legacy `.mcp.json` OR manifest `contributes.mcpServers`),
+ * AND every required consent class is on record. For legacy plugins `requiredConsents` is always
+ * [] so `consentComplete` is vacuously true and behavior is byte-identical to pre-4a (enable
+ * alone suffices). For a manifest plugin with exec content, enabling WITHOUT a consent record
+ * leaves this false — the caller (daemon.ts) is expected to log why when that happens.
+ */
+export function pluginMcpEligible(p: PluginInfo): boolean {
+  return p.mcpEnabled && !p.disabled && (p.hasMcp || p.hasManifestMcp) && consentComplete(p);
 }

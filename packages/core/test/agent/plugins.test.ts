@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PluginStore } from "../../src/agent/plugins";
+import { PluginStore, consentComplete, pluginMcpEligible, type PluginInfo } from "../../src/agent/plugins";
 import { execPayloadLines, loadManifest, requiredConsentClasses, type NormaManifest } from "../../src/agent/plugin-manifest";
 
 function home(): string { return mkdtempSync(join(tmpdir(), "norma-plugins-")); }
@@ -22,6 +22,15 @@ function normaPlugin(h: string, name: string, manifest: unknown, opts: { skills?
 /** Minimal valid NormaManifest, id/tier defaulted, everything else overridable. */
 function mkManifest(overrides: Partial<NormaManifest> = {}): NormaManifest {
   return { id: "p", tier: "capability", ...overrides };
+}
+/** Minimal valid PluginInfo (legacy-shaped defaults), everything overridable — for pure
+ *  consentComplete/pluginMcpEligible table tests that don't need a real PluginStore fixture. */
+function mkPluginInfo(overrides: Partial<PluginInfo> = {}): PluginInfo {
+  return {
+    name: "p", skills: [], hasMcp: false, mcpEnabled: false, disabled: false,
+    requiredConsents: [], consented: [], legacy: true, hasManifestMcp: false,
+    ...overrides,
+  };
 }
 
 describe("PluginStore", () => {
@@ -130,6 +139,132 @@ describe("PluginStore + norma-plugin.json", () => {
   });
 });
 
+describe("PluginStore + consents (Task 2)", () => {
+  // Legacy-unchanged case FIRST: a legacy plugin's requiredConsents is always [], so enabling it
+  // is exactly as sufficient as it was before consent records existed — no consents dep, no
+  // record, still eligible.
+  test("legacy plugin: enable alone is eligible — no consents involved (UNCHANGED baseline)", () => {
+    const h = home(); plugin(h, "demo", { mcp: true });
+    const [p] = new PluginStore({ normaHome: h, plugins: { enabled: ["demo"] } }).list();
+    if (!p) throw new Error("expected one plugin");
+    expect(p.legacy).toBe(true);
+    expect(p.requiredConsents).toEqual([]);
+    expect(p.consented).toEqual([]); // no consents dep supplied at all
+    expect(consentComplete(p)).toBe(true); // vacuously true — requiredConsents is []
+    expect(pluginMcpEligible(p)).toBe(true); // enable alone suffices, exactly like pre-4a
+  });
+
+  test("consented fills from settings.plugins.consents[name] — one entry per present class", () => {
+    const h = home();
+    normaPlugin(h, "demo", {
+      id: "demo", tier: "capability",
+      permissions: { tcc: ["accessibility"] },
+      contributes: { mcpServers: [{ name: "srv", command: "node" }] },
+    });
+    const [p] = new PluginStore({ normaHome: h, consents: { demo: { exec: 1000, tcc: 2000 } } }).list();
+    if (!p) throw new Error("expected one plugin");
+    expect(p.requiredConsents.sort()).toEqual(["exec", "tcc"]);
+    expect(p.consented.sort()).toEqual(["exec", "tcc"]);
+  });
+
+  test("consents present for a DIFFERENT plugin id → this plugin's consented stays []", () => {
+    const h = home();
+    normaPlugin(h, "demo", { id: "demo", tier: "capability", permissions: { exec: true } });
+    const [p] = new PluginStore({ normaHome: h, consents: { other: { exec: 1 } } }).list();
+    if (!p) throw new Error("expected one plugin");
+    expect(p.consented).toEqual([]);
+  });
+
+  test("partial consent — only some required classes recorded", () => {
+    const h = home();
+    normaPlugin(h, "demo", {
+      id: "demo", tier: "platform",
+      permissions: { tcc: ["accessibility"], hardware: ["battery"] },
+      entry: { command: "node" },
+    });
+    const [p] = new PluginStore({ normaHome: h, consents: { demo: { exec: 1 } } }).list();
+    if (!p) throw new Error("expected one plugin");
+    expect(p.requiredConsents.sort()).toEqual(["exec", "hardware", "tcc"]);
+    expect(p.consented).toEqual(["exec"]);
+  });
+});
+
+describe("consentComplete", () => {
+  test("legacy (requiredConsents []) → always true regardless of consented", () => {
+    expect(consentComplete(mkPluginInfo())).toBe(true);
+  });
+  test("manifest requiring exec, nothing consented → false", () => {
+    expect(consentComplete(mkPluginInfo({ requiredConsents: ["exec"], consented: [] }))).toBe(false);
+  });
+  test("manifest requiring exec+tcc, only exec consented → false", () => {
+    expect(consentComplete(mkPluginInfo({ requiredConsents: ["exec", "tcc"], consented: ["exec"] }))).toBe(false);
+  });
+  test("manifest requiring exec+tcc, both consented → true", () => {
+    expect(consentComplete(mkPluginInfo({ requiredConsents: ["exec", "tcc"], consented: ["exec", "tcc"] }))).toBe(true);
+  });
+  test("extra unrelated consented classes don't matter", () => {
+    expect(consentComplete(mkPluginInfo({ requiredConsents: ["tcc"], consented: ["exec", "tcc", "hardware"] }))).toBe(true);
+  });
+});
+
+describe("pluginMcpEligible", () => {
+  test("legacy: enabled + hasMcp + not disabled → eligible (no consent needed) [UNCHANGED]", () => {
+    expect(pluginMcpEligible(mkPluginInfo({ mcpEnabled: true, hasMcp: true }))).toBe(true);
+  });
+  test("legacy: not enabled → not eligible", () => {
+    expect(pluginMcpEligible(mkPluginInfo({ mcpEnabled: false, hasMcp: true }))).toBe(false);
+  });
+  test("disabled beats enabled → not eligible", () => {
+    expect(pluginMcpEligible(mkPluginInfo({ mcpEnabled: true, disabled: true, hasMcp: true }))).toBe(false);
+  });
+  test("no MCP content at all (hasMcp false, hasManifestMcp false) → not eligible even if enabled", () => {
+    expect(pluginMcpEligible(mkPluginInfo({ mcpEnabled: true, hasMcp: false, hasManifestMcp: false }))).toBe(false);
+  });
+  test("hasManifestMcp alone (no legacy .mcp.json) counts as MCP content", () => {
+    expect(pluginMcpEligible(mkPluginInfo({ mcpEnabled: true, hasMcp: false, hasManifestMcp: true, legacy: false }))).toBe(true);
+  });
+  test("manifest+exec: enabled but unconsented → not eligible", () => {
+    expect(pluginMcpEligible(mkPluginInfo({
+      mcpEnabled: true, hasManifestMcp: true, legacy: false, requiredConsents: ["exec"], consented: [],
+    }))).toBe(false);
+  });
+  test("manifest+exec: enabled + consented → eligible", () => {
+    expect(pluginMcpEligible(mkPluginInfo({
+      mcpEnabled: true, hasManifestMcp: true, legacy: false, requiredConsents: ["exec"], consented: ["exec"],
+    }))).toBe(true);
+  });
+
+  // CARRIED from T1's review: entry/mcpServers present + permissions.exec:false is an
+  // OR-derivation, not AND — requiredConsentClasses still requires exec (see the
+  // requiredConsentClasses table below), so the filter must still exclude an unconsented plugin
+  // in that combo, end-to-end through a real PluginStore fixture (not just the pure predicate).
+  test("CARRIED: mcpServers present + permissions.exec:false, enabled, no record → excluded", () => {
+    const h = home();
+    normaPlugin(h, "demo", {
+      id: "demo", tier: "capability",
+      permissions: { exec: false },
+      contributes: { mcpServers: [{ name: "srv", command: "node" }] },
+    });
+    const [p] = new PluginStore({ normaHome: h, plugins: { enabled: ["demo"] } }).list();
+    if (!p) throw new Error("expected one plugin");
+    expect(p.requiredConsents).toContain("exec");
+    expect(pluginMcpEligible(p)).toBe(false);
+  });
+  test("CARRIED: same plugin, once exec-consented → included", () => {
+    const h = home();
+    normaPlugin(h, "demo", {
+      id: "demo", tier: "capability",
+      permissions: { exec: false },
+      contributes: { mcpServers: [{ name: "srv", command: "node" }] },
+    });
+    const [p] = new PluginStore({
+      normaHome: h, plugins: { enabled: ["demo"] }, consents: { demo: { exec: Date.now() } },
+    }).list();
+    if (!p) throw new Error("expected one plugin");
+    expect(pluginMcpEligible(p)).toBe(true);
+  });
+});
+
 describe("loadManifest", () => {
   test("missing norma-plugin.json → legacy:true, no manifest, no log", () => {
     const h = home(); const dir = join(h, "plugins", "x"); mkdirSync(dir, { recursive: true });
@@ -172,6 +307,19 @@ describe("requiredConsentClasses", () => {
   });
   test("permissions.exec:false with no other exec source → []", () => {
     expect(requiredConsentClasses(mkManifest({ permissions: { exec: false } }))).toEqual([]);
+  });
+  // CARRIED from T1's review: entry/mcpServers presence is an OR-derivation, not gated by
+  // permissions.exec — an author declaring permissions.exec:false cannot suppress the exec
+  // consent requirement while also shipping an entry point or mcpServers.
+  test("CARRIED: entry present + permissions.exec:false → still requires exec (OR, not AND)", () => {
+    expect(requiredConsentClasses(mkManifest({
+      entry: { command: "node" }, permissions: { exec: false },
+    }))).toEqual(["exec"]);
+  });
+  test("CARRIED: mcpServers present + permissions.exec:false → still requires exec (OR, not AND)", () => {
+    expect(requiredConsentClasses(mkManifest({
+      contributes: { mcpServers: [{ name: "s", command: "node" }] }, permissions: { exec: false },
+    }))).toEqual(["exec"]);
   });
   test("tcc-only → tcc", () => {
     expect(requiredConsentClasses(mkManifest({ permissions: { tcc: ["accessibility"] } }))).toEqual(["tcc"]);
