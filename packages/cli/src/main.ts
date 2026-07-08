@@ -28,6 +28,7 @@ import {
   type FooterSelection,
 } from "./task-block";
 import { installPlugin, removePluginDir, removePluginFromSettings, setPluginEnabled } from "./plugin-cli";
+import { formatElapsed, formatTokens } from "./task-display";
 import { isOtherChoice, parseQuestionAnswer } from "./questions";
 import { parsePlanResponse } from "./plan-response";
 
@@ -784,6 +785,23 @@ if (import.meta.main) {
     c.close();
     break;
   }
+  case "status": {
+    const c = await connect("cli-status");
+    const s = await c.daemonStatus();
+    const provider = s.provider ? `${s.provider.id} (${s.provider.model})` : "(none configured)";
+    console.log(`${AQUA}norma-core v${s.version}${RESET} ${DIM}up ${formatElapsed(s.uptimeMs)} · ${s.socketPath}${RESET}`);
+    console.log(`${DIM}provider: ${provider} · sessions: ${s.sessionsCount} · plugins: ${s.pluginsCount}${RESET}`);
+    c.close();
+    break;
+  }
+  case "quota": {
+    const c = await connect("cli-quota");
+    const q = await c.quotaState();
+    const state = q.kind === "ok" ? "ok" : `limited (resumes ${new Date(q.resumeAt ?? 0).toLocaleString()})`;
+    console.log(`${AQUA}quota: ${state}${RESET} ${DIM}${formatTokens(q.inputTokens)} in / ${formatTokens(q.outputTokens)} out${RESET}`);
+    c.close();
+    break;
+  }
   case "send": {
     // usage: norma send <sessionId|new> <text...>
     const args = process.argv.slice(3);
@@ -822,13 +840,28 @@ if (import.meta.main) {
       }
       if (dirs.length === 0) console.log("(none)");
       else for (const d of dirs) console.log(d);
+    } else if (arg === "list") {
+      // Phase 2f Task 6: same listing, but over the daemon's trust.list RPC (Task 3) instead of
+      // reading the file directly — requires the daemon to be running, unlike --list above.
+      const c = await connect("cli-trust-list");
+      const dirs = await c.trustList();
+      c.close();
+      if (dirs.length === 0) console.log("(none)");
+      else for (const d of dirs) console.log(d);
+    } else if (arg === "remove") {
+      const path = process.argv[4];
+      if (!path) { console.error("usage: norma trust remove <path>"); process.exit(1); }
+      const c = await connect("cli-trust-remove");
+      const removed = await c.trustRemove(resolve(path));
+      console.log(removed ? `${AQUA}untrusted ${resolve(path)}${RESET}` : `${DIM}already untrusted: ${resolve(path)}${RESET}`);
+      c.close();
     } else if (arg) {
       const c = await connect("cli-trust");
       await c.trustDir(resolve(arg));
       console.log(`${AQUA}trusted ${resolve(arg)}${RESET}`);
       c.close();
     } else {
-      console.error("usage: norma trust <dir> | norma trust --list");
+      console.error("usage: norma trust <dir> | norma trust --list | norma trust list | norma trust remove <path>");
       process.exit(1);
     }
     break;
@@ -1108,10 +1141,10 @@ if (import.meta.main) {
   default:
     console.log(`norma (Phase 1b-ii-d) — commands:
   daemon run | daemon install | daemon uninstall | daemon status
-  ping | sessions | send <sessionId|new> <text> | watch <sessionId> | add-dir <sessionId> <path> [--persist] | cd <sessionId> <path>
+  ping | sessions | status | quota | send <sessionId|new> <text> | watch <sessionId> | add-dir <sessionId> <path> [--persist] | cd <sessionId> <path>
   steer <sessionId> <text> | interrupt <sessionId> | compact <sessionId>
   resume [id] [msg]   list sessions, or continue an existing one
-  trust <dir> [--list]
+  trust <dir> [--list] | trust list | trust remove <path>
   skills                                          list discovered skills for this directory
   mcp                                              list configured MCP servers and their tools
   plugin list | install <git-url> [name] | enable <name> | disable <name> | remove <name>
