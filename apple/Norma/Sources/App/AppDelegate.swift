@@ -11,6 +11,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var stickiness: StickinessEngine?
     private var startTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
+    /// Task 3 (2e-iv): owns the CLI launcher the menu bar's "Open CLI" item drives.
+    private let cliLauncher = CliLauncher()
 
     /// Task 3 (2d-ii-b) registry: every currently-open detached window. Task 4's detach
     /// choreography appends via `registerDetachedWindow` on spawn; `onClosed` (wired there) removes
@@ -294,6 +296,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             summonField: {
                 TriggerHub.shared.fire(from: "menu")
             },
+            openCli: { [weak self] in self?.cliLauncher.openCli() },
+            openNormaApp: { [weak self] in self?.openStandaloneNormaWindow() },
             quit: { NSApp.terminate(nil) }
         )
         mb.install()
