@@ -163,8 +163,9 @@ final class DashboardTests: XCTestCase {
         let client = NormaClientTestFactory.make()
         let directory = SessionDirectory(lister: { [] })
         let peripheral = PeripheralProvider(client: client)
+        let helperClient = HelperClient()
         let frame = NSRect(x: 100, y: 80, width: 800, height: 560)
-        let controller = DashboardWindowController(client: client, directory: directory, peripheral: peripheral, onOpenSessionDetached: { _ in }, frame: frame)
+        let controller = DashboardWindowController(client: client, directory: directory, peripheral: peripheral, helperClient: helperClient, onOpenSessionDetached: { _ in }, frame: frame)
         defer { controller.close() }
 
         controller.show()

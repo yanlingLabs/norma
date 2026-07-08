@@ -12,6 +12,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// — the app's MAIN feed client/socket (the daemon rule: THE provider = the most-recent-
     /// advertiser CONNECTION, so this must never be a second/detached-window client).
     private(set) var peripheralProvider: PeripheralProvider?
+    /// Task 4 (4c): owns the `com.norma.helper` SMAppService lifecycle + XPC connection — read by
+    /// both `hardwareBridge` (the approval gate) and the Dashboard's Peripheral pane (the
+    /// helper-status row). Constructed unconditionally in `boot()` (its `status` read is safe
+    /// anytime); only the real `register()` call is gated behind `!isRunningUnitTests` below.
+    private(set) var helperClient: HelperClient?
+    /// Task 4 (4c): answers `hardware_requested` pushes (battery charge-limit verbs) by routing
+    /// through `helperClient`'s XPC calls — composed into the SAME `onPeripheralEvent` hook
+    /// `peripheralProvider` uses, alongside it, never replacing it.
+    private(set) var hardwareBridge: HardwareBridge?
     /// Task 5 (2f-ii): the Dashboard's singleton window controller — `nil` until first opened,
     /// nil'd again via `onClosed` (same one-shot-latch/registry-removal convention as
     /// `registerDetachedWindow`'s `onClosed`). `openDashboard()` below is what enforces the
@@ -136,8 +145,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             dashboardWindow.show()
             return
         }
-        guard let model = appModel, let peripheral = peripheralProvider else {
-            OrbDebug.log("openDashboard: no appModel/peripheralProvider — spawn aborted")
+        guard let model = appModel, let peripheral = peripheralProvider, let helper = helperClient else {
+            OrbDebug.log("openDashboard: no appModel/peripheralProvider/helperClient — spawn aborted")
             return
         }
         let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
@@ -145,6 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             client: model.client,
             directory: model.directory,
             peripheral: peripheral,
+            helperClient: helper,
             onOpenSessionDetached: { [weak self] sid in self?.openSessionInNewDetachedWindow(sid) },
             frame: centeredDashboardFrame(visibleFrame: visible)
         )
@@ -202,7 +212,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // what session the orb happens to be focused on.
         let peripheral = PeripheralProvider(client: model.client)
         peripheralProvider = peripheral
-        model.onPeripheralEvent = { [weak peripheral] event in await peripheral?.handle(event) }
+
+        // Task 4 (4c): the hardware bridge — battery charge-limit verbs, routed through
+        // `HelperClient`'s XPC connection to `NormaHelper`. Composed onto the SAME
+        // `onPeripheralEvent` hook `peripheral` uses below (both are side-observers of the raw
+        // event stream fired for every `.session` event — see `AppModel.init`'s `feed.onEvent`),
+        // never restructuring that plumbing. `HelperClient()`'s own init only reads
+        // `service.status` (safe anytime, no prompt/registration side effect); the real
+        // `register()` call is gated below, same `!isRunningUnitTests` posture as
+        // `peripheral.registerPanicSurfaces()`.
+        let helper = HelperClient()
+        helperClient = helper
+        let hardware = HardwareBridge(client: model.client, helperClient: helper)
+        hardwareBridge = hardware
+
+        model.onPeripheralEvent = { [weak peripheral, weak hardware] event in
+            await peripheral?.handle(event)
+            await hardware?.handle(event)
+        }
         model.onClientConnected = { [weak peripheral] in Task { await peripheral?.advertiseIfConnected() } }
 
         let orb = OrbWindowController(session: model.session)
@@ -313,6 +340,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // `shouldServe` directly against a scripted client instead.
             peripheral.registerPanicSurfaces()
             peripheral.startTCCPolling()
+
+            // Task 4 (4c): register the NormaHelper daemon with SMAppService at launch. A real
+            // registration call (servicemanagementd round-trip) — same `!isRunningUnitTests` gate
+            // as above; the `NormaAppTests` bundle loader IS the real `Norma.app`, so an
+            // ungated call here would attempt to register an actual privileged daemon from the
+            // test process. Live approval (System Settings > Login Items) is Task 6's gate —
+            // `helper.status` degrades to `.requiresApproval` until the user acts, which
+            // `hardwareBridge`/the dashboard row both already handle.
+            helper.register()
 
             TriggerHub.shared.didTrigger
                 .sink { [weak orb] in

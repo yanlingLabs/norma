@@ -85,6 +85,13 @@ targets:
         CODE_SIGN_STYLE: Manual
         SWIFT_VERSION: "5.9"
         MACOSX_DEPLOYMENT_TARGET: "26.0"
+        # Task 4 (4c) rider (T3 review): without this, codesign identifies the embedded helper
+        # binary as "NormaHelper" (the PRODUCT_NAME) rather than its bundle id/plist Label
+        # (com.norma.helper) — SMAppService/launchd match the daemon by that Label, and
+        # HelperServiceDelegate's code-signing requirement pins the CONNECTING peer's team, not
+        # this identifier, but keeping the signed identifier in sync with the Label/mach-service
+        # name avoids a needless mismatch. `-i com.norma.helper` explicitly sets it.
+        OTHER_CODE_SIGN_FLAGS: -i com.norma.helper
 schemes:
   Norma:
     build:

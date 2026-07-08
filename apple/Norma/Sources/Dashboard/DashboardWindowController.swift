@@ -52,7 +52,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
     /// Test-only read-through, same convention as `DetachedWindowController.windowForTesting`.
     var windowForTesting: NSWindow? { window }
 
-    init(client: NormaClient, directory: SessionDirectory, peripheral: PeripheralProvider, onOpenSessionDetached: @escaping (String) -> Void, frame: NSRect) {
+    init(client: NormaClient, directory: SessionDirectory, peripheral: PeripheralProvider, helperClient: HelperClient, onOpenSessionDetached: @escaping (String) -> Void, frame: NSRect) {
         let window = NSWindow(
             contentRect: frame,
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -81,7 +81,8 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
             quotaState: { try await client.quotaState() },
             trustList: { try await client.trustList() },
             trustRemove: { try await client.trustRemove(path: $0) },
-            peripheral: peripheral
+            peripheral: peripheral,
+            helperClient: helperClient
         )
         window.contentView = NSHostingView(rootView: DashboardView(wiring: wiring))
         window.setFrame(frame, display: true)

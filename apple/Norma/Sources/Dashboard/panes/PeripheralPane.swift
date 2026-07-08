@@ -1,3 +1,4 @@
+import ServiceManagement
 import SwiftUI
 
 /// "kind:id" — e.g. "session:s_1". Takes plain strings (not `SessionEvent.Holder` — that type has
@@ -24,6 +25,9 @@ func peripheralLeaseAgeText(expiresAt: Int, nowMs: Int) -> String {
 /// item and hotkey use (Task 4).
 struct PeripheralPane: View {
     @ObservedObject var provider: PeripheralProvider
+    /// Task 4 (4c): the helper-approval row below reads this directly — same `@ObservedObject`
+    /// posture as `provider` above.
+    @ObservedObject var helperClient: HelperClient
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -34,6 +38,8 @@ struct PeripheralPane: View {
                     .foregroundStyle(.red)
                     .disabled(provider.activeLeases.isEmpty)
             }
+            helperStatusRow
+            Divider()
             if provider.activeLeases.isEmpty {
                 Text("No active leases").font(.system(size: 12)).foregroundStyle(.secondary)
             } else {
@@ -57,5 +63,26 @@ struct PeripheralPane: View {
             Spacer()
         }
         .padding()
+    }
+
+    /// Task 4 (4c): "helper-status row — state text from the @Published status enum + 'Open System
+    /// Settings' button" (brief). The button opens the SAME Login Items pane the user approves
+    /// `NormaHelper` in — `SMAppService.openSystemSettingsLoginItems()` — shown only when
+    /// `helperStatusDisplay` says there's something actionable there (`.requiresApproval`/
+    /// `.unknown`; see that function's doc comment in `HelperClient.swift`).
+    private var helperStatusRow: some View {
+        let display = helperStatusDisplay(helperClient.status)
+        return HStack {
+            Text(display.stateText)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            Spacer()
+            if display.showsOpenSettingsButton {
+                Button("Open System Settings") {
+                    SMAppService.openSystemSettingsLoginItems()
+                }
+                .font(.system(size: 12))
+            }
+        }
     }
 }
