@@ -58,25 +58,24 @@ export interface RunningDaemon {
   stop(): void;
 }
 
-/** Builds the `policy(sessionId)` dependency PeripheralBroker.lease() awaits (spec §A1: "lease
- *  acquisition FOLLOWS THE SESSION APPROVAL POLICY for ALL classes" — plan→denied, auto→granted,
- *  ask→a normal approval card). Reuses the SAME ApprovalBroker + approval_requested/
+/** Builds the `policy(sessionId, cls)` dependency PeripheralBroker.lease() awaits (spec §A1:
+ *  "lease acquisition FOLLOWS THE SESSION APPROVAL POLICY for ALL classes" — plan→denied,
+ *  auto→granted, ask→a normal approval card). Reuses the SAME ApprovalBroker + approval_requested/
  *  approval_resolved/approval.respond machinery the agent engine's tool-call approvals use (no
  *  new wire method) — see engine.ts's `requestApproval` for the byte-identical
  *  wait-before-emit pattern this mirrors.
  *
- *  `classHint` is the synchronous side-channel ipc/server.ts's `peripheral.lease` handler writes
- *  right before calling `broker.lease()` (see server.ts's carried-item-#3 comment) so the
- *  approval card's summary can name the requested class — PeripheralBroker.lease() only forwards
- *  `sessionId` to this closure, not `class`. */
+ *  `cls` is now a plain call argument — PeripheralBroker.lease() passes `req.class` straight
+ *  through, so the approval card's summary reads it off this closure's own parameter instead of
+ *  a synchronous set/get side-channel (the former `peripheralClassHint` map) that only stayed
+ *  race-safe because nothing ever awaited between the set and the card emit. */
 function buildLeasePolicy(deps: {
   store: SessionStore;
   approvals: ApprovalBroker;
   hub: SessionHub;
-  classHint: Map<string, PeripheralClass>;
   timeoutMs?: number;
-}): (sessionId: string) => Promise<"granted" | "denied"> {
-  return async (sessionId: string): Promise<"granted" | "denied"> => {
+}): (sessionId: string, cls: PeripheralClass) => Promise<"granted" | "denied"> {
+  return async (sessionId: string, cls: PeripheralClass): Promise<"granted" | "denied"> => {
     let approvalPolicy: "ask" | "auto" | "plan";
     try {
       approvalPolicy = deps.store.meta(sessionId).approvalPolicy;
@@ -88,7 +87,6 @@ function buildLeasePolicy(deps: {
 
     // ask: register the wait BEFORE emitting approval_requested (the append is synchronous, so a
     // watcher that resolves as soon as it observes the event would otherwise race broker.wait()).
-    const cls = deps.classHint.get(sessionId) ?? "a capability";
     const callId = `lease_${randomBytes(6).toString("hex")}`;
     const waiting = deps.approvals.wait(sessionId, callId, deps.timeoutMs ?? 5 * 60_000);
     const event: NewSessionEvent = {
@@ -269,14 +267,13 @@ export async function startDaemon(opts: {
 
   // Peripheral lease v1 (Phase 2f). Built unconditionally (like approvalBroker/quota above) —
   // leasing has nothing to do with whether an LLM provider is configured.
-  const peripheralClassHint = new Map<string, PeripheralClass>();
   const audit = new AuditLog(join(normaHome, "audit.jsonl"));
   const providerLink = new ProviderLink();
   const peripheral = new PeripheralBroker({
     audit,
     heartbeatMs: settings?.peripheral?.heartbeatMs,
     expiryMs: settings?.peripheral?.expiryMs,
-    policy: buildLeasePolicy({ store, approvals: approvalBroker, hub, classHint: peripheralClassHint }),
+    policy: buildLeasePolicy({ store, approvals: approvalBroker, hub }),
     emitTransient: (sessionId, event) => { hub.broadcastTransient(sessionId, event); },
     pushToProvider: (event) => providerLink.push(event),
   });
@@ -302,7 +299,6 @@ export async function startDaemon(opts: {
     plans: plans ?? undefined,
     peripheral,
     providerLink,
-    peripheralClassHint,
     quota,
     providerInfo,
     startedAt,

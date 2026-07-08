@@ -27,7 +27,7 @@ import type { BackgroundTaskRegistry } from "../agent/bg-registry";
 import type { SkillStore } from "../agent/skills";
 import type { McpManager } from "../agent/mcp/manager";
 import type { PluginStore } from "../agent/plugins";
-import type { PeripheralBroker, PeripheralClass } from "../peripheral/broker";
+import type { PeripheralBroker } from "../peripheral/broker";
 import type { ProviderLink } from "../peripheral/provider-link";
 import type { QuotaManager } from "../providers/quota";
 import { addLocalDir } from "../settings";
@@ -61,10 +61,6 @@ export interface IpcServerOptions {
   peripheral?: PeripheralBroker; // lease machinery; peripheral.* verbs (Phase 2f)
   providerLink?: ProviderLink;   // bridges PeripheralBroker.call()'s pushToProvider to the live
                                   // provider connection this server tracks (Phase 2f)
-  peripheralClassHint?: Map<string, PeripheralClass>; // sessionId -> in-flight lease's class, set
-                                  // synchronously just before PeripheralBroker.lease() so the
-                                  // daemon-level ask-policy closure can build the approval
-                                  // summary "Session <id> requests <class>" (see daemon.ts)
   quota?: QuotaManager;      // token/rate-limit snapshot; quota.state (dashboard read)
   providerInfo?: { id: string; model: string } | null; // active LLM provider identity; daemon.status
   startedAt?: number;        // daemon process start time (Date.now()); daemon.status uptimeMs
@@ -385,12 +381,6 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         if (socket.data.authedRole !== "harness") return { code: "denied", reason: "plugin-leasing-not-yet-available" };
         try { opts.store.meta(p.sessionId); } catch (e) { throw new RpcFailure(ERR.NOT_FOUND, (e as Error).message); }
         if (!opts.peripheral) return { code: "no_provider" };
-        // Synchronous hand-off: PeripheralBroker.lease() only forwards `sessionId` to the injected
-        // `policy(sessionId)` closure (not `class`) — daemon.ts's ask-policy builder reads this map
-        // to compose the approval card's "Session <id> requests <class>" summary. Safe under
-        // concurrency because everything from this `set()` through the synchronous prelude of
-        // `policy()` runs with no intervening `await` (see the Task 3 report for the full argument).
-        opts.peripheralClassHint?.set(p.sessionId, p.class);
         return await opts.peripheral.lease({ sessionId: p.sessionId, class: p.class });
       }
       case METHODS.peripheralRenew: {

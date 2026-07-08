@@ -112,8 +112,11 @@ export interface PeripheralBrokerDeps {
    *  constructor-overridable timeouts elsewhere in this codebase). */
   callTimeoutMs?: number;
   /** Session approval-policy check for a lease request (Task 3 builds this on ApprovalBroker).
-   *  The broker never touches policy internals — it only awaits "granted" | "denied". */
-  policy: (sessionId: string) => Promise<"granted" | "denied">;
+   *  The broker never touches policy internals — it only awaits "granted" | "denied". Takes the
+   *  requested `class` directly (the broker already has it in `req.class`) so a caller building
+   *  an approval-card summary reads it as a plain call argument, not through a side-channel that
+   *  a future `await` could desynchronize from the request it was meant to describe. */
+  policy: (sessionId: string, cls: PeripheralClass) => Promise<"granted" | "denied">;
   /** Broadcast a TRANSIENT event to a session's attached clients (Task 3 wires this to
    *  `hub.broadcastTransient`). Used for lease_granted/lease_lost — the broker never touches the
    *  hub directly. */
@@ -182,7 +185,7 @@ export class PeripheralBroker {
     if (pre.kind === "held") return this.denyHeld(req, pre.holder);
     if (pre.kind === "no_provider") return this.denyNoProvider(req);
 
-    const outcome = await this.deps.policy(req.sessionId);
+    const outcome = await this.deps.policy(req.sessionId, req.class);
     if (outcome === "denied") return this.denyPolicy(req);
 
     const post = decide();

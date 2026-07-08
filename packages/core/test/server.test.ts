@@ -1030,6 +1030,73 @@ describe("daemon IPC", () => {
     provider.close(); c.close();
   });
 
+  // Regression coverage for the deleted `peripheralClassHint` side-channel (a sessionId -> class
+  // map ipc/server.ts used to `set()` synchronously right before calling `broker.lease()`, read
+  // back by daemon.ts's ask-policy closure). That map was keyed ONLY by sessionId, so two
+  // near-simultaneous lease() calls from the SAME session for DIFFERENT classes could clobber
+  // each other's hint between the set() and the (possibly slow, ask-mode) policy read — a real
+  // future bug even though it was race-free the day it was written. The fix threads the class
+  // straight through as a policy(sessionId, cls) call argument, so each in-flight policy
+  // invocation closes over its OWN class with nothing shared to race on. This test drives BOTH
+  // approval cards into existence before resolving EITHER, so it would have caught the old
+  // mislabeling bug.
+  test("peripheral.lease concurrent same-session different-class requests under ask policy: each approval card names ITS OWN class", async () => {
+    await boot();
+    const provider = await TestClient.connect(daemon.socketPath);
+    await provider.hello(harnessToken, "concurrent-ask-provider");
+    await provider.request(METHODS.peripheralAdvertise, {
+      classes: [{ class: "noop", tccGranted: true }, { class: "screenshot", tccGranted: true }],
+    });
+
+    const watcher = await TestClient.connect(daemon.socketPath);
+    await watcher.hello(harnessToken, "concurrent-ask-watcher");
+    const { result: created } = await watcher.request(METHODS.sessionCreate, { scope: "global", approvalPolicy: "ask" });
+    await watcher.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
+
+    // Two SEPARATE connections issue the two lease requests — same session, different classes.
+    // (Deliberately not both on one connection: this server's per-connection `data()` handler
+    // awaits each RPC line's `handle()` before parsing the next line in the same read, so two
+    // blocking ask-policy calls queued back-to-back on ONE socket would serialize instead of
+    // actually overlapping — that would defeat the point of this test.)
+    const reqA = await TestClient.connect(daemon.socketPath);
+    await reqA.hello(harnessToken, "concurrent-ask-a");
+    const reqB = await TestClient.connect(daemon.socketPath);
+    await reqB.hello(harnessToken, "concurrent-ask-b");
+
+    // Fire both requests before awaiting either — both policy() invocations are in flight
+    // concurrently, parked on their own approvalBroker.wait().
+    const leaseNoop = reqA.request(METHODS.peripheralLease, { sessionId: created.sessionId, class: "noop" });
+    const leaseScreenshot = reqB.request(METHODS.peripheralLease, { sessionId: created.sessionId, class: "screenshot" });
+
+    // Collect BOTH approval_requested cards before resolving either — this is exactly the window
+    // where a shared sessionId-keyed hint could have been overwritten by the second request
+    // before the first card's summary was built.
+    const asks: any[] = [];
+    while (asks.length < 2) {
+      const n = await watcher.waitForNotification((notif) =>
+        notif.method === METHODS.event && notif.params.type === "approval_requested" &&
+        notif.params.toolName === "peripheral.lease" && !asks.some((a) => a.params.callId === notif.params.callId));
+      asks.push(n);
+    }
+
+    const askNoop = asks.find((a) => a.params.summary === `Session ${created.sessionId} requests noop`);
+    const askScreenshot = asks.find((a) => a.params.summary === `Session ${created.sessionId} requests screenshot`);
+    expect(askNoop).toBeDefined();
+    expect(askScreenshot).toBeDefined();
+
+    // Resolve screenshot's card first (reverse of request order) so a same-session ordering
+    // assumption can't accidentally paper over a mislabel.
+    await watcher.request(METHODS.approvalRespond, { sessionId: created.sessionId, callId: askScreenshot.params.callId, approved: true });
+    await watcher.request(METHODS.approvalRespond, { sessionId: created.sessionId, callId: askNoop.params.callId, approved: true });
+
+    const resNoop = await leaseNoop;
+    const resScreenshot = await leaseScreenshot;
+    expect(resNoop.result.leaseId).toBeTruthy();
+    expect(resScreenshot.result.leaseId).toBeTruthy();
+
+    provider.close(); watcher.close(); reqA.close(); reqB.close();
+  });
+
   test("peripheral.lease under plan policy is denied immediately (no approval card)", async () => {
     await boot();
     const provider = await TestClient.connect(daemon.socketPath);

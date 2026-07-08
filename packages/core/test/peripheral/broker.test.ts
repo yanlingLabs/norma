@@ -133,7 +133,7 @@ interface Fakes {
   pushed: NewSessionEvent[];
   pushReturn: boolean;
   policyReturn: "granted" | "denied";
-  policyCalls: string[];
+  policyCalls: Array<{ sessionId: string; class: PeripheralClass }>;
 }
 
 function setup(overrides: Partial<PeripheralBrokerDeps> = {}) {
@@ -144,7 +144,10 @@ function setup(overrides: Partial<PeripheralBrokerDeps> = {}) {
 
   const deps: PeripheralBrokerDeps = {
     audit,
-    policy: async (sessionId) => { fakes.policyCalls.push(sessionId); return fakes.policyReturn; },
+    // Records BOTH sessionId and class — the broker now passes the class straight through as a
+    // call argument (no more `peripheralClassHint` side-channel), so this fake's call log is the
+    // most direct way to assert that argument actually carries the right class.
+    policy: async (sessionId, cls) => { fakes.policyCalls.push({ sessionId, class: cls }); return fakes.policyReturn; },
     emitTransient: (sessionId, event) => { fakes.emitted.push({ sessionId, event }); },
     pushToProvider: (event) => { fakes.pushed.push(event); return fakes.pushReturn; },
     ...overrides,
@@ -178,7 +181,7 @@ describe("PeripheralBroker", () => {
     expect(g.leaseId).toBeTruthy();
     expect(g.token).toBeTruthy();
     expect(g.expiresAt).toBeGreaterThan(Date.now());
-    expect(fakes.policyCalls).toEqual(["s1"]);
+    expect(fakes.policyCalls).toEqual([{ sessionId: "s1", class: "noop" }]);
 
     const granted = fakes.emitted.find((e) => e.event.type === "lease_granted");
     expect(granted).toBeDefined();
@@ -429,7 +432,7 @@ describe("PeripheralBroker", () => {
 
     const broker = new PeripheralBroker({
       audit,
-      policy: async (sessionId) => { if (sessionId === "s1") await gate; return "granted"; },
+      policy: async (sessionId, _cls) => { if (sessionId === "s1") await gate; return "granted"; },
       emitTransient: () => {},
       pushToProvider: () => true,
     });
