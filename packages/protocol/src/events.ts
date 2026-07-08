@@ -159,6 +159,18 @@ export const PeripheralCallRequestedEvent = ThreadBase.extend({
   payloadJson: z.string(),
 });
 
+/** TRANSIENT (broadcast-only, like `assistant_delta`/the lease events above) — core pushes this
+ *  to a plugin's own connection (the same approval-broker request/response pattern as
+ *  `peripheral_call_requested`); the plugin answers via `plugin.toolResult`
+ *  {requestId, resultJson?, error?} (methods.ts). A tool-call turn is never resurrected by
+ *  replay, so this must never be persisted or re-delivered on session.attach. */
+export const PluginToolInvokeEvent = ThreadBase.extend({
+  type: z.literal("plugin_tool_invoke"),
+  requestId: z.string().min(1),
+  tool: z.string().min(1),
+  argsJson: z.string(),
+});
+
 export const SessionEvent = z.discriminatedUnion("type", [
   SessionCreatedEvent,
   HarnessAttachedEvent,
@@ -191,6 +203,7 @@ export const SessionEvent = z.discriminatedUnion("type", [
   LeaseGrantedEvent,
   LeaseLostEvent,
   PeripheralCallRequestedEvent,
+  PluginToolInvokeEvent,
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 

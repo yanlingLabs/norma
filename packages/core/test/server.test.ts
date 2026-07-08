@@ -121,6 +121,29 @@ describe("daemon IPC", () => {
     c.close();
   });
 
+  // Phase 4b Task 1: the wire shape (Role already carries "plugin"; HelloParams now carries an
+  // optional pluginId) parses, but plugin token verification is Task 2 — TokenAuthority.verify()
+  // has no "plugin" entry in TOKEN_NAMES, so this fails closed today by construction. Pinned here
+  // so Task 2 changes this test's expectation deliberately rather than by accident.
+  test("plugin-role hello (with pluginId) is shape-valid but fails verification (no plugin token path yet) — never auths as harness", async () => {
+    await boot();
+    const c = await TestClient.connect(daemon.socketPath);
+    const res = await c.request(METHODS.hello, {
+      protocolVersion: PROTOCOL_VERSION, role: "plugin", token: "anything", clientName: "sample-echo", pluginId: "sample-echo",
+    });
+    expect(res.error.code).toBe(ERR.UNAUTHORIZED);
+
+    // Confirm the failed plugin hello never joined the harness broadcast set: a harness-created
+    // session_created event must not reach it (mirrors the "G2" bad-harness-token assertion above).
+    const harness = await TestClient.connect(daemon.socketPath);
+    await harness.hello(harnessToken, "control-harness");
+    await harness.request(METHODS.sessionCreate, { scope: "global" });
+    await new Promise((r) => setTimeout(r, 100));
+    expect(c.notifications).toHaveLength(0);
+
+    c.close(); harness.close();
+  });
+
   test("hello with wrong protocolVersion rejected with VERSION_MISMATCH", async () => {
     await boot();
     const c = await TestClient.connect(daemon.socketPath);

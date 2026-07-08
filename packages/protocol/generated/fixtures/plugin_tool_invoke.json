@@ -1,0 +1,10 @@
+{
+  "type": "plugin_tool_invoke",
+  "sessionId": "s_1",
+  "threadId": "main",
+  "seq": 22,
+  "ts": 1700000000012,
+  "requestId": "req_2",
+  "tool": "echo",
+  "argsJson": "{\"text\":\"hi\"}"
+}

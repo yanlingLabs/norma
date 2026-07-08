@@ -17,6 +17,11 @@ export const HelloParams = z.object({
   role: Role,
   token: z.string().min(1),
   clientName: z.string().min(1),
+  // Phase 4b Task 1: role "plugin" is id-bound (a plugin authenticates AS a specific installed
+  // plugin id, not just "any plugin"). Verification (matching token to this id) is Task 2 —
+  // TokenAuthority.verify() has no "plugin" entry yet, so a plugin hello fails closed today
+  // regardless of what's sent here; this field only makes the shape parse ahead of that wiring.
+  pluginId: z.string().min(1).optional(),
 });
 export const HelloResult = z.object({
   ok: z.literal(true),
@@ -252,6 +257,61 @@ export const TrustListResult = z.object({ dirs: z.array(z.string()) });
 export const TrustRemoveParams = z.object({ path: AbsoluteDirPath });
 export const TrustRemoveResult = z.object({ removed: z.boolean() });
 
+// ---------------------------------------------------------------------------------------------
+// Plugin role verbs (Phase 4b Task 1, spec §3 "Tier-2 — supervisor + plugin role"). Wire shapes
+// only here — the supervisor/registry wiring that makes these verbs DO something (ToolRegistry
+// registration, contrib registries, role→method allowlist) is Task 2/3/4. A plugin connection may
+// ONLY call these six verbs (plus the 2f lease verbs above); everything else is role-rejected.
+// ---------------------------------------------------------------------------------------------
+
+export const PluginRegisterParams = z.object({ pluginId: z.string().min(1) });
+export const PluginRegisterResult = z.object({ ok: z.literal(true) });
+
+/** `parameters` is a raw JSON-schema-shaped record (mirrors ToolDef.rawParameters in
+ *  agent/tools/registry.ts) — the plugin author supplies whatever `z.toJSONSchema` would've
+ *  produced; core does not re-validate its shape beyond "is an object". Optional: a schema-less
+ *  tool is still registrable (deferred-detail case — spec §3 "optionally deferred JSON schema"). */
+export const ToolRegisterParams = z.object({
+  name: z.string().min(1),
+  description: z.string().min(1),
+  parameters: z.record(z.string(), z.unknown()).optional(),
+});
+/** `registeredAs` is the namespaced tool name core assigns (`plugin__<pluginId>__<name>`, Task 4)
+ *  — round-tripped to the plugin so its own logs/errors can reference the name the agent sees. */
+export const ToolRegisterResult = z.object({ ok: z.literal(true), registeredAs: z.string().min(1) });
+
+export const ShortcutRegisterParams = z.object({
+  shortcuts: z.array(z.object({
+    id: z.string().min(1),
+    description: z.string().optional(),
+    default: z.string().optional(), // default keybinding suggestion; user-set binding always wins (spec §6)
+  })),
+});
+export const ShortcutRegisterResult = z.object({ ok: z.literal(true) });
+
+/** Declarative tile schema is spec §6's `{title, value?, icon?, progress?, actions?}` — kept as an
+ *  opaque record at the wire layer (like ToolRegisterParams.parameters) since core's job is
+ *  latest-per-plugin storage + broadcast, not shape validation of plugin-supplied UI data. */
+export const TileUpdateParams = z.object({ tile: z.record(z.string(), z.unknown()) });
+export const TileUpdateResult = z.object({ ok: z.literal(true) });
+
+/** Reserved-minimal (spec §3 `provider?: true` manifest flag): model-provider registration wiring
+ *  is a later plugin's phase (the local-models plugin), not Phase 4b. `info` is opaque here. */
+export const ProviderRegisterParams = z.object({ info: z.record(z.string(), z.unknown()) });
+export const ProviderRegisterResult = z.object({ ok: z.literal(true) });
+
+/** A plugin's answer to a `plugin_tool_invoke` push (events.ts) — the PluginSupervisor's
+ *  request/response correlation (Task 3), mirroring `PeripheralRespondParams`'s shape exactly
+ *  (`peripheral.respond`'s provider-answers-a-push pattern) but without `alreadyResolved`: the
+ *  supervisor's pending-invoke map is the single source of truth for double-settle guarding, not
+ *  the wire result. */
+export const PluginToolResultParams = z.object({
+  requestId: z.string().min(1),
+  resultJson: z.string().optional(),
+  error: z.string().optional(),
+});
+export const PluginToolResultResult = z.object({ ok: z.literal(true) });
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -288,4 +348,10 @@ export const METHODS = {
   quotaState: "quota.state",
   trustList: "trust.list",
   trustRemove: "trust.remove",
+  pluginRegister: "plugin.register",
+  toolRegister: "tool.register",
+  shortcutRegister: "shortcut.register",
+  tileUpdate: "tile.update",
+  providerRegister: "provider.register",
+  pluginToolResult: "plugin.toolResult",
 } as const;
