@@ -16,6 +16,10 @@ import {
   type SupervisedProcess,
 } from "../../src/plugins/supervisor";
 import { PluginContribRegistry } from "../../src/plugins/contrib";
+import { AuditLog } from "../../src/peripheral/audit";
+import { PeripheralBroker } from "../../src/peripheral/broker";
+import { ProviderLink } from "../../src/peripheral/provider-link";
+import { HardwareBroker } from "../../src/peripheral/hardware";
 
 /**
  * Shared boot machinery for Phase 4b's real-child plugin suites (Task 6's `supervised-e2e.test.ts`
@@ -30,14 +34,17 @@ import { PluginContribRegistry } from "../../src/plugins/contrib";
  */
 
 const EXAMPLES_DIR = join(import.meta.dir, "../../../../examples/sample-echo");
+const BATTERY_LIMITER_DIR = join(import.meta.dir, "../../../../examples/battery-limiter");
 const PLUGIN_SDK_ENTRY = join(import.meta.dir, "../../../plugin-sdk/src/index.ts");
 
-/** Copies `examples/sample-echo` into `<normaHome>/plugins/<pluginId>` and rewrites its
- *  `@norma/plugin-sdk` import to an absolute path (a bare copy has no `node_modules` of its own —
- *  see the module doc comment). Returns the installed directory. */
-export function installSampleEcho(normaHome: string, pluginId: string): string {
+/** Copies an `examples/<name>` reference plugin into `<normaHome>/plugins/<pluginId>` and
+ *  rewrites its `@norma/plugin-sdk` import to an absolute path (a bare copy has no `node_modules`
+ *  of its own — see the module doc comment). Returns the installed directory. Shared by
+ *  `installSampleEcho` and `installBatteryLimiter` below — identical rewrite, different source
+ *  tree. */
+function installExample(srcDir: string, normaHome: string, pluginId: string): string {
   const dest = join(normaHome, "plugins", pluginId);
-  cpSync(EXAMPLES_DIR, dest, { recursive: true });
+  cpSync(srcDir, dest, { recursive: true });
   const indexPath = join(dest, "index.ts");
   const rewritten = readFileSync(indexPath, "utf8").replace(
     'from "@norma/plugin-sdk"',
@@ -45,6 +52,20 @@ export function installSampleEcho(normaHome: string, pluginId: string): string {
   );
   writeFileSync(indexPath, rewritten);
   return dest;
+}
+
+/** Copies `examples/sample-echo` into `<normaHome>/plugins/<pluginId>` and rewrites its
+ *  `@norma/plugin-sdk` import to an absolute path (a bare copy has no `node_modules` of its own —
+ *  see the module doc comment). Returns the installed directory. */
+export function installSampleEcho(normaHome: string, pluginId: string): string {
+  return installExample(EXAMPLES_DIR, normaHome, pluginId);
+}
+
+/** Phase 4c Task 5: same install-and-rewrite as `installSampleEcho`, for
+ *  `examples/battery-limiter` — the `ctx.hardware()` reference plugin. Used by
+ *  `battery-limiter-e2e.test.ts`'s real-child-process hardware round-trip. */
+export function installBatteryLimiter(normaHome: string, pluginId: string): string {
+  return installExample(BATTERY_LIMITER_DIR, normaHome, pluginId);
 }
 
 /** `ps -p <pid>` liveness probe — a REAL process check (not `process.kill(pid, 0)`), matching the
@@ -79,12 +100,18 @@ export function realSpawn(cmd: string[], opts: { cwd: string; env: Record<string
 
 /** Writes a real settings.json (installed + ENABLED + exec-CONSENTED — the exact state
  *  `pluginSpawnEligible` (agent/plugins.ts) requires before the real daemon would ever spawn a
- *  Tier-2 plugin) and loads it back through the real `loadSettings` pipeline. */
-export function writeAndLoadSettings(home: string, pluginId: string): Settings {
+ *  Tier-2 plugin) and loads it back through the real `loadSettings` pipeline. `opts.hardwareConsent`
+ *  (Phase 4c Task 5, off by default — purely additive) also grants the "hardware" consent class,
+ *  needed for `battery-limiter-e2e.test.ts`'s `pluginSpawnEligible`/`consentComplete` check to pass
+ *  a manifest that declares `permissions.hardware: ["battery"]` (plugin-manifest.ts's
+ *  `requiredConsentClasses` adds "hardware" to what a manifest like that requires). */
+export function writeAndLoadSettings(home: string, pluginId: string, opts?: { hardwareConsent?: boolean }): Settings {
+  const consent: { exec: number; hardware?: number } = { exec: Date.now() };
+  if (opts?.hardwareConsent) consent.hardware = Date.now();
   writeFileSync(join(home, "settings.json"), JSON.stringify({
     schemaVersion: 2,
     provider: { type: "codex-oauth", model: "gpt-5.4" }, // unused (nothing here constructs a real provider) but required by the settings schema
-    plugins: { enabled: [pluginId], consents: { [pluginId]: { exec: Date.now() } } },
+    plugins: { enabled: [pluginId], consents: { [pluginId]: consent } },
   }));
   return loadSettings(join(home, "settings.json"));
 }
@@ -108,6 +135,11 @@ export interface SupervisedInstance {
   contrib: PluginContribRegistry;
   supervisor: PluginSupervisor;
   server: IpcServer;
+  /** Only set when `params.hardware` was true (Phase 4c Task 5) — see that param's doc comment. */
+  providerLink?: ProviderLink;
+  hardware?: HardwareBroker;
+  peripheral?: PeripheralBroker;
+  plugins?: PluginStore;
 }
 
 /** One "core instance" worth of real, wired-together server-side plumbing — a real IPC server
@@ -127,6 +159,18 @@ export async function createSupervisedInstance(params: {
    *  `stopAll()` teardown (needed to make its later socket-close a no-op — see that test's
    *  comments) can never reach out and kill the child it's supposed to be leaving behind alive. */
   signalPid?: (pid: number, signal: NodeJS.Signals) => void;
+  /** Phase 4c Task 5, opt-in and purely additive (every other caller omits it — sample-echo never
+   *  touches hardware.request, so standing up this extra plumbing for them would be pure noise).
+   *  When true, wires a `ProviderLink` + `PeripheralBroker` (needed only so `hardware.respond`'s
+   *  `isProvider()` gate has something to check a scripted provider connection's identity against
+   *  — no lease machinery is exercised) + `HardwareBroker` + a real `PluginStore` (reads `home`'s
+   *  ALREADY-WRITTEN settings.json — every current caller calls `writeAndLoadSettings` before this,
+   *  so it's always there by the time this runs) into the IPC server, mirroring daemon.ts's real
+   *  wiring AND `server.test.ts`'s `bootHardwareServer` exactly. Lets `battery-limiter-e2e.test.ts`
+   *  drive a REAL spawned battery-limiter child's `ctx.hardware()` calls end-to-end against a
+   *  scripted provider connection, instead of the raw-RPC/no-real-plugin-process coverage
+   *  `server.test.ts`'s "hardware.request / hardware.respond" suite already has. */
+  hardware?: boolean;
 }): Promise<SupervisedInstance> {
   const { home, socketPath, supervisorSettings, spawn, signalPid } = params;
   const store = new SessionStore(home);
@@ -146,11 +190,33 @@ export async function createSupervisedInstance(params: {
     onCircuitOpen: (id) => registry.unregisterByPrefix(`plugin__${id}__`),
   });
 
+  let providerLink: ProviderLink | undefined;
+  let hardwareBroker: HardwareBroker | undefined;
+  let peripheral: PeripheralBroker | undefined;
+  let plugins: PluginStore | undefined;
+  if (params.hardware) {
+    const audit = new AuditLog(join(home, "audit.jsonl"));
+    providerLink = new ProviderLink();
+    peripheral = new PeripheralBroker({
+      audit, policy: async () => "granted", emitTransient: () => {},
+      pushToProvider: (e) => providerLink!.push(e),
+    });
+    hardwareBroker = new HardwareBroker({ audit, pushToProvider: (e) => providerLink!.push(e) });
+    const settings = loadSettings(join(home, "settings.json"));
+    plugins = new PluginStore({
+      normaHome: home, plugins: settings.plugins, consents: settings.plugins?.consents,
+      log: (m) => { if (process.env.NORMA_TEST_DEBUG) console.error(`[plugins] ${m}`); },
+    });
+  }
+
   // The socket must already be listening before startAll() spawns a child — the child connects to
   // NORMA_SOCKET immediately on startup.
-  const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, registry, supervisor, contrib });
+  const server = startIpcServer({
+    socketPath, serverVersion: "test", tokens: authority, store, registry, supervisor, contrib,
+    providerLink, hardware: hardwareBroker, peripheral, plugins,
+  });
 
-  return { store, authority, registry, contrib, supervisor, server };
+  return { store, authority, registry, contrib, supervisor, server, providerLink, hardware: hardwareBroker, peripheral, plugins };
 }
 
 /** The Task 6 convenience wrapper: installs sample-echo into a fresh tmp `normaHome`, writes/loads

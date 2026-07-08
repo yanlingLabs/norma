@@ -1,0 +1,8 @@
+{
+  "name": "battery-limiter",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@norma/plugin-sdk": "workspace:*"
+  }
+}
