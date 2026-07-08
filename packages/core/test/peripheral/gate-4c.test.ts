@@ -174,20 +174,20 @@ describe("4c gate: hardware broker paths (spec §5, plan Task 6)", () => {
         );
         expect(JSON.parse(pushed.params.argsJson)).toEqual({ percent: 80 });
         const respond = await provider.request(METHODS.hardwareRespond, {
-          requestId: pushed.params.requestId, resultJson: JSON.stringify({ percent: 80 }),
+          requestId: pushed.params.requestId, resultJson: JSON.stringify({ percent: 55 }),
         });
         expect(respond.result).toEqual({ ok: true });
 
         const outcome = await setPromise;
         expect(outcome.isError).toBe(false);
-        expect(JSON.parse(outcome.output)).toEqual({ percent: 80 });
+        expect(JSON.parse(outcome.output)).toEqual({ percent: 55 });
 
         // Audit completeness (path 6, success leg): one {kind:"hardware"} line, requester names the
         // REAL plugin id, outcome carries the resultJson.
         const hwLine = readAuditLines(home).find((l) => l.kind === "hardware" && l.verb === "setChargeLimit");
         expect(hwLine).toMatchObject({
           kind: "hardware", verb: "setChargeLimit", requester: { kind: "plugin", id: pluginId },
-          outcome: { resultJson: JSON.stringify({ percent: 80 }) },
+          outcome: { resultJson: JSON.stringify({ percent: 55 }) },
         });
         expect(typeof (hwLine as Record<string, unknown>).ts).toBe("number");
 
