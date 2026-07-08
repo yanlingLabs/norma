@@ -52,16 +52,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// machinery. The morph panel has no production frame accessor, so the new window spawns
     /// centered on the main screen (the user can move it); a `nil` model or missing daemon token
     /// aborts with a log, same posture as the yellow-light and detached-side spawns.
-    private func openSessionInNewDetachedWindow(_ sessionId: String) {
+    /// Task 2 (2e-iv): `frame` override lets `openStandaloneNormaWindow()` below reuse this exact
+    /// body instead of duplicating it. `nil` (every pre-existing caller) keeps the original
+    /// behavior — centered on the main screen — now computed via the shared pure
+    /// `centeredStandaloneFrame` instead of the inline midX/midY math this method used before.
+    private func openSessionInNewDetachedWindow(_ sessionId: String, frame: NSRect? = nil) {
         guard let model = appModel,
               let (feed, session) = model.makeDetachedFeed(sessionId: sessionId) else {
             OrbDebug.log("openSessionInNewDetachedWindow: no appModel or makeDetachedFeed nil — spawn aborted")
             return
         }
-        let size = chatWindowDefaultSize
         let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let origin = NSPoint(x: visible.midX - size.width / 2, y: visible.midY - size.height / 2)
-        spawnDetachedWindow(feed: feed, session: session, frame: NSRect(origin: origin, size: size), title: "Norma")
+        let resolvedFrame = frame ?? centeredStandaloneFrame(visibleFrame: visible)
+        spawnDetachedWindow(feed: feed, session: session, frame: resolvedFrame, title: "Norma")
+    }
+
+    /// Task 2 (2e-iv): the menu bar's "Open Norma App" entry (`NSMenuItem` wiring is Task 3) — a
+    /// brand-new session via the SAME create+focus primitive the detach choreography and sidebar's
+    /// "+ New session" already reuse (`startFreshSessionAfterDetach`). Its orb-focus side effect
+    /// isn't separable from the create here, and is harmless: the orb's next summon simply lands on
+    /// this same fresh session too. Then a detached window on that id, centered on the main screen
+    /// via `centeredStandaloneFrame` — unlike the other two spawn paths (yellow-light detach,
+    /// sidebar's ⌘-click), this one is never offset from an existing window/orb frame.
+    ///
+    /// Defensive, same posture as `openSessionInNewDetachedWindow`'s own guard (line 58 precedent):
+    /// no `appModel`, `startFreshSessionAfterDetach` producing no focused session (RPC failure), or
+    /// `makeDetachedFeed` nil (missing token, checked inside `openSessionInNewDetachedWindow`) all
+    /// resolve to `OrbDebug.log` + no-op, never a crash or a half-open window.
+    func openStandaloneNormaWindow() {
+        guard let model = appModel else {
+            OrbDebug.log("openStandaloneNormaWindow: no appModel — spawn aborted")
+            return
+        }
+        Task { @MainActor [weak self] in
+            await model.startFreshSessionAfterDetach()
+            guard let self, let sid = model.focusedSessionId else {
+                OrbDebug.log("openStandaloneNormaWindow: startFreshSessionAfterDetach produced no focused session — spawn aborted")
+                return
+            }
+            let visible = NSScreen.main?.visibleFrame ?? .zero
+            self.openSessionInNewDetachedWindow(sid, frame: centeredStandaloneFrame(visibleFrame: visible))
+        }
     }
 
     @discardableResult

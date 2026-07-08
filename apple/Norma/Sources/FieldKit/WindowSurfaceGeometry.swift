@@ -208,3 +208,20 @@ func fenceAnchorForWindowCollapse(
         y: Swift.min(Swift.max(anchor.y, bounds.minY), bounds.maxY)
     )
 }
+
+// MARK: - Task 2 (2e-iv): standalone-window spawn geometry ("Open Norma App" menu entry)
+
+/// `chatWindowDefaultSize` CENTERED in `visibleFrame`. PURE (no `NSScreen` dependency, unlike
+/// `openSessionInNewDetachedWindow`'s inline main-screen computation which this now backs) so the
+/// centering math is unit-tested directly. `AppDelegate.openStandaloneNormaWindow()` feeds it
+/// `NSScreen.main?.visibleFrame` — same type as `NSRect` (a plain `CGRect` typealias), kept as
+/// `CGRect` here to match this AppKit-free file's existing convention.
+func centeredStandaloneFrame(visibleFrame: CGRect) -> CGRect {
+    let size = chatWindowDefaultSize
+    return CGRect(
+        x: visibleFrame.midX - size.width / 2,
+        y: visibleFrame.midY - size.height / 2,
+        width: size.width,
+        height: size.height
+    )
+}
