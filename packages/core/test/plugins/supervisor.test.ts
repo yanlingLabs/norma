@@ -52,6 +52,20 @@ function makeSpawnFn(pidStart = 1000) {
   return { spawn, calls, spawned };
 }
 
+/** Deterministic default for the `processStartedAt` injection seam (PID-reuse identity
+ *  verification, see supervisor.ts's `reclaimOrphans` doc comment) — every test gets a fixed,
+ *  fake "start time" for any pid so nothing ever shells out to a real `ps`. Tests that exercise
+ *  mismatch/unavailable/legacy-format handling override this per-call. */
+const FAKE_STARTED_AT = "Thu Jan  1 00:00:00 1970";
+
+/** Writes an identity-bearing PID file in the current (post-fix) JSON shape directly, bypassing
+ *  the supervisor entirely — mirrors what `writePidFile` itself would have written, for tests that
+ *  need to fabricate an "orphan" PID file on disk before calling `reclaimOrphans`/`startAll`. */
+function writeOrphanPidFile(dir: string, id: string, pid: number, startedAt: string | null = FAKE_STARTED_AT): void {
+  mkdirSync(join(dir, "plugins"), { recursive: true });
+  writeFileSync(join(dir, "plugins", `${id}.pid`), JSON.stringify({ pid, pluginId: id, startedAt }));
+}
+
 function fakeConn(): PluginConn & { pushed: Array<Record<string, unknown>>; delivered: boolean } {
   return {
     pushed: [],
@@ -84,6 +98,7 @@ function makeSupervisor(overrides: Partial<PluginSupervisorDeps> = {}) {
     onLog: (m) => logs.push(m),
     isAlivePid: () => false,
     signalPid: () => {},
+    processStartedAt: () => FAKE_STARTED_AT,
     ...rest,
   });
   return { supervisor, dir, mints, logs, calls, spawned };
@@ -508,28 +523,26 @@ describe("reclaimOrphans", () => {
     expect(existsSync(pidPath)).toBe(false);
   });
 
-  test("live PID -> adopted into 'starting', given the re-registration window, no fresh spawn", () => {
+  test("live PID with verified start time -> adopted into 'starting', given the re-registration window, no fresh spawn", () => {
     const { supervisor, dir, calls } = makeSupervisor({ isAlivePid: (pid) => pid === 424_242 });
     const p = fakePlugin();
-    mkdirSync(join(dir, "plugins"), { recursive: true });
-    writeFileSync(join(dir, "plugins", `${p.id}.pid`), "424242");
+    writeOrphanPidFile(dir, p.id, 424_242);
     supervisor.reclaimOrphans([p]);
     expect(supervisor.status(p.id)).toBe("starting");
     expect(calls).toHaveLength(0);
   });
 
-  test("live PID that registers within the window -> running, exactly like a fresh spawn", () => {
+  test("live PID with verified start time that registers within the window -> running, exactly like a fresh spawn", () => {
     const { supervisor, dir } = makeSupervisor({ isAlivePid: (pid) => pid === 424_242 });
     const p = fakePlugin();
-    mkdirSync(join(dir, "plugins"), { recursive: true });
-    writeFileSync(join(dir, "plugins", `${p.id}.pid`), "424242");
+    writeOrphanPidFile(dir, p.id, 424_242);
     supervisor.reclaimOrphans([p]);
     const conn = fakeConn();
     expect(supervisor.notifyRegistered(p.id, conn)).toBe(true);
     expect(supervisor.status(p.id)).toBe("running");
   });
 
-  test("live PID that never re-registers is killed (SIGTERM) after the window and enters backoff", async () => {
+  test("live PID with verified start time that never re-registers is killed (SIGTERM) after the window and enters backoff", async () => {
     const signals: Array<{ pid: number; sig: string }> = [];
     const { supervisor, dir } = makeSupervisor({
       settings: { registrationTimeoutMs: 20, killGraceMs: 500 },
@@ -537,15 +550,14 @@ describe("reclaimOrphans", () => {
       signalPid: (pid, sig) => signals.push({ pid, sig }),
     });
     const p = fakePlugin();
-    mkdirSync(join(dir, "plugins"), { recursive: true });
-    writeFileSync(join(dir, "plugins", `${p.id}.pid`), "424242");
+    writeOrphanPidFile(dir, p.id, 424_242);
     supervisor.reclaimOrphans([p]);
     await sleep(70);
     expect(signals).toEqual([{ pid: 424_242, sig: "SIGTERM" }]);
     expect(supervisor.status(p.id)).toBe("backoff");
   });
 
-  test("an unresponsive orphan is SIGKILLed after the kill grace elapses, if still alive", async () => {
+  test("an unresponsive VERIFIED orphan is SIGKILLed after the kill grace elapses, if still alive", async () => {
     const signals: Array<{ pid: number; sig: string }> = [];
     const { supervisor, dir } = makeSupervisor({
       settings: { registrationTimeoutMs: 15, killGraceMs: 20 },
@@ -553,8 +565,7 @@ describe("reclaimOrphans", () => {
       signalPid: (pid, sig) => signals.push({ pid, sig }),
     });
     const p = fakePlugin();
-    mkdirSync(join(dir, "plugins"), { recursive: true });
-    writeFileSync(join(dir, "plugins", `${p.id}.pid`), "424242");
+    writeOrphanPidFile(dir, p.id, 424_242);
     supervisor.reclaimOrphans([p]);
     await sleep(90);
     expect(signals).toEqual([
@@ -563,27 +574,105 @@ describe("reclaimOrphans", () => {
     ]);
   });
 
-  test("startAll folds reclaimOrphans in — a live-orphan plugin is adopted, never double-spawned", () => {
+  test("startAll folds reclaimOrphans in — a verified live-orphan plugin is adopted, never double-spawned", () => {
     const { supervisor, dir, calls } = makeSupervisor({ isAlivePid: (pid) => pid === 555 });
     const p = fakePlugin();
-    mkdirSync(join(dir, "plugins"), { recursive: true });
-    writeFileSync(join(dir, "plugins", `${p.id}.pid`), "555");
+    writeOrphanPidFile(dir, p.id, 555);
     supervisor.startAll([p]);
     expect(calls).toHaveLength(0);
     expect(supervisor.status(p.id)).toBe("starting");
   });
 
-  test("startAll spawns OTHER eligible plugins normally alongside one reclaimed orphan", () => {
+  test("startAll spawns OTHER eligible plugins normally alongside one reclaimed (verified) orphan", () => {
     const { supervisor, dir, calls } = makeSupervisor({ isAlivePid: (pid) => pid === 555 });
     const orphaned = fakePlugin({ id: "orphaned" });
     const fresh = fakePlugin({ id: "fresh" });
-    mkdirSync(join(dir, "plugins"), { recursive: true });
-    writeFileSync(join(dir, "plugins", "orphaned.pid"), "555");
+    writeOrphanPidFile(dir, "orphaned", 555);
     supervisor.startAll([orphaned, fresh]);
     expect(calls).toHaveLength(1);
     expect(calls[0]!.opts.env.NORMA_PLUGIN_ID).toBe("fresh");
     expect(supervisor.status("orphaned")).toBe("starting");
     expect(supervisor.status("fresh")).toBe("starting");
+  });
+
+  // -----------------------------------------------------------------------------------------
+  // PID-reuse identity verification (hardening fix): a live PID is NEVER enough on its own — see
+  // supervisor.ts's `reclaimOrphans` doc comment. Every path below must NOT adopt (so the process
+  // can never later be signalled) and must clean up the PID file, fail-safe.
+  // -----------------------------------------------------------------------------------------
+
+  test("live PID but MISMATCHED start time (PID reuse suspected) -> NOT adopted, NOT signalled, file cleaned", async () => {
+    const signals: Array<{ pid: number; sig: string }> = [];
+    const { supervisor, dir } = makeSupervisor({
+      settings: { registrationTimeoutMs: 15, killGraceMs: 15 },
+      isAlivePid: (pid) => pid === 424_242,
+      signalPid: (pid, sig) => signals.push({ pid, sig }),
+      processStartedAt: () => "the-actual-live-process-start-time",
+    });
+    const p = fakePlugin();
+    const pidPath = join(dir, "plugins", `${p.id}.pid`);
+    // Recorded start time (from a previous, now-dead incarnation) does NOT match the live
+    // process's actual start time -> the OS almost certainly reused this pid.
+    writeOrphanPidFile(dir, p.id, 424_242, "a-stale-recorded-start-time");
+    supervisor.reclaimOrphans([p]);
+    expect(supervisor.status(p.id)).toBe("stopped"); // never adopted
+    expect(existsSync(pidPath)).toBe(false); // cleaned up
+    await sleep(50); // long enough that a (bogus) re-registration-window timer would have fired
+    expect(signals).toEqual([]); // never signalled — the innocent live process is left alone
+  });
+
+  test("processStartedAt unavailable (ps errors, returns null) -> NOT adopted, NOT signalled, file cleaned", async () => {
+    const signals: Array<{ pid: number; sig: string }> = [];
+    const { supervisor, dir } = makeSupervisor({
+      settings: { registrationTimeoutMs: 15, killGraceMs: 15 },
+      isAlivePid: (pid) => pid === 424_242,
+      signalPid: (pid, sig) => signals.push({ pid, sig }),
+      processStartedAt: () => null, // simulates ps being unavailable/erroring in this environment
+    });
+    const p = fakePlugin();
+    const pidPath = join(dir, "plugins", `${p.id}.pid`);
+    writeOrphanPidFile(dir, p.id, 424_242, FAKE_STARTED_AT);
+    supervisor.reclaimOrphans([p]);
+    expect(supervisor.status(p.id)).toBe("stopped");
+    expect(existsSync(pidPath)).toBe(false);
+    await sleep(50);
+    expect(signals).toEqual([]);
+  });
+
+  test("live PID with a recorded startedAt of null (this core itself couldn't stamp it) -> unverifiable, NOT adopted/signalled", async () => {
+    const signals: Array<{ pid: number; sig: string }> = [];
+    const { supervisor, dir } = makeSupervisor({
+      settings: { registrationTimeoutMs: 15, killGraceMs: 15 },
+      isAlivePid: (pid) => pid === 424_242,
+      signalPid: (pid, sig) => signals.push({ pid, sig }),
+      processStartedAt: () => FAKE_STARTED_AT, // ps works fine NOW, but the recorded value is null
+    });
+    const p = fakePlugin();
+    const pidPath = join(dir, "plugins", `${p.id}.pid`);
+    writeOrphanPidFile(dir, p.id, 424_242, null);
+    supervisor.reclaimOrphans([p]);
+    expect(supervisor.status(p.id)).toBe("stopped");
+    expect(existsSync(pidPath)).toBe(false);
+    await sleep(50);
+    expect(signals).toEqual([]);
+  });
+
+  test("legacy bare-PID file (pre-fix format) with a LIVE pid -> treated unverifiable, NOT adopted/signalled, file cleaned", async () => {
+    const signals: Array<{ pid: number; sig: string }> = [];
+    const { supervisor, dir } = makeSupervisor({
+      settings: { registrationTimeoutMs: 15, killGraceMs: 15 },
+      isAlivePid: (pid) => pid === 424_242, // genuinely alive — old code would have adopted+later-killed it
+      signalPid: (pid, sig) => signals.push({ pid, sig }),
+    });
+    const p = fakePlugin();
+    mkdirSync(join(dir, "plugins"), { recursive: true });
+    const pidPath = join(dir, "plugins", `${p.id}.pid`);
+    writeFileSync(pidPath, "424242"); // bare PID — the pre-fix on-disk format
+    supervisor.reclaimOrphans([p]);
+    expect(supervisor.status(p.id)).toBe("stopped"); // never adopted
+    expect(existsSync(pidPath)).toBe(false); // cleaned up
+    await sleep(50);
+    expect(signals).toEqual([]); // never signalled — no innocent-PID kill from a legacy file
   });
 });
 
@@ -592,12 +681,14 @@ describe("reclaimOrphans", () => {
 // -------------------------------------------------------------------------------------------
 
 describe("PID file lifecycle", () => {
-  test("written on spawn with the spawned pid, under <runDir>/plugins/<id>.pid", () => {
+  test("written on spawn as identity-bearing JSON (pid/pluginId/startedAt), under <runDir>/plugins/<id>.pid", () => {
     const { supervisor, dir, spawned } = makeSupervisor();
     const p = fakePlugin();
     supervisor.startAll([p]);
     const pidPath = join(dir, "plugins", `${p.id}.pid`);
-    expect(readFileSync(pidPath, "utf8")).toBe(String(spawned[0]!.proc.pid));
+    expect(JSON.parse(readFileSync(pidPath, "utf8"))).toEqual({
+      pid: spawned[0]!.proc.pid, pluginId: p.id, startedAt: FAKE_STARTED_AT,
+    });
   });
 
   test("removed by stopAll", () => {
@@ -620,7 +711,7 @@ describe("PID file lifecycle", () => {
     await sleep(70);
     expect(spawned.length).toBeGreaterThanOrEqual(2);
     const pidPath = join(dir, "plugins", `${p.id}.pid`);
-    expect(readFileSync(pidPath, "utf8")).toBe(String(spawned[spawned.length - 1]!.proc.pid));
+    expect(JSON.parse(readFileSync(pidPath, "utf8")).pid).toBe(spawned[spawned.length - 1]!.proc.pid);
   });
 });
 

@@ -93,6 +93,23 @@ function defaultSignal(pid: number, signal: NodeJS.Signals): void {
   }
 }
 
+/** `ps -o lstart= -p <pid>` — the process's exact start timestamp string, or `null` if `ps`
+ *  errors/is unavailable or reports nothing for that pid (process gone, or a sandboxed/odd
+ *  environment without a working `ps`). This is the ONLY identity signal available without a
+ *  platform-specific "process start time" syscall (macOS gives no cheap owner/identity check) —
+ *  see `reclaimOrphans`'s doc comment for why every caller of this MUST fail safe (never signal) on
+ *  a `null` result rather than assume liveness implies identity. */
+function defaultProcessStartedAt(pid: number): string | null {
+  try {
+    const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)]);
+    if (result.exitCode !== 0) return null;
+    const out = result.stdout.toString().trim();
+    return out.length > 0 ? out : null;
+  } catch {
+    return null;
+  }
+}
+
 // -------------------------------------------------------------------------------------------
 // Public types.
 // -------------------------------------------------------------------------------------------
@@ -157,6 +174,52 @@ export interface PluginSupervisorDeps {
    *  never need overriding outside tests. */
   isAlivePid?: (pid: number) => boolean;
   signalPid?: (pid: number, signal: NodeJS.Signals) => void;
+  /** Testability seam for PID-reuse identity verification — see `defaultProcessStartedAt` above.
+   *  Real `ps` semantics by default; tests inject a fake so they never shell out. */
+  processStartedAt?: (pid: number) => string | null;
+}
+
+/** On-disk shape of `<runDir>/plugins/<id>.pid` since the PID-reuse hardening fix: identity-
+ *  bearing, not a bare PID. `startedAt` (from `processStartedAt`/`ps -o lstart=`) is what lets
+ *  `reclaimOrphans` tell "this live PID is really our plugin" apart from "the OS recycled this PID
+ *  to an unrelated process after a core crash" — see that method's doc comment. `null` means the
+ *  supervisor itself couldn't read a start time at spawn time (e.g. `ps` raced the just-spawned
+ *  process); such a file can never be verified later either, by design (see reclaim's fail-safe
+ *  handling of a `null` recorded `startedAt`). */
+interface PidFileContents {
+  pid: number;
+  pluginId: string;
+  startedAt: string | null;
+}
+
+/** Parses `<id>.pid` file contents written either by this fix (JSON `PidFileContents`) or by a
+ *  pre-fix core (a bare PID integer, e.g. `"12345"`) or anything unreadable. Bare-PID and
+ *  unreadable content both come back with `startedAt: null` — the caller (`reclaimOrphans`)
+ *  treats a `null` recorded `startedAt` as unverifiable and never adopts/signals it, which is
+ *  exactly the fail-safe legacy-format handling this hardening fix requires. Returns `null` only
+ *  when there isn't even a plausible PID to report (nothing to reclaim OR clean up as "ours"). */
+function parsePidFile(raw: string): PidFileContents | null {
+  const trimmed = raw.trim();
+
+  try {
+    const parsed = JSON.parse(trimmed) as Partial<PidFileContents>;
+    if (typeof parsed.pid === "number" && Number.isInteger(parsed.pid) && parsed.pid > 0) {
+      return {
+        pid: parsed.pid,
+        pluginId: typeof parsed.pluginId === "string" ? parsed.pluginId : "",
+        startedAt: typeof parsed.startedAt === "string" ? parsed.startedAt : null,
+      };
+    }
+    return null; // valid JSON but not a plausible PID file — corrupt, nothing to trust
+  } catch {
+    // Not JSON — either a pre-fix bare-PID file or garbage. A bare positive integer is the
+    // legacy format: tolerate it as an unverifiable PID (startedAt: null), never as anything more.
+    const pid = Number(trimmed);
+    if (Number.isInteger(pid) && pid > 0 && /^\d+$/.test(trimmed)) {
+      return { pid, pluginId: "", startedAt: null };
+    }
+    return null;
+  }
 }
 
 // -------------------------------------------------------------------------------------------
@@ -211,6 +274,7 @@ export class PluginSupervisor {
   private readonly nowFn: () => number;
   private readonly isAliveFn: (pid: number) => boolean;
   private readonly signalFn: (pid: number, signal: NodeJS.Signals) => void;
+  private readonly processStartedAtFn: (pid: number) => string | null;
 
   private readonly registrationTimeoutMs: number;
   private readonly backoffCapMs: number;
@@ -224,6 +288,7 @@ export class PluginSupervisor {
     this.nowFn = deps.now ?? Date.now;
     this.isAliveFn = deps.isAlivePid ?? defaultIsAlive;
     this.signalFn = deps.signalPid ?? defaultSignal;
+    this.processStartedAtFn = deps.processStartedAt ?? defaultProcessStartedAt;
 
     this.registrationTimeoutMs = deps.settings?.registrationTimeoutMs ?? 10_000;
     this.backoffCapMs = deps.settings?.backoffCapMs ?? 60_000;
@@ -249,11 +314,27 @@ export class PluginSupervisor {
   }
 
   /** Boot-time orphan reclaim (design spec §3): for each plugin, if `<runDir>/plugins/<id>.pid`
-   *  names a still-alive process, adopt it into a "starting" runtime and give it the SAME
-   *  re-registration window a fresh spawn gets (`registrationTimeoutMs`) before killing it
-   *  (SIGTERM → `killGraceMs` → SIGKILL) and falling through to the normal failure/backoff path.
-   *  A dead or unreadable PID file is just cleaned up — the plugin gets a fresh spawn via
-   *  `startAll`'s own loop, which skips anything this method has already claimed.
+   *  names a still-alive process that VERIFIES as the same process we spawned, adopt it into a
+   *  "starting" runtime and give it the SAME re-registration window a fresh spawn gets
+   *  (`registrationTimeoutMs`) before killing it (SIGTERM → `killGraceMs` → SIGKILL) and falling
+   *  through to the normal failure/backoff path. A dead or unreadable PID file is just cleaned up
+   *  — the plugin gets a fresh spawn via `startAll`'s own loop, which skips anything this method
+   *  has already claimed.
+   *
+   *  PID-REUSE HARDENING: a bare "live PID" is NOT sufficient grounds to signal it. After a core
+   *  crash, the recorded PID may since have been recycled by the OS to a completely unrelated
+   *  process — signalling it on a failed re-registration would kill an innocent process. Identity
+   *  is therefore verified before EVER adopting (and thus before this plugin can ever be signalled
+   *  later): the on-disk file is per-plugin (`<id>.pid`, so `pluginId` is implicit) AND its
+   *  `startedAt` (captured via `processStartedAt`/`ps -o lstart=` at spawn time) must match the
+   *  live process's ACTUAL start time. macOS gives no cheaper owner/identity check than this. Any
+   *  of the following makes the PID unverifiable, and the file is cleaned up WITHOUT adopting or
+   *  signalling anything (fail-safe, never a false-positive kill):
+   *    - the file predates this fix (bare-PID legacy format — `parsePidFile` reports `startedAt:
+   *      null`) or is otherwise corrupt/unreadable;
+   *    - `processStartedAt` can't read a start time for the live PID right now (`ps` unavailable/
+   *      erroring in this environment) — we simply have no way to check, so we don't guess;
+   *    - the recorded and actual start times don't match — the PID was almost certainly reused.
    *
    *  Public (not just an internal step of `startAll`) because "orphan reclaim paths" is its own
    *  TDD area per the plan — tests exercise it directly against a fabricated PID file without
@@ -269,18 +350,51 @@ export class PluginSupervisor {
         continue; // no PID file on disk — nothing to reclaim
       }
 
-      const pid = Number(raw.trim());
-      if (!Number.isInteger(pid) || pid <= 0 || !this.isAliveFn(pid)) {
+      const parsed = parsePidFile(raw);
+      if (!parsed) {
         this.removePidFile(config.id);
-        this.log(`plugin ${config.id}: stale PID file removed (pid "${raw.trim()}" not alive)`);
+        this.log(`plugin ${config.id}: unreadable/corrupt PID file removed (fail-safe, no signal sent)`);
+        continue;
+      }
+      const { pid } = parsed;
+
+      if (!this.isAliveFn(pid)) {
+        this.removePidFile(config.id);
+        this.log(`plugin ${config.id}: stale PID file removed (pid ${pid} not alive)`);
         continue;
       }
 
+      // Live PID — but liveness alone never proves identity (PID reuse). Verify start time.
+      const actualStartedAt = this.processStartedAtFn(pid);
+      if (parsed.startedAt === null) {
+        // Legacy bare-PID file (pre-fix) or a JSON file this core itself failed to stamp at spawn
+        // time — unverifiable either way. Fail safe: never signal a PID we can't confirm is ours.
+        this.removePidFile(config.id);
+        this.log(`plugin ${config.id}: pid ${pid} is alive but unverifiable (no recorded start time — legacy/corrupt PID file) — removed without signalling (fail-safe)`);
+        continue;
+      }
+      if (actualStartedAt === null) {
+        // Can't read the live process's start time right now (ps unavailable/erroring) — no basis
+        // for comparison, so don't guess. Fail safe: never signal.
+        this.removePidFile(config.id);
+        this.log(`plugin ${config.id}: cannot verify pid ${pid} identity (start-time check unavailable) — removed without signalling (fail-safe)`);
+        continue;
+      }
+      if (actualStartedAt !== parsed.startedAt) {
+        // Recorded vs. actual start time mismatch — the OS almost certainly recycled this PID to
+        // an unrelated process since our plugin last ran. Never signal it.
+        this.removePidFile(config.id);
+        this.log(`plugin ${config.id}: pid ${pid} start time mismatch (recorded "${parsed.startedAt}", actual "${actualStartedAt}") — PID reuse suspected, removed without signalling`);
+        continue;
+      }
+
+      // Verified: same pid, same recorded start time as the live process — this is genuinely our
+      // orphaned plugin process. Adopt it exactly as before this hardening fix.
       const rt: PluginRuntime = {
         config, status: "starting", pid, failures: [], attempt: 0, generation: 1, settledGeneration: 0,
       };
       this.runtimes.set(config.id, rt);
-      this.log(`plugin ${config.id}: reclaiming orphan pid ${pid} — ${this.registrationTimeoutMs}ms re-registration window`);
+      this.log(`plugin ${config.id}: reclaiming verified orphan pid ${pid} — ${this.registrationTimeoutMs}ms re-registration window`);
 
       const gen = rt.generation;
       const timer = setTimeout(
@@ -559,9 +673,16 @@ export class PluginSupervisor {
   private pidFilePath(id: string): string {
     return join(this.pluginsRunDir(), `${id}.pid`);
   }
+  /** Writes the identity-bearing PID file (`PidFileContents`) `reclaimOrphans` later verifies
+   *  against — see its doc comment for why a bare PID is no longer enough. `startedAt` is captured
+   *  right now, immediately after spawn, via `processStartedAtFn`; a `null` here (e.g. `ps` racing
+   *  the just-spawned process) is written as-is rather than retried — `reclaimOrphans` already
+   *  treats a `null` recorded `startedAt` as permanently unverifiable, which is the correct
+   *  fail-safe outcome for a start time we were never able to pin down in the first place. */
   private writePidFile(id: string, pid: number): void {
     mkdirSync(this.pluginsRunDir(), { recursive: true });
-    writeFileSync(this.pidFilePath(id), String(pid));
+    const contents: PidFileContents = { pid, pluginId: id, startedAt: this.processStartedAtFn(pid) };
+    writeFileSync(this.pidFilePath(id), JSON.stringify(contents));
   }
   private removePidFile(id: string): void {
     try {
