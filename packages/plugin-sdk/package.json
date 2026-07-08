@@ -4,6 +4,6 @@
   "private": true,
   "type": "module",
   "exports": { ".": "./src/index.ts" },
-  "scripts": { "test": "echo 'no tests yet (Phase 4)' && exit 0" },
+  "scripts": { "test": "bun test" },
   "dependencies": { "@norma/protocol": "workspace:*" }
 }
