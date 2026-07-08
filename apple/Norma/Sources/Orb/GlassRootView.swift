@@ -235,6 +235,22 @@ struct GlassRootView: View {
     /// there is nothing extra to arrive for a field the user is already looking at.
     private func handleTurnCompleted() {
         guard controller.surface == .orb else { return }
+        // gate-feedback-1 FIX A: suppressed OUTRIGHT — no expand, no unread-blink either — when a
+        // CLI harness is attached to THIS orb's own focused session AND the frontmost app is a
+        // terminal. Rationale: the user is chatting with this exact session from their terminal
+        // right now, so the reply is already visible there; auto-expanding the orb (or even
+        // flipping the passive unread-blink) on top of that is pure noise. Checked BEFORE the
+        // hidden-panel branch below so it also suppresses THAT branch's `hasUnread` flip, not just
+        // the visible-panel calm-gate. Manual summon (`OrbWindowController.toggleField()` — 4-finger
+        // tap / hotkey / menu, `AppDelegate.swift`) never calls this method at all, so it is
+        // completely unaffected by this guard.
+        guard !isAutoRevealSuppressed(
+            cliAttachedToFocused: session.state.cliAttached,
+            frontmostIsTerminal: frontmostApplicationIsTerminal()
+        ) else {
+            OrbDebug.log("answer arrived: suppressed (CLI attached to focused session + frontmost terminal)")
+            return
+        }
         // Final-review I1: never auto-expand a HIDDEN panel (menu "Hide Orb") — expanding an
         // ordered-out panel re-creates the b8e1f8b wedge (surface=.field while invisible, next
         // summon collapses instead of opening). A hidden orb marks the answer unread instead.
@@ -252,6 +268,28 @@ struct GlassRootView: View {
             adapter.hasUnread = true
         }
     }
+}
+
+/// gate-feedback-1 FIX A: the pure suppression table behind `handleTurnCompleted()`'s terminal-chat
+/// guard above, extracted so `AutoRevealSuppressionTests` can drive it directly. Suppressed ONLY
+/// when BOTH conditions hold — a CLI harness attached to the orb's focused session is not enough
+/// on its own (the user might be looking at something else entirely), and a terminal being
+/// frontmost is not enough on its own (nothing attached there means no redundant reply visible).
+func isAutoRevealSuppressed(cliAttachedToFocused: Bool, frontmostIsTerminal: Bool) -> Bool {
+    cliAttachedToFocused && frontmostIsTerminal
+}
+
+/// gate-feedback-1 FIX A: `shouldAutoExpand` composes the suppression table above with the
+/// pre-existing calm-gate (`OrbFollower.isCursorCalm()`) into the single boolean
+/// `handleTurnCompleted()`'s calm-check used to branch on — kept as its own pure function (rather
+/// than inlining `!isAutoRevealSuppressed(...) && calm`) so a test can assert the composed
+/// decision directly without re-deriving the `&&`. Suppression wins outright: `calm` is never even
+/// consulted once suppressed.
+func shouldAutoExpand(calm: Bool, cliAttachedToFocused: Bool, frontmostIsTerminal: Bool) -> Bool {
+    guard !isAutoRevealSuppressed(cliAttachedToFocused: cliAttachedToFocused, frontmostIsTerminal: frontmostIsTerminal) else {
+        return false
+    }
+    return calm
 }
 
 /// GATE-3 FIX (round 3, F4) — the summon home-state rule, extracted pure so it's unit-testable

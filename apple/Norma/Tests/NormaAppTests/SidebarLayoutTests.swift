@@ -115,4 +115,41 @@ final class SidebarLayoutTests: XCTestCase {
         let t = toggleRightSidebar(leftExpanded: true, rightExpanded: false, width: 800)
         XCTAssertEqual(t.right, true); XCTAssertEqual(t.left, false)
     }
+
+    // MARK: - gate-feedback-1 FIX B: `WindowContentView`'s `@State private var sidebar` now
+    // defaults to `SidebarState(leftExpanded: true, rightExpanded: true, ...)` (both sides
+    // expanded — previously only the right was). These pin the two width thresholds the brief
+    // called out against THAT exact default combination, so a future default drift is caught here
+    // rather than only visually.
+
+    /// At (or above) the both-fit width (1000 = `sidebarContentMinWidth` 520 + `sidebarLeftWidth`
+    /// 220 + `sidebarRightWidth` 260), the new default renders BOTH sidebars inline — no mutual
+    /// exclusion applies above this threshold.
+    func testDefaultStateAtBothFitWidthShowsBothSidebars() {
+        let r = resolveSidebars(width: 1000, leftExpanded: true, rightExpanded: true)
+        XCTAssertTrue(r.leftVisible)
+        XCTAssertTrue(r.rightVisible)
+        XCTAssertFalse(r.leftOverlay)
+        XCTAssertFalse(r.rightOverlay)
+    }
+
+    /// Below the both-fit width (800 < 1000, but ≥ 780 so the right alone still fits), mutual
+    /// exclusion kicks in and the RIGHT wins the tie — even though `leftExpanded` is ALSO true by
+    /// default now, only the right renders (the left shows as a chevron, not an overlay).
+    func testDefaultStateAt800ShowsRightOnly() {
+        let r = resolveSidebars(width: 800, leftExpanded: true, rightExpanded: true)
+        XCTAssertFalse(r.leftVisible, "below both-fit, right wins the tie even with left also expanded")
+        XCTAssertTrue(r.rightVisible)
+        XCTAssertFalse(r.leftOverlay, "unfit-but-expanded is a chevron, never an auto-overlay")
+        XCTAssertFalse(r.rightOverlay)
+    }
+
+    // MARK: - gate-feedback-1 FIX C: the edge-chevron glyph moved from vertically-centered to
+    // top-anchored (`WindowContentView.sidebarChevron`) — visual only, pinning the layout constant
+    // it uses (`sidebarChevronTopOffset`) against the brief's "~12-16pt below the top inset".
+
+    func testChevronTopOffsetWithinSpecRange() {
+        XCTAssertGreaterThanOrEqual(sidebarChevronTopOffset, 12)
+        XCTAssertLessThanOrEqual(sidebarChevronTopOffset, 16)
+    }
 }

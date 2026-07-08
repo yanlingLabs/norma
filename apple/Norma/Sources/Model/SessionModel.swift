@@ -124,6 +124,24 @@ struct OrbSessionState: Equatable {
     /// (`agentError`) — since a queued steer never survives past the turn it was queued for.
     var queuedSteers: [String] = []
 
+    /// gate-feedback-1 FIX A: client names currently attached to this session, via
+    /// `harness_attached`/`harness_detached` (previously ignored by the `default:` branch below).
+    /// `harnessAttached` appends; `harnessDetached` removes ONE matching entry (first match, not
+    /// "all matching") — this keeps a replay of the daemon's event log safe: a replayed
+    /// attach/detach PAIR for the same clientName appends then removes, netting to exactly the
+    /// same list a fresh live stream would produce, even if the same client name attaches twice
+    /// concurrently (e.g. two `cli-chat` sessions) — each detach only cancels ONE of its own
+    /// attaches, not every entry sharing that name.
+    var attachedClients: [String] = []
+
+    /// gate-feedback-1 FIX A: true when any attached client's name starts with "cli" (the CLI's
+    /// `connect(name:)` call sites all pass names prefixed `cli-`, see `packages/cli/src/main.ts`
+    /// — e.g. `cli-chat`/`cli-p`/`cli-send`). Drives the orb's terminal-chat auto-expand
+    /// suppression (`GlassRootView.handleTurnCompleted()`/`isAutoRevealSuppressed`).
+    var cliAttached: Bool {
+        attachedClients.contains { $0.hasPrefix("cli") }
+    }
+
     /// Interrupt-feedback gate polish: true exactly when the MOST RECENT `turn_completed(main)`
     /// carried `stopReason == "aborted"` (an Esc-interrupt) — false for any other stop reason
     /// ("end_turn", tool-limit, etc.) and cleared back to false the instant the NEXT turn starts.
@@ -162,6 +180,12 @@ enum SessionReducer {
     static func reduce(_ state: OrbSessionState, _ event: SessionEvent) -> OrbSessionState {
         var s = state
         switch event {
+        case .harnessAttached(let v): // gate-feedback-1 FIX A — see `attachedClients`'s doc.
+            s.attachedClients.append(v.clientName)
+        case .harnessDetached(let v):
+            if let i = s.attachedClients.firstIndex(of: v.clientName) {
+                s.attachedClients.remove(at: i) // remove-first-match, see `attachedClients`'s doc
+            }
         case .userMessage(let v) where v.threadId == mainThread:
             if s.turnRunning, let last = s.exchanges.indices.last, s.exchanges[last].reply.isEmpty {
                 // Mid-turn steer: same turn, same exchange — the prompt grows (one turn = one exchange).
@@ -343,7 +367,8 @@ enum SessionReducer {
                 }
             }
         default:
-            break // messages/deltas/bg/checkpoint/harness + child-thread events don't move state
+            break // messages/deltas/bg/checkpoint + child-thread events don't move state (harness
+                  // attach/detach ARE now handled above — gate-feedback-1 FIX A)
         }
         return s
     }
