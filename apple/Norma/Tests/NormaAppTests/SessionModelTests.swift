@@ -39,6 +39,12 @@ final class SessionModelTests: XCTestCase {
     func userMessage(_ text: String, seq: Int = 1, thread: String = "main") -> SessionEvent {
         ev(#"{"type":"user_message","seq":\#(seq),"sessionId":"s","ts":0,"threadId":"\#(thread)","text":"\#(text)","clientName":"cli"}"#)
     }
+    func harnessAttached(_ clientName: String, seq: Int = 1) -> SessionEvent {
+        ev(#"{"type":"harness_attached","seq":\#(seq),"sessionId":"s","ts":0,"clientName":"\#(clientName)"}"#)
+    }
+    func harnessDetached(_ clientName: String, seq: Int = 2) -> SessionEvent {
+        ev(#"{"type":"harness_detached","seq":\#(seq),"sessionId":"s","ts":0,"clientName":"\#(clientName)"}"#)
+    }
 
     func testTurnLifecycleDrivesStatus() {
         var s = OrbSessionState()
@@ -559,5 +565,81 @@ final class SessionModelTests: XCTestCase {
 
         session.apply(turnCompleted(seq: 5))
         XCTAssertNil(adapter.queuedText)
+    }
+
+    // MARK: - gate-feedback-1 FIX A: harness attach/detach reducer state (`attachedClients`,
+    // `cliAttached`) — previously ignored entirely by the `default:` branch.
+
+    func testHarnessAttachedAppendsClientName() {
+        var s = OrbSessionState()
+        XCTAssertTrue(s.attachedClients.isEmpty)
+        XCTAssertFalse(s.cliAttached)
+        s = SessionReducer.reduce(s, harnessAttached("cli-chat"))
+        XCTAssertEqual(s.attachedClients, ["cli-chat"])
+        XCTAssertTrue(s.cliAttached)
+    }
+
+    func testHarnessDetachedRemovesFirstMatchOnly() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, harnessAttached("cli-chat", seq: 1))
+        s = SessionReducer.reduce(s, harnessAttached("cli-chat", seq: 2)) // two concurrent attaches, same name
+        XCTAssertEqual(s.attachedClients, ["cli-chat", "cli-chat"])
+        s = SessionReducer.reduce(s, harnessDetached("cli-chat", seq: 3))
+        // Only ONE entry removed — the other cli-chat client is still attached.
+        XCTAssertEqual(s.attachedClients, ["cli-chat"])
+        XCTAssertTrue(s.cliAttached)
+        s = SessionReducer.reduce(s, harnessDetached("cli-chat", seq: 4))
+        XCTAssertTrue(s.attachedClients.isEmpty)
+        XCTAssertFalse(s.cliAttached)
+    }
+
+    /// A detach for a clientName that was never attached (or already fully detached) is a no-op —
+    /// must not crash or remove an unrelated entry.
+    func testHarnessDetachedForUnknownClientIsNoOp() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, harnessAttached("cli-chat"))
+        s = SessionReducer.reduce(s, harnessDetached("cli-status", seq: 2))
+        XCTAssertEqual(s.attachedClients, ["cli-chat"])
+    }
+
+    /// `cliAttached` requires the "cli" PREFIX specifically — an app-side or other non-CLI client
+    /// name must not flip it true (mirrors the "cli-" prefix every `connect()` call site in
+    /// `packages/cli/src/main.ts` actually uses).
+    func testCliAttachedRequiresCliPrefixNotJustAnyClient() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, harnessAttached("app-dashboard"))
+        XCTAssertFalse(s.cliAttached)
+        s = SessionReducer.reduce(s, harnessAttached("cli-ping", seq: 2))
+        XCTAssertTrue(s.cliAttached)
+    }
+
+    /// Replay-safety (the daemon replays its full event log on reconnect/refocus): a historical
+    /// attach/detach PAIR for the same clientName must cancel out to the SAME state a fresh live
+    /// stream (which only ever sees the currently-attached client) would produce — not double-count
+    /// or leak a phantom entry.
+    func testReplayedAttachDetachPairCancelsOut() {
+        var s = OrbSessionState()
+        // Replayed history: an earlier client attached and detached before the current one arrived.
+        s = SessionReducer.reduce(s, harnessAttached("cli-p", seq: 1))
+        s = SessionReducer.reduce(s, harnessDetached("cli-p", seq: 2))
+        s = SessionReducer.reduce(s, harnessAttached("cli-chat", seq: 3)) // the currently-live client
+        XCTAssertEqual(s.attachedClients, ["cli-chat"])
+        XCTAssertTrue(s.cliAttached)
+    }
+
+    /// Multiple interleaved attach/detach pairs across different client names all net out
+    /// correctly, replay-order preserved.
+    func testMultipleInterleavedAttachDetachPairsNetOutCorrectly() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, harnessAttached("cli-chat", seq: 1))
+        s = SessionReducer.reduce(s, harnessAttached("cli-status", seq: 2))
+        s = SessionReducer.reduce(s, harnessDetached("cli-chat", seq: 3))
+        s = SessionReducer.reduce(s, harnessAttached("cli-quota", seq: 4))
+        s = SessionReducer.reduce(s, harnessDetached("cli-quota", seq: 5))
+        XCTAssertEqual(s.attachedClients, ["cli-status"])
+        XCTAssertTrue(s.cliAttached)
+        s = SessionReducer.reduce(s, harnessDetached("cli-status", seq: 6))
+        XCTAssertTrue(s.attachedClients.isEmpty)
+        XCTAssertFalse(s.cliAttached)
     }
 }

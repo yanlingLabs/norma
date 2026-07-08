@@ -11,6 +11,15 @@ let sidebarLeftWidth: CGFloat = 220
 let sidebarRightWidth: CGFloat = 260
 let sidebarContentMinWidth: CGFloat = 520
 
+/// gate-feedback-1 FIX C: the edge-chevron affordances (`WindowContentView.sidebarChevron`) used
+/// to render their glyph vertically CENTERED across the full column height, which read oddly next
+/// to the top-aligned header/sidebars. Now top-anchored: the glyph sits this many points below the
+/// content's `topInset` (roughly level with the header row, `chatWindowHeaderHeight` = 30 —
+/// `WindowSurfaceView.swift`). Visual-only — the hit target itself is unchanged (still the FULL
+/// column height via `.frame(maxHeight: .infinity)`; only the glyph's position within it moves),
+/// same horizontal edges (left chevron on the left edge, right chevron on the right edge).
+let sidebarChevronTopOffset: CGFloat = 14
+
 struct EffectiveSidebars: Equatable {
     var leftVisible: Bool
     var rightVisible: Bool

@@ -26,19 +26,20 @@ final class SidebarRelocationTests: XCTestCase {
         }
     }
 
-    /// Tap-only overlays (SPEC): at the 560-wide morph window with the DEFAULT state (right
-    /// expanded), the right sidebar is too narrow to sit inline, so it collapses to a CHEVRON — NO
-    /// auto-overlay. Work therefore renders INLINE below the composer and BOTH edge chevrons show.
-    /// The work relocates into the (overlay) work sidebar ONLY after an explicit chevron tap.
+    /// Tap-only overlays (SPEC): at the 560-wide morph window with the DEFAULT state (gate-feedback-1
+    /// FIX B: BOTH sides now default expanded), neither sidebar is wide enough to sit inline, so
+    /// BOTH collapse to a CHEVRON — NO auto-overlay. Work therefore renders INLINE below the
+    /// composer and BOTH edge chevrons show. The work relocates into the (overlay) work sidebar
+    /// ONLY after an explicit chevron tap.
     func testMorphWidthPlacesWorkInlineUntilRightOverlayOpens() {
-        let defaultState = SidebarState(leftExpanded: false, rightExpanded: true,
+        let defaultState = SidebarState(leftExpanded: true, rightExpanded: true,
                                         leftOverlayOpen: false, rightOverlayOpen: false)
         let resolved = resolveSidebars(width: 560,
                                        leftExpanded: defaultState.leftExpanded, rightExpanded: defaultState.rightExpanded,
                                        leftOverlayOpen: defaultState.leftOverlayOpen, rightOverlayOpen: defaultState.rightOverlayOpen)
         XCTAssertFalse(resolved.rightVisible, "expanded-but-unfit right is a chevron, never an auto-overlay")
         XCTAssertFalse(resolved.rightOverlay)
-        XCTAssertFalse(resolved.leftVisible, "left collapsed → a chevron on the left edge too")
+        XCTAssertFalse(resolved.leftVisible, "left expanded-but-unfit → a chevron on the left edge too")
         let placed = sidebarContentPlacement(resolved)
         XCTAssertTrue(placed.inlineWork, "work renders inline below the composer")
         XCTAssertFalse(placed.sidebarWork)

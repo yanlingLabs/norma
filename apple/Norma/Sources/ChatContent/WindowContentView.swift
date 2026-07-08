@@ -34,11 +34,15 @@ struct WindowContentView<Accessory: View>: View {
     /// measured" (no sidebars resolved) so a stale zero never briefly opens the right overlay.
     @State private var measuredWidth: CGFloat = 0
     /// Task 6 (2e-iii): the raw sidebar flags the width engine (`resolveSidebars`) resolves against
-    /// `measuredWidth`. Defaults per the brief: the left switcher collapsed, the right work sidebar
-    /// EXPANDED — so it appears INLINE the moment the width fits it, and collapses to a CHEVRON (never
-    /// an auto-overlay) when it doesn't. Overlays are tap-only: `overlayOpen` is set solely by a
-    /// chevron tap on a side that can't fit inline, and cleared on dismiss / once it fits inline.
-    @State private var sidebar = SidebarState(leftExpanded: false, rightExpanded: true,
+    /// `measuredWidth`. gate-feedback-1 FIX B: BOTH default to EXPANDED (the left session switcher
+    /// previously defaulted collapsed) — so each appears INLINE the moment the width fits it, and
+    /// collapses to a CHEVRON (never an auto-overlay) when it doesn't. Below the both-fit width
+    /// (`sidebarLayout`'s `resolveSidebars`) mutual exclusion still applies with the right winning
+    /// ties, so a narrower window still shows at most one side even with both flags true — see
+    /// `SidebarLayoutTests`' "default state" pins. Overlays are tap-only: `overlayOpen` is set
+    /// solely by a chevron tap on a side that can't fit inline, and cleared on dismiss / once it
+    /// fits inline.
+    @State private var sidebar = SidebarState(leftExpanded: true, rightExpanded: true,
                                               leftOverlayOpen: false, rightOverlayOpen: false)
 
     var body: some View {
@@ -204,14 +208,20 @@ struct WindowContentView<Accessory: View>: View {
         workSidebar.padding(.top, topInset)
     }
 
-    /// A full-height 16pt edge chevron (`.secondary`), the hit-target for opening a hidden side.
+    /// A full-height 16pt-wide edge chevron (`.secondary`), the hit-target for opening a hidden
+    /// side. gate-feedback-1 FIX C: the GLYPH is now top-anchored (`sidebarChevronTopOffset` below
+    /// `topInset`) instead of vertically centered — visual only, the hit target itself still spans
+    /// the FULL column height (`.frame(maxHeight: .infinity, alignment: .top)` + `.contentShape`
+    /// covers the same full-height/16pt-wide rectangle as before; only where the icon renders
+    /// within it moved).
     private func sidebarChevron(_ systemName: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: systemName)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
+                .padding(.top, topInset + sidebarChevronTopOffset)
                 .frame(width: 16)
-                .frame(maxHeight: .infinity)
+                .frame(maxHeight: .infinity, alignment: .top)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
