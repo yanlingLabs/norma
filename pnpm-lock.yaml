@@ -15,6 +15,12 @@ importers:
         specifier: ^5.6.0
         version: 5.9.3
 
+  examples/sample-echo:
+    dependencies:
+      '@norma/plugin-sdk':
+        specifier: workspace:*
+        version: link:../../packages/plugin-sdk
+
   packages/cli:
     dependencies:
       '@norma/core':
