@@ -8,6 +8,9 @@ import {
   SessionSteerParams, SessionInterruptParams, SessionCompactParams, SkillsListParams, McpListParams,
   PluginsListParams, AskUserRespondParams, TaskListParams, PlanRespondParams, SessionSetPolicyParams,
   ThreadListParams,
+  PeripheralLeaseParams, PeripheralRenewParams, PeripheralReleaseParams, PeripheralAdvertiseParams,
+  PeripheralRevokeParams, PeripheralRespondParams, DaemonStatusParams, QuotaStateParams,
+  TrustListParams, TrustRemoveParams,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
@@ -24,6 +27,9 @@ import type { BackgroundTaskRegistry } from "../agent/bg-registry";
 import type { SkillStore } from "../agent/skills";
 import type { McpManager } from "../agent/mcp/manager";
 import type { PluginStore } from "../agent/plugins";
+import type { PeripheralBroker, PeripheralClass } from "../peripheral/broker";
+import type { ProviderLink } from "../peripheral/provider-link";
+import type { QuotaManager } from "../providers/quota";
 import { addLocalDir } from "../settings";
 
 interface ConnState {
@@ -52,6 +58,16 @@ export interface IpcServerOptions {
   questions?: QuestionBroker; // in-flight ask_user questions; ask_user.respond
   tasks?: TaskStore;         // session task lists; task.list
   plans?: PlanBroker;        // in-flight exit_plan_mode plans; plan.respond
+  peripheral?: PeripheralBroker; // lease machinery; peripheral.* verbs (Phase 2f)
+  providerLink?: ProviderLink;   // bridges PeripheralBroker.call()'s pushToProvider to the live
+                                  // provider connection this server tracks (Phase 2f)
+  peripheralClassHint?: Map<string, PeripheralClass>; // sessionId -> in-flight lease's class, set
+                                  // synchronously just before PeripheralBroker.lease() so the
+                                  // daemon-level ask-policy closure can build the approval
+                                  // summary "Session <id> requests <class>" (see daemon.ts)
+  quota?: QuotaManager;      // token/rate-limit snapshot; quota.state (dashboard read)
+  providerInfo?: { id: string; model: string } | null; // active LLM provider identity; daemon.status
+  startedAt?: number;        // daemon process start time (Date.now()); daemon.status uptimeMs
   helloTimeoutMs?: number;   // default 5000
   maxConnections?: number;   // default 64
   preAuthMaxLine?: number;   // default 64 KiB
@@ -132,6 +148,12 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         if (socket.data.helloTimer) clearTimeout(socket.data.helloTimer);
         if (socket.data.hubClient) hub.detach(socket.data.hubClient);
         harnessConns.delete(socket.data);
+        // Provider disconnect (spec §A3): only the connection that most recently advertised
+        // counts — isProvider() is checked BEFORE providerGone() resets the broker's identity.
+        if (opts.peripheral?.isProvider(socket.data)) {
+          opts.peripheral.providerGone();
+          opts.providerLink?.setWriter(null);
+        }
       },
       async data(socket, chunk) {
         let lines: string[];
@@ -350,6 +372,104 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         opts.bg?.killAllForSession(p.sessionId);
         return { ok: true, killed };
       }
+
+      // -----------------------------------------------------------------------------------------
+      // Peripheral lease v1 (Phase 2f, spec §A1/§A2). Requester scope is SESSIONS-ONLY in v1: a
+      // non-"harness" role (the plugin role doesn't exist end-to-end yet — TokenAuthority.verify
+      // has no plugin token, so this guard is defensive/future-proofing) gets the typed denied
+      // result the spec pins, rather than a bare role-rejection error — see spec §A2 "Requester
+      // scope" and the plan's Task 3 carried item #4.
+      // -----------------------------------------------------------------------------------------
+      case METHODS.peripheralLease: {
+        const p = parseParams(PeripheralLeaseParams, params);
+        if (socket.data.authedRole !== "harness") return { code: "denied", reason: "plugin-leasing-not-yet-available" };
+        try { opts.store.meta(p.sessionId); } catch (e) { throw new RpcFailure(ERR.NOT_FOUND, (e as Error).message); }
+        if (!opts.peripheral) return { code: "no_provider" };
+        // Synchronous hand-off: PeripheralBroker.lease() only forwards `sessionId` to the injected
+        // `policy(sessionId)` closure (not `class`) — daemon.ts's ask-policy builder reads this map
+        // to compose the approval card's "Session <id> requests <class>" summary. Safe under
+        // concurrency because everything from this `set()` through the synchronous prelude of
+        // `policy()` runs with no intervening `await` (see the Task 3 report for the full argument).
+        opts.peripheralClassHint?.set(p.sessionId, p.class);
+        return await opts.peripheral.lease({ sessionId: p.sessionId, class: p.class });
+      }
+      case METHODS.peripheralRenew: {
+        const p = parseParams(PeripheralRenewParams, params);
+        if (socket.data.authedRole !== "harness") return { code: "denied", reason: "plugin-leasing-not-yet-available" };
+        try { opts.store.meta(p.sessionId); } catch (e) { throw new RpcFailure(ERR.NOT_FOUND, (e as Error).message); }
+        if (!opts.peripheral) return { code: "not_found" };
+        return opts.peripheral.renew({ leaseId: p.leaseId, token: p.token });
+      }
+      case METHODS.peripheralRelease: {
+        const p = parseParams(PeripheralReleaseParams, params);
+        if (socket.data.authedRole !== "harness") return { code: "denied", reason: "plugin-leasing-not-yet-available" };
+        try { opts.store.meta(p.sessionId); } catch (e) { throw new RpcFailure(ERR.NOT_FOUND, (e as Error).message); }
+        if (!opts.peripheral) return { code: "not_found" };
+        return opts.peripheral.release({ leaseId: p.leaseId, token: p.token });
+      }
+      case METHODS.peripheralAdvertise: {
+        const p = parseParams(PeripheralAdvertiseParams, params);
+        // Pin (Task 3 carried item #3): THE provider = the connection that most recently
+        // advertised — any authed harness may advertise; last write wins (mirrors
+        // PeripheralBroker.advertise's own "last advertiser wins" semantics).
+        if (socket.data.authedRole !== "harness") {
+          throw new RpcFailure(ERR.UNAUTHORIZED, "peripheral.advertise requires harness role");
+        }
+        opts.peripheral?.advertise(socket.data, p.classes);
+        opts.providerLink?.setWriter(socket.data.writer);
+        return { ok: true };
+      }
+      case METHODS.peripheralRevoke: {
+        const p = parseParams(PeripheralRevokeParams, params);
+        if (!opts.peripheral?.isProvider(socket.data)) {
+          throw new RpcFailure(ERR.UNAUTHORIZED, "peripheral.revoke requires the active provider connection");
+        }
+        return opts.peripheral.revoke({ leaseId: p.leaseId, all: p.all, reason: p.reason });
+      }
+      case METHODS.peripheralRespond: {
+        const p = parseParams(PeripheralRespondParams, params);
+        if (!opts.peripheral?.isProvider(socket.data)) {
+          throw new RpcFailure(ERR.UNAUTHORIZED, "peripheral.respond requires the active provider connection");
+        }
+        return opts.peripheral.respond({ requestId: p.requestId, resultJson: p.resultJson, error: p.error });
+      }
+
+      // -----------------------------------------------------------------------------------------
+      // Dashboard read methods (Phase 2f, spec Part B). All read-only except trust.remove.
+      // -----------------------------------------------------------------------------------------
+      case METHODS.daemonStatus: {
+        parseParams(DaemonStatusParams, params);
+        return {
+          version: opts.serverVersion,
+          uptimeMs: Date.now() - (opts.startedAt ?? Date.now()),
+          socketPath: opts.socketPath,
+          provider: opts.providerInfo ?? null,
+          sessionsCount: opts.store.list().length,
+          pluginsCount: 0, // Phase 4
+        };
+      }
+      case METHODS.quotaState: {
+        parseParams(QuotaStateParams, params);
+        const state = opts.quota?.state() ?? { kind: "ok" as const };
+        const usage = opts.quota?.usage() ?? { inputTokens: 0, outputTokens: 0 };
+        return { ...state, ...usage }; // FLAT merge — see carried item #2 (matches the NormaKit wrapper)
+      }
+      case METHODS.trustList: {
+        parseParams(TrustListParams, params);
+        return { dirs: opts.trust?.list() ?? [] };
+      }
+      case METHODS.trustRemove: {
+        const p = parseParams(TrustRemoveParams, params);
+        // No admin-gating precedent exists on this socket yet (daemon.trustDir has none either) —
+        // fall back to harness-role + an audit log line, per the plan's Task 3 interface note.
+        if (socket.data.authedRole !== "harness") {
+          throw new RpcFailure(ERR.UNAUTHORIZED, "trust.remove requires harness role");
+        }
+        const removed = opts.trust?.remove(p.path) ?? false;
+        console.error(`[trust.remove] path=${p.path} removed=${removed} by=${socket.data.clientName}`);
+        return { removed };
+      }
+
       default:
         throw new RpcFailure(ERR.METHOD_NOT_FOUND, `method not found: ${method}`);
     }

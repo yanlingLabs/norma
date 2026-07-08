@@ -41,6 +41,26 @@ import {
   ThreadInfoSchema,
   ThreadListParams,
   ThreadListResult,
+  PeripheralLeaseParams,
+  PeripheralLeaseResult,
+  PeripheralRenewParams,
+  PeripheralRenewResult,
+  PeripheralReleaseParams,
+  PeripheralReleaseResult,
+  PeripheralAdvertiseParams,
+  PeripheralAdvertiseResult,
+  PeripheralRevokeParams,
+  PeripheralRevokeResult,
+  PeripheralRespondParams,
+  PeripheralRespondResult,
+  DaemonStatusParams,
+  DaemonStatusResult,
+  QuotaStateParams,
+  QuotaStateResult,
+  TrustListParams,
+  TrustListResult,
+  TrustRemoveParams,
+  TrustRemoveResult,
   METHODS,
 } from "../src/methods";
 
@@ -264,6 +284,78 @@ describe("peripheral lease + dashboard read methods", () => {
     expect(METHODS.quotaState).toBe("quota.state");
     expect(METHODS.trustList).toBe("trust.list");
     expect(METHODS.trustRemove).toBe("trust.remove");
+  });
+
+  test("peripheral.lease params/result: class enum + grant/held/no_provider/denied variants", () => {
+    expect(PeripheralLeaseParams.parse({ sessionId: "s1", class: "noop" }).class).toBe("noop");
+    expect(() => PeripheralLeaseParams.parse({ sessionId: "s1", class: "bogus" })).toThrow();
+    const granted = PeripheralLeaseResult.parse({ leaseId: "l1", token: "t1", expiresAt: 100 });
+    expect("leaseId" in granted && granted.leaseId).toBe("l1");
+    expect(PeripheralLeaseResult.parse({ code: "lease_held", holder: { kind: "session", id: "s2" } })).toEqual({
+      code: "lease_held", holder: { kind: "session", id: "s2" },
+    });
+    expect(PeripheralLeaseResult.parse({ code: "no_provider" })).toEqual({ code: "no_provider" });
+    expect(PeripheralLeaseResult.parse({ code: "denied" })).toEqual({ code: "denied" });
+    const pluginDenied = PeripheralLeaseResult.parse({ code: "denied", reason: "plugin-leasing-not-yet-available" });
+    expect("reason" in pluginDenied && pluginDenied.reason).toBe("plugin-leasing-not-yet-available");
+    expect(() => PeripheralLeaseResult.parse({ code: "bogus" })).toThrow();
+  });
+
+  test("peripheral.renew / peripheral.release params/result", () => {
+    const rp = PeripheralRenewParams.parse({ sessionId: "s1", leaseId: "l1", token: "t1" });
+    expect(rp).toEqual({ sessionId: "s1", leaseId: "l1", token: "t1" });
+    const renewed = PeripheralRenewResult.parse({ ok: true, expiresAt: 200 });
+    expect("expiresAt" in renewed && renewed.expiresAt).toBe(200);
+    expect(PeripheralRenewResult.parse({ code: "not_found" })).toEqual({ code: "not_found" });
+    expect(PeripheralRenewResult.parse({ code: "token_mismatch" })).toEqual({ code: "token_mismatch" });
+    const renewDenied = PeripheralRenewResult.parse({ code: "denied", reason: "plugin-leasing-not-yet-available" });
+    expect("code" in renewDenied && renewDenied.code).toBe("denied");
+
+    const relp = PeripheralReleaseParams.parse({ sessionId: "s1", leaseId: "l1", token: "t1" });
+    expect(relp).toEqual({ sessionId: "s1", leaseId: "l1", token: "t1" });
+    expect(PeripheralReleaseResult.parse({ ok: true })).toEqual({ ok: true });
+    expect(PeripheralReleaseResult.parse({ code: "not_found" })).toEqual({ code: "not_found" });
+  });
+
+  test("peripheral.advertise / peripheral.revoke / peripheral.respond params/result", () => {
+    const ap = PeripheralAdvertiseParams.parse({ classes: [{ class: "noop", tccGranted: true }] });
+    expect(ap.classes).toHaveLength(1);
+    expect(PeripheralAdvertiseResult.parse({ ok: true })).toEqual({ ok: true });
+
+    expect(PeripheralRevokeParams.parse({ all: true, reason: "panic" })).toEqual({ all: true, reason: "panic" });
+    expect(PeripheralRevokeParams.parse({ leaseId: "l1", reason: "revoked" }).leaseId).toBe("l1");
+    expect(() => PeripheralRevokeParams.parse({ all: true, reason: "bogus" })).toThrow();
+    expect(PeripheralRevokeResult.parse({ ok: true, revoked: 2 }).revoked).toBe(2);
+
+    expect(PeripheralRespondParams.parse({ requestId: "r1", resultJson: "{}" }).requestId).toBe("r1");
+    expect(PeripheralRespondParams.parse({ requestId: "r1", error: "boom" }).error).toBe("boom");
+    expect(PeripheralRespondResult.parse({ ok: true, alreadyResolved: false }).alreadyResolved).toBe(false);
+  });
+
+  test("daemon.status / quota.state shapes", () => {
+    expect(DaemonStatusParams.parse({})).toEqual({});
+    const status = DaemonStatusResult.parse({
+      version: "0.0.1", uptimeMs: 1234, socketPath: "/tmp/core.sock",
+      provider: { id: "fake", model: "fake-1" }, sessionsCount: 2, pluginsCount: 0,
+    });
+    expect(status.provider?.id).toBe("fake");
+    expect(DaemonStatusResult.parse({
+      version: "0.0.1", uptimeMs: 0, socketPath: "/tmp/core.sock",
+      provider: null, sessionsCount: 0, pluginsCount: 0,
+    }).provider).toBeNull();
+
+    expect(QuotaStateParams.parse({})).toEqual({});
+    expect(QuotaStateResult.parse({ kind: "ok", inputTokens: 0, outputTokens: 0 }).kind).toBe("ok");
+    const limited = QuotaStateResult.parse({ kind: "limited", resumeAt: 999, inputTokens: 5, outputTokens: 6 });
+    expect(limited.resumeAt).toBe(999);
+  });
+
+  test("trust.list / trust.remove params/result", () => {
+    expect(TrustListParams.parse({})).toEqual({});
+    expect(TrustListResult.parse({ dirs: ["/a", "/b"] }).dirs).toHaveLength(2);
+    expect(TrustRemoveParams.parse({ path: "/a" }).path).toBe("/a");
+    expect(() => TrustRemoveParams.parse({ path: "rel" })).toThrow();
+    expect(TrustRemoveResult.parse({ removed: true }).removed).toBe(true);
   });
 });
 
