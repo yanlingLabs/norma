@@ -17,10 +17,10 @@ export const HelloParams = z.object({
   role: Role,
   token: z.string().min(1),
   clientName: z.string().min(1),
-  // Phase 4b Task 1: role "plugin" is id-bound (a plugin authenticates AS a specific installed
-  // plugin id, not just "any plugin"). Verification (matching token to this id) is Task 2 —
-  // TokenAuthority.verify() has no "plugin" entry yet, so a plugin hello fails closed today
-  // regardless of what's sent here; this field only makes the shape parse ahead of that wiring.
+  // Phase 4b Task 2 (spec §3): role "plugin" is id-bound (a plugin authenticates AS a specific
+  // installed plugin id, not just "any plugin"). Verification is sqlite-hashed and lives outside
+  // TokenAuthority — ipc/server.ts routes role "plugin" through SessionStore.verifyPluginToken
+  // instead; a missing pluginId (or one with no minted/matching token) fails closed.
   pluginId: z.string().min(1).optional(),
 });
 export const HelloResult = z.object({
@@ -260,8 +260,13 @@ export const TrustRemoveResult = z.object({ removed: z.boolean() });
 // ---------------------------------------------------------------------------------------------
 // Plugin role verbs (Phase 4b Task 1, spec §3 "Tier-2 — supervisor + plugin role"). Wire shapes
 // only here — the supervisor/registry wiring that makes these verbs DO something (ToolRegistry
-// registration, contrib registries, role→method allowlist) is Task 2/3/4. A plugin connection may
-// ONLY call these six verbs (plus the 2f lease verbs above); everything else is role-rejected.
+// registration, contrib registries) is Task 3/4. Task 2 implements the role→methods allowlist
+// (ipc/server.ts) covering EXACTLY these six verbs — a plugin connection may call these and
+// nothing else; everything else, including the 2f peripheral.lease/renew/release verbs the spec
+// text names as a plugin-facing cross-spec fix, is role-rejected. That's a deliberate narrowing
+// of the spec's plugin-can-lease language for this task's scope (Task 2's contract fixes exactly
+// these six) — widening the allowlist to admit peripheral leasing for plugins, if still wanted,
+// is a follow-up decision for a later task, not implied by anything below.
 // ---------------------------------------------------------------------------------------------
 
 export const PluginRegisterParams = z.object({ pluginId: z.string().min(1) });
@@ -312,6 +317,15 @@ export const PluginToolResultParams = z.object({
 });
 export const PluginToolResultResult = z.object({ ok: z.literal(true) });
 
+/** Harness-role admin verb (Phase 4b Task 2, spec §3): deletes a plugin's stored token hash so a
+ *  subsequent plugin hello for that id fails closed. Mirrors trust.remove's role precedent — NOT
+ *  itself one of the six plugin-role verbs (a plugin can never revoke its own or another plugin's
+ *  token). Exists because `plugin_tokens` lives in the daemon's sqlite: the CLI's disable/remove
+ *  never opens that database directly (locking risk) and calls this RPC best-effort instead —
+ *  mint stays daemon-side (Task 3, at supervisor spawn). */
+export const PluginRevokeTokenParams = z.object({ pluginId: z.string().min(1) });
+export const PluginRevokeTokenResult = z.object({ ok: z.literal(true) });
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -354,4 +368,5 @@ export const METHODS = {
   tileUpdate: "tile.update",
   providerRegister: "provider.register",
   pluginToolResult: "plugin.toolResult",
+  pluginRevokeToken: "plugin.revokeToken",
 } as const;

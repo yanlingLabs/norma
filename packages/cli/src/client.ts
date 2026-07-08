@@ -7,6 +7,7 @@ import {
   PluginsListResult, AskUserRespondResult, TaskListResult, ThreadListResult,
   PlanRespondResult, SessionSetPolicyResult, type ApprovalPolicy,
   DaemonStatusResult, QuotaStateResult, TrustListResult, TrustRemoveResult,
+  PluginRevokeTokenResult,
   ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 
@@ -191,6 +192,12 @@ export class NormaClient {
   }
   async trustRemove(path: string): Promise<boolean> {
     return this.validated(TrustRemoveResult, await this.request(METHODS.trustRemove, { path }), METHODS.trustRemove).removed;
+  }
+  /** Phase 4b Task 2: `plugin_tokens` lives in the daemon's sqlite, not settings.json — the CLI
+   *  never opens that database directly (locking risk), so disable/remove revoke via this
+   *  harness-role RPC instead (mint stays daemon-side, Task 3). */
+  async pluginRevokeToken(pluginId: string): Promise<{ ok: true }> {
+    return this.validated(PluginRevokeTokenResult, await this.request(METHODS.pluginRevokeToken, { pluginId }), METHODS.pluginRevokeToken);
   }
   close(): void { this.socket.end(); }
 }

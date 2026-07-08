@@ -35,6 +35,7 @@ import {
   missingConsents,
   removePluginDir,
   removePluginFromSettings,
+  revokePluginTokenBestEffort,
   setPluginEnabled,
   stripPluginConsents,
 } from "./plugin-cli";
@@ -182,6 +183,18 @@ function socketPath(): string {
 
 async function connect(name: string, onEvent: (e: any) => void = () => {}): Promise<NormaClient> {
   return NormaClient.connect({ socketPath: socketPath(), token: await getToken(), clientName: name, onEvent });
+}
+
+/** Phase 4b Task 2: connect + call `plugin.revokeToken` + close, for
+ *  `revokePluginTokenBestEffort` (plugin-cli.ts) — a down daemon (no socket, no harness token
+ *  yet, …) surfaces as a rejected promise, which the caller tolerates rather than treats as fatal. */
+async function revokePluginTokenViaDaemon(pluginId: string): Promise<void> {
+  const c = await connect(`cli-plugin-revoke-${pluginId}`);
+  try {
+    await c.pluginRevokeToken(pluginId);
+  } finally {
+    c.close();
+  }
 }
 
 // Canned prompt for `norma init`: surveys the project and writes/updates a NORMA.md at its root.
@@ -1025,6 +1038,11 @@ if (import.meta.main) {
       const { loadSettings, saveSettings } = await import("@norma/core");
       const settings = stripPluginConsents(setPluginEnabled(loadSettings(settingsPath), name, false), name);
       saveSettings(settingsPath, settings);
+      // Phase 4b Task 2: best-effort revoke of the plugin's daemon-side token (Tier-2 platform
+      // plugins only have one, but revoking is harmless/no-op for Tier-1 — the daemon just deletes
+      // a row that never existed). A down daemon is tolerated, never blocks the disable.
+      const revoked = await revokePluginTokenBestEffort(revokePluginTokenViaDaemon, name);
+      if (!revoked.ok) console.log(`${DIM}${revoked.note}${RESET}`);
       console.log(`${AQUA}${name} disabled${RESET} — restart the daemon to apply`);
       break;
     }
@@ -1040,6 +1058,10 @@ if (import.meta.main) {
       }
       const { loadSettings, saveSettings } = await import("@norma/core");
       saveSettings(settingsPath, removePluginFromSettings(loadSettings(settingsPath), name));
+      // Phase 4b Task 2: same best-effort token revoke as disable (see comment there) — removing
+      // the plugin dir must not silently leave a stale, still-valid token in the daemon's sqlite.
+      const revoked = await revokePluginTokenBestEffort(revokePluginTokenViaDaemon, name);
+      if (!revoked.ok) console.log(`${DIM}${revoked.note}${RESET}`);
       console.log(`${AQUA}removed ${name}${RESET}`);
       break;
     }

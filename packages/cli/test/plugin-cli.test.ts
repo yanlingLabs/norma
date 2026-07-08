@@ -14,6 +14,7 @@ import {
   removePluginDir,
   removePluginFromSettings,
   resolvePluginTarget,
+  revokePluginTokenBestEffort,
   setPluginEnabled,
   stripPluginConsents,
   type ConsentBlockPlugin,
@@ -359,5 +360,22 @@ describe("removePluginDir", () => {
   test("a nonexistent (but validly-scoped) name is refused", () => {
     const pluginsRoot = mkdtempSync(join(tmpdir(), "norma-plugins-root-"));
     expect(() => removePluginDir(pluginsRoot, "ghost")).toThrow(/no such plugin/);
+  });
+});
+
+// Phase 4b Task 2: disable/remove's best-effort daemon-side token revoke. `revoke` is injected
+// (see plugin-cli.ts) so this stays a pure unit test — no real socket/daemon involved.
+describe("revokePluginTokenBestEffort", () => {
+  test("a successful revoke resolves ok:true with no note", async () => {
+    const calls: string[] = [];
+    const result = await revokePluginTokenBestEffort(async (pluginId) => { calls.push(pluginId); }, "demo");
+    expect(result).toEqual({ ok: true });
+    expect(calls).toEqual(["demo"]);
+  });
+
+  test("a rejected revoke (daemon down, timeout, etc.) is tolerated: ok:false with a note, never throws", async () => {
+    const result = await revokePluginTokenBestEffort(async () => { throw new Error("connect ECONNREFUSED"); }, "demo");
+    expect(result.ok).toBe(false);
+    expect(result.note).toContain("connect ECONNREFUSED");
   });
 });

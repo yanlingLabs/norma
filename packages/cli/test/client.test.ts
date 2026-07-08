@@ -199,6 +199,17 @@ describe("NormaClient", () => {
     client.close();
   });
 
+  // Phase 4b Task 2: the CLI-facing wrapper over the harness-role plugin.revokeToken RPC (used by
+  // `norma plugin disable/remove`). `plugin_tokens` lives in the daemon's own sqlite, which this
+  // test doesn't have direct access to (RunningDaemon doesn't expose SessionStore) — but the
+  // handler is idempotent for a never-minted id, so the round-trip is fully exercisable without it.
+  test("pluginRevokeToken client method round-trips (idempotent on a never-minted id)", async () => {
+    await boot(null);
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "prt", onEvent: () => {} });
+    expect(await client.pluginRevokeToken("never-minted-plugin")).toEqual({ ok: true });
+    client.close();
+  });
+
   test("init prompt reaches the session (canned NORMA.md-generation prompt)", async () => {
     const { INIT_PROMPT } = await import("../src/main");
     expect(INIT_PROMPT).toMatch(/NORMA\.md/i);

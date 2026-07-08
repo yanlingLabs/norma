@@ -73,6 +73,8 @@ import {
   ProviderRegisterResult,
   PluginToolResultParams,
   PluginToolResultResult,
+  PluginRevokeTokenParams,
+  PluginRevokeTokenResult,
   METHODS,
 } from "../src/methods";
 
@@ -462,5 +464,15 @@ describe("plugin verbs (Phase 4b Task 1, spec §3)", () => {
       .toBe("plugin sample-echo crashed during echo");
     expect(() => PluginToolResultParams.parse({ requestId: "" })).toThrow();
     expect(PluginToolResultResult.parse({ ok: true })).toEqual({ ok: true });
+  });
+});
+
+describe("plugin.revokeToken (Phase 4b Task 2, spec §3 — harness-role admin verb, NOT one of the six plugin verbs)", () => {
+  test("METHODS carries it; params require a non-empty pluginId; result is a plain ok", () => {
+    expect(METHODS.pluginRevokeToken).toBe("plugin.revokeToken");
+    expect(PluginRevokeTokenParams.parse({ pluginId: "sample-echo" }).pluginId).toBe("sample-echo");
+    expect(() => PluginRevokeTokenParams.parse({ pluginId: "" })).toThrow();
+    expect(() => PluginRevokeTokenParams.parse({})).toThrow();
+    expect(PluginRevokeTokenResult.parse({ ok: true })).toEqual({ ok: true });
   });
 });

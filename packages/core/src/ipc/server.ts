@@ -10,7 +10,7 @@ import {
   ThreadListParams,
   PeripheralLeaseParams, PeripheralRenewParams, PeripheralReleaseParams, PeripheralAdvertiseParams,
   PeripheralRevokeParams, PeripheralRespondParams, DaemonStatusParams, QuotaStateParams,
-  TrustListParams, TrustRemoveParams,
+  TrustListParams, TrustRemoveParams, PluginRevokeTokenParams,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
@@ -39,6 +39,10 @@ interface ConnState {
   hubClient: HubClient | null;
   helloTimer: ReturnType<typeof setTimeout> | null;
   writer: ConnWriter;
+  // Phase 4b Task 2: set on a successful role:"plugin" hello (the specific installed plugin id
+  // this connection authenticated as); null for every other role. Consumed by Task 3/4's
+  // supervisor wiring (notifyRegistered/tool bridge) to correlate a connection to its plugin.
+  pluginId: string | null;
 }
 
 export interface IpcServerOptions {
@@ -72,6 +76,23 @@ export interface IpcServerOptions {
 export interface IpcServer { stop(): void }
 
 class RpcFailure extends Error { constructor(public code: number, message: string) { super(message); } }
+
+// Phase 4b Task 2 (spec §3): the table-driven role→methods gate for plugin connections. A plugin
+// authenticates as a SPECIFIC installed plugin id (hello role "plugin") and may ONLY ever call
+// these six wire verbs — everything else (session.*, approval.*, peripheral.*, daemon.*, trust.*,
+// plugins.*, ask_user.*, etc.) is role-rejected BEFORE dispatch, never reaching a handler. Handlers
+// for these six aren't all wired yet (plugin.register/tool.register/shortcut.register/tile.update/
+// provider.register land in Task 4) — an allowed-but-unwired method falls through to the switch's
+// existing METHOD_NOT_FOUND default, which is the correct "not yet implemented" signal, distinct
+// from a role rejection.
+const PLUGIN_ALLOWED_METHODS = new Set<string>([
+  METHODS.pluginRegister,
+  METHODS.toolRegister,
+  METHODS.shortcutRegister,
+  METHODS.tileUpdate,
+  METHODS.providerRegister,
+  METHODS.pluginToolResult,
+]);
 
 export function startIpcServer(opts: IpcServerOptions): IpcServer {
   if (opts.engine && !opts.hub) {
@@ -133,6 +154,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
           hubClient: null,
           helloTimer: setTimeout(() => socket.end(), helloTimeoutMs),
           writer: new ConnWriter(socket as unknown as WritableSocket),
+          pluginId: null,
         };
       },
       drain(socket) {
@@ -190,11 +212,20 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       if (p.protocolVersion !== PROTOCOL_VERSION) {
         throw new RpcFailure(ERR.VERSION_MISMATCH, `server speaks protocol v${PROTOCOL_VERSION}, client sent v${p.protocolVersion}`);
       }
-      if (!(await opts.tokens.verify(p.role, p.token))) {
+      // Phase 4b Task 2: role "plugin" is id-bound and verified against SessionStore's sqlite-
+      // hashed plugin_tokens table (mintPluginToken/verifyPluginToken), NOT TokenAuthority — a
+      // plugin's token has nothing to do with the harness/admin Keychain secrets. A hello with no
+      // pluginId, or one whose token doesn't match what was minted for that exact id, fails closed.
+      if (p.role === "plugin") {
+        if (!p.pluginId || !opts.store.verifyPluginToken(p.pluginId, p.token)) {
+          throw new RpcFailure(ERR.UNAUTHORIZED, "invalid token for role");
+        }
+      } else if (!(await opts.tokens.verify(p.role, p.token))) {
         throw new RpcFailure(ERR.UNAUTHORIZED, "invalid token for role");
       }
       socket.data.authedRole = p.role;
       socket.data.clientName = p.clientName;
+      socket.data.pluginId = p.role === "plugin" ? p.pluginId! : null;
       if (socket.data.helloTimer) { clearTimeout(socket.data.helloTimer); socket.data.helloTimer = null; }
       socket.data.decoder = new LineDecoder(); // authed: default 8 MiB line cap
       if (p.role === "harness") harnessConns.add(socket.data);
@@ -202,6 +233,11 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
     }
 
     if (socket.data.authedRole === null) throw new RpcFailure(ERR.UNAUTHORIZED, "hello required first");
+
+    // Role→method allowlist gate — BEFORE dispatch, ahead of the switch below (Task 2 contract).
+    if (socket.data.authedRole === "plugin" && !PLUGIN_ALLOWED_METHODS.has(method)) {
+      throw new RpcFailure(ERR.UNAUTHORIZED, `plugin role may not call ${method}`);
+    }
 
     switch (method) {
       case METHODS.sessionCreate: {
@@ -458,6 +494,22 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         const removed = opts.trust?.remove(p.path) ?? false;
         console.error(`[trust.remove] path=${p.path} removed=${removed} by=${socket.data.clientName}`);
         return { removed };
+      }
+
+      // -----------------------------------------------------------------------------------------
+      // plugin.revokeToken (Phase 4b Task 2, spec §3): harness-role admin verb, same precedent as
+      // trust.remove above — NOT one of the six plugin-role verbs (rejected by the allowlist gate
+      // above before ever reaching here if called from a plugin connection). The CLI's `norma
+      // plugin disable/remove` call this best-effort instead of opening the daemon's sqlite
+      // directly (locking risk) — mint stays daemon-side (Task 3, lazily at supervisor spawn).
+      // -----------------------------------------------------------------------------------------
+      case METHODS.pluginRevokeToken: {
+        const p = parseParams(PluginRevokeTokenParams, params);
+        if (socket.data.authedRole !== "harness") {
+          throw new RpcFailure(ERR.UNAUTHORIZED, "plugin.revokeToken requires harness role");
+        }
+        opts.store.revokePluginToken(p.pluginId);
+        return { ok: true };
       }
 
       default:

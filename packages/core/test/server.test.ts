@@ -103,6 +103,24 @@ describe("daemon IPC", () => {
 
   afterEach(() => daemon?.stop());
 
+  // Phase 4b Task 2: a self-contained bare IPC server (own SessionStore + TokenAuthority, no
+  // AgentEngine/etc) for plugin-role tests that only need store+tokens — RunningDaemon doesn't
+  // expose its SessionStore, so the shared boot()/daemon fixture can't mint plugin tokens.
+  async function bootPluginTestServer(): Promise<{
+    store: SessionStore; socketPath: string; harnessToken: string; adminToken: string; stop: () => void;
+  }> {
+    const home = mkdtempSync(join(tmpdir(), "norma-plugin-role-"));
+    const store = new SessionStore(home);
+    const socketPath = join(home, "core.sock");
+    const authority = new TokenAuthority(new FileSecretStore(join(home, "secrets.json")));
+    const tokens = await authority.ensureTokens();
+    const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store });
+    return {
+      store, socketPath, harnessToken: tokens.harness, adminToken: tokens.admin,
+      stop: () => { server.stop(); store.close(); },
+    };
+  }
+
   test("methods before hello are rejected with UNAUTHORIZED", async () => {
     await boot();
     const c = await TestClient.connect(daemon.socketPath);
@@ -121,27 +139,53 @@ describe("daemon IPC", () => {
     c.close();
   });
 
-  // Phase 4b Task 1: the wire shape (Role already carries "plugin"; HelloParams now carries an
-  // optional pluginId) parses, but plugin token verification is Task 2 — TokenAuthority.verify()
-  // has no "plugin" entry in TOKEN_NAMES, so this fails closed today by construction. Pinned here
-  // so Task 2 changes this test's expectation deliberately rather than by accident.
-  test("plugin-role hello (with pluginId) is shape-valid but fails verification (no plugin token path yet) — never auths as harness", async () => {
-    await boot();
-    const c = await TestClient.connect(daemon.socketPath);
-    const res = await c.request(METHODS.hello, {
+  // Phase 4b Task 2: this test used to pin "fails closed by ABSENCE" (no plugin verification path
+  // existed at all — TokenAuthority.verify had no "plugin" entry). Now that SessionStore.
+  // mintPluginToken/verifyPluginToken exist, it flips to "fails closed by VERIFICATION" — every
+  // rejection path is deliberate (missing pluginId, never-minted id, wrong token), and a real
+  // minted token now succeeds. Kept as one test so the before/after contrast stays legible.
+  test("plugin-role hello: rejected with no pluginId / unknown id / wrong token; succeeds once a token is minted for that id", async () => {
+    const srv = await bootPluginTestServer();
+
+    const noId = await TestClient.connect(srv.socketPath);
+    const noIdRes = await noId.request(METHODS.hello, {
+      protocolVersion: PROTOCOL_VERSION, role: "plugin", token: "anything", clientName: "sample-echo",
+    });
+    expect(noIdRes.error.code).toBe(ERR.UNAUTHORIZED);
+    noId.close();
+
+    const unknownId = await TestClient.connect(srv.socketPath);
+    const unknownIdRes = await unknownId.request(METHODS.hello, {
       protocolVersion: PROTOCOL_VERSION, role: "plugin", token: "anything", clientName: "sample-echo", pluginId: "sample-echo",
     });
-    expect(res.error.code).toBe(ERR.UNAUTHORIZED);
+    expect(unknownIdRes.error.code).toBe(ERR.UNAUTHORIZED);
+    unknownId.close();
 
-    // Confirm the failed plugin hello never joined the harness broadcast set: a harness-created
-    // session_created event must not reach it (mirrors the "G2" bad-harness-token assertion above).
-    const harness = await TestClient.connect(daemon.socketPath);
-    await harness.hello(harnessToken, "control-harness");
+    const raw = srv.store.mintPluginToken("sample-echo");
+
+    const wrongToken = await TestClient.connect(srv.socketPath);
+    const wrongTokenRes = await wrongToken.request(METHODS.hello, {
+      protocolVersion: PROTOCOL_VERSION, role: "plugin", token: "0".repeat(64), clientName: "sample-echo", pluginId: "sample-echo",
+    });
+    expect(wrongTokenRes.error.code).toBe(ERR.UNAUTHORIZED);
+    wrongToken.close();
+
+    const c = await TestClient.connect(srv.socketPath);
+    const res = await c.request(METHODS.hello, {
+      protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: "sample-echo", pluginId: "sample-echo",
+    });
+    expect(res.result.ok).toBe(true);
+
+    // Confirm the plugin connection is tagged role "plugin" (not "harness"): it never joined the
+    // harness broadcast set, so a harness-created session_created event must not reach it (mirrors
+    // the "G2" bad-harness-token assertion above).
+    const harness = await TestClient.connect(srv.socketPath);
+    await harness.hello(srv.harnessToken, "control-harness");
     await harness.request(METHODS.sessionCreate, { scope: "global" });
     await new Promise((r) => setTimeout(r, 100));
     expect(c.notifications).toHaveLength(0);
 
-    c.close(); harness.close();
+    c.close(); harness.close(); srv.stop();
   });
 
   test("hello with wrong protocolVersion rejected with VERSION_MISMATCH", async () => {
@@ -1326,28 +1370,34 @@ describe("daemon IPC", () => {
     provider.close(); a.close(); b.close();
   });
 
-  test("peripheral.lease/renew/release from a non-harness (plugin) role are typed denied, never touching the broker", async () => {
+  // Phase 4b Task 2: this used to stub TokenAuthority to fake a "plugin"-role hello (no real
+  // plugin auth existed) and pinned the handlers' OWN defensive `authedRole !== "harness"` denied
+  // branch. Now that a real plugin-token path + a role→method allowlist exist, peripheral.lease/
+  // renew/release are NOT among the six plugin-role verbs (Task 2 contract), so a plugin
+  // connection is role-rejected by the allowlist gate BEFORE ever reaching those handlers — an
+  // even stronger form of "never touching the broker" than the old typed-denied result.
+  test("peripheral.lease/renew/release from a plugin-role connection are role-rejected before ever reaching the broker", async () => {
     const home = mkdtempSync(join(tmpdir(), "norma-peripheral-plugin-"));
     const store = new SessionStore(home);
     const socketPath = join(home, "core.sock");
-    // No plugin auth exists yet (TokenAuthority.verify has no plugin token) — stub the token
-    // authority so a "plugin"-role hello can succeed, isolating the ROLE guard itself (carried
-    // item #4: "implement the guard as a defensive check on role !== 'harness'").
-    const stubTokens = { verify: async (_role: string, token: string) => token === "plugin-tok" } as any;
+    const rawToken = store.mintPluginToken("plugin-client");
+    // `tokens` is never consulted for a role:"plugin" hello (routed through store.verifyPluginToken
+    // instead) — any object satisfying the type suffices.
+    const stubTokens = { verify: async () => false } as any;
     const server = startIpcServer({ socketPath, serverVersion: "test", tokens: stubTokens, store });
     try {
       const c = await TestClient.connect(socketPath);
       const hello = await c.request(METHODS.hello, {
-        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: "plugin-tok", clientName: "plugin-client",
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: rawToken, clientName: "plugin-client", pluginId: "plugin-client",
       });
       expect(hello.result.ok).toBe(true);
 
       const lease = await c.request(METHODS.peripheralLease, { sessionId: "s_whatever", class: "noop" });
-      expect(lease.result).toEqual({ code: "denied", reason: "plugin-leasing-not-yet-available" });
+      expect(lease.error?.code).toBe(ERR.UNAUTHORIZED);
       const renew = await c.request(METHODS.peripheralRenew, { sessionId: "s_whatever", leaseId: "l1", token: "t1" });
-      expect(renew.result).toEqual({ code: "denied", reason: "plugin-leasing-not-yet-available" });
+      expect(renew.error?.code).toBe(ERR.UNAUTHORIZED);
       const release = await c.request(METHODS.peripheralRelease, { sessionId: "s_whatever", leaseId: "l1", token: "t1" });
-      expect(release.result).toEqual({ code: "denied", reason: "plugin-leasing-not-yet-available" });
+      expect(release.error?.code).toBe(ERR.UNAUTHORIZED);
 
       c.close();
     } finally {
@@ -1623,5 +1673,115 @@ describe("daemon IPC", () => {
     const q = (await c.request(METHODS.quotaState, {})).result;
     expect(q).toEqual({ kind: "ok", inputTokens: 0, outputTokens: 0 });
     c.close();
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // Phase 4b Task 2: role→method allowlist for plugin connections (spec §3) + plugin.revokeToken.
+  // ---------------------------------------------------------------------------------------------
+  describe("plugin role method allowlist", () => {
+    async function setup(pluginId = "sample-echo"): Promise<{
+      srv: Awaited<ReturnType<typeof bootPluginTestServer>>; plugin: TestClient;
+    }> {
+      const srv = await bootPluginTestServer();
+      const raw = srv.store.mintPluginToken(pluginId);
+      const plugin = await TestClient.connect(srv.socketPath);
+      const hello = await plugin.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: pluginId, pluginId,
+      });
+      if (!hello.result?.ok) throw new Error(`test setup: plugin hello failed: ${JSON.stringify(hello.error)}`);
+      return { srv, plugin };
+    }
+
+    test("the six allowed verbs pass the role gate — never role-rejected, even though most handlers aren't wired until Task 4 (METHOD_NOT_FOUND instead)", async () => {
+      const { srv, plugin } = await setup();
+      for (const method of [
+        METHODS.pluginRegister, METHODS.toolRegister, METHODS.shortcutRegister,
+        METHODS.tileUpdate, METHODS.providerRegister, METHODS.pluginToolResult,
+      ]) {
+        const res = await plugin.request(method, {});
+        expect(res.error?.code).not.toBe(ERR.UNAUTHORIZED);
+      }
+      plugin.close(); srv.stop();
+    });
+
+    test("a representative set of everything else — incl. approval.respond and session.send — is role-rejected before dispatch", async () => {
+      const { srv, plugin } = await setup();
+      const attempts: Array<[string, unknown]> = [
+        [METHODS.sessionSend, { sessionId: "s_x", text: "hi" }],
+        [METHODS.sessionCreate, { scope: "global" }],
+        [METHODS.sessionList, {}],
+        [METHODS.sessionAttach, { sessionId: "s_x" }],
+        [METHODS.approvalRespond, { sessionId: "s_x", callId: "c_x", approved: true }],
+        [METHODS.askUserRespond, { sessionId: "s_x", callId: "c_x", answers: {} }],
+        [METHODS.peripheralLease, { sessionId: "s_x", class: "noop" }],
+        [METHODS.peripheralAdvertise, { classes: [] }],
+        [METHODS.daemonStatus, {}],
+        [METHODS.trustList, {}],
+        [METHODS.trustRemove, { path: "/tmp" }],
+        [METHODS.pluginsList, {}],
+      ];
+      for (const [method, params] of attempts) {
+        const res = await plugin.request(method, params);
+        expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      }
+      plugin.close(); srv.stop();
+    });
+
+    test("plugin.register from a HARNESS connection is not role-rejected (allowlist is per-role) but still hits METHOD_NOT_FOUND (unwired until Task 4)", async () => {
+      const srv = await bootPluginTestServer();
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "harness-trying-plugin-verb");
+      const res = await c.request(METHODS.pluginRegister, { pluginId: "sample-echo" });
+      expect(res.error?.code).toBe(ERR.METHOD_NOT_FOUND);
+      c.close(); srv.stop();
+    });
+  });
+
+  describe("plugin.revokeToken", () => {
+    test("harness role revokes a plugin's token; a subsequent plugin hello with the old raw token fails closed", async () => {
+      const srv = await bootPluginTestServer();
+      const raw = srv.store.mintPluginToken("sample-echo");
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "cli-plugin-disable");
+      const revoke = await harness.request(METHODS.pluginRevokeToken, { pluginId: "sample-echo" });
+      expect(revoke.result).toEqual({ ok: true });
+
+      const c = await TestClient.connect(srv.socketPath);
+      const hello = await c.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: "sample-echo", pluginId: "sample-echo",
+      });
+      expect(hello.error.code).toBe(ERR.UNAUTHORIZED);
+      harness.close(); c.close(); srv.stop();
+    });
+
+    test("revoking a never-minted plugin id is a no-op success (idempotent — disable/remove call this unconditionally)", async () => {
+      const srv = await bootPluginTestServer();
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "cli-plugin-disable");
+      const res = await harness.request(METHODS.pluginRevokeToken, { pluginId: "never-existed" });
+      expect(res.result).toEqual({ ok: true });
+      harness.close(); srv.stop();
+    });
+
+    test("plugin.revokeToken requires harness role — a plugin connection is role-rejected (it's not one of the six verbs)", async () => {
+      const srv = await bootPluginTestServer();
+      const raw = srv.store.mintPluginToken("sample-echo");
+      const c = await TestClient.connect(srv.socketPath);
+      await c.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: "sample-echo", pluginId: "sample-echo",
+      });
+      const res = await c.request(METHODS.pluginRevokeToken, { pluginId: "sample-echo" });
+      expect(res.error.code).toBe(ERR.UNAUTHORIZED);
+      c.close(); srv.stop();
+    });
+
+    test("an admin-role connection is also rejected (harness-only, same precedent as trust.remove)", async () => {
+      const srv = await bootPluginTestServer();
+      const admin = await TestClient.connect(srv.socketPath);
+      await admin.hello(srv.adminToken, "admin-conn", "admin");
+      const res = await admin.request(METHODS.pluginRevokeToken, { pluginId: "sample-echo" });
+      expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      admin.close(); srv.stop();
+    });
   });
 });
