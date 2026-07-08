@@ -61,6 +61,22 @@ import {
   TrustListResult,
   TrustRemoveParams,
   TrustRemoveResult,
+  PluginRegisterParams,
+  PluginRegisterResult,
+  ToolRegisterParams,
+  ToolRegisterResult,
+  ShortcutRegisterParams,
+  ShortcutRegisterResult,
+  TileUpdateParams,
+  TileUpdateResult,
+  ProviderRegisterParams,
+  ProviderRegisterResult,
+  PluginToolResultParams,
+  PluginToolResultResult,
+  PluginRevokeTokenParams,
+  PluginRevokeTokenResult,
+  PluginRestartParams,
+  PluginRestartResult,
   METHODS,
 } from "../src/methods";
 
@@ -387,5 +403,97 @@ describe("thread.list schema", () => {
     const r = ThreadListResult.parse({ ok: true, threads: [info] });
     expect(r.threads).toHaveLength(1);
     expect(METHODS.threadList).toBe("thread.list");
+  });
+});
+
+describe("plugin verbs (Phase 4b Task 1, spec §3)", () => {
+  test("METHODS carries the six plugin verbs", () => {
+    expect(METHODS.pluginRegister).toBe("plugin.register");
+    expect(METHODS.toolRegister).toBe("tool.register");
+    expect(METHODS.shortcutRegister).toBe("shortcut.register");
+    expect(METHODS.tileUpdate).toBe("tile.update");
+    expect(METHODS.providerRegister).toBe("provider.register");
+    expect(METHODS.pluginToolResult).toBe("plugin.toolResult");
+  });
+
+  test("plugin.register params/result", () => {
+    expect(PluginRegisterParams.parse({ pluginId: "sample-echo" }).pluginId).toBe("sample-echo");
+    expect(() => PluginRegisterParams.parse({ pluginId: "" })).toThrow();
+    expect(PluginRegisterResult.parse({ ok: true })).toEqual({ ok: true });
+  });
+
+  test("tool.register params/result: parameters optional, registeredAs required in result", () => {
+    const bare = ToolRegisterParams.parse({ name: "echo", description: "Echo the input back" });
+    expect(bare.parameters).toBeUndefined();
+    const withParams = ToolRegisterParams.parse({
+      name: "echo", description: "Echo the input back",
+      parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+    });
+    expect(withParams.parameters).toMatchObject({ type: "object" });
+    expect(() => ToolRegisterParams.parse({ name: "", description: "x" })).toThrow();
+    expect(() => ToolRegisterParams.parse({ name: "echo", description: "" })).toThrow();
+    expect(ToolRegisterResult.parse({ ok: true, registeredAs: "plugin__sample-echo__echo" }).registeredAs)
+      .toBe("plugin__sample-echo__echo");
+    expect(() => ToolRegisterResult.parse({ ok: true, registeredAs: "" })).toThrow();
+  });
+
+  test("tool.register name charset (final-review Fix 3): alphanumeric + single -/_ separators only — no __, no leading/trailing _, no other punctuation", () => {
+    for (const ok of ["echo", "read-file", "read_file", "a1-b2_c3", "UPPER", "123"]) {
+      expect(ToolRegisterParams.parse({ name: ok, description: "d" }).name).toBe(ok);
+    }
+    for (const bad of ["read__file", "_leading", "trailing_", "__", "has space", "has.dot", "has/slash", "emoji🎉"]) {
+      expect(() => ToolRegisterParams.parse({ name: bad, description: "d" })).toThrow();
+    }
+  });
+
+  test("shortcut.register params/result: description/default optional, id required", () => {
+    const p = ShortcutRegisterParams.parse({
+      shortcuts: [{ id: "toggle-limiter" }, { id: "boost", description: "Boost charging", default: "cmd+shift+b" }],
+    });
+    expect(p.shortcuts).toHaveLength(2);
+    expect(p.shortcuts[0]!.description).toBeUndefined();
+    expect(p.shortcuts[1]!.default).toBe("cmd+shift+b");
+    expect(() => ShortcutRegisterParams.parse({ shortcuts: [{ id: "" }] })).toThrow();
+    expect(ShortcutRegisterResult.parse({ ok: true })).toEqual({ ok: true });
+  });
+
+  test("tile.update params/result: tile is an opaque record", () => {
+    const p = TileUpdateParams.parse({ tile: { title: "Charge Limit", value: "80%", progress: 0.8 } });
+    expect(p.tile).toMatchObject({ title: "Charge Limit" });
+    expect(TileUpdateResult.parse({ ok: true })).toEqual({ ok: true });
+  });
+
+  test("provider.register params/result: reserved-minimal, info is an opaque record", () => {
+    const p = ProviderRegisterParams.parse({ info: { id: "local-models", model: "llama-3" } });
+    expect(p.info).toMatchObject({ id: "local-models" });
+    expect(ProviderRegisterResult.parse({ ok: true })).toEqual({ ok: true });
+  });
+
+  test("plugin.toolResult params/result: mirrors peripheral.respond's shape minus alreadyResolved", () => {
+    expect(PluginToolResultParams.parse({ requestId: "req_1", resultJson: "{\"echo\":\"hi\"}" }).requestId).toBe("req_1");
+    expect(PluginToolResultParams.parse({ requestId: "req_1", error: "plugin sample-echo crashed during echo" }).error)
+      .toBe("plugin sample-echo crashed during echo");
+    expect(() => PluginToolResultParams.parse({ requestId: "" })).toThrow();
+    expect(PluginToolResultResult.parse({ ok: true })).toEqual({ ok: true });
+  });
+});
+
+describe("plugin.revokeToken (Phase 4b Task 2, spec §3 — harness-role admin verb, NOT one of the six plugin verbs)", () => {
+  test("METHODS carries it; params require a non-empty pluginId; result is a plain ok", () => {
+    expect(METHODS.pluginRevokeToken).toBe("plugin.revokeToken");
+    expect(PluginRevokeTokenParams.parse({ pluginId: "sample-echo" }).pluginId).toBe("sample-echo");
+    expect(() => PluginRevokeTokenParams.parse({ pluginId: "" })).toThrow();
+    expect(() => PluginRevokeTokenParams.parse({})).toThrow();
+    expect(PluginRevokeTokenResult.parse({ ok: true })).toEqual({ ok: true });
+  });
+});
+
+describe("plugin.restart (final-review Fix 1 — restart rider, recovers a circuit-open plugin; harness/admin role like plugins.list, NOT one of the six plugin verbs)", () => {
+  test("METHODS carries it; params require a non-empty pluginId; result is a plain ok", () => {
+    expect(METHODS.pluginRestart).toBe("plugin.restart");
+    expect(PluginRestartParams.parse({ pluginId: "sample-echo" }).pluginId).toBe("sample-echo");
+    expect(() => PluginRestartParams.parse({ pluginId: "" })).toThrow();
+    expect(() => PluginRestartParams.parse({})).toThrow();
+    expect(PluginRestartResult.parse({ ok: true })).toEqual({ ok: true });
   });
 });

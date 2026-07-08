@@ -32,6 +32,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
     case leaseGranted(LeaseGranted)
     case leaseLost(LeaseLost)
     case peripheralCallRequested(PeripheralCallRequested)
+    case pluginToolInvoke(PluginToolInvoke)
 
     public struct SessionCreated: Codable, Equatable, Sendable {
         public let seq: Int
@@ -357,6 +358,20 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         public let payloadJson: String
     }
 
+    /// TRANSIENT (broadcast-only, like `assistant_delta`/the lease events above) — core pushes
+    /// this to a plugin's own connection (the same approval-broker request/response pattern as
+    /// `PeripheralCallRequested`); the plugin answers via `plugin.toolResult`
+    /// {requestId, resultJson?, error?}.
+    public struct PluginToolInvoke: Codable, Equatable, Sendable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let requestId: String
+        public let tool: String
+        public let argsJson: String
+    }
+
     private enum Discriminator: String, Codable {
         case session_created
         case harness_attached
@@ -389,6 +404,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         case lease_granted
         case lease_lost
         case peripheral_call_requested
+        case plugin_tool_invoke
     }
 
     private enum TypeKey: String, CodingKey { case type }
@@ -427,6 +443,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         case .lease_granted:        self = .leaseGranted(try LeaseGranted(from: decoder))
         case .lease_lost:           self = .leaseLost(try LeaseLost(from: decoder))
         case .peripheral_call_requested: self = .peripheralCallRequested(try PeripheralCallRequested(from: decoder))
+        case .plugin_tool_invoke:   self = .pluginToolInvoke(try PluginToolInvoke(from: decoder))
         }
     }
 
@@ -556,6 +573,10 @@ public enum SessionEvent: Codable, Equatable, Sendable {
             try v.encode(to: encoder)
             var c = encoder.container(keyedBy: TypeKey.self)
             try c.encode(Discriminator.peripheral_call_requested.rawValue, forKey: .type)
+        case .pluginToolInvoke(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.plugin_tool_invoke.rawValue, forKey: .type)
         }
     }
 }

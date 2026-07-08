@@ -1,0 +1,8 @@
+{
+  "name": "sample-echo",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@norma/plugin-sdk": "workspace:*"
+  }
+}

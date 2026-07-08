@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
 import { SessionEvent, type NewSessionEvent } from "@norma/protocol";
 
 // Keep in sync with SessionCreateParams scope regex (packages/protocol/src/methods.ts).
@@ -56,6 +56,14 @@ export class SessionStore {
         if (!String((e as Error).message ?? e).includes("duplicate column")) throw e;
       }
     }
+    // Phase 4b Task 2 (spec §3 "Plugin role tokens"): a brand-new table, so CREATE TABLE IF NOT
+    // EXISTS alone is enough — no column-migration loop needed (unlike `sessions` above, which
+    // predates several of its columns). One row per plugin id; re-minting upserts (rotates).
+    this.db.run(`CREATE TABLE IF NOT EXISTS plugin_tokens (
+      plugin_id TEXT PRIMARY KEY,
+      token_hash TEXT NOT NULL,
+      minted_at INTEGER NOT NULL
+    )`);
     this.recoverAll();
   }
 
@@ -244,6 +252,48 @@ export class SessionStore {
     const p = row.approval_policy;
     const approvalPolicy: "ask" | "auto" | "plan" = p === "auto" ? "auto" : p === "plan" ? "plan" : "ask";
     return { sessionId, scope: row.scope, cwd: row.cwd, approvalPolicy };
+  }
+
+  // -----------------------------------------------------------------------------------------
+  // Plugin role tokens (Phase 4b Task 2, spec §3): minted daemon-side (at supervisor spawn —
+  // Task 3 — or lazily by whatever caller needs one; the CLI never opens this sqlite directly,
+  // see plugin.revokeToken in ipc/server.ts), delivered to the plugin process via env only, and
+  // verified id-bound on the socket hello. Only the sha256 HASH is ever persisted; the raw value
+  // is returned exactly once by mintPluginToken and is never logged.
+  // -----------------------------------------------------------------------------------------
+
+  /** Mints a fresh 32-byte-random hex token for `pluginId` and persists ONLY its sha256 hash
+   *  (upsert — re-minting an already-minted id rotates the token, invalidating any previously
+   *  issued raw value). Returns the RAW token — the one and only time it is ever observable. */
+  mintPluginToken(pluginId: string): string {
+    const raw = randomBytes(32).toString("hex");
+    const hash = createHash("sha256").update(raw).digest("hex");
+    this.db.run(
+      `INSERT INTO plugin_tokens (plugin_id, token_hash, minted_at) VALUES (?, ?, ?)
+       ON CONFLICT(plugin_id) DO UPDATE SET token_hash = excluded.token_hash, minted_at = excluded.minted_at`,
+      [pluginId, hash, Date.now()],
+    );
+    return raw;
+  }
+
+  /** sha256(raw) compared against the id's stored hash — length-guarded timingSafeEqual, same
+   *  precedent as TokenAuthority.verify (auth/tokens.ts:30-31). Id-bound: a token minted for one
+   *  plugin id never verifies for a different id. An unknown (never-minted or revoked) id fails
+   *  closed rather than throwing. */
+  verifyPluginToken(pluginId: string, raw: string): boolean {
+    const row = this.db.query("SELECT token_hash FROM plugin_tokens WHERE plugin_id = ?").get(pluginId) as
+      | { token_hash: string } | null;
+    if (!row) return false;
+    const hash = createHash("sha256").update(raw).digest("hex");
+    const a = Buffer.from(row.token_hash);
+    const b = Buffer.from(hash);
+    return a.length === b.length && timingSafeEqual(a, b);
+  }
+
+  /** Deletes the token record so subsequent verifyPluginToken calls fail closed. A no-op (not a
+   *  throw) when nothing was ever minted for this id — disable/remove call this unconditionally. */
+  revokePluginToken(pluginId: string): void {
+    this.db.run("DELETE FROM plugin_tokens WHERE plugin_id = ?", [pluginId]);
   }
 
   close(): void { this.db.close(); }

@@ -9,6 +9,9 @@ import { SessionStore } from "../src/sessions/store";
 import { FileSecretStore } from "../src/auth/secret-store";
 import { TokenAuthority } from "../src/auth/tokens";
 import { PluginStore } from "../src/agent/plugins";
+import { ToolRegistry } from "../src/agent/tools/registry";
+import { PluginSupervisor } from "../src/plugins/supervisor";
+import { PluginContribRegistry } from "../src/plugins/contrib";
 import type { Provider } from "../src/providers/types";
 
 /** Minimal raw test client speaking NDJSON JSON-RPC. */
@@ -103,6 +106,24 @@ describe("daemon IPC", () => {
 
   afterEach(() => daemon?.stop());
 
+  // Phase 4b Task 2: a self-contained bare IPC server (own SessionStore + TokenAuthority, no
+  // AgentEngine/etc) for plugin-role tests that only need store+tokens — RunningDaemon doesn't
+  // expose its SessionStore, so the shared boot()/daemon fixture can't mint plugin tokens.
+  async function bootPluginTestServer(): Promise<{
+    store: SessionStore; socketPath: string; harnessToken: string; adminToken: string; stop: () => void;
+  }> {
+    const home = mkdtempSync(join(tmpdir(), "norma-plugin-role-"));
+    const store = new SessionStore(home);
+    const socketPath = join(home, "core.sock");
+    const authority = new TokenAuthority(new FileSecretStore(join(home, "secrets.json")));
+    const tokens = await authority.ensureTokens();
+    const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store });
+    return {
+      store, socketPath, harnessToken: tokens.harness, adminToken: tokens.admin,
+      stop: () => { server.stop(); store.close(); },
+    };
+  }
+
   test("methods before hello are rejected with UNAUTHORIZED", async () => {
     await boot();
     const c = await TestClient.connect(daemon.socketPath);
@@ -119,6 +140,55 @@ describe("daemon IPC", () => {
     expect(ok.result.ok).toBe(true);
     expect(ok.result.protocolVersion).toBe(PROTOCOL_VERSION);
     c.close();
+  });
+
+  // Phase 4b Task 2: this test used to pin "fails closed by ABSENCE" (no plugin verification path
+  // existed at all — TokenAuthority.verify had no "plugin" entry). Now that SessionStore.
+  // mintPluginToken/verifyPluginToken exist, it flips to "fails closed by VERIFICATION" — every
+  // rejection path is deliberate (missing pluginId, never-minted id, wrong token), and a real
+  // minted token now succeeds. Kept as one test so the before/after contrast stays legible.
+  test("plugin-role hello: rejected with no pluginId / unknown id / wrong token; succeeds once a token is minted for that id", async () => {
+    const srv = await bootPluginTestServer();
+
+    const noId = await TestClient.connect(srv.socketPath);
+    const noIdRes = await noId.request(METHODS.hello, {
+      protocolVersion: PROTOCOL_VERSION, role: "plugin", token: "anything", clientName: "sample-echo",
+    });
+    expect(noIdRes.error.code).toBe(ERR.UNAUTHORIZED);
+    noId.close();
+
+    const unknownId = await TestClient.connect(srv.socketPath);
+    const unknownIdRes = await unknownId.request(METHODS.hello, {
+      protocolVersion: PROTOCOL_VERSION, role: "plugin", token: "anything", clientName: "sample-echo", pluginId: "sample-echo",
+    });
+    expect(unknownIdRes.error.code).toBe(ERR.UNAUTHORIZED);
+    unknownId.close();
+
+    const raw = srv.store.mintPluginToken("sample-echo");
+
+    const wrongToken = await TestClient.connect(srv.socketPath);
+    const wrongTokenRes = await wrongToken.request(METHODS.hello, {
+      protocolVersion: PROTOCOL_VERSION, role: "plugin", token: "0".repeat(64), clientName: "sample-echo", pluginId: "sample-echo",
+    });
+    expect(wrongTokenRes.error.code).toBe(ERR.UNAUTHORIZED);
+    wrongToken.close();
+
+    const c = await TestClient.connect(srv.socketPath);
+    const res = await c.request(METHODS.hello, {
+      protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: "sample-echo", pluginId: "sample-echo",
+    });
+    expect(res.result.ok).toBe(true);
+
+    // Confirm the plugin connection is tagged role "plugin" (not "harness"): it never joined the
+    // harness broadcast set, so a harness-created session_created event must not reach it (mirrors
+    // the "G2" bad-harness-token assertion above).
+    const harness = await TestClient.connect(srv.socketPath);
+    await harness.hello(srv.harnessToken, "control-harness");
+    await harness.request(METHODS.sessionCreate, { scope: "global" });
+    await new Promise((r) => setTimeout(r, 100));
+    expect(c.notifications).toHaveLength(0);
+
+    c.close(); harness.close(); srv.stop();
   });
 
   test("hello with wrong protocolVersion rejected with VERSION_MISMATCH", async () => {
@@ -1303,28 +1373,34 @@ describe("daemon IPC", () => {
     provider.close(); a.close(); b.close();
   });
 
-  test("peripheral.lease/renew/release from a non-harness (plugin) role are typed denied, never touching the broker", async () => {
+  // Phase 4b Task 2: this used to stub TokenAuthority to fake a "plugin"-role hello (no real
+  // plugin auth existed) and pinned the handlers' OWN defensive `authedRole !== "harness"` denied
+  // branch. Now that a real plugin-token path + a role→method allowlist exist, peripheral.lease/
+  // renew/release are NOT among the six plugin-role verbs (Task 2 contract), so a plugin
+  // connection is role-rejected by the allowlist gate BEFORE ever reaching those handlers — an
+  // even stronger form of "never touching the broker" than the old typed-denied result.
+  test("peripheral.lease/renew/release from a plugin-role connection are role-rejected before ever reaching the broker", async () => {
     const home = mkdtempSync(join(tmpdir(), "norma-peripheral-plugin-"));
     const store = new SessionStore(home);
     const socketPath = join(home, "core.sock");
-    // No plugin auth exists yet (TokenAuthority.verify has no plugin token) — stub the token
-    // authority so a "plugin"-role hello can succeed, isolating the ROLE guard itself (carried
-    // item #4: "implement the guard as a defensive check on role !== 'harness'").
-    const stubTokens = { verify: async (_role: string, token: string) => token === "plugin-tok" } as any;
+    const rawToken = store.mintPluginToken("plugin-client");
+    // `tokens` is never consulted for a role:"plugin" hello (routed through store.verifyPluginToken
+    // instead) — any object satisfying the type suffices.
+    const stubTokens = { verify: async () => false } as any;
     const server = startIpcServer({ socketPath, serverVersion: "test", tokens: stubTokens, store });
     try {
       const c = await TestClient.connect(socketPath);
       const hello = await c.request(METHODS.hello, {
-        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: "plugin-tok", clientName: "plugin-client",
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: rawToken, clientName: "plugin-client", pluginId: "plugin-client",
       });
       expect(hello.result.ok).toBe(true);
 
       const lease = await c.request(METHODS.peripheralLease, { sessionId: "s_whatever", class: "noop" });
-      expect(lease.result).toEqual({ code: "denied", reason: "plugin-leasing-not-yet-available" });
+      expect(lease.error?.code).toBe(ERR.UNAUTHORIZED);
       const renew = await c.request(METHODS.peripheralRenew, { sessionId: "s_whatever", leaseId: "l1", token: "t1" });
-      expect(renew.result).toEqual({ code: "denied", reason: "plugin-leasing-not-yet-available" });
+      expect(renew.error?.code).toBe(ERR.UNAUTHORIZED);
       const release = await c.request(METHODS.peripheralRelease, { sessionId: "s_whatever", leaseId: "l1", token: "t1" });
-      expect(release.result).toEqual({ code: "denied", reason: "plugin-leasing-not-yet-available" });
+      expect(release.error?.code).toBe(ERR.UNAUTHORIZED);
 
       c.close();
     } finally {
@@ -1600,5 +1676,467 @@ describe("daemon IPC", () => {
     const q = (await c.request(METHODS.quotaState, {})).result;
     expect(q).toEqual({ kind: "ok", inputTokens: 0, outputTokens: 0 });
     c.close();
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // Phase 4b Task 2: role→method allowlist for plugin connections (spec §3) + plugin.revokeToken.
+  // ---------------------------------------------------------------------------------------------
+  describe("plugin role method allowlist", () => {
+    async function setup(pluginId = "sample-echo"): Promise<{
+      srv: Awaited<ReturnType<typeof bootPluginTestServer>>; plugin: TestClient;
+    }> {
+      const srv = await bootPluginTestServer();
+      const raw = srv.store.mintPluginToken(pluginId);
+      const plugin = await TestClient.connect(srv.socketPath);
+      const hello = await plugin.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: pluginId, pluginId,
+      });
+      if (!hello.result?.ok) throw new Error(`test setup: plugin hello failed: ${JSON.stringify(hello.error)}`);
+      return { srv, plugin };
+    }
+
+    test("the six allowed verbs pass the role gate — never role-rejected (Task 4's handlers reject empty {} params as INVALID_PARAMS instead, which proves dispatch reached the handler, not the allowlist)", async () => {
+      const { srv, plugin } = await setup();
+      for (const method of [
+        METHODS.pluginRegister, METHODS.toolRegister, METHODS.shortcutRegister,
+        METHODS.tileUpdate, METHODS.providerRegister, METHODS.pluginToolResult,
+      ]) {
+        const res = await plugin.request(method, {});
+        expect(res.error?.code).not.toBe(ERR.UNAUTHORIZED);
+      }
+      plugin.close(); srv.stop();
+    });
+
+    test("a representative set of everything else — incl. approval.respond and session.send — is role-rejected before dispatch", async () => {
+      const { srv, plugin } = await setup();
+      const attempts: Array<[string, unknown]> = [
+        [METHODS.sessionSend, { sessionId: "s_x", text: "hi" }],
+        [METHODS.sessionCreate, { scope: "global" }],
+        [METHODS.sessionList, {}],
+        [METHODS.sessionAttach, { sessionId: "s_x" }],
+        [METHODS.approvalRespond, { sessionId: "s_x", callId: "c_x", approved: true }],
+        [METHODS.askUserRespond, { sessionId: "s_x", callId: "c_x", answers: {} }],
+        [METHODS.peripheralLease, { sessionId: "s_x", class: "noop" }],
+        [METHODS.peripheralAdvertise, { classes: [] }],
+        [METHODS.daemonStatus, {}],
+        [METHODS.trustList, {}],
+        [METHODS.trustRemove, { path: "/tmp" }],
+        [METHODS.pluginsList, {}],
+      ];
+      for (const [method, params] of attempts) {
+        const res = await plugin.request(method, params);
+        expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      }
+      plugin.close(); srv.stop();
+    });
+
+    // Phase 4b Task 4: now that plugin.register is wired, a harness connection reaching it is
+    // rejected for a DIFFERENT reason than an allowlist rejection — the allowlist only restricts
+    // plugin-role connections (never widens who else may call these six), so dispatch reaches the
+    // handler; the handler's OWN identity check then fails closed because a harness connection's
+    // `socket.data.pluginId` is always null (only a role:"plugin" hello ever sets it), which can
+    // never match any wire `pluginId`. The message text (not just the code) distinguishes this from
+    // the allowlist's own UNAUTHORIZED rejection, proving it's the handler, not the gate above it.
+    test("plugin.register from a HARNESS connection is not role-rejected by the allowlist — it fails the handler's own pluginId-match check instead", async () => {
+      const srv = await bootPluginTestServer();
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "harness-trying-plugin-verb");
+      const res = await c.request(METHODS.pluginRegister, { pluginId: "sample-echo" });
+      expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      expect(res.error?.message).not.toMatch(/plugin role may not call/); // proves it wasn't the allowlist gate
+      expect(res.error?.message).toContain("pluginId does not match");
+      c.close(); srv.stop();
+    });
+  });
+
+  describe("plugin.revokeToken", () => {
+    test("harness role revokes a plugin's token; a subsequent plugin hello with the old raw token fails closed", async () => {
+      const srv = await bootPluginTestServer();
+      const raw = srv.store.mintPluginToken("sample-echo");
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "cli-plugin-disable");
+      const revoke = await harness.request(METHODS.pluginRevokeToken, { pluginId: "sample-echo" });
+      expect(revoke.result).toEqual({ ok: true });
+
+      const c = await TestClient.connect(srv.socketPath);
+      const hello = await c.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: "sample-echo", pluginId: "sample-echo",
+      });
+      expect(hello.error.code).toBe(ERR.UNAUTHORIZED);
+      harness.close(); c.close(); srv.stop();
+    });
+
+    test("revoking a never-minted plugin id is a no-op success (idempotent — disable/remove call this unconditionally)", async () => {
+      const srv = await bootPluginTestServer();
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "cli-plugin-disable");
+      const res = await harness.request(METHODS.pluginRevokeToken, { pluginId: "never-existed" });
+      expect(res.result).toEqual({ ok: true });
+      harness.close(); srv.stop();
+    });
+
+    test("plugin.revokeToken requires harness role — a plugin connection is role-rejected (it's not one of the six verbs)", async () => {
+      const srv = await bootPluginTestServer();
+      const raw = srv.store.mintPluginToken("sample-echo");
+      const c = await TestClient.connect(srv.socketPath);
+      await c.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: "sample-echo", pluginId: "sample-echo",
+      });
+      const res = await c.request(METHODS.pluginRevokeToken, { pluginId: "sample-echo" });
+      expect(res.error.code).toBe(ERR.UNAUTHORIZED);
+      c.close(); srv.stop();
+    });
+
+    test("an admin-role connection is also rejected (harness-only, same precedent as trust.remove)", async () => {
+      const srv = await bootPluginTestServer();
+      const admin = await TestClient.connect(srv.socketPath);
+      await admin.hello(srv.adminToken, "admin-conn", "admin");
+      const res = await admin.request(METHODS.pluginRevokeToken, { pluginId: "sample-echo" });
+      expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      admin.close(); srv.stop();
+    });
+  });
+
+  // -----------------------------------------------------------------------------------------
+  // plugin.restart (final-review Fix 1): PluginSupervisor.restart() existed and was unit-tested
+  // (test/plugins/supervisor.test.ts) but had no IPC caller — wired here against a REAL supervisor
+  // (fake spawn/isAlivePid/signalPid, same injection precedent as "plugin tool bridge (Task 4)"
+  // below) so a circuit-open plugin can actually be driven and observed re-spawning through the
+  // wire, not just through the supervisor's own direct API.
+  // -----------------------------------------------------------------------------------------
+  describe("plugin.restart", () => {
+    async function bootRestartServer(): Promise<{
+      store: SessionStore; socketPath: string; harnessToken: string; adminToken: string;
+      supervisor: PluginSupervisor; stop: () => void;
+    }> {
+      const home = mkdtempSync(join(tmpdir(), "norma-plugin-restart-"));
+      const store = new SessionStore(home);
+      const socketPath = join(home, "core.sock");
+      const authority = new TokenAuthority(new FileSecretStore(join(home, "secrets.json")));
+      const tokens = await authority.ensureTokens();
+      let nextPid = 7000;
+      const supervisor = new PluginSupervisor({
+        runDir: join(home, "run"),
+        socketPath,
+        mintToken: (id) => store.mintPluginToken(id),
+        spawn: () => ({ pid: nextPid++, kill: () => {}, exited: new Promise<number>(() => {}) }),
+        isAlivePid: () => false,
+        signalPid: () => {},
+        // registrationTimeoutMs + circuitFailures:1 drives a fresh spawn straight to circuit-open
+        // (the fake process never registers) fast — same recipe as
+        // supervisor.test.ts's "restart() (manual restart rider)" describe block.
+        settings: { registrationTimeoutMs: 10, backoffCapMs: 10, circuitFailures: 1, circuitWindowMs: 600_000 },
+      });
+      const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, supervisor });
+      return {
+        store, socketPath, harnessToken: tokens.harness, adminToken: tokens.admin, supervisor,
+        stop: () => { supervisor.stopAll(); server.stop(); store.close(); },
+      };
+    }
+
+    test("harness role restarts a circuit-open plugin — it respawns", async () => {
+      const srv = await bootRestartServer();
+      const pluginId = "sample-echo";
+      srv.supervisor.startAll([{ id: pluginId, dir: `/plugins/${pluginId}`, entry: { command: "bun" } }]);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(srv.supervisor.status(pluginId)).toBe("circuit-open");
+
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "cli-plugin-restart");
+      const res = await harness.request(METHODS.pluginRestart, { pluginId });
+      expect(res.result).toEqual({ ok: true });
+      expect(srv.supervisor.status(pluginId)).toBe("starting"); // respawned — no longer stuck
+
+      harness.close(); srv.stop();
+    });
+
+    test("an admin-role connection may also restart (harness/admin, like plugins.list — unlike plugin.revokeToken's harness-only gate)", async () => {
+      const srv = await bootRestartServer();
+      const pluginId = "sample-echo";
+      srv.supervisor.startAll([{ id: pluginId, dir: `/plugins/${pluginId}`, entry: { command: "bun" } }]);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(srv.supervisor.status(pluginId)).toBe("circuit-open");
+
+      const admin = await TestClient.connect(srv.socketPath);
+      await admin.hello(srv.adminToken, "admin-restart", "admin");
+      const res = await admin.request(METHODS.pluginRestart, { pluginId });
+      expect(res.result).toEqual({ ok: true });
+      expect(srv.supervisor.status(pluginId)).toBe("starting");
+
+      admin.close(); srv.stop();
+    });
+
+    test("restarting an unknown plugin id -> typed NOT_FOUND, never a crash", async () => {
+      const srv = await bootRestartServer();
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "cli-plugin-restart");
+      const res = await harness.request(METHODS.pluginRestart, { pluginId: "never-existed" });
+      expect(res.error?.code).toBe(ERR.NOT_FOUND);
+      harness.close(); srv.stop();
+    });
+
+    test("plugin.restart is not one of the six plugin-role verbs — a plugin connection is role-rejected before dispatch", async () => {
+      const srv = await bootRestartServer();
+      const raw = srv.store.mintPluginToken("sample-echo");
+      const c = await TestClient.connect(srv.socketPath);
+      await c.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: "sample-echo", pluginId: "sample-echo",
+      });
+      const res = await c.request(METHODS.pluginRestart, { pluginId: "sample-echo" });
+      expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      c.close(); srv.stop();
+    });
+  });
+
+  // -----------------------------------------------------------------------------------------
+  // Plugin tool bridge (Phase 4b Task 4, spec §3): plugin.register/tool.register/
+  // plugin.toolResult wired to a real PluginSupervisor + ToolRegistry (constructed directly here,
+  // mirroring daemon.ts's own wiring, exactly like the "noop capability call round-trips..." test
+  // above constructs PeripheralBroker/ProviderLink directly instead of going through startDaemon);
+  // shortcut.register/tile.update/provider.register wired to PluginContribRegistry.
+  // -----------------------------------------------------------------------------------------
+  describe("plugin tool bridge (Task 4)", () => {
+    async function bootBridgeServer(): Promise<{
+      store: SessionStore; socketPath: string; harnessToken: string;
+      registry: ToolRegistry; supervisor: PluginSupervisor; contrib: PluginContribRegistry;
+      stop: () => void;
+    }> {
+      const home = mkdtempSync(join(tmpdir(), "norma-plugin-bridge-"));
+      const store = new SessionStore(home);
+      const socketPath = join(home, "core.sock");
+      const authority = new TokenAuthority(new FileSecretStore(join(home, "secrets.json")));
+      const tokens = await authority.ensureTokens();
+      const registry = new ToolRegistry();
+      let nextPid = 9000;
+      // Injected spawn/isAlivePid/signalPid — mirrors test/plugins/supervisor.test.ts's fixtures
+      // (fakeProc/makeSpawnFn) so the supervisor's bookkeeping (PID files, backoff/circuit
+      // failAttempt path) runs for real, but never touches an actual OS process. The "plugin
+      // process" in every test below is really a scripted TestClient connecting over the real
+      // socket — the fake spawn just gives the supervisor a runtime entry ("starting" status) for
+      // plugin.register to transition out of.
+      const supervisor = new PluginSupervisor({
+        runDir: join(home, "run"),
+        socketPath,
+        mintToken: (id) => store.mintPluginToken(id),
+        spawn: () => ({ pid: nextPid++, kill: () => {}, exited: new Promise<number>(() => {}) }),
+        isAlivePid: () => false,
+        signalPid: () => {},
+        settings: { registrationTimeoutMs: 5000, backoffCapMs: 100, circuitFailures: 5, circuitWindowMs: 600_000 },
+      });
+      const contrib = new PluginContribRegistry();
+      const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, registry, supervisor, contrib });
+      return {
+        store, socketPath, harnessToken: tokens.harness, registry, supervisor, contrib,
+        stop: () => { supervisor.stopAll(); server.stop(); store.close(); },
+      };
+    }
+
+    /** Spawns (fake) + hellos + plugin.registers a plugin connection — every test below starts
+     *  from here, exactly mirroring the SDK's own hello → plugin.register sequence (Task 5). */
+    async function registerAndHello(srv: Awaited<ReturnType<typeof bootBridgeServer>>, pluginId: string): Promise<TestClient> {
+      srv.supervisor.startAll([{ id: pluginId, dir: `/plugins/${pluginId}`, entry: { command: "bun", args: ["index.ts"] } }]);
+      const raw = srv.store.mintPluginToken(pluginId);
+      const plugin = await TestClient.connect(srv.socketPath);
+      const hello = await plugin.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: pluginId, pluginId,
+      });
+      if (!hello.result?.ok) throw new Error(`test setup: plugin hello failed: ${JSON.stringify(hello.error)}`);
+      const reg = await plugin.request(METHODS.pluginRegister, { pluginId });
+      expect(reg.result).toEqual({ ok: true });
+      expect(srv.supervisor.status(pluginId)).toBe("running");
+      return plugin;
+    }
+
+    test("register -> tool callable through registry.execute: round-trips to the plugin conn's plugin_tool_invoke and resolves via plugin.toolResult", async () => {
+      const srv = await bootBridgeServer();
+      const pluginId = "sample-echo";
+      const plugin = await registerAndHello(srv, pluginId);
+
+      const toolReg = await plugin.request(METHODS.toolRegister, { name: "echo", description: "echoes text back" });
+      expect(toolReg.result.ok).toBe(true);
+      expect(toolReg.result.registeredAs).toBe(`plugin__${pluginId}__echo`);
+      expect(srv.registry.has(toolReg.result.registeredAs)).toBe(true);
+
+      const execPromise = srv.registry.execute(
+        toolReg.result.registeredAs,
+        { text: "hi" },
+        { cwd: "/", roots: ["/"], sessionId: "s1" },
+      );
+
+      const invoked = await plugin.waitForNotification((n) => n.method === METHODS.event && n.params.type === "plugin_tool_invoke");
+      expect(invoked.params.tool).toBe("echo");
+      expect(JSON.parse(invoked.params.argsJson)).toEqual({ text: "hi" });
+
+      const resolved = await plugin.request(METHODS.pluginToolResult, {
+        requestId: invoked.params.requestId,
+        resultJson: JSON.stringify({ echo: "hi" }),
+      });
+      expect(resolved.result).toEqual({ ok: true });
+
+      const outcome = await execPromise;
+      expect(outcome.isError).toBe(false);
+      expect(JSON.parse(outcome.output)).toEqual({ echo: "hi" });
+
+      plugin.close(); srv.stop();
+    });
+
+    test("a plugin's raw JSON schema rides verbatim as rawParameters (like MCP)", async () => {
+      const srv = await bootBridgeServer();
+      const plugin = await registerAndHello(srv, "sample-echo");
+      const schema = { type: "object", properties: { ms: { type: "number" } }, required: ["ms"] };
+      const toolReg = await plugin.request(METHODS.toolRegister, { name: "sleep", description: "sleeps", parameters: schema });
+      const spec = srv.registry.specFor(toolReg.result.registeredAs);
+      expect(spec?.parameters).toEqual(schema);
+      plugin.close(); srv.stop();
+    });
+
+    test("plugin crash mid-invoke (connection drop) -> the in-flight call resolves as a typed isError naming the plugin+tool, and its tools are unregistered", async () => {
+      const srv = await bootBridgeServer();
+      const pluginId = "sample-echo";
+      const plugin = await registerAndHello(srv, pluginId);
+      const toolReg = await plugin.request(METHODS.toolRegister, { name: "sleep", description: "sleeps" });
+      const registeredAs = toolReg.result.registeredAs;
+      expect(srv.registry.has(registeredAs)).toBe(true);
+
+      const execPromise = srv.registry.execute(registeredAs, {}, { cwd: "/", roots: ["/"], sessionId: "s1" });
+      await plugin.waitForNotification((n) => n.method === METHODS.event && n.params.type === "plugin_tool_invoke");
+
+      plugin.close(); // simulate the plugin process disappearing mid-call
+
+      const outcome = await execPromise;
+      expect(outcome.isError).toBe(true);
+      expect(outcome.output).toBe(`plugin ${pluginId} crashed during sleep`);
+
+      // the socket close() handler's unregister is synchronous with the close event, but give the
+      // event loop a beat to be safe against any scheduling jitter.
+      await new Promise((r) => setTimeout(r, 20));
+      expect(srv.registry.has(registeredAs)).toBe(false);
+      expect(srv.supervisor.status(pluginId)).not.toBe("running");
+
+      srv.stop();
+    });
+
+    test("plugin.register requires the wire pluginId to match the authenticated connection", async () => {
+      const srv = await bootBridgeServer();
+      srv.supervisor.startAll([{ id: "sample-echo", dir: "/plugins/sample-echo", entry: { command: "bun" } }]);
+      const raw = srv.store.mintPluginToken("sample-echo");
+      const plugin = await TestClient.connect(srv.socketPath);
+      await plugin.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: "sample-echo", pluginId: "sample-echo",
+      });
+      const res = await plugin.request(METHODS.pluginRegister, { pluginId: "someone-else" });
+      expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      expect(srv.supervisor.status("sample-echo")).toBe("starting"); // never flipped to running
+      plugin.close(); srv.stop();
+    });
+
+    test("tool.register rejects a duplicate tool name with a typed error, not a crash", async () => {
+      const srv = await bootBridgeServer();
+      const plugin = await registerAndHello(srv, "sample-echo");
+      const first = await plugin.request(METHODS.toolRegister, { name: "dup", description: "d" });
+      expect(first.result.ok).toBe(true);
+      const second = await plugin.request(METHODS.toolRegister, { name: "dup", description: "d" });
+      expect(second.error).toBeTruthy();
+      expect(second.error.message).toContain("duplicate tool");
+      plugin.close(); srv.stop();
+    });
+
+    test("tool.register rejects a \"__\"-bearing (or otherwise unsafe-charset) name with INVALID_PARAMS (final-review Fix 3)", async () => {
+      const srv = await bootBridgeServer();
+      const plugin = await registerAndHello(srv, "sample-echo");
+      const collateral = await plugin.request(METHODS.toolRegister, { name: "evil__collateral", description: "d" });
+      expect(collateral.error?.code).toBe(ERR.INVALID_PARAMS);
+      const spacey = await plugin.request(METHODS.toolRegister, { name: "has space", description: "d" });
+      expect(spacey.error?.code).toBe(ERR.INVALID_PARAMS);
+      // a safe name still registers fine — this isn't a blanket tool.register regression.
+      const ok = await plugin.request(METHODS.toolRegister, { name: "safe-name_ok", description: "d" });
+      expect(ok.result?.ok).toBe(true);
+      plugin.close(); srv.stop();
+    });
+
+    test("shortcut.register/tile.update/provider.register land in PluginContribRegistry (latest write wins)", async () => {
+      const srv = await bootBridgeServer();
+      const plugin = await registerAndHello(srv, "sample-echo");
+
+      await plugin.request(METHODS.shortcutRegister, { shortcuts: [{ id: "toggle", description: "toggle it" }] });
+      await plugin.request(METHODS.tileUpdate, { tile: { title: "Sample", value: "1" } });
+      await plugin.request(METHODS.providerRegister, { info: { kind: "noop" } });
+
+      const state = srv.contrib.get("sample-echo");
+      expect(state?.shortcuts).toEqual([{ id: "toggle", description: "toggle it" }]);
+      expect(state?.tile).toEqual({ title: "Sample", value: "1" });
+      expect(state?.provider).toEqual({ kind: "noop" });
+
+      await plugin.request(METHODS.tileUpdate, { tile: { title: "Sample", value: "2" } }); // latest write wins
+      expect(srv.contrib.get("sample-echo")?.tile).toEqual({ title: "Sample", value: "2" });
+
+      plugin.close(); srv.stop();
+    });
+
+    test("disconnect unregisters every plugin__<id>__* tool and calls notifyDisconnected", async () => {
+      const srv = await bootBridgeServer();
+      const pluginId = "sample-echo";
+      const plugin = await registerAndHello(srv, pluginId);
+      await plugin.request(METHODS.toolRegister, { name: "a", description: "d" });
+      await plugin.request(METHODS.toolRegister, { name: "b", description: "d" });
+      expect(srv.registry.has(`plugin__${pluginId}__a`)).toBe(true);
+      expect(srv.registry.has(`plugin__${pluginId}__b`)).toBe(true);
+      expect(srv.supervisor.status(pluginId)).toBe("running");
+
+      plugin.close();
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(srv.registry.has(`plugin__${pluginId}__a`)).toBe(false);
+      expect(srv.registry.has(`plugin__${pluginId}__b`)).toBe(false);
+      expect(srv.supervisor.status(pluginId)).not.toBe("running"); // notifyDisconnected ran
+
+      srv.stop();
+    });
+
+    test("plugin.toolResult is caller-bound (final-review Fix 2): plugin B answering plugin A's requestId is a no-op; A's own answer works", async () => {
+      const srv = await bootBridgeServer();
+      const pluginA = "sample-echo";
+      const pluginB = "sample-echo-2";
+      const a = await registerAndHello(srv, pluginA);
+      const b = await registerAndHello(srv, pluginB);
+
+      await a.request(METHODS.toolRegister, { name: "echo", description: "d" });
+      const registeredAs = `plugin__${pluginA}__echo`;
+
+      const execPromise = srv.registry.execute(registeredAs, {}, { cwd: "/", roots: ["/"], sessionId: "s1" });
+      const invoked = await a.waitForNotification((n) => n.method === METHODS.event && n.params.type === "plugin_tool_invoke");
+      const requestId = invoked.params.requestId as string;
+
+      // Plugin B — a DIFFERENT, correctly-authenticated connection — tries to answer A's requestId.
+      const hijack = await b.request(METHODS.pluginToolResult, { requestId, resultJson: "\"hijacked\"" });
+      expect(hijack.result).toEqual({ ok: true }); // never throws either way (safe-no-op wire contract)
+
+      // A's own answer still works — B's attempt above never consumed/settled the pending entry.
+      const legit = await a.request(METHODS.pluginToolResult, { requestId, resultJson: "\"legit\"" });
+      expect(legit.result).toEqual({ ok: true });
+
+      const outcome = await execPromise;
+      expect(outcome.isError).toBe(false);
+      expect(JSON.parse(outcome.output)).toBe("legit");
+
+      a.close(); b.close(); srv.stop();
+    });
+
+    test("tool.register/shortcut.register/tile.update/provider.register all require an authenticated plugin connection (defensive — unreachable from a plugin conn, but not role-gated for other roles)", async () => {
+      const srv = await bootBridgeServer();
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "harness-trying-plugin-verbs");
+      const attempts: Array<[string, unknown]> = [
+        [METHODS.toolRegister, { name: "x", description: "d" }],
+        [METHODS.shortcutRegister, { shortcuts: [] }],
+        [METHODS.tileUpdate, { tile: {} }],
+        [METHODS.providerRegister, { info: {} }],
+      ];
+      for (const [method, params] of attempts) {
+        const res = await c.request(method, params);
+        expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      }
+      c.close(); srv.stop();
+    });
   });
 });

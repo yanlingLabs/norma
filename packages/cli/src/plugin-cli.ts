@@ -174,3 +174,27 @@ export function removePluginDir(pluginsRoot: string, name: string): string {
   rmSync(target, { recursive: true, force: true });
   return target;
 }
+
+/**
+ * Best-effort daemon-side token revoke for `disable`/`remove` (Phase 4b Task 2). `plugin_tokens`
+ * lives in the daemon's own sqlite (SessionStore) — the CLI must NEVER open that database
+ * directly (it risks a lock conflict with a running daemon) — so revocation goes through the
+ * harness-role `plugin.revokeToken` RPC instead. A down daemon (no socket, no harness token yet,
+ * a timed-out request, …) is TOLERATED, not fatal: disable/remove must keep working exactly as
+ * they always have when the daemon isn't running; the caller just gets a note to surface.
+ *
+ * `revoke` is injected (connect + call + close, supplied by the caller) so this stays unit-
+ * testable without a real socket — pass a function that resolves on success or rejects with
+ * whatever error the connect/RPC layer produced.
+ */
+export async function revokePluginTokenBestEffort(
+  revoke: (pluginId: string) => Promise<unknown>,
+  pluginId: string,
+): Promise<{ ok: boolean; note?: string }> {
+  try {
+    await revoke(pluginId);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, note: `plugin token revoke skipped (daemon unreachable?): ${(err as Error).message}` };
+  }
+}

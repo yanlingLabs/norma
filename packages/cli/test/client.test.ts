@@ -199,6 +199,31 @@ describe("NormaClient", () => {
     client.close();
   });
 
+  // Phase 4b Task 2: the CLI-facing wrapper over the harness-role plugin.revokeToken RPC (used by
+  // `norma plugin disable/remove`). `plugin_tokens` lives in the daemon's own sqlite, which this
+  // test doesn't have direct access to (RunningDaemon doesn't expose SessionStore) — but the
+  // handler is idempotent for a never-minted id, so the round-trip is fully exercisable without it.
+  test("pluginRevokeToken client method round-trips (idempotent on a never-minted id)", async () => {
+    await boot(null);
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "prt", onEvent: () => {} });
+    expect(await client.pluginRevokeToken("never-minted-plugin")).toEqual({ ok: true });
+    client.close();
+  });
+
+  // Final-review Fix 1: the CLI-facing wrapper over the harness/admin-role plugin.restart RPC
+  // (used by `norma plugin restart <id>`). A `FakeProvider` daemon DOES wire a real
+  // PluginSupervisor (daemon.ts only builds one `if (agentProvider)`) but this fixture home has no
+  // plugins directory, so the supervisor tracks nothing — restarting an id it never saw is exactly
+  // `plugin.restart`'s typed NOT_FOUND path (ipc/server.ts), fully exercisable without a real
+  // spawned plugin process. The deeper "restarts a circuit-open plugin and it re-spawns" behavior
+  // is covered at the ipc/server.ts level (core/test/server.test.ts) with an injected fake spawn.
+  test("restartPlugin client method rejects a plugin id the supervisor has never tracked", async () => {
+    await boot(new FakeProvider([]));
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "rsp", onEvent: () => {} });
+    await expect(client.restartPlugin("never-existed")).rejects.toThrow(/unknown plugin/);
+    client.close();
+  });
+
   test("init prompt reaches the session (canned NORMA.md-generation prompt)", async () => {
     const { INIT_PROMPT } = await import("../src/main");
     expect(INIT_PROMPT).toMatch(/NORMA\.md/i);

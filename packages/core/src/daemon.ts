@@ -44,7 +44,9 @@ import { ContextAssembler } from "./agent/context";
 import { SkillStore } from "./agent/skills";
 import { BackgroundTaskRegistry } from "./agent/bg-registry";
 import { sessionTmpDir } from "./agent/session-tmp";
-import { PluginStore, pluginMcpEligible } from "./agent/plugins";
+import { PluginStore, pluginMcpEligible, pluginSpawnEligible } from "./agent/plugins";
+import { PluginSupervisor } from "./plugins/supervisor";
+import { PluginContribRegistry } from "./plugins/contrib";
 import { AuditLog } from "./peripheral/audit";
 import { PeripheralBroker, type PeripheralClass } from "./peripheral/broker";
 import { ProviderLink } from "./peripheral/provider-link";
@@ -143,6 +145,11 @@ export async function startDaemon(opts: {
   const pluginStore = new PluginStore({
     normaHome, plugins: settings?.plugins, consents: settings?.plugins?.consents, log: (m) => console.error(m),
   });
+  // Built unconditionally (Phase 4b Task 4): shortcut.register/tile.update/provider.register are
+  // plain latest-per-plugin storage, independent of whether an LLM provider (and thus a
+  // ToolRegistry/PluginSupervisor) exists — a plugin process started outside the supervisor (e.g.
+  // manually, for development) can still register contributions over a plain plugin-role hello.
+  const pluginContrib = new PluginContribRegistry();
   const skillStore = new SkillStore({ normaHome, trust: trustStore, plugins: { disabled: settings?.plugins?.disabled ?? [] } });
   const assembler = new ContextAssembler({ normaHome, trust: trustStore, skills: skillStore });
   // Built unconditionally (needs only store, no provider) so the server's session.addDir /
@@ -196,8 +203,16 @@ export async function startDaemon(opts: {
   let questions: QuestionBroker | null = null;
   let taskStore: TaskStore | null = null;
   let plans: PlanBroker | null = null;
+  let pluginSupervisor: PluginSupervisor | null = null;
+  // ipc/server.ts (Phase 4b Task 4) needs the SAME ToolRegistry instance the engine executes tool
+  // calls against, to register/unregister `plugin__<id>__<tool>` tools — but startIpcServer() is
+  // called OUTSIDE the `if (agentProvider)` block below, where the registry is constructed.
+  // Mirrored into this outer binding right after construction rather than hoisting the `const`
+  // itself, so every existing narrowed (non-null) use of `registry` inside the block is untouched.
+  let sharedRegistry: ToolRegistry | null = null;
   if (agentProvider) {
     const registry = new ToolRegistry();
+    sharedRegistry = registry;
     registerReadTools(registry);
     registerWriteTools(registry);
     registerBashTool(registry, { bgRegistry });
@@ -250,6 +265,32 @@ export async function startDaemon(opts: {
       .filter(pluginMcpEligible)
       .map((p) => ({ name: p.name, dir: join(normaHome, "plugins", p.name), manifestServers: p.manifestServers }));
     await mcp.startPlugins(enabledPlugins);
+
+    // Tier-2 platform plugins (Phase 4b Task 3, spec §3): PluginSupervisor owns process lifecycle
+    // (spawn/registration timeout/crash backoff/circuit breaker/PID-file orphan reclaim) for every
+    // spawn-eligible plugin (pluginSpawnEligible — tier "platform" + entry present + enabled +
+    // consented, the same enabled/disabled/consent shape as pluginMcpEligible above). Built right
+    // after mcp.startPlugins, unconditionally for the eligible set — startAll() is non-blocking
+    // (orphan reclaim/registration waits are timer-driven, never awaited here). Task 4 wires the
+    // actual tool.register/plugin_tool_invoke bridge into `registry` and the ipc handlers that
+    // call notifyRegistered/notifyDisconnected/resolveToolResult. `onCircuitOpen` is Task 4's other
+    // half of that wiring: when the breaker trips, this plugin's process is done until a manual
+    // restart — its `plugin__<id>__*` tools must stop being offered to the agent, so we unregister
+    // them straight out of the SAME registry `registerReadTools` etc. above populated (safe to
+    // reference here — `registry` is in scope, non-null, for the rest of this block).
+    pluginSupervisor = new PluginSupervisor({
+      runDir: dirs.runDir,
+      socketPath: dirs.socketPath,
+      mintToken: (id) => store.mintPluginToken(id),
+      settings: settings?.plugins?.supervisor,
+      onLog: (m) => console.error(m),
+      onCircuitOpen: (id) => registry.unregisterByPrefix(`plugin__${id}__`),
+    });
+    const spawnablePlugins = allPlugins
+      .filter(pluginSpawnEligible)
+      .map((p) => ({ id: p.name, dir: join(normaHome, "plugins", p.name), entry: p.entry! }));
+    pluginSupervisor.startAll(spawnablePlugins);
+
     registerRequestDirTool(registry, {
       broker: approvalBroker,
       dirs: sessionDirs,
@@ -330,6 +371,12 @@ export async function startDaemon(opts: {
     skills: skillStore,
     plugins: pluginStore,
     mcp: mcp ?? undefined,
+    // Phase 4b Task 4: the plugin tool bridge. `registry`/`supervisor` are undefined together
+    // whenever agentProvider is null (see `sharedRegistry`'s doc comment above); `contrib` is
+    // always available.
+    registry: sharedRegistry ?? undefined,
+    supervisor: pluginSupervisor ?? undefined,
+    contrib: pluginContrib,
     questions: questions ?? undefined,
     tasks: taskStore ?? undefined,
     plans: plans ?? undefined,
@@ -345,7 +392,7 @@ export async function startDaemon(opts: {
   return {
     socketPath: dirs.socketPath,
     tokens,
-    stop() { server.stop(); mcp?.stopAll(); bgRegistry.killAll(); store.close(); lock.release(); },
+    stop() { server.stop(); mcp?.stopAll(); pluginSupervisor?.stopAll(); bgRegistry.killAll(); store.close(); lock.release(); },
   };
 }
 

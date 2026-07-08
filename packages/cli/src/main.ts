@@ -35,6 +35,7 @@ import {
   missingConsents,
   removePluginDir,
   removePluginFromSettings,
+  revokePluginTokenBestEffort,
   setPluginEnabled,
   stripPluginConsents,
 } from "./plugin-cli";
@@ -182,6 +183,18 @@ function socketPath(): string {
 
 async function connect(name: string, onEvent: (e: any) => void = () => {}): Promise<NormaClient> {
   return NormaClient.connect({ socketPath: socketPath(), token: await getToken(), clientName: name, onEvent });
+}
+
+/** Phase 4b Task 2: connect + call `plugin.revokeToken` + close, for
+ *  `revokePluginTokenBestEffort` (plugin-cli.ts) — a down daemon (no socket, no harness token
+ *  yet, …) surfaces as a rejected promise, which the caller tolerates rather than treats as fatal. */
+async function revokePluginTokenViaDaemon(pluginId: string): Promise<void> {
+  const c = await connect(`cli-plugin-revoke-${pluginId}`);
+  try {
+    await c.pluginRevokeToken(pluginId);
+  } finally {
+    c.close();
+  }
 }
 
 // Canned prompt for `norma init`: surveys the project and writes/updates a NORMA.md at its root.
@@ -1025,6 +1038,11 @@ if (import.meta.main) {
       const { loadSettings, saveSettings } = await import("@norma/core");
       const settings = stripPluginConsents(setPluginEnabled(loadSettings(settingsPath), name, false), name);
       saveSettings(settingsPath, settings);
+      // Phase 4b Task 2: best-effort revoke of the plugin's daemon-side token (Tier-2 platform
+      // plugins only have one, but revoking is harmless/no-op for Tier-1 — the daemon just deletes
+      // a row that never existed). A down daemon is tolerated, never blocks the disable.
+      const revoked = await revokePluginTokenBestEffort(revokePluginTokenViaDaemon, name);
+      if (!revoked.ok) console.log(`${DIM}${revoked.note}${RESET}`);
       console.log(`${AQUA}${name} disabled${RESET} — restart the daemon to apply`);
       break;
     }
@@ -1040,11 +1058,31 @@ if (import.meta.main) {
       }
       const { loadSettings, saveSettings } = await import("@norma/core");
       saveSettings(settingsPath, removePluginFromSettings(loadSettings(settingsPath), name));
+      // Phase 4b Task 2: same best-effort token revoke as disable (see comment there) — removing
+      // the plugin dir must not silently leave a stale, still-valid token in the daemon's sqlite.
+      const revoked = await revokePluginTokenBestEffort(revokePluginTokenViaDaemon, name);
+      if (!revoked.ok) console.log(`${DIM}${revoked.note}${RESET}`);
       console.log(`${AQUA}removed ${name}${RESET}`);
       break;
     }
 
-    console.error("usage: norma plugin list | install <git-url> [name] | enable <name> | disable <name> | remove <name>");
+    if (sub === "restart") {
+      const name = process.argv[4];
+      if (!name) { console.error("usage: norma plugin restart <name>"); process.exit(1); }
+      const c = await connect(`cli-plugin-restart-${name}`);
+      try {
+        await c.restartPlugin(name);
+      } catch (err) {
+        console.error((err as Error).message);
+        c.close();
+        process.exit(1);
+      }
+      console.log(`${AQUA}${name} restart requested${RESET}`);
+      c.close();
+      process.exit(0);
+    }
+
+    console.error("usage: norma plugin list | install <git-url> [name] | enable <name> | disable <name> | remove <name> | restart <name>");
     process.exit(1);
   }
   case "bg": {
@@ -1208,7 +1246,7 @@ if (import.meta.main) {
   trust <dir> [--list] | trust list | trust remove <path>
   skills                                          list discovered skills for this directory
   mcp                                              list configured MCP servers and their tools
-  plugin list | install <git-url> [name] | enable <name> | disable <name> | remove <name>
+  plugin list | install <git-url> [name] | enable <name> | disable <name> | remove <name> | restart <name>
   bg list <session> | bg peek <session> <taskId> | bg kill <session> <taskId>
   login [--api-key] | logout | provider | provider-smoke [--prompt <text>]
   init                                            generate/update NORMA.md by surveying the project

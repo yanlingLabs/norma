@@ -10,7 +10,9 @@ import {
   ThreadListParams,
   PeripheralLeaseParams, PeripheralRenewParams, PeripheralReleaseParams, PeripheralAdvertiseParams,
   PeripheralRevokeParams, PeripheralRespondParams, DaemonStatusParams, QuotaStateParams,
-  TrustListParams, TrustRemoveParams,
+  TrustListParams, TrustRemoveParams, PluginRevokeTokenParams, PluginRestartParams,
+  PluginRegisterParams, ToolRegisterParams, ShortcutRegisterParams, TileUpdateParams,
+  ProviderRegisterParams, PluginToolResultParams,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
@@ -27,6 +29,9 @@ import type { BackgroundTaskRegistry } from "../agent/bg-registry";
 import type { SkillStore } from "../agent/skills";
 import type { McpManager } from "../agent/mcp/manager";
 import type { PluginStore } from "../agent/plugins";
+import type { ToolRegistry } from "../agent/tools/registry";
+import type { PluginSupervisor, PluginConn, InvokeError } from "../plugins/supervisor";
+import type { PluginContribRegistry } from "../plugins/contrib";
 import type { PeripheralBroker } from "../peripheral/broker";
 import type { ProviderLink } from "../peripheral/provider-link";
 import type { QuotaManager } from "../providers/quota";
@@ -39,6 +44,10 @@ interface ConnState {
   hubClient: HubClient | null;
   helloTimer: ReturnType<typeof setTimeout> | null;
   writer: ConnWriter;
+  // Phase 4b Task 2: set on a successful role:"plugin" hello (the specific installed plugin id
+  // this connection authenticated as); null for every other role. Consumed by Task 3/4's
+  // supervisor wiring (notifyRegistered/tool bridge) to correlate a connection to its plugin.
+  pluginId: string | null;
 }
 
 export interface IpcServerOptions {
@@ -55,6 +64,19 @@ export interface IpcServerOptions {
   skills?: SkillStore;       // discovered SKILL.md skills; skills.list
   mcp?: McpManager;          // MCP servers started at boot; mcp.list
   plugins?: PluginStore;     // discovered ~/.norma/plugins/*; plugins.list
+  // Phase 4b Task 4 (spec §3): the plugin tool bridge. `registry` is the SAME ToolRegistry the
+  // AgentEngine executes tool calls against (daemon.ts shares the one instance) — tool.register
+  // registers `plugin__<pluginId>__<tool>` into it; the socket close() handler and the
+  // supervisor's onCircuitOpen callback unregister a plugin's tools out of it. `supervisor`
+  // brokers plugin.register/tool.register's bridged run()/plugin.toolResult against
+  // PluginSupervisor (Task 3). `contrib` is latest-per-plugin storage for shortcut.register/
+  // tile.update/provider.register (Phase 4d's read surface). `registry`/`supervisor` are normally
+  // undefined together (no agentProvider ⇒ no ToolRegistry at all) — tool.register then throws a
+  // typed RpcFailure rather than crashing; plugin.register/plugin.toolResult degrade to a bare
+  // `{ok:true}` no-op (same precedent as `mcp`/`plans`/`tasks` above).
+  registry?: ToolRegistry;
+  supervisor?: PluginSupervisor;
+  contrib?: PluginContribRegistry;
   questions?: QuestionBroker; // in-flight ask_user questions; ask_user.respond
   tasks?: TaskStore;         // session task lists; task.list
   plans?: PlanBroker;        // in-flight exit_plan_mode plans; plan.respond
@@ -72,6 +94,35 @@ export interface IpcServerOptions {
 export interface IpcServer { stop(): void }
 
 class RpcFailure extends Error { constructor(public code: number, message: string) { super(message); } }
+
+// Phase 4b Task 2 (spec §3): the table-driven role→methods gate for plugin connections. A plugin
+// authenticates as a SPECIFIC installed plugin id (hello role "plugin") and may ONLY ever call
+// these six wire verbs — everything else (session.*, approval.*, peripheral.*, daemon.*, trust.*,
+// plugins.*, ask_user.*, etc.) is role-rejected BEFORE dispatch, never reaching a handler. Task 4
+// wires all six handlers (plugin.register/tool.register/shortcut.register/tile.update/
+// provider.register/plugin.toolResult) into PluginSupervisor + ToolRegistry + PluginContribRegistry
+// below.
+const PLUGIN_ALLOWED_METHODS = new Set<string>([
+  METHODS.pluginRegister,
+  METHODS.toolRegister,
+  METHODS.shortcutRegister,
+  METHODS.tileUpdate,
+  METHODS.providerRegister,
+  METHODS.pluginToolResult,
+]);
+
+/** Maps a failed `PluginSupervisor.invoke()` result to the message a `throw new Error(...)` in
+ *  `tool.register`'s bridged `run()` turns into an isError tool_result (ToolRegistry.execute's
+ *  catch path) — see that handler below. */
+function pluginInvokeErrorMessage(pluginId: string, tool: string, err: InvokeError): string {
+  switch (err.code) {
+    case "not_running": return `plugin ${pluginId} is not running`;
+    case "no_connection": return `plugin ${pluginId} has no active connection`;
+    case "timeout": return `plugin ${pluginId} tool ${tool} timed out`;
+    case "crashed": return err.message;
+    case "plugin_error": return err.message;
+  }
+}
 
 export function startIpcServer(opts: IpcServerOptions): IpcServer {
   if (opts.engine && !opts.hub) {
@@ -133,6 +184,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
           hubClient: null,
           helloTimer: setTimeout(() => socket.end(), helloTimeoutMs),
           writer: new ConnWriter(socket as unknown as WritableSocket),
+          pluginId: null,
         };
       },
       drain(socket) {
@@ -149,6 +201,17 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         if (opts.peripheral?.isProvider(socket.data)) {
           opts.peripheral.providerGone();
           opts.providerLink?.setWriter(null);
+        }
+        // Phase 4b Task 4: a plugin connection dropping (crash, SIGTERM, clean SDK shutdown, the
+        // socket cap, anything) means every tool it registered can no longer be invoked —
+        // unregister them FIRST (so a stale plugin__<id>__* tool never lingers in specs()/
+        // ToolSearch even for the instant before notifyDisconnected's own backoff/circuit
+        // bookkeeping runs), then tell the supervisor the connection is gone. notifyDisconnected
+        // is an idempotent no-op outside status "running" (see its doc comment) — safe even for a
+        // connection that never got past hello/plugin.register.
+        if (socket.data.pluginId) {
+          opts.registry?.unregisterByPrefix(`plugin__${socket.data.pluginId}__`);
+          opts.supervisor?.notifyDisconnected(socket.data.pluginId);
         }
       },
       async data(socket, chunk) {
@@ -190,11 +253,20 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       if (p.protocolVersion !== PROTOCOL_VERSION) {
         throw new RpcFailure(ERR.VERSION_MISMATCH, `server speaks protocol v${PROTOCOL_VERSION}, client sent v${p.protocolVersion}`);
       }
-      if (!(await opts.tokens.verify(p.role, p.token))) {
+      // Phase 4b Task 2: role "plugin" is id-bound and verified against SessionStore's sqlite-
+      // hashed plugin_tokens table (mintPluginToken/verifyPluginToken), NOT TokenAuthority — a
+      // plugin's token has nothing to do with the harness/admin Keychain secrets. A hello with no
+      // pluginId, or one whose token doesn't match what was minted for that exact id, fails closed.
+      if (p.role === "plugin") {
+        if (!p.pluginId || !opts.store.verifyPluginToken(p.pluginId, p.token)) {
+          throw new RpcFailure(ERR.UNAUTHORIZED, "invalid token for role");
+        }
+      } else if (!(await opts.tokens.verify(p.role, p.token))) {
         throw new RpcFailure(ERR.UNAUTHORIZED, "invalid token for role");
       }
       socket.data.authedRole = p.role;
       socket.data.clientName = p.clientName;
+      socket.data.pluginId = p.role === "plugin" ? p.pluginId! : null;
       if (socket.data.helloTimer) { clearTimeout(socket.data.helloTimer); socket.data.helloTimer = null; }
       socket.data.decoder = new LineDecoder(); // authed: default 8 MiB line cap
       if (p.role === "harness") harnessConns.add(socket.data);
@@ -202,6 +274,11 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
     }
 
     if (socket.data.authedRole === null) throw new RpcFailure(ERR.UNAUTHORIZED, "hello required first");
+
+    // Role→method allowlist gate — BEFORE dispatch, ahead of the switch below (Task 2 contract).
+    if (socket.data.authedRole === "plugin" && !PLUGIN_ALLOWED_METHODS.has(method)) {
+      throw new RpcFailure(ERR.UNAUTHORIZED, `plugin role may not call ${method}`);
+    }
 
     switch (method) {
       case METHODS.sessionCreate: {
@@ -458,6 +535,133 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         const removed = opts.trust?.remove(p.path) ?? false;
         console.error(`[trust.remove] path=${p.path} removed=${removed} by=${socket.data.clientName}`);
         return { removed };
+      }
+
+      // -----------------------------------------------------------------------------------------
+      // plugin.revokeToken (Phase 4b Task 2, spec §3): harness-role admin verb, same precedent as
+      // trust.remove above — NOT one of the six plugin-role verbs (rejected by the allowlist gate
+      // above before ever reaching here if called from a plugin connection). The CLI's `norma
+      // plugin disable/remove` call this best-effort instead of opening the daemon's sqlite
+      // directly (locking risk) — mint stays daemon-side (Task 3, lazily at supervisor spawn).
+      // -----------------------------------------------------------------------------------------
+      case METHODS.pluginRevokeToken: {
+        const p = parseParams(PluginRevokeTokenParams, params);
+        if (socket.data.authedRole !== "harness") {
+          throw new RpcFailure(ERR.UNAUTHORIZED, "plugin.revokeToken requires harness role");
+        }
+        opts.store.revokePluginToken(p.pluginId);
+        return { ok: true };
+      }
+
+      // -----------------------------------------------------------------------------------------
+      // plugin.restart (final-review Fix 1): the `PluginSupervisor.restart()` manual-restart rider
+      // existed and was tested (supervisor.ts) but had no caller — this wires it up so `norma
+      // plugin restart <id>` can recover a plugin stuck "circuit-open" (nothing else ever clears
+      // that state short of a daemon restart). harness OR admin role, same precedent as
+      // `plugins.list` above (no extra role check here) — NOT one of the six plugin-role verbs, so
+      // a plugin connection never reaches this case at all (rejected by the allowlist gate first).
+      // `configFor` looks up the spawn config the supervisor already has on record for a TRACKED
+      // plugin (set at `startAll`/`reclaimOrphans`/an earlier `restart`) — a plugin id the
+      // supervisor has never seen has nothing to restart FROM, so that's a typed NOT_FOUND rather
+      // than silently no-op'ing.
+      // -----------------------------------------------------------------------------------------
+      case METHODS.pluginRestart: {
+        const p = parseParams(PluginRestartParams, params);
+        if (!opts.supervisor) throw new RpcFailure(ERR.INTERNAL, "plugin supervisor is not available on this server");
+        const config = opts.supervisor.configFor(p.pluginId);
+        if (!config) throw new RpcFailure(ERR.NOT_FOUND, `unknown plugin: ${p.pluginId}`);
+        opts.supervisor.restart(config);
+        return { ok: true };
+      }
+
+      // -----------------------------------------------------------------------------------------
+      // Plugin tool bridge (Phase 4b Task 4, spec §3): wires the six plugin-role verbs (Task 1's
+      // wire shapes, Task 2's role allowlist) into PluginSupervisor (Task 3) and the SAME
+      // ToolRegistry the agent engine executes every other tool call against. The
+      // PLUGIN_ALLOWED_METHODS gate above only RESTRICTS what a plugin-role connection may call —
+      // it never widens who may call these, so a harness connection could technically reach these
+      // cases too; each handler below still requires `socket.data.pluginId` itself (a
+      // contribution/tool with no owning plugin id makes no sense), which only a plugin-role hello
+      // ever sets.
+      // -----------------------------------------------------------------------------------------
+      case METHODS.pluginRegister: {
+        const p = parseParams(PluginRegisterParams, params);
+        // socket.data.pluginId is the id THIS connection actually authenticated as (hello,
+        // verified against the sqlite-hashed plugin_tokens table) — authoritative over the wire
+        // param. A mismatch means a plugin trying to register under an id it never authenticated
+        // as; reject rather than silently trust `p.pluginId`.
+        if (!socket.data.pluginId || p.pluginId !== socket.data.pluginId) {
+          throw new RpcFailure(ERR.UNAUTHORIZED, "plugin.register: pluginId does not match the authenticated connection");
+        }
+        const conn: PluginConn = {
+          push: (event) => socket.data.writer.enqueue(encodeLine({ jsonrpc: "2.0", method: METHODS.event, params: event })),
+        };
+        // The wire result is always {ok:true} (PluginRegisterResult has no room for a typed
+        // rejection) regardless of whether the supervisor actually accepted the registration — a
+        // late/duplicate/unexpected registration (notifyRegistered returns false) just means this
+        // connection's tools, once registered, will never be invokable until a fresh spawn cycle
+        // re-registers it; the plugin itself learns nothing different from a normal success.
+        opts.supervisor?.notifyRegistered(socket.data.pluginId, conn);
+        return { ok: true };
+      }
+      case METHODS.toolRegister: {
+        const p = parseParams(ToolRegisterParams, params);
+        const pluginId = socket.data.pluginId;
+        if (!pluginId) throw new RpcFailure(ERR.UNAUTHORIZED, "tool.register requires an authenticated plugin connection");
+        if (!opts.registry || !opts.supervisor) {
+          throw new RpcFailure(ERR.INTERNAL, "plugin tool bridge is not available on this server");
+        }
+        const registry = opts.registry;
+        const supervisor = opts.supervisor;
+        const registeredAs = `plugin__${pluginId}__${p.name}`;
+        try {
+          registry.register({
+            name: registeredAs,
+            description: p.description,
+            // The plugin author's raw JSON schema (or none) rides verbatim as rawParameters,
+            // exactly like MCP's mcp/manager.ts#startOne — `args` is a permissive passthrough
+            // since core never re-validates plugin-supplied argument shapes beyond "is an object"
+            // (ToolRegisterParams.parameters's own doc comment, protocol/methods.ts).
+            args: z.object({}).passthrough(),
+            rawParameters: p.parameters,
+            run: async (args) => {
+              const result = await supervisor.invoke(pluginId, p.name, JSON.stringify(args));
+              if ("ok" in result) return result.resultJson;
+              // Throwing here is deliberate: ToolRegistry.execute's catch turns a thrown Error's
+              // message into `{output: message, isError: true}` — the ONLY way a ToolDefinition's
+              // `run()` (which returns a plain string) produces an isError tool_result.
+              throw new Error(pluginInvokeErrorMessage(pluginId, p.name, result));
+            },
+          });
+        } catch (e) {
+          throw new RpcFailure(ERR.INVALID_REQUEST, (e as Error).message);
+        }
+        return { ok: true, registeredAs };
+      }
+      case METHODS.pluginToolResult: {
+        const p = parseParams(PluginToolResultParams, params);
+        // Final-review Fix 2: caller-bound — settle only goes through if THIS connection's own
+        // authenticated pluginId (never a wire param) matches the pending invoke's pluginId. See
+        // resolveToolResult's doc comment (plugins/supervisor.ts).
+        return opts.supervisor?.resolveToolResult(p, socket.data.pluginId) ?? { ok: true };
+      }
+      case METHODS.shortcutRegister: {
+        const p = parseParams(ShortcutRegisterParams, params);
+        if (!socket.data.pluginId) throw new RpcFailure(ERR.UNAUTHORIZED, "shortcut.register requires an authenticated plugin connection");
+        opts.contrib?.setShortcuts(socket.data.pluginId, p.shortcuts);
+        return { ok: true };
+      }
+      case METHODS.tileUpdate: {
+        const p = parseParams(TileUpdateParams, params);
+        if (!socket.data.pluginId) throw new RpcFailure(ERR.UNAUTHORIZED, "tile.update requires an authenticated plugin connection");
+        opts.contrib?.setTile(socket.data.pluginId, p.tile);
+        return { ok: true };
+      }
+      case METHODS.providerRegister: {
+        const p = parseParams(ProviderRegisterParams, params);
+        if (!socket.data.pluginId) throw new RpcFailure(ERR.UNAUTHORIZED, "provider.register requires an authenticated plugin connection");
+        opts.contrib?.setProvider(socket.data.pluginId, p.info);
+        return { ok: true };
       }
 
       default:

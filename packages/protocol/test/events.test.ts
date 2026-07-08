@@ -201,6 +201,24 @@ describe("SessionEvent discriminated union", () => {
       expect(SessionEvent.safeParse({ ...t, type: "lease_granted", leaseId: "l", class: cls, holder, expiresAt: 1, tokenHash: "a".repeat(64) }).success).toBe(true);
     }
   });
+
+  // Phase 4b Task 1 (spec §3): plugin.register's `tool.register`'d tools get invoked over the
+  // plugin's own connection via this push, mirroring peripheral_call_requested's request/response
+  // shape one-for-one — the plugin answers with `plugin.toolResult` (methods.ts).
+  test("plugin_tool_invoke round-trips", () => {
+    const t = { sessionId: "s", threadId: "main", seq: 1, ts: 1 };
+    const invoke = { ...t, type: "plugin_tool_invoke", requestId: "req_1", tool: "echo", argsJson: '{"text":"hi"}' } as const;
+    expect(SessionEvent.parse(invoke)).toEqual(invoke);
+  });
+
+  test("plugin_tool_invoke rejects empty requestId/tool", () => {
+    const t = { sessionId: "s", threadId: "main", seq: 1, ts: 1 };
+    expect(SessionEvent.safeParse({ ...t, type: "plugin_tool_invoke", requestId: "", tool: "echo", argsJson: "{}" }).success).toBe(false);
+    expect(SessionEvent.safeParse({ ...t, type: "plugin_tool_invoke", requestId: "req_1", tool: "", argsJson: "{}" }).success).toBe(false);
+    // argsJson has no min(1) — an argument-less tool invoke still needs a wire representation ("{}"),
+    // and zod's z.string() alone (matching tool_call's argsJson) allows the empty string too.
+    expect(SessionEvent.safeParse({ ...t, type: "plugin_tool_invoke", requestId: "req_1", tool: "echo", argsJson: "" }).success).toBe(true);
+  });
 });
 
 describe("hello method schemas", () => {
@@ -212,5 +230,27 @@ describe("hello method schemas", () => {
 
   test("unknown role rejected", () => {
     expect(() => HelloParams.parse({ protocolVersion: 0, role: "root", token: "t", clientName: "x" })).toThrow();
+  });
+
+  // Phase 4b Task 1: role "plugin" is id-bound — hello carries an optional pluginId so a plugin
+  // authenticates AS a specific installed plugin. This is shape-only (verification is Task 2);
+  // pluginId is absent for the other two roles and must stay optional so their hellos still parse.
+  test("role \"plugin\" accepted with an optional pluginId", () => {
+    const withId = HelloParams.parse({ protocolVersion: PROTOCOL_VERSION, role: "plugin", token: "t", clientName: "sample-echo", pluginId: "sample-echo" });
+    expect(withId.role).toBe("plugin");
+    expect(withId.pluginId).toBe("sample-echo");
+
+    const withoutId = HelloParams.parse({ protocolVersion: PROTOCOL_VERSION, role: "plugin", token: "t", clientName: "sample-echo" });
+    expect(withoutId.pluginId).toBeUndefined();
+  });
+
+  test("pluginId rejects an empty string when present", () => {
+    expect(() => HelloParams.parse({ protocolVersion: PROTOCOL_VERSION, role: "plugin", token: "t", clientName: "x", pluginId: "" })).toThrow();
+  });
+
+  test("pluginId is accepted (and ignored) on non-plugin roles too — the field isn't role-gated at the wire layer", () => {
+    const p = HelloParams.parse({ protocolVersion: PROTOCOL_VERSION, role: "harness", token: "t", clientName: "x", pluginId: "sample-echo" });
+    expect(p.role).toBe("harness");
+    expect(p.pluginId).toBe("sample-echo");
   });
 });

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, appendFileSync, readFileSync, statSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -242,6 +243,68 @@ describe("SessionStore", () => {
     }
     const reopened = new SessionStore(dir);
     expect(reopened.list().find(r => r.sessionId === sid)!.title).toBe("Greeting session");
+    reopened.close();
+  });
+});
+
+// -----------------------------------------------------------------------------------------
+// Plugin role tokens (Phase 4b Task 2, spec §3 "Plugin role tokens").
+// -----------------------------------------------------------------------------------------
+describe("SessionStore plugin tokens", () => {
+  test("mint returns a 64-hex-char raw token; verify accepts it for the same id", () => {
+    const { store } = makeStore();
+    const raw = store.mintPluginToken("sample-echo");
+    expect(raw).toMatch(/^[0-9a-f]{64}$/);
+    expect(store.verifyPluginToken("sample-echo", raw)).toBe(true);
+  });
+
+  test("verify rejects a wrong token, an unknown/never-minted plugin id, and id-bound cross-use", () => {
+    const { store } = makeStore();
+    const raw = store.mintPluginToken("sample-echo");
+    expect(store.verifyPluginToken("sample-echo", "0".repeat(64))).toBe(false);
+    expect(store.verifyPluginToken("never-minted", raw)).toBe(false);
+    store.mintPluginToken("other-plugin");
+    // A token minted for "sample-echo" must never verify for a DIFFERENT plugin id (id-bound).
+    expect(store.verifyPluginToken("other-plugin", raw)).toBe(false);
+  });
+
+  test("re-minting rotates the token: the previously issued raw value no longer verifies", () => {
+    const { store } = makeStore();
+    const first = store.mintPluginToken("sample-echo");
+    const second = store.mintPluginToken("sample-echo");
+    expect(second).not.toBe(first);
+    expect(store.verifyPluginToken("sample-echo", first)).toBe(false);
+    expect(store.verifyPluginToken("sample-echo", second)).toBe(true);
+  });
+
+  test("revoke invalidates the token; verify fails closed after", () => {
+    const { store } = makeStore();
+    const raw = store.mintPluginToken("sample-echo");
+    store.revokePluginToken("sample-echo");
+    expect(store.verifyPluginToken("sample-echo", raw)).toBe(false);
+  });
+
+  test("revoking a never-minted plugin id is a no-op, not a throw", () => {
+    const { store } = makeStore();
+    expect(() => store.revokePluginToken("never-existed")).not.toThrow();
+  });
+
+  test("the sqlite row persists the HASH, never the raw token", () => {
+    const { store, dir } = makeStore();
+    const raw = store.mintPluginToken("sample-echo");
+    const db = new Database(join(dir, "sessions", "index.db"));
+    const row = db.query("SELECT token_hash FROM plugin_tokens WHERE plugin_id = ?").get("sample-echo") as { token_hash: string };
+    expect(row.token_hash).not.toBe(raw);
+    expect(row.token_hash).toMatch(/^[0-9a-f]{64}$/);
+    db.close();
+  });
+
+  test("a minted token survives a store reopen (same homeDir)", () => {
+    const { store, dir } = makeStore();
+    const raw = store.mintPluginToken("sample-echo");
+    store.close();
+    const reopened = new SessionStore(dir);
+    expect(reopened.verifyPluginToken("sample-echo", raw)).toBe(true);
     reopened.close();
   });
 });
