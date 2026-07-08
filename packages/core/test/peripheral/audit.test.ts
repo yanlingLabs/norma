@@ -15,14 +15,14 @@ describe("AuditLog", () => {
     const log = new AuditLog(path);
 
     const before = Date.now();
-    log.append({ action: "lease_grant", leaseId: "lease_1", class: "noop" });
-    log.append({ action: "lease_lost", leaseId: "lease_1", reason: "expired" });
+    log.append({ kind: "lease", action: "lease_grant", leaseId: "lease_1", class: "noop", holder: { kind: "session", id: "s1" } });
+    log.append({ kind: "lease", action: "lease_lost", leaseId: "lease_1", reason: "expired", class: "noop", holder: { kind: "session", id: "s1" } });
     const after = Date.now();
 
     const rows = lines(path) as Array<Record<string, unknown>>;
     expect(rows).toHaveLength(2);
-    expect(rows[0]).toMatchObject({ action: "lease_grant", leaseId: "lease_1", class: "noop" });
-    expect(rows[1]).toMatchObject({ action: "lease_lost", leaseId: "lease_1", reason: "expired" });
+    expect(rows[0]).toMatchObject({ kind: "lease", action: "lease_grant", leaseId: "lease_1", class: "noop", holder: { kind: "session", id: "s1" } });
+    expect(rows[1]).toMatchObject({ kind: "lease", action: "lease_lost", leaseId: "lease_1", reason: "expired", class: "noop", holder: { kind: "session", id: "s1" } });
     for (const r of rows) {
       expect(typeof r.ts).toBe("number");
       expect(r.ts as number).toBeGreaterThanOrEqual(before);
@@ -46,7 +46,7 @@ describe("AuditLog", () => {
     const path = join(dir, "audit.jsonl");
     const log = new AuditLog(path);
 
-    log.append({ action: "advertise", ts: 1 });
+    log.append({ kind: "lease", action: "lease_grant", leaseId: "lease_1", class: "noop", holder: { kind: "session", id: "s1" }, ts: 1 });
 
     const row = lines(path)[0] as Record<string, unknown>;
     expect(row.ts).not.toBe(1);

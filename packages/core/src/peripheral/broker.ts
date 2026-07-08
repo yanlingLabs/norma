@@ -195,7 +195,7 @@ export class PeripheralBroker {
     this.entries.set(req.class, { leaseId, class: req.class, holder, tokenHash: hashToken(token), expiresAt });
     this.armSweep();
 
-    this.audit("lease_grant", { sessionId: req.sessionId, class: req.class, leaseId, expiresAt });
+    this.auditLease("lease_grant", { class: req.class, leaseId, holder });
     this.deps.emitTransient(req.sessionId, {
       type: "lease_granted", sessionId: req.sessionId, threadId: "main",
       leaseId, class: req.class, holder, expiresAt,
@@ -204,17 +204,17 @@ export class PeripheralBroker {
   }
 
   private denyHeld(req: { sessionId: string; class: PeripheralClass }, holder: Holder): LeaseError {
-    this.audit("lease_denied", { sessionId: req.sessionId, class: req.class, reason: "held", holder });
+    this.auditLease("lease_denied", { class: req.class, reason: "held", holder });
     return { code: "lease_held", holder };
   }
 
   private denyNoProvider(req: { sessionId: string; class: PeripheralClass }): LeaseError {
-    this.audit("lease_denied", { sessionId: req.sessionId, class: req.class, reason: "no_provider" });
+    this.auditLease("lease_denied", { class: req.class, reason: "no_provider" });
     return { code: "no_provider" };
   }
 
   private denyPolicy(req: { sessionId: string; class: PeripheralClass }): LeaseError {
-    this.audit("lease_denied", { sessionId: req.sessionId, class: req.class, reason: "denied" });
+    this.auditLease("lease_denied", { class: req.class, reason: "denied" });
     return { code: "denied" };
   }
 
@@ -223,16 +223,16 @@ export class PeripheralBroker {
   renew(req: { leaseId: string; token: string }): RenewResult {
     const found = this.findByLeaseId(req.leaseId);
     if (!found) {
-      this.audit("renew_failed", { leaseId: req.leaseId, reason: "not_found" });
+      this.auditLease("renew_failed", { leaseId: req.leaseId, reason: "not_found" });
       return { code: "not_found" };
     }
     const [cls, entry] = found;
     if (entry.tokenHash !== hashToken(req.token)) {
-      this.audit("renew_failed", { leaseId: req.leaseId, reason: "token_mismatch" });
+      this.auditLease("renew_failed", { leaseId: req.leaseId, class: cls, reason: "token_mismatch" });
       return { code: "token_mismatch" };
     }
     entry.expiresAt = Date.now() + this.expiryMs;
-    this.audit("renew", { leaseId: req.leaseId, class: cls, expiresAt: entry.expiresAt });
+    this.auditLease("renew", { leaseId: req.leaseId, class: cls });
     return { ok: true, expiresAt: entry.expiresAt };
   }
 
@@ -241,12 +241,12 @@ export class PeripheralBroker {
   release(req: { leaseId: string; token: string }): ReleaseResult {
     const found = this.findByLeaseId(req.leaseId);
     if (!found) {
-      this.audit("release_failed", { leaseId: req.leaseId, reason: "not_found" });
+      this.auditLease("release_failed", { leaseId: req.leaseId, reason: "not_found" });
       return { code: "not_found" };
     }
     const [cls, entry] = found;
     if (entry.tokenHash !== hashToken(req.token)) {
-      this.audit("release_failed", { leaseId: req.leaseId, reason: "token_mismatch" });
+      this.auditLease("release_failed", { leaseId: req.leaseId, class: cls, reason: "token_mismatch" });
       return { code: "token_mismatch" };
     }
     this.dropLease(cls, "released");
@@ -258,7 +258,7 @@ export class PeripheralBroker {
    *  a "make sure it's gone" verb, not an assertion that it existed. */
   revoke(req: { leaseId?: string; all?: boolean; reason: LeaseLostReason }): RevokeResult {
     const revoked = req.all ? this.dropAll(req.reason) : this.dropOne(req.leaseId, req.reason);
-    this.audit("revoke", { leaseId: req.leaseId ?? null, all: !!req.all, reason: req.reason, revoked });
+    this.auditLease("revoke", { leaseId: req.leaseId, reason: req.reason, all: !!req.all, revoked });
     return { ok: true, revoked };
   }
 
@@ -378,7 +378,7 @@ export class PeripheralBroker {
         leaseId: entry.leaseId, class: cls, holder: entry.holder, reason,
       });
     }
-    this.audit("lease_lost", { leaseId: entry.leaseId, class: cls, holder: entry.holder, reason });
+    this.auditLease("lease_lost", { leaseId: entry.leaseId, class: cls, holder: entry.holder, reason });
     if (this.entries.size === 0 && this.sweepTimer) {
       clearInterval(this.sweepTimer);
       this.sweepTimer = null;
@@ -390,7 +390,7 @@ export class PeripheralBroker {
       if (p.leaseId !== leaseId) continue;
       this.pending.delete(requestId);
       clearTimeout(p.timer);
-      this.audit("call_failed", { requestId, leaseId, reason });
+      this.auditLease("call_failed", { leaseId, reason });
       p.resolve({ code: "lease_gone", reason });
     }
   }
@@ -400,6 +400,32 @@ export class PeripheralBroker {
     const timer = setInterval(() => this.sweep(Date.now()), SWEEP_INTERVAL_MS);
     timer.unref();
     this.sweepTimer = timer;
+  }
+
+  private auditLease(
+    action: string,
+    fields: {
+      class?: PeripheralClass;
+      leaseId?: string;
+      holder?: Holder;
+      reason?: string;
+      [key: string]: unknown;
+    }
+  ): void {
+    const entry: Record<string, unknown> = {
+      kind: "lease",
+      action,
+      class: fields.class,
+      leaseId: fields.leaseId,
+      holder: fields.holder,
+    };
+    // Add any extra fields (like reason, revoked count, etc.)
+    for (const [k, v] of Object.entries(fields)) {
+      if (k !== "class" && k !== "leaseId" && k !== "holder" && v !== undefined) {
+        entry[k] = v;
+      }
+    }
+    this.deps.audit.append(entry);
   }
 
   private audit(action: string, fields: Record<string, unknown>): void {

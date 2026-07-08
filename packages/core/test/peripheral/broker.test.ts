@@ -258,7 +258,9 @@ describe("PeripheralBroker", () => {
     expect(lost!.sessionId).toBe("s1");
     expect(lost!.event).toMatchObject({ type: "lease_lost", leaseId: g.leaseId, class: "noop", reason: "expired" });
 
-    expect(auditRows().some((r) => r.action === "lease_lost" && r.reason === "expired" && r.leaseId === g.leaseId)).toBe(true);
+    const auditRow = auditRows().find((r) => r.action === "lease_lost" && r.reason === "expired" && r.leaseId === g.leaseId);
+    expect(auditRow).toBeDefined();
+    expect(auditRow).toMatchObject({ kind: "lease", action: "lease_lost", class: "noop", leaseId: g.leaseId, reason: "expired", holder: { kind: "session", id: "s1" } });
 
     // Gone from the table: a fresh lease for the same class grants cleanly.
     expect("leaseId" in (await broker.lease({ sessionId: "s2", class: "noop" }))).toBe(true);
@@ -451,11 +453,17 @@ describe("PeripheralBroker", () => {
 
     const rows = auditRows();
     expect(rows.map((r) => r.action)).toEqual(["advertise", "lease_grant", "renew", "lease_lost"]);
-    expect(rows[3]).toMatchObject({ action: "lease_lost", reason: "released", leaseId: g.leaseId, class: "noop" });
+    expect(rows[3]).toMatchObject({ kind: "lease", action: "lease_lost", reason: "released", leaseId: g.leaseId, class: "noop", holder: { kind: "session", id: "s1" } });
     // requester identity + class + lease id (spec §A1) on every lease-identifying line
     for (const row of rows.slice(1)) {
       expect(row.leaseId).toBe(g.leaseId);
       expect(row.class).toBe("noop");
+      // Lease entries have kind: "lease"
+      expect(row.kind).toBe("lease");
+      // Holder is a {kind, id} object (not a bare sessionId)
+      if (row.action !== "renew" && row.action !== "renew_failed" && row.action !== "lease_denied") {
+        expect(row.holder).toMatchObject({ kind: expect.any(String), id: expect.any(String) });
+      }
     }
     for (const row of rows) expect(typeof row.ts).toBe("number");
   });
