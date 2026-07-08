@@ -123,6 +123,20 @@ export const PluginInfoSchema = z.object({
   hasMcp: z.boolean(),
   mcpEnabled: z.boolean(),
   disabled: z.boolean(),
+  // Phase 4a Task 3 additions — carried so the CLI's consent flow (norma plugin enable/list) can
+  // render tier + consent state + the full exec-payload disclosure without a second round trip.
+  // All optional so older-shaped fixtures/servers still parse (see methods.test.ts).
+  tier: z.enum(["capability", "platform"]).optional(),
+  requiredConsents: z.array(z.string()).optional(),
+  consented: z.array(z.string()).optional(),
+  legacy: z.boolean().optional(),
+  /** Verbatim exec-payload disclosure lines (plugin-manifest.ts#execPayloadLines) — spec §1:
+   *  "Consent text always shows the exec payload ... never just a summary." */
+  execPayload: z.array(z.string()).optional(),
+  /** manifest.permissions.tcc verbatim, for the "will request macOS permission: <each>" lines. */
+  tccPermissions: z.array(z.string()).optional(),
+  /** manifest.permissions.hardware verbatim, for the "hardware access via Norma.app helper: <each>" lines. */
+  hardwarePermissions: z.array(z.string()).optional(),
 });
 export const PluginsListParams = z.object({});
 export const PluginsListResult = z.object({ ok: z.literal(true), plugins: z.array(PluginInfoSchema) });

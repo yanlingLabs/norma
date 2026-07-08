@@ -1018,6 +1018,11 @@ describe("daemon IPC", () => {
     expect(plugins.plugins[0]).toMatchObject({
       name: "demo", hasMcp: true, mcpEnabled: true, disabled: false,
       requiredConsents: ["exec"], consented: [],
+      // Task 3: the CLI consent flow's display data reaches the wire too (core → ipc passthrough
+      // — no transform strips these; the protocol schema round-trip itself is covered by
+      // packages/protocol/test/methods.test.ts).
+      tier: "capability", legacy: false,
+      execPayload: [`mcp: bun run ${fixture}`], tccPermissions: [], hardwarePermissions: [],
     });
     expect(captured.some((m) => m.includes("demo") && m.includes("exec"))).toBe(true); // the "why" log line
     c.close();

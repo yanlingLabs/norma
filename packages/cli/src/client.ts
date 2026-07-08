@@ -145,7 +145,15 @@ export class NormaClient {
     const r = await this.request(METHODS.mcpList, { cwd });
     return r.servers;
   }
-  async pluginsList(): Promise<{ ok: true; plugins: Array<{ name: string; description?: string; version?: string; skills: string[]; hasMcp: boolean; mcpEnabled: boolean; disabled: boolean }> }> {
+  async pluginsList(): Promise<{
+    ok: true;
+    plugins: Array<{
+      name: string; description?: string; version?: string; skills: string[]; hasMcp: boolean; mcpEnabled: boolean; disabled: boolean;
+      // Phase 4a Task 3 — consent-flow display data (all optional: older servers may omit them).
+      tier?: "capability" | "platform"; requiredConsents?: string[]; consented?: string[]; legacy?: boolean;
+      execPayload?: string[]; tccPermissions?: string[]; hardwarePermissions?: string[];
+    }>;
+  }> {
     return this.validated(PluginsListResult, await this.request(METHODS.pluginsList, {}), METHODS.pluginsList);
   }
   async askUserRespond(params: { sessionId: string; callId: string; answers: Record<string, string> }): Promise<{ ok: true; alreadyResolved: boolean }> {

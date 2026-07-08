@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
-import { loadManifest, requiredConsentClasses } from "./plugin-manifest";
+import { execPayloadLines, loadManifest, requiredConsentClasses } from "./plugin-manifest";
 
 export const PluginManifest = z.object({
   name: z.string().optional(), description: z.string().optional(),
@@ -22,6 +22,15 @@ export interface PluginInfo {
   legacy: boolean;
   /** true when norma-plugin.json declares contributes.mcpServers. Distinct from hasMcp, which reflects the legacy .mcp.json file. */
   hasManifestMcp: boolean;
+  /** Display data for the CLI consent block (Task 3, spec §1: "Consent text always shows the
+   *  exec payload ... never just a summary."). execPayload = plugin-manifest.ts#execPayloadLines
+   *  verbatim (one line per mcpServer/hook/entry). [] for legacy plugins or manifests with no
+   *  exec-class content. */
+  execPayload: string[];
+  /** manifest.permissions.tcc verbatim (e.g. "accessibility") — one consent-block line per entry. [] when tcc isn't required. */
+  tccPermissions: string[];
+  /** manifest.permissions.hardware verbatim (e.g. "battery") — one consent-block line per entry. [] when hardware isn't required. */
+  hardwarePermissions: string[];
 }
 
 /** Consent record shape for one plugin: settings.plugins.consents[id] (settings.ts). */
@@ -79,6 +88,9 @@ export class PluginStore {
           consented,
           legacy: false,
           hasManifestMcp: Boolean(manifest.contributes?.mcpServers?.length),
+          execPayload: execPayloadLines(manifest),
+          tccPermissions: manifest.permissions?.tcc ?? [],
+          hardwarePermissions: manifest.permissions?.hardware ?? [],
         };
       }
 
@@ -93,6 +105,9 @@ export class PluginStore {
         consented,
         legacy: true,
         hasManifestMcp: false,
+        execPayload: [],
+        tccPermissions: [],
+        hardwarePermissions: [],
       };
     });
   }

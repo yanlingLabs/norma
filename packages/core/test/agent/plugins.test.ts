@@ -29,6 +29,7 @@ function mkPluginInfo(overrides: Partial<PluginInfo> = {}): PluginInfo {
   return {
     name: "p", skills: [], hasMcp: false, mcpEnabled: false, disabled: false,
     requiredConsents: [], consented: [], legacy: true, hasManifestMcp: false,
+    execPayload: [], tccPermissions: [], hardwarePermissions: [],
     ...overrides,
   };
 }
@@ -50,6 +51,10 @@ describe("PluginStore", () => {
     expect(p.requiredConsents).toEqual([]);
     expect(p.consented).toEqual([]);
     expect(p.hasManifestMcp).toBe(false);
+    // Task 3 additions — legacy plugins carry no consent-block display data.
+    expect(p.execPayload).toEqual([]);
+    expect(p.tccPermissions).toEqual([]);
+    expect(p.hardwarePermissions).toEqual([]);
   });
   test("manifest-less + malformed-manifest plugins still load", () => {
     const h = home(); plugin(h, "bare", { skills: ["s1"] }); plugin(h, "broken", { manifest: "{not json", skills: ["s2"] });
@@ -92,6 +97,10 @@ describe("PluginStore + norma-plugin.json", () => {
     expect(p.legacy).toBe(false);
     expect(p.hasManifestMcp).toBe(true);
     expect(p.skills).toEqual(["greet"]); // skill discovery stays directory-based regardless of manifest
+    // Task 3 additions — consent-block display data, filled from the manifest.
+    expect(p.execPayload).toEqual(["mcp: node server.js", "entry: node index.js"]);
+    expect(p.tccPermissions).toEqual(["accessibility"]);
+    expect(p.hardwarePermissions).toEqual([]);
   });
 
   test("id mismatch → directory name wins + warning logged", () => {
@@ -136,6 +145,29 @@ describe("PluginStore + norma-plugin.json", () => {
     expect(p.description).toBe("manifest-desc");
     expect(p.version).toBe("2.0.0");
     expect(p.legacy).toBe(false);
+  });
+});
+
+describe("PluginStore + consent-block display data (Task 3)", () => {
+  test("hardware-only manifest → hardwarePermissions populated, tcc/execPayload empty", () => {
+    const h = home();
+    normaPlugin(h, "demo", { id: "demo", tier: "platform", permissions: { hardware: ["battery"] } });
+    const [p] = new PluginStore({ normaHome: h }).list();
+    if (!p) throw new Error("expected one plugin");
+    expect(p.hardwarePermissions).toEqual(["battery"]);
+    expect(p.tccPermissions).toEqual([]);
+    expect(p.execPayload).toEqual([]);
+  });
+
+  test("manifest with no exec/tcc/hardware content → all three display arrays empty", () => {
+    const h = home();
+    normaPlugin(h, "demo", { id: "demo", tier: "capability", contributes: { skills: true } });
+    const [p] = new PluginStore({ normaHome: h }).list();
+    if (!p) throw new Error("expected one plugin");
+    expect(p.requiredConsents).toEqual([]);
+    expect(p.execPayload).toEqual([]);
+    expect(p.tccPermissions).toEqual([]);
+    expect(p.hardwarePermissions).toEqual([]);
   });
 });
 

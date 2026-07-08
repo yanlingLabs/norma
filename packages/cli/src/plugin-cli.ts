@@ -44,12 +44,82 @@ export function installPlugin(opts: { url: string; name?: string; pluginsRoot: s
 }
 
 /** Enable: add to enabled, remove from disabled. Disable: add to disabled, remove from enabled
- *  (fresh-consent rule — re-enabling after a disable is a deliberate act, not automatic). */
+ *  (fresh-consent rule — re-enabling after a disable is a deliberate act, not automatic).
+ *  Preserves `settings.plugins.consents` untouched (Task 3: this used to rebuild `plugins` from
+ *  scratch with only {enabled, disabled}, silently dropping any consent records — callers that
+ *  need to strip consents do so explicitly via `stripPluginConsents`). */
 export function setPluginEnabled(settings: Settings, name: string, enabled: boolean): Settings {
   const en = new Set(settings.plugins?.enabled ?? []);
   const dis = new Set(settings.plugins?.disabled ?? []);
   if (enabled) { en.add(name); dis.delete(name); } else { dis.add(name); en.delete(name); }
-  return { ...settings, plugins: { enabled: [...en], disabled: [...dis] } };
+  return { ...settings, plugins: { ...settings.plugins, enabled: [...en], disabled: [...dis] } };
+}
+
+/** Consent classes a plugin's manifest requires but doesn't yet have a record for — the CLI's
+ *  "is the consent block needed" check (design spec §1: exec/tcc/hardware content is spawnable/
+ *  loadable ONLY once every declared class has a consent record). */
+export function missingConsents(requiredConsents: string[], consented: string[]): string[] {
+  return requiredConsents.filter((c) => !consented.includes(c));
+}
+
+/** The shape `buildConsentBlock` needs — a structural subset of core's `PluginInfo` (and of the
+ *  `plugins.list` RPC result), so callers can pass either directly. */
+export interface ConsentBlockPlugin {
+  name: string;
+  requiredConsents: string[];
+  execPayload: string[];
+  tccPermissions: string[];
+  hardwarePermissions: string[];
+}
+
+/**
+ * Pure consent-block line builder (design spec §1: "Consent text always shows the exec payload
+ * (commands to be run), never just a summary."). Header, then one line per required class in the
+ * fixed exec → tcc → hardware order (matches PluginStore's CONSENT_CLASSES order):
+ *   - exec: every `execPayload` line verbatim (already self-describing — "mcp: …", "hook(…): …",
+ *     "entry: …" — no extra prefix).
+ *   - tcc: one "will request macOS permission: <perm>" line per `tccPermissions` entry.
+ *   - hardware: one "hardware access via Norma.app helper: <perm>" line per `hardwarePermissions`
+ *     entry.
+ * Does NOT include the trailing `type "yes" to consent:` prompt — that's printed by the caller's
+ * own `readLine` call, since it's an input prompt, not a disclosure line.
+ */
+export function buildConsentBlock(info: ConsentBlockPlugin): string[] {
+  const lines: string[] = [`plugin ${info.name} requests:`];
+  // Fixed exec → tcc → hardware order (matches PluginStore's CONSENT_CLASSES), independent of
+  // whatever order requiredConsents happens to list them in.
+  if (info.requiredConsents.includes("exec")) lines.push(...info.execPayload);
+  if (info.requiredConsents.includes("tcc")) {
+    for (const perm of info.tccPermissions) lines.push(`will request macOS permission: ${perm}`);
+  }
+  if (info.requiredConsents.includes("hardware")) {
+    for (const perm of info.hardwarePermissions) lines.push(`hardware access via Norma.app helper: ${perm}`);
+  }
+  return lines;
+}
+
+/** Record a fresh consent timestamp (Date.now() at grant time, per class) for `name`, merging
+ *  into any existing record — for this plugin's OTHER already-granted classes, and for every
+ *  OTHER plugin's records, which are left untouched. Unrecognized class strings are ignored
+ *  (defensive — `classes` normally comes straight from a plugin's own `requiredConsents`). */
+export function grantPluginConsents(settings: Settings, name: string, classes: string[], ts: number): Settings {
+  const consents = { ...(settings.plugins?.consents ?? {}) };
+  const record = { ...(consents[name] ?? {}) };
+  for (const c of classes) {
+    if (c === "exec" || c === "tcc" || c === "hardware") record[c] = ts;
+  }
+  consents[name] = record;
+  return { ...settings, plugins: { ...settings.plugins, consents } };
+}
+
+/** Delete `name`'s whole consent record (design spec: `disable` = fresh-consent semantics,
+ *  generalized from today's enabled-strip — re-enabling after a disable requires consenting
+ *  again). A no-op when there's nothing to delete (returns `settings` unchanged, not a copy). */
+export function stripPluginConsents(settings: Settings, name: string): Settings {
+  if (!settings.plugins?.consents?.[name]) return settings;
+  const consents = { ...settings.plugins.consents };
+  delete consents[name];
+  return { ...settings, plugins: { ...settings.plugins, consents } };
 }
 
 /** Strip `name` from both the enabled and disabled lists (used when removing a plugin). */
