@@ -273,6 +273,20 @@ describe("removePluginFromSettings", () => {
     const s = baseSettings();
     expect(removePluginFromSettings(s, "demo")).toBe(s);
   });
+  test("removing A leaves B's consents intact", () => {
+    const s = removePluginFromSettings(
+      baseSettings({ plugins: { enabled: ["demo"], disabled: [], consents: { demo: { exec: 1000 }, other: { tcc: 2000 } } } }),
+      "demo",
+    );
+    expect(s.plugins?.consents?.other).toEqual({ tcc: 2000 });
+  });
+  test("removing A deletes A's consent record", () => {
+    const s = removePluginFromSettings(
+      baseSettings({ plugins: { enabled: ["demo"], disabled: [], consents: { demo: { exec: 1000 }, other: { tcc: 2000 } } } }),
+      "demo",
+    );
+    expect(s.plugins?.consents?.demo).toBeUndefined();
+  });
 });
 
 describe("removePluginDir", () => {

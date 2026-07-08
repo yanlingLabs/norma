@@ -122,16 +122,20 @@ export function stripPluginConsents(settings: Settings, name: string): Settings 
   return { ...settings, plugins: { ...settings.plugins, consents } };
 }
 
-/** Strip `name` from both the enabled and disabled lists (used when removing a plugin). */
+/** Strip `name` from both the enabled and disabled lists (used when removing a plugin). Preserves
+ *  other plugins' consent records and explicitly strips the removed plugin's own record
+ *  (fresh-consent: reinstalling under the same name cannot inherit consents). */
 export function removePluginFromSettings(settings: Settings, name: string): Settings {
   if (!settings.plugins) return settings;
-  return {
+  let result = {
     ...settings,
     plugins: {
+      ...settings.plugins,
       enabled: (settings.plugins.enabled ?? []).filter((n) => n !== name),
       disabled: (settings.plugins.disabled ?? []).filter((n) => n !== name),
     },
   };
+  return stripPluginConsents(result, name);
 }
 
 /** Validate + delete `<pluginsRoot>/<name>` (path-containment + existence checked). Returns the
