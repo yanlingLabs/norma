@@ -1695,7 +1695,7 @@ describe("daemon IPC", () => {
       return { srv, plugin };
     }
 
-    test("the seven allowed verbs pass the role gate — never role-rejected (Task 4's handlers reject empty {} params as INVALID_PARAMS instead, which proves dispatch reached the handler, not the allowlist; hardware.request has no handler yet — Task 2 — so it hits the unknown-method default instead, which is likewise never UNAUTHORIZED)", async () => {
+    test("the seven allowed verbs pass the role gate — never role-rejected (every handler rejects empty {} params as INVALID_PARAMS instead, which proves dispatch reached the handler, not the allowlist)", async () => {
       const { srv, plugin } = await setup();
       for (const method of [
         METHODS.pluginRegister, METHODS.toolRegister, METHODS.shortcutRegister,
@@ -1759,6 +1759,231 @@ describe("daemon IPC", () => {
       expect(res.error?.message).not.toMatch(/plugin role may not call/); // proves it wasn't the allowlist gate
       expect(res.error?.message).toContain("pluginId does not match");
       c.close(); srv.stop();
+    });
+  });
+
+  // -----------------------------------------------------------------------------------------
+  // Hardware helper (Phase 4c Task 2, spec §5): plugin (or harness, dev/testing) → core →
+  // Norma.app's XPC helper, via HardwareBroker + the SAME ProviderLink/PeripheralBroker.isProvider
+  // gate peripheral.respond uses. Constructed directly here (AuditLog/PeripheralBroker/
+  // ProviderLink/HardwareBroker/PluginStore), mirroring daemon.ts's own wiring exactly — same
+  // precedent as "plugin tool bridge (Task 4)"'s bootBridgeServer and the "noop capability call
+  // round-trips" test's inline PeripheralBroker/ProviderLink construction above.
+  // -----------------------------------------------------------------------------------------
+  describe("hardware.request / hardware.respond (Phase 4c Task 2, spec §5)", () => {
+    async function bootHardwareServer(opts: {
+      consents?: Record<string, { exec?: number; tcc?: number; hardware?: number }>;
+      timeoutMs?: number;
+    } = {}): Promise<{
+      store: SessionStore; socketPath: string; harnessToken: string; home: string; stop: () => void;
+    }> {
+      const { AuditLog } = await import("../src/peripheral/audit");
+      const { PeripheralBroker } = await import("../src/peripheral/broker");
+      const { ProviderLink } = await import("../src/peripheral/provider-link");
+      const { HardwareBroker } = await import("../src/peripheral/hardware");
+
+      const home = mkdtempSync(join(tmpdir(), "norma-hardware-ipc-"));
+      const store = new SessionStore(home);
+      const socketPath = join(home, "core.sock");
+      const authority = new TokenAuthority(new FileSecretStore(join(home, "secrets.json")));
+      const tokens = await authority.ensureTokens();
+
+      const audit = new AuditLog(join(home, "audit.jsonl"));
+      const providerLink = new ProviderLink();
+      // peripheral is wired ONLY so hardware.respond's isProvider() gate has something to check
+      // against (ipc/server.ts reuses PeripheralBroker's provider-identity tracking) — no lease
+      // machinery is exercised by these tests.
+      const peripheral = new PeripheralBroker({
+        audit, policy: async () => "granted", emitTransient: () => {},
+        pushToProvider: (e) => providerLink.push(e),
+      });
+      const hardware = new HardwareBroker({
+        audit, pushToProvider: (e) => providerLink.push(e), timeoutMs: opts.timeoutMs ?? 500,
+      });
+      const plugins = new PluginStore({ normaHome: home, consents: opts.consents });
+
+      const server = startIpcServer({
+        socketPath, serverVersion: "test", tokens: authority, store, peripheral, providerLink, hardware, plugins,
+      });
+      return {
+        store, socketPath, harnessToken: tokens.harness, home,
+        stop: () => { server.stop(); store.close(); },
+      };
+    }
+
+    function seedBatteryPlugin(home: string, pluginId: string, permissions: { hardware?: string[] } = { hardware: ["battery"] }): void {
+      mkdirSync(join(home, "plugins", pluginId), { recursive: true });
+      writeFileSync(join(home, "plugins", pluginId, "norma-plugin.json"), JSON.stringify({
+        id: pluginId, tier: "capability", permissions,
+      }));
+    }
+
+    async function connectPlugin(store: SessionStore, socketPath: string, pluginId: string): Promise<TestClient> {
+      const raw = store.mintPluginToken(pluginId);
+      const c = await TestClient.connect(socketPath);
+      const hello = await c.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: pluginId, pluginId,
+      });
+      if (!hello.result?.ok) throw new Error(`test setup: plugin hello failed: ${JSON.stringify(hello.error)}`);
+      return c;
+    }
+
+    /** Connects a harness connection and advertises it as THE provider (peripheral.advertise —
+     *  same connection ProviderLink then routes hardware_requested pushes to). */
+    async function connectProvider(socketPath: string, harnessToken: string, clientName = "hw-provider"): Promise<TestClient> {
+      const p = await TestClient.connect(socketPath);
+      await p.hello(harnessToken, clientName);
+      await p.request(METHODS.peripheralAdvertise, { classes: [] });
+      return p;
+    }
+
+    test("no provider connected → typed no_provider (plugin caller, fully consented)", async () => {
+      const srv = await bootHardwareServer({ consents: { "battery-limiter": { hardware: Date.now() } } });
+      seedBatteryPlugin(srv.home, "battery-limiter");
+      const plugin = await connectPlugin(srv.store, srv.socketPath, "battery-limiter");
+
+      const res = await plugin.request(METHODS.hardwareRequest, { verb: "getChargeLimit" });
+      expect(res.result).toEqual({ code: "no_provider", message: "hardware features require Norma.app" });
+
+      plugin.close(); srv.stop();
+    });
+
+    test("consented plugin round-trip: scripted provider answers hardware.request via hardware_requested/hardware.respond", async () => {
+      const srv = await bootHardwareServer({ consents: { "battery-limiter": { hardware: Date.now() } } });
+      seedBatteryPlugin(srv.home, "battery-limiter");
+      const provider = await connectProvider(srv.socketPath, srv.harnessToken);
+      const plugin = await connectPlugin(srv.store, srv.socketPath, "battery-limiter");
+
+      const reqPromise = plugin.request(METHODS.hardwareRequest, { verb: "setChargeLimit", argsJson: '{"percent":80}' });
+      const pushed = await provider.waitForNotification((n) => n.method === METHODS.event && n.params.type === "hardware_requested");
+      expect(pushed.params.verb).toBe("setChargeLimit");
+      expect(pushed.params.argsJson).toBe('{"percent":80}');
+
+      const respond = await provider.request(METHODS.hardwareRespond, {
+        requestId: pushed.params.requestId, resultJson: '{"percent":80}',
+      });
+      expect(respond.result).toEqual({ ok: true });
+
+      const res = await reqPromise;
+      expect(res.result).toEqual({ resultJson: '{"percent":80}' });
+
+      provider.close(); plugin.close(); srv.stop();
+    });
+
+    test("unconsented plugin (manifest declares battery, but no hardware consent record) → typed consent_denied naming the missing consent class", async () => {
+      const srv = await bootHardwareServer(); // no consents at all
+      seedBatteryPlugin(srv.home, "battery-limiter");
+      const plugin = await connectPlugin(srv.store, srv.socketPath, "battery-limiter");
+
+      const res = await plugin.request(METHODS.hardwareRequest, { verb: "getChargeLimit" });
+      expect(res.result).toEqual({ code: "consent_denied", missing: "hardware" });
+
+      plugin.close(); srv.stop();
+    });
+
+    test("unconsented plugin (consented, but manifest doesn't declare the battery permission) → typed consent_denied naming the missing permission class", async () => {
+      const srv = await bootHardwareServer({ consents: { "battery-limiter": { hardware: Date.now() } } });
+      seedBatteryPlugin(srv.home, "battery-limiter", {}); // permissions.hardware omitted entirely
+      const plugin = await connectPlugin(srv.store, srv.socketPath, "battery-limiter");
+
+      const res = await plugin.request(METHODS.hardwareRequest, { verb: "getChargeLimit" });
+      expect(res.result).toEqual({ code: "consent_denied", missing: "battery" });
+
+      plugin.close(); srv.stop();
+    });
+
+    test("a plugin with no PluginStore record at all (never installed) → typed consent_denied, fails closed", async () => {
+      const srv = await bootHardwareServer();
+      const plugin = await connectPlugin(srv.store, srv.socketPath, "ghost-plugin"); // no plugins/ghost-plugin dir at all
+      const res = await plugin.request(METHODS.hardwareRequest, { verb: "getChargeLimit" });
+      expect(res.result).toEqual({ code: "consent_denied", missing: "battery" });
+      plugin.close(); srv.stop();
+    });
+
+    test("unknown verb from a fully consented plugin → typed unknown_verb, bypassing consent entirely", async () => {
+      const srv = await bootHardwareServer({ consents: { "battery-limiter": { hardware: Date.now() } } });
+      seedBatteryPlugin(srv.home, "battery-limiter");
+      const plugin = await connectPlugin(srv.store, srv.socketPath, "battery-limiter");
+
+      const res = await plugin.request(METHODS.hardwareRequest, { verb: "setFanSpeed" });
+      expect(res.result).toEqual({ code: "unknown_verb" });
+
+      plugin.close(); srv.stop();
+    });
+
+    test("timeout: the provider is connected but never answers → typed timeout after the configured budget", async () => {
+      const srv = await bootHardwareServer({ consents: { "battery-limiter": { hardware: Date.now() } }, timeoutMs: 50 });
+      seedBatteryPlugin(srv.home, "battery-limiter");
+      const provider = await connectProvider(srv.socketPath, srv.harnessToken);
+      const plugin = await connectPlugin(srv.store, srv.socketPath, "battery-limiter");
+
+      const res = await plugin.request(METHODS.hardwareRequest, { verb: "getChargeLimit" });
+      expect(res.result).toEqual({ code: "timeout" });
+
+      provider.close(); plugin.close(); srv.stop();
+    });
+
+    test("hardware.respond from a non-provider connection is rejected; the real provider connection can respond", async () => {
+      const srv = await bootHardwareServer({ consents: { "battery-limiter": { hardware: Date.now() } } });
+      seedBatteryPlugin(srv.home, "battery-limiter");
+      const provider = await connectProvider(srv.socketPath, srv.harnessToken, "real-provider");
+      const impostor = await TestClient.connect(srv.socketPath);
+      await impostor.hello(srv.harnessToken, "impostor");
+
+      const impostorRespond = await impostor.request(METHODS.hardwareRespond, { requestId: "req_whatever" });
+      expect(impostorRespond.error?.code).toBe(ERR.UNAUTHORIZED);
+
+      const plugin = await connectPlugin(srv.store, srv.socketPath, "battery-limiter");
+      const reqPromise = plugin.request(METHODS.hardwareRequest, { verb: "getChargeLimit" });
+      const pushed = await provider.waitForNotification((n) => n.method === METHODS.event && n.params.type === "hardware_requested");
+      const ok = await provider.request(METHODS.hardwareRespond, { requestId: pushed.params.requestId, resultJson: "{}" });
+      expect(ok.result).toEqual({ ok: true });
+      expect((await reqPromise).result).toEqual({ resultJson: "{}" });
+
+      provider.close(); impostor.close(); plugin.close(); srv.stop();
+    });
+
+    test("harness-role caller skips consent entirely and round-trips; audited with a {kind:'harness'} requester", async () => {
+      const srv = await bootHardwareServer(); // no PluginStore consents seeded at all
+      const provider = await connectProvider(srv.socketPath, srv.harnessToken);
+      const dev = await TestClient.connect(srv.socketPath);
+      await dev.hello(srv.harnessToken, "dev-cli");
+
+      const reqPromise = dev.request(METHODS.hardwareRequest, { verb: "setChargeLimit", argsJson: '{"percent":100}' });
+      const pushed = await provider.waitForNotification((n) => n.method === METHODS.event && n.params.type === "hardware_requested");
+      await provider.request(METHODS.hardwareRespond, { requestId: pushed.params.requestId, resultJson: '{"percent":100}' });
+      expect((await reqPromise).result).toEqual({ resultJson: '{"percent":100}' });
+
+      const auditLines = readFileSync(join(srv.home, "audit.jsonl"), "utf8").split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l));
+      const hwLine = auditLines.find((l) => l.kind === "hardware" && l.verb === "setChargeLimit");
+      expect(hwLine).toMatchObject({
+        kind: "hardware", verb: "setChargeLimit", requester: { kind: "harness", id: "dev-cli" },
+        outcome: { resultJson: '{"percent":100}' },
+      });
+      expect(typeof hwLine.ts).toBe("number");
+
+      provider.close(); dev.close(); srv.stop();
+    });
+
+    test("audit trail: a consented plugin's round-trip is audited with a {kind:'plugin'} requester naming the pluginId", async () => {
+      const srv = await bootHardwareServer({ consents: { "battery-limiter": { hardware: Date.now() } } });
+      seedBatteryPlugin(srv.home, "battery-limiter");
+      const provider = await connectProvider(srv.socketPath, srv.harnessToken);
+      const plugin = await connectPlugin(srv.store, srv.socketPath, "battery-limiter");
+
+      const reqPromise = plugin.request(METHODS.hardwareRequest, { verb: "getChargeLimit" });
+      const pushed = await provider.waitForNotification((n) => n.method === METHODS.event && n.params.type === "hardware_requested");
+      await provider.request(METHODS.hardwareRespond, { requestId: pushed.params.requestId, resultJson: '{"percent":80}' });
+      await reqPromise;
+
+      const auditLines = readFileSync(join(srv.home, "audit.jsonl"), "utf8").split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l));
+      const hwLine = auditLines.find((l) => l.kind === "hardware" && l.verb === "getChargeLimit");
+      expect(hwLine).toMatchObject({
+        kind: "hardware", verb: "getChargeLimit", requester: { kind: "plugin", id: "battery-limiter" },
+        outcome: { resultJson: '{"percent":80}' },
+      });
+
+      provider.close(); plugin.close(); srv.stop();
     });
   });
 

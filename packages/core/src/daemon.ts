@@ -50,6 +50,7 @@ import { PluginContribRegistry } from "./plugins/contrib";
 import { AuditLog } from "./peripheral/audit";
 import { PeripheralBroker, type PeripheralClass } from "./peripheral/broker";
 import { ProviderLink } from "./peripheral/provider-link";
+import { HardwareBroker } from "./peripheral/hardware";
 import type { NewSessionEvent } from "@norma/protocol";
 
 export const CORE_VERSION = "0.0.1";
@@ -355,6 +356,14 @@ export async function startDaemon(opts: {
     pushToProvider: (event) => providerLink.push(event),
   });
 
+  // Hardware helper (Phase 4c Task 2, spec §5). Built unconditionally, same precedent as
+  // `peripheral` above — hardware access has nothing to do with whether an LLM provider is
+  // configured. Shares the SAME `providerLink`/`audit` instances as `peripheral`: Norma.app's one
+  // provider connection doubles as the hardware provider, and `hardware.respond` (ipc/server.ts)
+  // reuses `peripheral.isProvider()` to gate on that SAME connection identity rather than tracking
+  // its own.
+  const hardware = new HardwareBroker({ audit, pushToProvider: (event) => providerLink.push(event) });
+
   const providerInfo = agentProvider ? { id: agentProvider.provider.id, model: agentProvider.model } : null;
 
   const server: IpcServer = startIpcServer({
@@ -382,6 +391,7 @@ export async function startDaemon(opts: {
     plans: plans ?? undefined,
     peripheral,
     providerLink,
+    hardware,
     quota,
     providerInfo,
     startedAt,

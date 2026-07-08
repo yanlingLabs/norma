@@ -361,7 +361,23 @@ export const HardwareRequestParams = z.object({
   verb: z.string().min(1),
   argsJson: z.string().optional(),
 });
-export const HardwareRequestResult = z.object({ resultJson: z.string() });
+/** Task 2 review pin (binding): a typed RESULT UNION, not RpcFailure — mirrors
+ *  `PeripheralLeaseResult`'s success|error-code union shape (see "Peripheral lease v1" above).
+ *  Success carries `resultJson`; failures are typed by `code`: `unknown_verb`
+ *  (`verbClass(verb) === null`, core's peripheral/hardware.ts), `consent_denied` (a plugin-role
+ *  caller's manifest permissions/consent record didn't cover the verb's class — `missing` names
+ *  which permission/consent class was absent), `no_provider` (Norma.app isn't connected —
+ *  `message` is the user-facing "hardware features require Norma.app" string), `timeout` (the
+ *  provider never answered within the broker's timeoutMs), and `provider_error` (the provider's
+ *  own `hardware.respond` carried an `error` string, passed through verbatim as `message`). */
+export const HardwareRequestResult = z.union([
+  z.object({ resultJson: z.string() }),
+  z.object({ code: z.literal("unknown_verb") }),
+  z.object({ code: z.literal("consent_denied"), missing: z.string().optional() }),
+  z.object({ code: z.literal("no_provider"), message: z.string() }),
+  z.object({ code: z.literal("timeout") }),
+  z.object({ code: z.literal("provider_error"), message: z.string() }),
+]);
 
 /** The active provider connection's answer to a `hardware_requested` push — mirrors
  *  `PeripheralRespondParams`'s shape exactly (provider-answers-a-push pattern) but without
