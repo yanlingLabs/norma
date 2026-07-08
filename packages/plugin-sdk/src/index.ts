@@ -262,11 +262,17 @@ export function createPlugin(def: PluginDefinition): Plugin {
     if (closed) return;
     const delay = backoffDelayMs(reconnectAttempt);
     reconnectAttempt++;
+    // Deliberately NOT unref'd: staying connected (or reconnecting) IS this process's entire
+    // purpose while `serve()` is active. An idle plugin between calls has no other open handle
+    // once its connection drops — an unref'd timer here would let the event loop see "nothing
+    // left to do" and exit the process immediately, before the timer ever gets a chance to fire,
+    // defeating the "core restart resilience" this reconnect loop exists for (empirically
+    // confirmed: a bare unref'd setTimeout as the only handle left in a Bun/Node process does not
+    // block exit — the process exits right away instead of waiting out the delay).
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       attemptConnect();
     }, delay);
-    reconnectTimer.unref?.();
   }
 
   function attemptConnect(): void {

@@ -1,16 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { cpSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { startIpcServer } from "../../src/ipc/server";
-import { SessionStore } from "../../src/sessions/store";
-import { FileSecretStore } from "../../src/auth/secret-store";
-import { TokenAuthority } from "../../src/auth/tokens";
-import { loadSettings } from "../../src/settings";
-import { PluginStore, pluginSpawnEligible } from "../../src/agent/plugins";
-import { ToolRegistry } from "../../src/agent/tools/registry";
-import { PluginSupervisor } from "../../src/plugins/supervisor";
-import { PluginContribRegistry } from "../../src/plugins/contrib";
+import { bootSupervisedServer, isPidAlive, waitFor } from "./supervised-fixtures";
 
 /**
  * Phase 4b Task 6 — the sample-echo reference plugin, proven end to end against a REAL `bun
@@ -25,120 +14,10 @@ import { PluginContribRegistry } from "../../src/plugins/contrib";
  * `settings.json` — exactly the state `pluginSpawnEligible` (agent/plugins.ts) requires before the
  * real daemon would ever spawn it.
  *
- * SDK IMPORT PATH: `examples/sample-echo/index.ts` imports `@norma/plugin-sdk` as a normal
- * workspace dependency (package.json: `"@norma/plugin-sdk": "workspace:*"`) — that resolves fine
- * for the real, pnpm-installed `examples/sample-echo` package. But this suite spawns `bun
- * index.ts` out of a COPY of that directory under a throwaway tmp `normaHome/plugins/sample-echo`
- * (copy, not symlink — installed plugins are real directories on disk, and the manifest's
- * `dirName === manifest.id` semantics in agent/plugin-manifest.ts#loadManifest depend on that), and
- * a bare copy has no `node_modules` of its own (copying pnpm's relative symlinks would break
- * anyway — the relative depth from a tmp dir elsewhere on disk is different). `installSampleEcho`
- * below therefore rewrites the ONE bare-specifier import in the COPY to an absolute file path
- * straight at the SDK's real TypeScript source (`packages/plugin-sdk/src/index.ts`), leaving
- * `examples/sample-echo` itself untouched/clean. This works because Bun/Node resolve a module's
- * OWN bare specifiers (e.g. the SDK's `import ... from "@norma/protocol"`) relative to the file
- * doing the importing, not the entry point — so the SDK file, imported from its real unmoved
- * location, still finds `packages/plugin-sdk/node_modules/@norma/protocol` normally. Verified
- * manually against a throwaway fixture server before this suite was written.
+ * The install/settings/boot machinery is shared with Task 7's `gate-4b.test.ts` — see
+ * `./supervised-fixtures.ts` for the SDK-import-path rewrite rationale (bare `@norma/plugin-sdk`
+ * specifier -> absolute path into `packages/plugin-sdk/src/index.ts`) and the full boot sequence.
  */
-
-const EXAMPLES_DIR = join(import.meta.dir, "../../../../examples/sample-echo");
-const PLUGIN_SDK_ENTRY = join(import.meta.dir, "../../../plugin-sdk/src/index.ts");
-
-/** Copies `examples/sample-echo` into `<normaHome>/plugins/<pluginId>` and rewrites its
- *  `@norma/plugin-sdk` import to an absolute path (see file doc comment above). Returns the
- *  installed directory. */
-function installSampleEcho(normaHome: string, pluginId: string): string {
-  const dest = join(normaHome, "plugins", pluginId);
-  cpSync(EXAMPLES_DIR, dest, { recursive: true });
-  const indexPath = join(dest, "index.ts");
-  const rewritten = readFileSync(indexPath, "utf8").replace(
-    'from "@norma/plugin-sdk"',
-    `from ${JSON.stringify(PLUGIN_SDK_ENTRY)}`,
-  );
-  writeFileSync(indexPath, rewritten);
-  return dest;
-}
-
-/** `ps -p <pid>` liveness probe — real process check (not `process.kill(pid, 0)`), matching the
- *  "verify with a ps check on the child pid" requirement for the no-orphan-process assertion. */
-function isPidAlive(pid: number): boolean {
-  const result = Bun.spawnSync(["ps", "-p", String(pid)]);
-  return result.exitCode === 0;
-}
-
-async function waitFor(predicate: () => boolean, timeoutMs: number, label: string): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (predicate()) return;
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  throw new Error(`timed out waiting for: ${label}`);
-}
-
-async function bootSupervisedServer(pluginId: string): Promise<{
-  home: string;
-  store: SessionStore;
-  socketPath: string;
-  registry: ToolRegistry;
-  supervisor: PluginSupervisor;
-  contrib: PluginContribRegistry;
-  stop: () => void;
-}> {
-  const home = mkdtempSync(join(tmpdir(), "norma-supervised-e2e-"));
-  installSampleEcho(home, pluginId);
-
-  // "installed + ENABLED + exec-CONSENTED in settings" — a real settings.json on disk, read
-  // through the real loadSettings() pipeline (server.test.ts's `boot()` convention), not a
-  // hand-built PluginStore fixture.
-  writeFileSync(join(home, "settings.json"), JSON.stringify({
-    schemaVersion: 2,
-    provider: { type: "codex-oauth", model: "gpt-5.4" }, // unused (nothing here constructs a real provider) but required by the settings schema
-    plugins: { enabled: [pluginId], consents: { [pluginId]: { exec: Date.now() } } },
-  }));
-  const settings = loadSettings(join(home, "settings.json"));
-
-  const store = new SessionStore(home);
-  const socketPath = join(home, "core.sock");
-  const authority = new TokenAuthority(new FileSecretStore(join(home, "secrets.json")));
-  await authority.ensureTokens();
-
-  const registry = new ToolRegistry();
-  const contrib = new PluginContribRegistry();
-  // PRODUCTION deps throughout: spawn/isAlivePid/signalPid/processStartedAt are all omitted, so
-  // the supervisor uses the REAL Bun.spawn/process.kill/ps — this is the whole point of this
-  // suite, versus server.test.ts's "plugin tool bridge (Task 4)" tests, which inject a fake spawn
-  // and drive the "plugin" side with a scripted TestClient. Only the timing knobs are shortened
-  // for test speed; `killGraceMs` is a constructor-only test-injection seam per supervisor.ts's own
-  // doc comment (never settings.json-overridable), distinct from the spawn/signal seams above.
-  const supervisor = new PluginSupervisor({
-    runDir: join(home, "run"),
-    socketPath,
-    mintToken: (id) => store.mintPluginToken(id),
-    settings: { registrationTimeoutMs: 10_000, killGraceMs: 1_500 },
-    onLog: (m) => { if (process.env.NORMA_TEST_DEBUG) console.error(`[supervisor] ${m}`); },
-    onCircuitOpen: (id) => registry.unregisterByPrefix(`plugin__${id}__`),
-  });
-
-  // The socket must already be listening before startAll() spawns the child — the child connects
-  // to NORMA_SOCKET immediately on startup.
-  const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, registry, supervisor, contrib });
-
-  const pluginStore = new PluginStore({
-    normaHome: home, plugins: settings.plugins, consents: settings.plugins?.consents,
-    log: (m) => { if (process.env.NORMA_TEST_DEBUG) console.error(`[plugins] ${m}`); },
-  });
-  const spawnable = pluginStore.list()
-    .filter(pluginSpawnEligible)
-    .map((p) => ({ id: p.name, dir: join(home, "plugins", p.name), entry: p.entry! }));
-  expect(spawnable.map((p) => p.id)).toEqual([pluginId]); // sanity: the eligibility pipeline actually picked it up
-  supervisor.startAll(spawnable);
-
-  return {
-    home, store, socketPath, registry, supervisor, contrib,
-    stop: () => { supervisor.stopAll(); server.stop(); store.close(); },
-  };
-}
 
 describe("supervised e2e: sample-echo (real Bun child process)", () => {
   let srv: Awaited<ReturnType<typeof bootSupervisedServer>> | null = null;
