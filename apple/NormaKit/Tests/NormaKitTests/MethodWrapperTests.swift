@@ -100,6 +100,7 @@ final class MethodWrapperTests: XCTestCase {
             ("peripheral.revoke", #"{"ok":true}"#, { try await client.peripheralRevoke(leaseId: "lease_1", reason: "panic") }),
             ("peripheral.revoke", #"{"ok":true}"#, { try await client.peripheralRevoke(leaseId: nil, reason: "panic") }),
             ("peripheral.respond", #"{"ok":true}"#, { try await client.peripheralRespond(requestId: "req_1", resultJson: "{}", error: nil) }),
+            ("hardware.respond", #"{"ok":true}"#, { try await client.hardwareRespond(requestId: "req_1", resultJson: "{\"percent\":80}", error: nil) }),
         ]
         var idx = 1
         for (method, result, call) in cases {

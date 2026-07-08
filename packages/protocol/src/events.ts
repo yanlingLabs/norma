@@ -171,6 +171,20 @@ export const PluginToolInvokeEvent = ThreadBase.extend({
   argsJson: z.string(),
 });
 
+/** TRANSIENT (broadcast-only, like `assistant_delta`/the lease events/`plugin_tool_invoke` above)
+ *  — core pushes this to the active PROVIDER's connection (Norma.app, spec §5) when a plugin (or
+ *  the harness, dev/testing) calls `hardware.request` (methods.ts): the app-side broker answers
+ *  via `hardware.respond` {requestId, resultJson?, error?}, the same approval-broker
+ *  request/response pattern as `peripheral_call_requested`/`plugin_tool_invoke`. A hardware verb
+ *  call is never resurrected by replay, so this must never be persisted or re-delivered on
+ *  session.attach. */
+export const HardwareRequestedEvent = ThreadBase.extend({
+  type: z.literal("hardware_requested"),
+  requestId: z.string().min(1),
+  verb: z.string().min(1),
+  argsJson: z.string(),
+});
+
 export const SessionEvent = z.discriminatedUnion("type", [
   SessionCreatedEvent,
   HarnessAttachedEvent,
@@ -204,6 +218,7 @@ export const SessionEvent = z.discriminatedUnion("type", [
   LeaseLostEvent,
   PeripheralCallRequestedEvent,
   PluginToolInvokeEvent,
+  HardwareRequestedEvent,
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 

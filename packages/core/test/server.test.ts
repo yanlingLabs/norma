@@ -1695,15 +1695,28 @@ describe("daemon IPC", () => {
       return { srv, plugin };
     }
 
-    test("the six allowed verbs pass the role gate — never role-rejected (Task 4's handlers reject empty {} params as INVALID_PARAMS instead, which proves dispatch reached the handler, not the allowlist)", async () => {
+    test("the seven allowed verbs pass the role gate — never role-rejected (Task 4's handlers reject empty {} params as INVALID_PARAMS instead, which proves dispatch reached the handler, not the allowlist; hardware.request has no handler yet — Task 2 — so it hits the unknown-method default instead, which is likewise never UNAUTHORIZED)", async () => {
       const { srv, plugin } = await setup();
       for (const method of [
         METHODS.pluginRegister, METHODS.toolRegister, METHODS.shortcutRegister,
         METHODS.tileUpdate, METHODS.providerRegister, METHODS.pluginToolResult,
+        METHODS.hardwareRequest,
       ]) {
         const res = await plugin.request(method, {});
         expect(res.error?.code).not.toBe(ERR.UNAUTHORIZED);
       }
+      plugin.close(); srv.stop();
+    });
+
+    // Phase 4c Task 1 (spec §5): hardware.respond is deliberately NOT on the plugin allowlist —
+    // only the active provider connection (Norma.app) may answer a hardware_requested push, same
+    // precedent as peripheral.respond. A plugin connection calling it is role-rejected before
+    // dispatch ever reaches the (Task 2) handler.
+    test("hardware.respond from a plugin connection is role-rejected — provider-only, not one of the seven plugin verbs", async () => {
+      const { srv, plugin } = await setup();
+      const res = await plugin.request(METHODS.hardwareRespond, { requestId: "req_1", resultJson: "{}" });
+      expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      expect(res.error?.message).toMatch(/plugin role may not call/);
       plugin.close(); srv.stop();
     });
 

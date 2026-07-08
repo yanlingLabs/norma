@@ -48,6 +48,7 @@ const fixtures: Record<string, unknown> = {
   lease_lost: { type: "lease_lost", sessionId: "s_1", threadId: "main", seq: 20, ts: 1700000000010, leaseId: "lease_1", class: "screenshot", holder: { kind: "session", id: "s_1" }, reason: "expired" },
   peripheral_call_requested: { type: "peripheral_call_requested", sessionId: "s_1", threadId: "main", seq: 21, ts: 1700000000011, requestId: "req_1", leaseId: "lease_1", token: "tok_9f3a7c2e1b", class: "noop", payloadJson: "{}" },
   plugin_tool_invoke: { type: "plugin_tool_invoke", sessionId: "s_1", threadId: "main", seq: 22, ts: 1700000000012, requestId: "req_2", tool: "echo", argsJson: '{"text":"hi"}' },
+  hardware_requested: { type: "hardware_requested", sessionId: "s_1", threadId: "main", seq: 23, ts: 1700000000013, requestId: "req_3", verb: "setChargeLimit", argsJson: '{"percent":80}' },
 };
 for (const [name, value] of Object.entries(fixtures)) {
   SessionEvent.parse(value); // fixtures must be valid by construction

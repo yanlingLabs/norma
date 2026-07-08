@@ -77,6 +77,10 @@ import {
   PluginRevokeTokenResult,
   PluginRestartParams,
   PluginRestartResult,
+  HardwareRequestParams,
+  HardwareRequestResult,
+  HardwareRespondParams,
+  HardwareRespondResult,
   METHODS,
 } from "../src/methods";
 
@@ -495,5 +499,29 @@ describe("plugin.restart (final-review Fix 1 — restart rider, recovers a circu
     expect(() => PluginRestartParams.parse({ pluginId: "" })).toThrow();
     expect(() => PluginRestartParams.parse({})).toThrow();
     expect(PluginRestartResult.parse({ ok: true })).toEqual({ ok: true });
+  });
+});
+
+describe("hardware.request / hardware.respond (Phase 4c Task 1, spec §5)", () => {
+  test("METHODS carries both verbs", () => {
+    expect(METHODS.hardwareRequest).toBe("hardware.request");
+    expect(METHODS.hardwareRespond).toBe("hardware.respond");
+  });
+
+  test("hardware.request params/result: verb required, argsJson optional, resultJson required string", () => {
+    expect(HardwareRequestParams.parse({ verb: "setChargeLimit", argsJson: '{"percent":80}' }).verb).toBe("setChargeLimit");
+    const bare = HardwareRequestParams.parse({ verb: "getChargeLimit" });
+    expect(bare.argsJson).toBeUndefined();
+    expect(() => HardwareRequestParams.parse({ verb: "" })).toThrow();
+    expect(() => HardwareRequestParams.parse({})).toThrow();
+    expect(HardwareRequestResult.parse({ resultJson: "{\"percent\":80}" }).resultJson).toBe("{\"percent\":80}");
+    expect(() => HardwareRequestResult.parse({})).toThrow();
+  });
+
+  test("hardware.respond params/result: mirrors peripheral.respond's shape minus alreadyResolved, same precedent as plugin.toolResult", () => {
+    expect(HardwareRespondParams.parse({ requestId: "req_1", resultJson: "{\"percent\":80}" }).requestId).toBe("req_1");
+    expect(HardwareRespondParams.parse({ requestId: "req_1", error: "unsupported_value" }).error).toBe("unsupported_value");
+    expect(() => HardwareRespondParams.parse({ requestId: "" })).toThrow();
+    expect(HardwareRespondResult.parse({ ok: true })).toEqual({ ok: true });
   });
 });

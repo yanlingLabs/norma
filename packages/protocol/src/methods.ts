@@ -347,6 +347,33 @@ export const PluginRevokeTokenResult = z.object({ ok: z.literal(true) });
 export const PluginRestartParams = z.object({ pluginId: z.string().min(1) });
 export const PluginRestartResult = z.object({ ok: z.literal(true) });
 
+// ---------------------------------------------------------------------------------------------
+// Hardware helper (Phase 4c Task 1, spec §5): plugin (or harness, dev/testing) → core →
+// Norma.app's XPC helper. `hardware.request` is PLUGIN-CALLABLE (ipc/server.ts's
+// PLUGIN_ALLOWED_METHODS gains it, growing the plugin-role allowlist to seven verbs);
+// `hardware.respond` is NOT — only the active provider connection (Norma.app) may answer a
+// `hardware_requested` push (events.ts), same precedent as `peripheral.respond` above. The
+// core-side broker (Task 2) owns unknown-verb/consent/no-provider/timeout error shaping; this
+// task only pins the wire shapes.
+// ---------------------------------------------------------------------------------------------
+
+export const HardwareRequestParams = z.object({
+  verb: z.string().min(1),
+  argsJson: z.string().optional(),
+});
+export const HardwareRequestResult = z.object({ resultJson: z.string() });
+
+/** The active provider connection's answer to a `hardware_requested` push — mirrors
+ *  `PeripheralRespondParams`'s shape exactly (provider-answers-a-push pattern) but without
+ *  `alreadyResolved`, same precedent as `PluginToolResultParams`: the broker's pending-request
+ *  map (Task 2) is the single source of truth for double-settle guarding, not the wire result. */
+export const HardwareRespondParams = z.object({
+  requestId: z.string().min(1),
+  resultJson: z.string().optional(),
+  error: z.string().optional(),
+});
+export const HardwareRespondResult = z.object({ ok: z.literal(true) });
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -391,4 +418,6 @@ export const METHODS = {
   pluginToolResult: "plugin.toolResult",
   pluginRevokeToken: "plugin.revokeToken",
   pluginRestart: "plugin.restart",
+  hardwareRequest: "hardware.request",
+  hardwareRespond: "hardware.respond",
 } as const;

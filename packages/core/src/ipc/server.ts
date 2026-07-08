@@ -97,11 +97,20 @@ class RpcFailure extends Error { constructor(public code: number, message: strin
 
 // Phase 4b Task 2 (spec §3): the table-driven role→methods gate for plugin connections. A plugin
 // authenticates as a SPECIFIC installed plugin id (hello role "plugin") and may ONLY ever call
-// these six wire verbs — everything else (session.*, approval.*, peripheral.*, daemon.*, trust.*,
+// these wire verbs — everything else (session.*, approval.*, peripheral.*, daemon.*, trust.*,
 // plugins.*, ask_user.*, etc.) is role-rejected BEFORE dispatch, never reaching a handler. Task 4
-// wires all six handlers (plugin.register/tool.register/shortcut.register/tile.update/
+// wires the original six handlers (plugin.register/tool.register/shortcut.register/tile.update/
 // provider.register/plugin.toolResult) into PluginSupervisor + ToolRegistry + PluginContribRegistry
 // below.
+//
+// Phase 4c Task 1 (spec §5) adds a seventh: `hardware.request` — a plugin's own tool may need to
+// ask Norma.app's XPC helper to do something (e.g. set the battery charge limit). `hardware.respond`
+// is DELIBERATELY NOT here: only the active provider connection (Norma.app) may answer a
+// `hardware_requested` push, same precedent as `peripheral.respond` staying off this list — a
+// plugin connection calling it is role-rejected before dispatch, never reaching the (Task 2)
+// handler. Handler wiring for hardware.request itself is Task 2; until then a plugin-role caller
+// passes this gate but falls through to the unknown-method default case (the 4b convention for an
+// allowed-but-unwired verb).
 const PLUGIN_ALLOWED_METHODS = new Set<string>([
   METHODS.pluginRegister,
   METHODS.toolRegister,
@@ -109,6 +118,7 @@ const PLUGIN_ALLOWED_METHODS = new Set<string>([
   METHODS.tileUpdate,
   METHODS.providerRegister,
   METHODS.pluginToolResult,
+  METHODS.hardwareRequest,
 ]);
 
 /** Maps a failed `PluginSupervisor.invoke()` result to the message a `throw new Error(...)` in

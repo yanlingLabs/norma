@@ -126,10 +126,11 @@ public actor NormaClient {
         case .event(let e):
             // Transient events bypass dedupe/lastSeq entirely (their seq = server lastSeq at
             // broadcast time, not their own; a naive `seq <= lastSeq` drop would kill every one
-            // of these — assistant_delta streaming, the peripheral-lease v1 events, and (Phase 4b
-            // Task 1) plugin_tool_invoke, all runtime-only and must never be resurrected by replay).
+            // of these — assistant_delta streaming, the peripheral-lease v1 events, (Phase 4b
+            // Task 1) plugin_tool_invoke, and (Phase 4c Task 1) hardware_requested, all
+            // runtime-only and must never be resurrected by replay).
             switch e {
-            case .assistantDelta, .leaseGranted, .leaseLost, .peripheralCallRequested, .pluginToolInvoke:
+            case .assistantDelta, .leaseGranted, .leaseLost, .peripheralCallRequested, .pluginToolInvoke, .hardwareRequested:
                 eventsCont.yield(.session(e))
                 return
             default:
@@ -234,6 +235,7 @@ extension SessionEvent {
         case .leaseLost(let v): return v.seq
         case .peripheralCallRequested(let v): return v.seq
         case .pluginToolInvoke(let v): return v.seq
+        case .hardwareRequested(let v): return v.seq
         }
     }
 
@@ -272,6 +274,7 @@ extension SessionEvent {
         case .leaseLost(let v): return v.sessionId
         case .peripheralCallRequested(let v): return v.sessionId
         case .pluginToolInvoke(let v): return v.sessionId
+        case .hardwareRequested(let v): return v.sessionId
         }
     }
 }

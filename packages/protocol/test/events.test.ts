@@ -219,6 +219,24 @@ describe("SessionEvent discriminated union", () => {
     // and zod's z.string() alone (matching tool_call's argsJson) allows the empty string too.
     expect(SessionEvent.safeParse({ ...t, type: "plugin_tool_invoke", requestId: "req_1", tool: "echo", argsJson: "" }).success).toBe(true);
   });
+
+  // Phase 4c Task 1 (spec §5): core pushes this to the active provider connection (Norma.app)
+  // when a plugin (or the harness) calls hardware.request; mirrors plugin_tool_invoke's
+  // request/response shape one-for-one — the provider answers with hardware.respond (methods.ts).
+  test("hardware_requested round-trips", () => {
+    const t = { sessionId: "s", threadId: "main", seq: 1, ts: 1 };
+    const requested = { ...t, type: "hardware_requested", requestId: "req_1", verb: "setChargeLimit", argsJson: '{"percent":80}' } as const;
+    expect(SessionEvent.parse(requested)).toEqual(requested);
+  });
+
+  test("hardware_requested rejects empty requestId/verb", () => {
+    const t = { sessionId: "s", threadId: "main", seq: 1, ts: 1 };
+    expect(SessionEvent.safeParse({ ...t, type: "hardware_requested", requestId: "", verb: "setChargeLimit", argsJson: "{}" }).success).toBe(false);
+    expect(SessionEvent.safeParse({ ...t, type: "hardware_requested", requestId: "req_1", verb: "", argsJson: "{}" }).success).toBe(false);
+    // argsJson has no min(1) — an argument-less verb still needs a wire representation ("{}"),
+    // and zod's z.string() alone (matching plugin_tool_invoke's argsJson) allows the empty string too.
+    expect(SessionEvent.safeParse({ ...t, type: "hardware_requested", requestId: "req_1", verb: "getChargeLimit", argsJson: "" }).success).toBe(true);
+  });
 });
 
 describe("hello method schemas", () => {

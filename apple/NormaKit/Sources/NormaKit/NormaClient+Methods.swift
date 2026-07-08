@@ -199,6 +199,18 @@ extension NormaClient {
         ]))
     }
 
+    /// Provider-side (Phase 4c Task 1, spec §5): answer a `hardware_requested` event with either
+    /// a JSON-encoded result or an error message (mutually exclusive) — mirrors
+    /// `peripheralRespond`'s shape exactly. Only the active provider connection (Norma.app) may
+    /// call this; the core-side broker (Task 2) rejects it otherwise.
+    public func hardwareRespond(requestId: String, resultJson: String?, error: String?) async throws {
+        _ = try await request("hardware.respond", params: obj([
+            "requestId": .string(requestId),
+            "resultJson": resultJson.map { .string($0) },
+            "error": error.map { .string($0) },
+        ]))
+    }
+
     /// Dashboard read: daemon identity/uptime + the current peripheral provider (if any).
     public func daemonStatus() async throws -> (version: String, uptimeMs: Int, socketPath: String, providerId: String?, providerModel: String?, sessionsCount: Int, pluginsCount: Int) {
         let r = try await request("daemon.status", params: nil)
