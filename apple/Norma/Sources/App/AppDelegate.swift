@@ -12,6 +12,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// — the app's MAIN feed client/socket (the daemon rule: THE provider = the most-recent-
     /// advertiser CONNECTION, so this must never be a second/detached-window client).
     private(set) var peripheralProvider: PeripheralProvider?
+    /// Task 5 (2f-ii): the Dashboard's singleton window controller — `nil` until first opened,
+    /// nil'd again via `onClosed` (same one-shot-latch/registry-removal convention as
+    /// `registerDetachedWindow`'s `onClosed`). `openDashboard()` below is what enforces the
+    /// "second invocation focuses the existing window" contract off this single stored ref.
+    private(set) var dashboardWindow: DashboardWindowController?
     private var stickiness: StickinessEngine?
     private var startTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
@@ -118,6 +123,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let visible = NSScreen.main?.visibleFrame ?? .zero
             self.openSessionInNewDetachedWindow(sid, frame: centeredStandaloneFrame(visibleFrame: visible))
         }
+    }
+
+    /// Task 5 (2f-ii): the menu bar's "Dashboard…" entry — singleton behavior per the brief: a
+    /// second invocation while the window is already open just refocuses it (`show()` is
+    /// idempotent — `makeKeyAndOrderFront` on an already-front window is a no-op), never
+    /// constructing a second `DashboardWindowController`. Defensive, same posture as
+    /// `openSessionInNewDetachedWindow`'s guard: no `appModel`/`peripheralProvider` (never booted)
+    /// resolves to a log + no-op, never a crash or a half-wired window.
+    func openDashboard() {
+        if let dashboardWindow {
+            dashboardWindow.show()
+            return
+        }
+        guard let model = appModel, let peripheral = peripheralProvider else {
+            OrbDebug.log("openDashboard: no appModel/peripheralProvider — spawn aborted")
+            return
+        }
+        let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let controller = DashboardWindowController(
+            client: model.client,
+            directory: model.directory,
+            peripheral: peripheral,
+            onOpenSessionDetached: { [weak self] sid in self?.openSessionInNewDetachedWindow(sid) },
+            frame: centeredDashboardFrame(visibleFrame: visible)
+        )
+        controller.onClosed = { [weak self] _ in self?.dashboardWindow = nil }
+        dashboardWindow = controller
+        controller.show()
     }
 
     @discardableResult
@@ -321,6 +354,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             openCli: { [weak self] in self?.cliLauncher.openCli() },
             openNormaApp: { [weak self] in self?.openStandaloneNormaWindow() },
+            openDashboard: { [weak self] in self?.openDashboard() },
             panic: { [weak peripheral] in peripheral?.panic() },
             quit: { NSApp.terminate(nil) }
         )
@@ -364,6 +398,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Best-effort: each detached window's own feed/socket must not survive the app (spec §5
         // D9 — a closed window leaves nothing running; termination is a harder stop than that).
         detachedWindows.forEach { $0.close() }
+        dashboardWindow?.close()
     }
 
     static var isRunningUnitTests: Bool {

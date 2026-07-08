@@ -7,6 +7,7 @@ final class MenuBarController {
     private let summonField: () -> Void
     private let openCli: () -> Void
     private let openNormaApp: () -> Void
+    private let openDashboard: () -> Void
     private let panicAction: () -> Void
     private let quitApplication: () -> Void
     // Task 3 (2e-iv): internal (not private), same stored-`let` pattern as `stateItem` below, so
@@ -18,6 +19,9 @@ final class MenuBarController {
     private let summonFieldItem = NSMenuItem(title: "Summon Field", action: #selector(didSummonField), keyEquivalent: "")
     let openCliItem = NSMenuItem(title: "Open CLI", action: #selector(didOpenCli), keyEquivalent: "")
     let openNormaAppItem = NSMenuItem(title: "Open Norma App", action: #selector(didOpenNormaApp), keyEquivalent: "")
+    // Task 5 (2f-ii): the Dashboard entry — same section/adjacency convention as `openCliItem`/
+    // `openNormaAppItem` (2e-iv), mirrored exactly.
+    let dashboardItem = NSMenuItem(title: "Dashboard…", action: #selector(didOpenDashboard), keyEquivalent: "")
     // Task 4 (2f): the red "Stop Norma's Control" panic item — mounted/unmounted (not just
     // shown/hidden, unlike `orbItem`'s title-flip via `setOrbVisible`) with the active-lease count.
     // `internal`, same testability posture as `openCliItem`/`openNormaAppItem` above.
@@ -32,6 +36,7 @@ final class MenuBarController {
         summonField: @escaping () -> Void,
         openCli: @escaping () -> Void,
         openNormaApp: @escaping () -> Void,
+        openDashboard: @escaping () -> Void,
         panic: @escaping () -> Void,
         quit: @escaping () -> Void
     ) {
@@ -40,6 +45,7 @@ final class MenuBarController {
         self.summonField = summonField
         self.openCli = openCli
         self.openNormaApp = openNormaApp
+        self.openDashboard = openDashboard
         self.panicAction = panic
         self.quitApplication = quit
     }
@@ -62,6 +68,8 @@ final class MenuBarController {
         menu.addItem(openCliItem)
         openNormaAppItem.target = self
         menu.addItem(openNormaAppItem)
+        dashboardItem.target = self
+        menu.addItem(dashboardItem)
         menu.addItem(preQuitSeparator)
         quitItem.target = self
         menu.addItem(quitItem)
@@ -106,6 +114,7 @@ final class MenuBarController {
     @objc private func didSummonField() { summonField() }
     @objc private func didOpenCli() { openCli() }
     @objc private func didOpenNormaApp() { openNormaApp() }
+    @objc private func didOpenDashboard() { openDashboard() }
     @objc private func didPanic() { panicAction() }
     @objc private func didQuit() { quitApplication() }
 }

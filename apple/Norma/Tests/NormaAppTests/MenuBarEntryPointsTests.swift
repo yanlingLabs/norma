@@ -17,6 +17,7 @@ final class MenuBarEntryPointsTests: XCTestCase {
     private func makeController(
         openCli: @escaping () -> Void = {},
         openNormaApp: @escaping () -> Void = {},
+        openDashboard: @escaping () -> Void = {},
         panic: @escaping () -> Void = {}
     ) -> MenuBarController {
         MenuBarController(
@@ -25,6 +26,7 @@ final class MenuBarEntryPointsTests: XCTestCase {
             summonField: {},
             openCli: openCli,
             openNormaApp: openNormaApp,
+            openDashboard: openDashboard,
             panic: panic,
             quit: {}
         )
@@ -59,10 +61,41 @@ final class MenuBarEntryPointsTests: XCTestCase {
         XCTAssertEqual(cliIdx, summonIdx + 2, "expected exactly one separator between Summon Field and Open CLI")
         XCTAssertEqual(appIdx, cliIdx + 1, "Open CLI and Open Norma App must be adjacent, no separator between them")
         XCTAssertTrue(items[summonIdx + 1].isSeparatorItem)
+    }
 
-        // The pre-existing pre-Quit separator is preserved between Open Norma App and Quit Norma.
-        XCTAssertEqual(quitIdx, appIdx + 2)
-        XCTAssertTrue(items[appIdx + 1].isSeparatorItem)
+    // MARK: - Task 5 (2f-ii): "Dashboard…" — same section, mirrors Open CLI/Open Norma App exactly.
+
+    func testMenuContainsDashboardRightAfterOpenNormaAppThenPreQuitSeparator() {
+        let controller = makeController()
+        controller.install()
+
+        let items = controller.statusItem?.menu?.items ?? []
+        let titles = items.map(\.title)
+
+        guard let appIdx = titles.firstIndex(of: "Open Norma App"),
+              let dashboardIdx = titles.firstIndex(of: "Dashboard…"),
+              let quitIdx = titles.firstIndex(of: "Quit Norma") else {
+            XCTFail("expected Open Norma App, Dashboard…, and Quit Norma present, got \(titles)")
+            return
+        }
+
+        XCTAssertEqual(dashboardIdx, appIdx + 1, "Dashboard… must be adjacent to Open Norma App, no separator between them")
+        // The pre-existing pre-Quit separator is preserved between Dashboard… and Quit Norma.
+        XCTAssertEqual(quitIdx, dashboardIdx + 2)
+        XCTAssertTrue(items[dashboardIdx + 1].isSeparatorItem)
+    }
+
+    func testDashboardItemFiresInjectedClosure() {
+        var fired = 0
+        let controller = makeController(openDashboard: { fired += 1 })
+        controller.install()
+
+        let item = controller.dashboardItem
+        XCTAssertNotNil(item.target)
+        XCTAssertNotNil(item.action)
+        NSApp.sendAction(item.action!, to: item.target, from: item)
+
+        XCTAssertEqual(fired, 1)
     }
 
     func testInstallIsIdempotentForNewItems() {
@@ -74,6 +107,7 @@ final class MenuBarEntryPointsTests: XCTestCase {
         let titles = controller.statusItem?.menu?.items.map(\.title) ?? []
         XCTAssertEqual(titles.filter { $0 == "Open CLI" }.count, 1)
         XCTAssertEqual(titles.filter { $0 == "Open Norma App" }.count, 1)
+        XCTAssertEqual(titles.filter { $0 == "Dashboard…" }.count, 1)
     }
 
     // MARK: - Closure firing
