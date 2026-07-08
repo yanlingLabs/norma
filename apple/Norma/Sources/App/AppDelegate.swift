@@ -18,6 +18,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// never accumulates closed controllers.
     private(set) var detachedWindows: [DetachedWindowController] = []
 
+    /// Test-only seam (DEFECT FIX regression, `StandaloneWindowTests`): `boot()`'s unit-test path
+    /// always constructs a degraded (no-token) `AppModel` whose transport never opens — every RPC,
+    /// including the very FIRST `createSession`, fails immediately. That makes it impossible to
+    /// reach a state with a REAL prior focused session before a LATER createSession failure, which
+    /// is exactly the scenario the defect fix targets. This wires in a scripted-transport
+    /// `AppModel` (already focused on a real session) directly, bypassing `boot()` entirely — same
+    /// "expose a narrow seam, don't fake the whole app" posture as `SessionModel.applyForTesting`/
+    /// `OrbWindowController.setSurfaceForTesting`.
+    func setAppModelForTesting(_ model: AppModel) {
+        appModel = model
+    }
+
     /// Registers a freshly spawned detached window and wires its one-shot `onClosed` to remove it
     /// from `detachedWindows` again. Called by `orb.onWindowDetach`'s closure below (Task 4's
     /// detach choreography — yellow on the morph window) and by `spawnDetachedWindow` (Task 5,
@@ -69,25 +81,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Task 2 (2e-iv): the menu bar's "Open Norma App" entry (`NSMenuItem` wiring is Task 3) — a
     /// brand-new session via the SAME create+focus primitive the detach choreography and sidebar's
-    /// "+ New session" already reuse (`startFreshSessionAfterDetach`). Its orb-focus side effect
+    /// "+ New session" already reuse (`AppModel.startFreshSession`). Its orb-focus side effect
     /// isn't separable from the create here, and is harmless: the orb's next summon simply lands on
     /// this same fresh session too. Then a detached window on that id, centered on the main screen
     /// via `centeredStandaloneFrame` — unlike the other two spawn paths (yellow-light detach,
     /// sidebar's ⌘-click), this one is never offset from an existing window/orb frame.
     ///
     /// Defensive, same posture as `openSessionInNewDetachedWindow`'s own guard (line 58 precedent):
-    /// no `appModel`, `startFreshSessionAfterDetach` producing no focused session (RPC failure), or
-    /// `makeDetachedFeed` nil (missing token, checked inside `openSessionInNewDetachedWindow`) all
-    /// resolve to `OrbDebug.log` + no-op, never a crash or a half-open window.
+    /// no `appModel`, `startFreshSession` returning `nil` (RPC failure), or `makeDetachedFeed` nil
+    /// (missing token, checked inside `openSessionInNewDetachedWindow`) all resolve to
+    /// `OrbDebug.log` + no-op, never a crash or a half-open window.
+    ///
+    /// DEFECT FIX (reviewed defect): this used to await the void `startFreshSessionAfterDetach()`
+    /// and then read `model.focusedSessionId` — which, on a `createSession` RPC failure, silently
+    /// stayed whatever it already was (a STALE PRIOR session, in the orb's normal running state),
+    /// so the guard below wrongly passed and spawned the standalone window on that stale session
+    /// instead of no-op-ing. Reading `startFreshSession()`'s RETURN VALUE instead — never
+    /// `focusedSessionId` — closes that: `nil` on failure is unambiguous regardless of any prior
+    /// focus, so a failed create can no longer be mistaken for a fresh one.
     func openStandaloneNormaWindow() {
         guard let model = appModel else {
             OrbDebug.log("openStandaloneNormaWindow: no appModel — spawn aborted")
             return
         }
         Task { @MainActor [weak self] in
-            await model.startFreshSessionAfterDetach()
-            guard let self, let sid = model.focusedSessionId else {
-                OrbDebug.log("openStandaloneNormaWindow: startFreshSessionAfterDetach produced no focused session — spawn aborted")
+            guard let self, let sid = await model.startFreshSession() else {
+                OrbDebug.log("openStandaloneNormaWindow: startFreshSession produced no session (RPC failure) — spawn aborted")
                 return
             }
             let visible = NSScreen.main?.visibleFrame ?? .zero
