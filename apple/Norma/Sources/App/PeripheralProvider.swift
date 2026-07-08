@@ -149,10 +149,22 @@ final class PeripheralProvider: ObservableObject {
         ]
     }
 
-    /// Called on client connect (`AppModel.onClientConnected`) and by the TCC-change poll below.
-    /// Best-effort: a failed advertise (e.g. not actually connected yet) just logs — the next
-    /// connect/poll tick retries.
+    /// Called on client connect AND reconnect (`AppModel.onClientConnected` — fired once for the
+    /// initial connect, and again for every subsequent reconnect; see `AppModel.handle`'s
+    /// `.connection(.connected)` case) and by the TCC-change poll below. Best-effort: a failed
+    /// advertise (e.g. not actually connected yet) just logs — the next connect/poll tick retries.
+    ///
+    /// FINAL-REVIEW FIX (M1): a daemon restart or socket drop kills core's `PeripheralBroker`
+    /// state entirely (fresh process, empty lease table) — but WITHOUT this, the app kept ghost
+    /// `activeLeases` from the OLD connection: the red panic menu item stayed mounted, the
+    /// ⌃⌥⌘Esc hotkey stayed grabbed, and the dashboard's Peripheral pane kept showing dead leases,
+    /// none of which core has any record of anymore. Clear the local set (and its derived UI
+    /// state, via `updatePanicRegistration()`) BEFORE re-advertising — mirrors `panic()`'s own
+    /// "local hard-stop first" ordering, just without the `revoke(all)` round-trip back to core:
+    /// there is nothing there left to revoke against.
     func advertiseIfConnected() async {
+        activeLeases.removeAll()
+        updatePanicRegistration()
         do {
             try await client.peripheralAdvertise(classes: Self.currentClasses())
         } catch {

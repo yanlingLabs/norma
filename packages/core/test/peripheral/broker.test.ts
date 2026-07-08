@@ -198,6 +198,20 @@ describe("PeripheralBroker", () => {
     expect(emittedTokenHash).toBe(createHash("sha256").update(g.token).digest("hex"));
   });
 
+  test("L2 fix: advertise() audits the advertiser's clientName, so provider displacement leaves a forensic trace", () => {
+    const { broker, auditRows } = setup();
+    broker.advertise({}, [{ class: "noop", tccGranted: true }], "harness-window-1");
+    broker.advertise({}, [{ class: "noop", tccGranted: true }], "harness-window-2"); // displaces it
+
+    const rows = auditRows().filter((r) => r.action === "advertise");
+    expect(rows.map((r) => r.clientName)).toEqual(["harness-window-1", "harness-window-2"]);
+
+    // Omitting clientName (existing call sites/tests that don't care about identity) still works
+    // — defaults to "" rather than throwing or leaving the field undefined-and-absent-vs-missing.
+    broker.advertise({}, [{ class: "noop", tccGranted: true }]);
+    expect(auditRows().filter((r) => r.action === "advertise").at(-1)?.clientName).toBe("");
+  });
+
   test("policy denial → {code:'denied'}, no entry created", async () => {
     const { broker, fakes } = setup();
     broker.advertise({}, [{ class: "noop", tccGranted: true }]);
@@ -243,6 +257,52 @@ describe("PeripheralBroker", () => {
   test("renew() on an unknown leaseId → {code:'not_found'}", () => {
     const { broker } = setup();
     expect(broker.renew({ leaseId: "nope", token: "t" })).toEqual({ code: "not_found" });
+  });
+
+  test("L1 fix: renew() rejects a lease past expiresAt but not yet swept (the pre-sweep window) instead of resurrecting it", async () => {
+    // The expiry sweep only runs on its own SWEEP_INTERVAL_MS cadence (~1s) — a renew can land
+    // strictly AFTER expiresAt but strictly BEFORE the sweep has gotten around to dropping the
+    // entry. Without the L1 fix, renew() only checked leaseId/token, so this window let an
+    // already-dead lease be renewed back to life. `broker.sweep()` is deliberately never called
+    // here — the entry must still be sitting in the table, unswept, when renew() rejects it.
+    const { broker, auditRows } = setup();
+    broker.advertise({}, [{ class: "noop", tccGranted: true }]);
+
+    const origNow = Date.now;
+    let g: { leaseId: string; token: string; expiresAt: number };
+    try {
+      Date.now = () => 1_000_000;
+      g = expectGranted(await broker.lease({ sessionId: "s1", class: "noop" }));
+      expect(g.expiresAt).toBe(1_000_000 + 15_000);
+
+      Date.now = () => g.expiresAt + 1; // past expiry, pre-sweep — the exact window L1 closes
+      expect(broker.renew({ leaseId: g.leaseId, token: g.token })).toEqual({ code: "expired" });
+    } finally {
+      Date.now = origNow;
+    }
+
+    const row = auditRows().find((r) => r.action === "renew_failed" && r.reason === "expired");
+    expect(row).toBeDefined();
+    expect(row).toMatchObject({ kind: "lease", action: "renew_failed", leaseId: g.leaseId, class: "noop", reason: "expired" });
+  });
+
+  test("L1 fix: renew() at exactly expiresAt (inclusive boundary, matching expiredLeases) is also rejected", async () => {
+    const { broker } = setup();
+    broker.advertise({}, [{ class: "noop", tccGranted: true }]);
+
+    const origNow = Date.now;
+    try {
+      Date.now = () => 1_000_000;
+      const g = expectGranted(await broker.lease({ sessionId: "s1", class: "noop" }));
+
+      Date.now = () => g.expiresAt; // exactly at the boundary — expired (inclusive)
+      expect(broker.renew({ leaseId: g.leaseId, token: g.token })).toEqual({ code: "expired" });
+
+      Date.now = () => g.expiresAt - 1; // one ms before — still renewable
+      expect(broker.renew({ leaseId: g.leaseId, token: g.token })).toMatchObject({ ok: true });
+    } finally {
+      Date.now = origNow;
+    }
   });
 
   test("expiry fires lease_lost(reason:'expired') + audit at exactly expiresAt (sweep called directly, no real wait)", async () => {
@@ -385,6 +445,49 @@ describe("PeripheralBroker", () => {
       type: "peripheral_call_requested", sessionId: "s1", threadId: "main",
       leaseId: g.leaseId, token: g.token, class: "noop", payloadJson: "{}",
     });
+  });
+
+  test("L3 fix: every call_failed audit line — all four of call()'s own rejection paths, plus failPending()'s revoke/expiry race — uniformly carries kind:'lease'", async () => {
+    // Previously call()'s four early-rejection paths (not_found/token_mismatch/expired/
+    // no_provider-on-delivery) logged call_failed via the plain audit() helper (no `kind`), while
+    // failPending()'s OWN call_failed line (an in-flight call losing its lease to a revoke/expiry)
+    // used auditLease() (kind:"lease") — same action name, two shapes on disk. All five paths
+    // below must now agree.
+    const { broker, fakes, auditRows } = setup();
+    broker.advertise({}, [{ class: "noop", tccGranted: true }]);
+    const g = expectGranted(await broker.lease({ sessionId: "s1", class: "noop" }));
+
+    // 1) not_found (wrong class for a real leaseId)
+    await broker.call({ leaseId: g.leaseId, token: g.token, class: "screenshot", payloadJson: "{}" });
+    // 2) token_mismatch
+    await broker.call({ leaseId: g.leaseId, token: "wrong", class: "noop", payloadJson: "{}" });
+    // 3) no_provider (pushToProvider delivery fails despite an entry existing)
+    fakes.pushReturn = false;
+    await broker.call({ leaseId: g.leaseId, token: g.token, class: "noop", payloadJson: "{}" });
+    fakes.pushReturn = true;
+    // 4) failPending's call_failed: an in-flight call loses its lease to a revoke
+    const inFlight = broker.call({ leaseId: g.leaseId, token: g.token, class: "noop", payloadJson: "{}" });
+    broker.revoke({ leaseId: g.leaseId, reason: "revoked" });
+    expect(await inFlight).toEqual({ code: "lease_gone", reason: "revoked" });
+
+    // 5) expired — a fresh lease, aged past its own expiresAt without ever being swept.
+    const origNow = Date.now;
+    try {
+      Date.now = () => 1_000_000;
+      const g2 = expectGranted(await broker.lease({ sessionId: "s2", class: "noop" }));
+      Date.now = () => g2.expiresAt;
+      await broker.call({ leaseId: g2.leaseId, token: g2.token, class: "noop", payloadJson: "{}" });
+    } finally {
+      Date.now = origNow;
+    }
+
+    const rows = auditRows().filter((r) => r.action === "call_failed");
+    expect(rows.map((r) => r.reason)).toEqual(["not_found", "token_mismatch", "no_provider", "revoked", "expired"]);
+    for (const row of rows) {
+      expect(row.kind).toBe("lease");
+      expect(typeof row.ts).toBe("number");
+      expect(row.leaseId).toBeTruthy();
+    }
   });
 
   test("respond-correlation: respond() resolves the matching pending call by requestId, first response wins", async () => {

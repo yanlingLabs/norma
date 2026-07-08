@@ -73,7 +73,7 @@ export type LeaseLostReason = "expired" | "released" | "panic" | "revoked" | "pr
 export type LeaseError = { code: "lease_held"; holder: Holder } | { code: "no_provider" } | { code: "denied" };
 export type LeaseResult = { leaseId: string; token: string; expiresAt: number } | LeaseError;
 
-export type RenewError = { code: "not_found" } | { code: "token_mismatch" };
+export type RenewError = { code: "not_found" } | { code: "token_mismatch" } | { code: "expired" };
 export type RenewResult = { ok: true; expiresAt: number } | RenewError;
 
 export type ReleaseError = { code: "not_found" } | { code: "token_mismatch" };
@@ -150,11 +150,18 @@ export class PeripheralBroker {
 
   /** Provider attach / TCC-state re-advertise. Last advertiser wins (Task 3 pins connection
    *  identity/authorization on top of `isProvider`); existing leases are untouched — only an
-   *  actual disconnect (`providerGone`) revokes them. */
-  advertise(conn: unknown, classes: Array<{ class: PeripheralClass; tccGranted: boolean }>): void {
+   *  actual disconnect (`providerGone`) revokes them.
+   *
+   *  L2 fix: `clientName` (the connecting harness's own self-reported identity, e.g.
+   *  `socket.data.clientName` at the ipc layer) rides the audit line alongside `classes` — when a
+   *  second advertiser silently displaces the first ("last advertiser wins"), the audit trail
+   *  previously had no way to say WHO the new provider was, only that SOME advertise happened.
+   *  Optional (defaults to `""`) so existing test/call sites that don't care about identity don't
+   *  have to thread one through. */
+  advertise(conn: unknown, classes: Array<{ class: PeripheralClass; tccGranted: boolean }>, clientName = ""): void {
     this.providerConn = conn;
     this.hasProvider = true;
-    this.audit("advertise", { classes });
+    this.audit("advertise", { classes, clientName });
   }
 
   /** True if `conn` is the connection that most recently advertised — the hook Task 3 needs to
@@ -226,7 +233,15 @@ export class PeripheralBroker {
   }
 
   /** Extend an existing lease's expiry by `expiryMs` from now. Does not change the class's
-   *  entry identity (leaseId/token unchanged) — only `expiresAt` moves forward. */
+   *  entry identity (leaseId/token unchanged) — only `expiresAt` moves forward.
+   *
+   *  L1 fix: a lease past its `expiresAt` but not yet swept (the sweep only runs on its own
+   *  `SWEEP_INTERVAL_MS` cadence, up to ~1s late — see `armSweep`/`sweep`) must not be renewable
+   *  back to life; without this check a renew landing in that pre-sweep window would silently
+   *  resurrect an already-expired lease. Same inclusive boundary as `expiredLeases`
+   *  (`nowMs >= expiresAt` counts as expired) and the same typed-error family as `not_found`/
+   *  `token_mismatch` above — deliberately NOT dropping the entry here: the sweep (or the next
+   *  call()/renew() to observe it) still owns firing the one `lease_lost` + audit line for it. */
   renew(req: { leaseId: string; token: string }): RenewResult {
     const found = this.findByLeaseId(req.leaseId);
     if (!found) {
@@ -237,6 +252,10 @@ export class PeripheralBroker {
     if (entry.tokenHash !== hashToken(req.token)) {
       this.auditLease("renew_failed", { leaseId: req.leaseId, class: cls, reason: "token_mismatch" });
       return { code: "token_mismatch" };
+    }
+    if (Date.now() >= entry.expiresAt) {
+      this.auditLease("renew_failed", { leaseId: req.leaseId, class: cls, reason: "expired" });
+      return { code: "expired" };
     }
     entry.expiresAt = Date.now() + this.expiryMs;
     this.auditLease("renew", { leaseId: req.leaseId, class: cls });
@@ -287,19 +306,26 @@ export class PeripheralBroker {
    *  class+expiry (indexing by `req.class` means a wrong class for a right leaseId naturally
    *  misses — no separate "class_mismatch" code is needed), then pushes
    *  `peripheral_call_requested` to the provider and awaits `respond()` (10s timeout). Never
-   *  throws: every failure path is a typed `CallError`. */
+   *  throws: every failure path is a typed `CallError`.
+   *
+   *  L3 fix: every `call_failed` audit line — here AND in `failPending` below — now goes through
+   *  `auditLease` (`kind: "lease"`). Previously this method logged `call_failed` via the plain
+   *  `audit()` helper (no `kind`) while `failPending`'s OWN `call_failed` line (a revoke/expiry
+   *  racing an in-flight call) used `auditLease` — same action name, two different shapes on
+   *  disk. Unified on `auditLease` since `call_failed` is fundamentally a lease-identifying event
+   *  (it always carries `leaseId`), same family as `lease_denied`/`lease_lost`. */
   async call(req: { leaseId: string; token: string; class: PeripheralClass; payloadJson: string }): Promise<CallResult> {
     const entry = this.entries.get(req.class);
     if (!entry || entry.leaseId !== req.leaseId) {
-      this.audit("call_failed", { leaseId: req.leaseId, class: req.class, reason: "not_found" });
+      this.auditLease("call_failed", { leaseId: req.leaseId, class: req.class, reason: "not_found" });
       return { code: "not_found" };
     }
     if (entry.tokenHash !== hashToken(req.token)) {
-      this.audit("call_failed", { leaseId: req.leaseId, class: req.class, reason: "token_mismatch" });
+      this.auditLease("call_failed", { leaseId: req.leaseId, class: req.class, reason: "token_mismatch" });
       return { code: "token_mismatch" };
     }
     if (Date.now() >= entry.expiresAt) {
-      this.audit("call_failed", { leaseId: req.leaseId, class: req.class, reason: "expired" });
+      this.auditLease("call_failed", { leaseId: req.leaseId, class: req.class, reason: "expired" });
       return { code: "expired" };
     }
 
@@ -324,7 +350,7 @@ export class PeripheralBroker {
     if (!delivered) {
       const p = this.pending.get(requestId);
       if (p) { clearTimeout(p.timer); this.pending.delete(requestId); }
-      this.audit("call_failed", { requestId, leaseId: req.leaseId, class: req.class, reason: "no_provider" });
+      this.auditLease("call_failed", { requestId, leaseId: req.leaseId, class: req.class, reason: "no_provider" });
       return { code: "lease_gone", reason: "provider-gone" };
     }
     return result;

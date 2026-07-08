@@ -405,7 +405,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         if (socket.data.authedRole !== "harness") {
           throw new RpcFailure(ERR.UNAUTHORIZED, "peripheral.advertise requires harness role");
         }
-        opts.peripheral?.advertise(socket.data, p.classes);
+        opts.peripheral?.advertise(socket.data, p.classes, socket.data.clientName);
         opts.providerLink?.setWriter(socket.data.writer);
         return { ok: true };
       }

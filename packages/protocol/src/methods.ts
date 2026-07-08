@@ -178,6 +178,9 @@ export const PeripheralRenewResult = z.union([
   z.object({ ok: z.literal(true), expiresAt: z.number().int().nonnegative() }),
   z.object({ code: z.literal("not_found") }),
   z.object({ code: z.literal("token_mismatch") }),
+  // L1 fix: renew() now rejects a lease past its expiresAt but not yet swept, instead of
+  // silently resurrecting it — see PeripheralBroker.renew()'s RenewError union in broker.ts.
+  z.object({ code: z.literal("expired") }),
   PeripheralDeniedSchema,
 ]);
 

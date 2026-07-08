@@ -308,6 +308,8 @@ describe("peripheral lease + dashboard read methods", () => {
     expect("expiresAt" in renewed && renewed.expiresAt).toBe(200);
     expect(PeripheralRenewResult.parse({ code: "not_found" })).toEqual({ code: "not_found" });
     expect(PeripheralRenewResult.parse({ code: "token_mismatch" })).toEqual({ code: "token_mismatch" });
+    // L1 fix: renew() rejects a lease past expiresAt (pre-sweep window) instead of resurrecting it.
+    expect(PeripheralRenewResult.parse({ code: "expired" })).toEqual({ code: "expired" });
     const renewDenied = PeripheralRenewResult.parse({ code: "denied", reason: "plugin-leasing-not-yet-available" });
     expect("code" in renewDenied && renewDenied.code).toBe("denied");
 

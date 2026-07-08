@@ -290,4 +290,36 @@ final class PeripheralProviderTests: XCTestCase {
         ackLastSent(t, index: 1)
         await handled
     }
+
+    /// FINAL-REVIEW FIX (M1): `advertiseIfConnected()` is the exact closure `AppDelegate` wires to
+    /// `AppModel.onClientConnected` — fired on the app's initial connect AND (since this fix) on
+    /// every subsequent reconnect. On a daemon restart/socket drop, core's `PeripheralBroker` state
+    /// dies with it; without clearing here first, the app would keep ghost `activeLeases` from the
+    /// dead connection. `activeLeases.isEmpty` is exactly the signal both panic surfaces key off —
+    /// `AppDelegate`'s `peripheral.$activeLeases` subscription mounts/unmounts the red menu item on
+    /// it, and `updatePanicRegistration()` (called synchronously here) does the same for the Carbon
+    /// hotkey — so asserting it's empty IS asserting both panic surfaces are unmounted.
+    func testAdvertiseIfConnectedClearsGhostLeasesBeforeReadvertising() async throws {
+        let (provider, t) = try await connectedProvider()
+        await provider.handle(leaseGrantedEvent())
+        XCTAssertEqual(provider.activeLeases.count, 1)
+
+        // Simulates the reconnect callback: AppModel.onClientConnected fires this SAME method
+        // again after a reconnect (see AppModel.handle's `.connection(.connected)` case).
+        async let handled: Void = provider.advertiseIfConnected()
+
+        // t.sent[0] is already "protocol.hello" from connectedProvider()'s own handshake.
+        await feedWaitUntil { t.sent.count >= 2 }
+        // Cleared BEFORE the advertise round-trip resolves — the clear is synchronous, at the top
+        // of advertiseIfConnected(), strictly ahead of the (async) network call.
+        XCTAssertTrue(provider.activeLeases.isEmpty, "reconnect must clear ghost leases from a dead broker's state, not just leave them until the next lease_lost")
+
+        let advertise = feedLineJSON(t.sent[1])
+        XCTAssertEqual(advertise["method"] as? String, "peripheral.advertise")
+        ackLastSent(t, index: 1)
+        await handled
+
+        // Still empty after the round-trip completes — the fresh advertise doesn't resurrect them.
+        XCTAssertTrue(provider.activeLeases.isEmpty)
+    }
 }

@@ -287,6 +287,16 @@ final class AppModel: ObservableObject {
         case .connection(let s):
             session.apply(connection: s)
             connectionSummary = summaryLine()
+            // FINAL-REVIEW FIX (M1): `.connection(.connected)` arriving through the event pump is
+            // UNAMBIGUOUSLY a RECONNECT — `NormaClient.connect()`'s own initial success never
+            // yields this event (its contract: "no `.connection(.connected)` event for the INITIAL
+            // connect... Reconnects DO yield `.connection` states" — NormaClient.swift); the
+            // initial connect fires `onClientConnected` directly via `feed.onConnected` above
+            // instead. Re-fire the SAME hook Task 4 wired for the initial connect so
+            // `PeripheralProvider.advertiseIfConnected()` runs again on reconnect too — otherwise a
+            // daemon restart/socket drop leaves the provider's ghost `activeLeases` never cleared
+            // (the fix lives in `advertiseIfConnected()` itself; this is what actually invokes it).
+            if s == .connected { onClientConnected?() }
         case .unknown:
             break // newer daemon event — orb has nothing to render for it
         }
