@@ -12,7 +12,11 @@ final class AppModel: ObservableObject {
     /// below stays here; it's specific to this mode and SessionFeed's `pinned` mode doesn't need
     /// it.
     private let feed: SessionFeed
-    private var client: NormaClient { feed.client }
+    /// Task 4 (2f): widened from `private` so `AppDelegate.boot()` can construct `PeripheralProvider`
+    /// against THIS SAME client/socket — the daemon rule (Task 3's server wiring) is THE provider =
+    /// the most-recent-advertiser CONNECTION, so advertise/respond/revoke must all go through the
+    /// app's MAIN feed client, never a second one.
+    var client: NormaClient { feed.client }
     /// Task 5 (2e-iii): the left sidebar's live session list (`SessionSidebar`, not yet mounted —
     /// Task 6 does that). Lists via this AppModel's own `client`, same socket the orb's focus-follow
     /// feed already uses — no second harness for the directory.
@@ -39,6 +43,17 @@ final class AppModel: ObservableObject {
     /// harness without a token").
     static let missingTokenSentinel = "missing-token"
 
+    /// Task 4 (2f): set by `AppDelegate.boot()` right after constructing `PeripheralProvider`
+    /// against `client` above. Composed into `feed.onEvent`/`feed.onConnected` below exactly like
+    /// `directory.handle(e)` — a side-observer, never gating `handle(ev)`'s own focused-session
+    /// filtering or the fixed `return true`. Lease events arrive on the REQUESTER's session (which
+    /// this AppModel may not be focused on at all) — that's expected, not a bug; see
+    /// `PeripheralProvider.handle`'s doc comment.
+    var onPeripheralEvent: ((SessionEvent) async -> Void)?
+    /// Task 4 (2f): fired once per successful connect (mirrors `onConnected` above) — the seam
+    /// `PeripheralProvider.advertiseIfConnected()` hangs off (spec §A4: "advertises on connect").
+    var onClientConnected: (() -> Void)?
+
     init(makeTransport: @escaping @Sendable () -> NormaTransport, token: String, clientName: String = "orb") {
         self.makeTransport = makeTransport
         self.token = token
@@ -62,13 +77,20 @@ final class AppModel: ObservableObject {
         feed.onConnected = { [weak self] in
             guard let self else { return }
             self.connectionSummary = self.summaryLine()
+            self.onClientConnected?()
         }
         feed.onEvent = { [weak self] ev in
             // Task 5 (2e-iii): forward session_created/session_titled to the directory FIRST —
             // composed at the top of the existing closure, not a replacement of it (the hook
             // contract's "return true consumes the event" doesn't apply here: `handle(ev)` below
             // still fully owns event application in followFocus mode, same as before this task).
-            if case .session(let e) = ev { self?.directory.handle(e) }
+            // Task 4 (2f): the peripheral provider hook is composed the SAME way, right after —
+            // both are side-observers of the raw event, independent of `handle(ev)`'s focused-
+            // session filtering below.
+            if case .session(let e) = ev {
+                self?.directory.handle(e)
+                await self?.onPeripheralEvent?(e)
+            }
             await self?.handle(ev)
             return true // AppModel's handle() fully owns event application in followFocus mode.
         }

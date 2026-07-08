@@ -274,7 +274,17 @@ export async function startDaemon(opts: {
     heartbeatMs: settings?.peripheral?.heartbeatMs,
     expiryMs: settings?.peripheral?.expiryMs,
     policy: buildLeasePolicy({ store, approvals: approvalBroker, hub }),
-    emitTransient: (sessionId, event) => { hub.broadcastTransient(sessionId, event); },
+    // lease_granted/lease_lost are emitted on the REQUESTER's session (broadcastTransient scopes
+    // fan-out to that session's attached harnesses), but the provider connection (Norma.app) is
+    // rarely attached to the requesting session — it needs its own copy of these two event types
+    // to track its active-lease set regardless of what it's attached to. peripheral_call_requested
+    // already reaches the provider via pushToProvider; lease_granted/lease_lost did not, which
+    // would have left the provider's lease-tracking silently blind whenever it wasn't attached to
+    // the leasing session. Pushed in addition to (not instead of) the session broadcast.
+    emitTransient: (sessionId, event) => {
+      hub.broadcastTransient(sessionId, event);
+      if (event.type === "lease_granted" || event.type === "lease_lost") providerLink.push(event);
+    },
     pushToProvider: (event) => providerLink.push(event),
   });
 

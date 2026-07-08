@@ -1337,6 +1337,39 @@ describe("daemon IPC", () => {
     }
   });
 
+  // Regression coverage for the daemon.ts emitTransient fix (Task 4 context: the provider
+  // connection is rarely attached to the requester's session, so broadcastTransient's
+  // session-scoped fan-out alone would never reach it). The provider here deliberately never
+  // attaches to ANY session — it must still see lease_granted (on acquire) and lease_lost (on
+  // release) so it can track its own active-lease set purely from these pushed events.
+  test("provider connection receives lease_granted/lease_lost even when not attached to the leasing session", async () => {
+    await boot();
+    const provider = await TestClient.connect(daemon.socketPath);
+    await provider.hello(harnessToken, "unattached-provider");
+    await provider.request(METHODS.peripheralAdvertise, { classes: [{ class: "noop", tccGranted: true }] });
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "leaser-elsewhere");
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", approvalPolicy: "auto" });
+    // Deliberately no sessionAttach for either connection — the provider must still be told.
+
+    const res = await c.request(METHODS.peripheralLease, { sessionId: created.sessionId, class: "noop" });
+    expect(res.result.leaseId).toBeTruthy();
+
+    const granted = await provider.waitForNotification((n) => n.method === METHODS.event && n.params.type === "lease_granted");
+    expect(granted.params.leaseId).toBe(res.result.leaseId);
+    expect(granted.params.holder).toEqual({ kind: "session", id: created.sessionId });
+
+    const rel = await c.request(METHODS.peripheralRelease, { sessionId: created.sessionId, leaseId: res.result.leaseId, token: res.result.token });
+    expect(rel.result).toEqual({ ok: true });
+
+    const lost = await provider.waitForNotification((n) => n.method === METHODS.event && n.params.type === "lease_lost");
+    expect(lost.params.leaseId).toBe(res.result.leaseId);
+    expect(lost.params.reason).toBe("released");
+
+    provider.close(); c.close();
+  });
+
   // -----------------------------------------------------------------------------------------
   // Dashboard read methods (Phase 2f): daemon.status, quota.state, trust.list, trust.remove.
   // -----------------------------------------------------------------------------------------

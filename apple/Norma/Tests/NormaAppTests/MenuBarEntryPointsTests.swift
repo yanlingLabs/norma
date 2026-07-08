@@ -16,7 +16,8 @@ import AppKit
 final class MenuBarEntryPointsTests: XCTestCase {
     private func makeController(
         openCli: @escaping () -> Void = {},
-        openNormaApp: @escaping () -> Void = {}
+        openNormaApp: @escaping () -> Void = {},
+        panic: @escaping () -> Void = {}
     ) -> MenuBarController {
         MenuBarController(
             statusLine: { "idle" },
@@ -24,6 +25,7 @@ final class MenuBarEntryPointsTests: XCTestCase {
             summonField: {},
             openCli: openCli,
             openNormaApp: openNormaApp,
+            panic: panic,
             quit: {}
         )
     }
@@ -114,5 +116,60 @@ final class MenuBarEntryPointsTests: XCTestCase {
 
         XCTAssertEqual(cliFired, 1)
         XCTAssertEqual(appFired, 0)
+    }
+
+    // MARK: - Task 4 (2f): panic item mount/unmount
+
+    /// The red panic item must not exist in the menu at all until a lease is active — unlike
+    /// `orbItem`'s title-flip, this is a true add/remove (spec §A4: "mounts/unmounts with
+    /// active-lease count").
+    func testPanicItemNotMountedByDefault() {
+        let controller = makeController()
+        controller.install()
+        let titles = controller.statusItem?.menu?.items.map(\.title) ?? []
+        XCTAssertFalse(titles.contains("Stop Norma's Control"), "panic item must not be mounted with zero active leases")
+    }
+
+    func testSetPanicVisibleMountsRightBeforeQuitAndUnmountsAgain() {
+        let controller = makeController()
+        controller.install()
+
+        controller.setPanicVisible(true)
+        var items = controller.statusItem?.menu?.items ?? []
+        var titles = items.map(\.title)
+        guard let panicIdx = titles.firstIndex(of: "Stop Norma's Control"),
+              let quitIdx = titles.firstIndex(of: "Quit Norma") else {
+            return XCTFail("expected panic item mounted before Quit Norma, got \(titles)")
+        }
+        XCTAssertEqual(quitIdx, panicIdx + 2, "expected panic item then the pre-existing separator then Quit Norma")
+        XCTAssertTrue(items[panicIdx + 1].isSeparatorItem)
+
+        controller.setPanicVisible(false)
+        items = controller.statusItem?.menu?.items ?? []
+        titles = items.map(\.title)
+        XCTAssertFalse(titles.contains("Stop Norma's Control"), "panic item must be fully removed once no leases are active")
+    }
+
+    func testSetPanicVisibleIsIdempotent() {
+        let controller = makeController()
+        controller.install()
+        controller.setPanicVisible(true)
+        controller.setPanicVisible(true)
+        let titles = controller.statusItem?.menu?.items.map(\.title) ?? []
+        XCTAssertEqual(titles.filter { $0 == "Stop Norma's Control" }.count, 1, "a repeated setPanicVisible(true) must not duplicate the item")
+    }
+
+    func testPanicItemFiresInjectedClosure() {
+        var fired = 0
+        let controller = makeController(panic: { fired += 1 })
+        controller.install()
+        controller.setPanicVisible(true)
+
+        let item = controller.panicItem
+        XCTAssertNotNil(item.target)
+        XCTAssertNotNil(item.action)
+        NSApp.sendAction(item.action!, to: item.target, from: item)
+
+        XCTAssertEqual(fired, 1)
     }
 }
