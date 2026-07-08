@@ -195,4 +195,35 @@ describe("HardwareBroker", () => {
       else process.env.NORMA_HARDWARE_TIMEOUT_MS = orig;
     }
   });
+
+  test("auditDenied: consent_denied writes the same shape as broker-audited outcomes", async () => {
+    const { broker, auditRows } = setup();
+    const before = Date.now();
+    broker.auditDenied({ requester: pluginRequester, verb: "getChargeLimit", code: "consent_denied", missing: "hardware" });
+    const after = Date.now();
+
+    const rows = auditRows();
+    expect(rows).toHaveLength(1);
+    const row = rows[0] as Record<string, unknown>;
+    expect(row).toMatchObject({
+      kind: "hardware", verb: "getChargeLimit", requester: pluginRequester,
+      outcome: { code: "consent_denied", missing: "hardware" },
+    });
+    expect(typeof row.ts).toBe("number");
+    expect(row.ts as number).toBeGreaterThanOrEqual(before);
+    expect(row.ts as number).toBeLessThanOrEqual(after);
+  });
+
+  test("auditDenied: unknown_verb writes the same shape as broker-audited outcomes", async () => {
+    const { broker, auditRows } = setup();
+    broker.auditDenied({ requester: harnessRequester, verb: "setFanSpeed", code: "unknown_verb" });
+
+    const rows = auditRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      kind: "hardware", verb: "setFanSpeed", requester: harnessRequester,
+      outcome: { code: "unknown_verb" },
+    });
+  });
+
 });

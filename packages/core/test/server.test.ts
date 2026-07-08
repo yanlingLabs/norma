@@ -1985,6 +1985,44 @@ describe("daemon IPC", () => {
 
       provider.close(); plugin.close(); srv.stop();
     });
+
+    test("audit trail: unconsented plugin's denied request lands an audit line with consent_denied outcome", async () => {
+      const srv = await bootHardwareServer(); // no consents at all
+      seedBatteryPlugin(srv.home, "battery-limiter");
+      const plugin = await connectPlugin(srv.store, srv.socketPath, "battery-limiter");
+
+      const res = await plugin.request(METHODS.hardwareRequest, { verb: "getChargeLimit" });
+      expect(res.result).toEqual({ code: "consent_denied", missing: "hardware" });
+
+      const auditLines = readFileSync(join(srv.home, "audit.jsonl"), "utf8").split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l));
+      const hwLine = auditLines.find((l) => l.kind === "hardware" && l.verb === "getChargeLimit");
+      expect(hwLine).toMatchObject({
+        kind: "hardware", verb: "getChargeLimit", requester: { kind: "plugin", id: "battery-limiter" },
+        outcome: { code: "consent_denied", missing: "hardware" },
+      });
+      expect(typeof hwLine.ts).toBe("number");
+
+      plugin.close(); srv.stop();
+    });
+
+    test("audit trail: unknown_verb from a plugin lands an audit line with unknown_verb outcome", async () => {
+      const srv = await bootHardwareServer({ consents: { "battery-limiter": { hardware: Date.now() } } });
+      seedBatteryPlugin(srv.home, "battery-limiter");
+      const plugin = await connectPlugin(srv.store, srv.socketPath, "battery-limiter");
+
+      const res = await plugin.request(METHODS.hardwareRequest, { verb: "setFanSpeed" });
+      expect(res.result).toEqual({ code: "unknown_verb" });
+
+      const auditLines = readFileSync(join(srv.home, "audit.jsonl"), "utf8").split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l));
+      const hwLine = auditLines.find((l) => l.kind === "hardware" && l.verb === "setFanSpeed");
+      expect(hwLine).toMatchObject({
+        kind: "hardware", verb: "setFanSpeed", requester: { kind: "plugin", id: "battery-limiter" },
+        outcome: { code: "unknown_verb" },
+      });
+      expect(typeof hwLine.ts).toBe("number");
+
+      plugin.close(); srv.stop();
+    });
   });
 
   describe("plugin.revokeToken", () => {

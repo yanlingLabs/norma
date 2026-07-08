@@ -537,13 +537,19 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         if (socket.data.authedRole === "plugin") {
           const pluginId = socket.data.pluginId;
           if (!pluginId) throw new RpcFailure(ERR.UNAUTHORIZED, "hardware.request requires an authenticated plugin connection");
+          requester = { kind: "plugin", id: pluginId };
           const cls = verbClass(p.verb);
           if (cls) {
             const info = opts.plugins?.list().find((pl) => pl.name === pluginId);
-            if (!info?.hardwarePermissions.includes(cls)) return { code: "consent_denied", missing: cls };
-            if (!info.consented.includes("hardware")) return { code: "consent_denied", missing: "hardware" };
+            if (!info?.hardwarePermissions.includes(cls)) {
+              opts.hardware.auditDenied({ requester, verb: p.verb, code: "consent_denied", missing: cls });
+              return { code: "consent_denied", missing: cls };
+            }
+            if (!info.consented.includes("hardware")) {
+              opts.hardware.auditDenied({ requester, verb: p.verb, code: "consent_denied", missing: "hardware" });
+              return { code: "consent_denied", missing: "hardware" };
+            }
           }
-          requester = { kind: "plugin", id: pluginId };
         } else {
           requester = { kind: "harness", id: socket.data.clientName };
         }

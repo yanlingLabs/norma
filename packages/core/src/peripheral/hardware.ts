@@ -154,6 +154,18 @@ export class HardwareBroker {
     return { ok: true };
   }
 
+  /** Audit a denied hardware request (consent gate rejection before broker.request() is called).
+   *  Writes the same uniform `{kind:"hardware", verb, requester, outcome}` shape as the broker's
+   *  internal auditHardware method — used by the ipc consent handler on both early-return paths
+   *  (missing permission class, missing hardware consent, and unknown verb that bypasses consent). */
+  auditDenied(req: { requester: HardwareRequester; verb: string; code: "consent_denied" | "unknown_verb"; missing?: string }): void {
+    const outcome: HardwareRequestError =
+      req.code === "consent_denied"
+        ? { code: "consent_denied", ...(req.missing && { missing: req.missing }) }
+        : { code: "unknown_verb" };
+    this.deps.audit.append({ kind: "hardware", verb: req.verb, requester: req.requester, outcome });
+  }
+
   private auditHardware(verb: string, requester: HardwareRequester, outcome: HardwareRequestResult): void {
     this.deps.audit.append({ kind: "hardware", verb, requester, outcome });
   }
