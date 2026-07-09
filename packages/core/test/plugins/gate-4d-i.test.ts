@@ -146,10 +146,10 @@ describe("4d-i gate: live tiles + shortcut/tile-action round-trip (real sample-e
       // --- (a) initial tile.update (once-at-connect paint) ---
       const initial = await harness.waitForNotification((n) => isPluginTileUpdated(n, pluginId));
       expect(initial.params.sessionId).toBe("$system"); // SYSTEM_SESSION_ID sentinel — session-less event
-      expect(initial.params.tile).toEqual({ title: "echo", value: "0" });
+      expect(initial.params.tile).toEqual({ title: "echo", value: "0", actions: [{ id: "reset", label: "Reset" }] });
 
       const contribInitial = await harness.request(METHODS.pluginsContrib, {});
-      expect(contribInitial.result.entries).toEqual([{ pluginId, tile: { title: "echo", value: "0" } }]);
+      expect(contribInitial.result.entries).toEqual([{ pluginId, shortcuts: [{ id: "bump", description: "Bump the echo counter" }], tile: { title: "echo", value: "0", actions: [{ id: "reset", label: "Reset" }] } }]);
 
       // --- (b) invoking `echo` -> the REAL child's `run` calls ctx.updateTile mid-session ---
       harness.notifications.length = 0; // isolate this step's broadcast from the initial paint above
@@ -165,7 +165,7 @@ describe("4d-i gate: live tiles + shortcut/tile-action round-trip (real sample-e
       const childPid = echoResult.pluginPid;
 
       const afterEcho = await harness.waitForNotification((n) => isPluginTileUpdated(n, pluginId));
-      expect(afterEcho.params.tile).toEqual({ title: "echo", value: "1" }); // INCREMENTED — proves the live push, not a replay of the initial paint
+      expect(afterEcho.params.tile).toEqual({ title: "echo", value: "1", actions: [{ id: "reset", label: "Reset" }] }); // INCREMENTED — proves the live push, not a replay of the initial paint
 
       // --- (c) shortcut.invoke -> the real child's onShortcut ran (tile bumps again) ---
       harness.notifications.length = 0;
@@ -173,7 +173,7 @@ describe("4d-i gate: live tiles + shortcut/tile-action round-trip (real sample-e
       expect(shortcutRes.result).toEqual({ ok: true });
 
       const afterShortcut = await harness.waitForNotification((n) => isPluginTileUpdated(n, pluginId));
-      expect(afterShortcut.params.tile).toEqual({ title: "echo", value: "2" });
+      expect(afterShortcut.params.tile).toEqual({ title: "echo", value: "2", actions: [{ id: "reset", label: "Reset" }] });
 
       // --- (d) tile.action -> the real child's onTileAction ran (tile resets) ---
       // Notifications cleared FIRST: at this point the array holds step (c)'s stale entry (value
@@ -185,7 +185,7 @@ describe("4d-i gate: live tiles + shortcut/tile-action round-trip (real sample-e
       expect(tileActionRes.result).toEqual({ ok: true });
 
       const afterReset = await harness.waitForNotification((n) => isPluginTileUpdated(n, pluginId));
-      expect(afterReset.params.tile).toEqual({ title: "echo", value: "0" });
+      expect(afterReset.params.tile).toEqual({ title: "echo", value: "0", actions: [{ id: "reset", label: "Reset" }] });
 
       // --- (e) plugins.list reports the live child's real supervisor status ---
       const listed = await harness.request(METHODS.pluginsList, {});

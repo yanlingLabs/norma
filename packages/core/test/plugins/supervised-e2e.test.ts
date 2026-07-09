@@ -61,7 +61,7 @@ describe("supervised e2e: sample-echo (real Bun child process)", () => {
         2_000,
         `tile.update landed in the contrib registry for ${pluginId}`,
       );
-      expect(srv.contrib.get(pluginId)?.tile).toEqual({ title: "echo", value: "0" });
+      expect(srv.contrib.get(pluginId)?.tile).toEqual({ title: "echo", value: "0", actions: [{ id: "reset", label: "Reset" }] });
 
       // 4. Echo round-trip: registry.execute pushes plugin_tool_invoke over the REAL socket to
       // the REAL child, which runs its `echo` handler and answers with plugin.toolResult — the
