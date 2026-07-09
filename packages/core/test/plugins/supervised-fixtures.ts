@@ -180,6 +180,14 @@ export async function createSupervisedInstance(params: {
    *  `ctx.hardware()` at all — standing up that extra plumbing for it would be pure noise, same
    *  precedent as `hardware`'s own doc comment below. */
   plugins?: boolean;
+  /** Phase 4d-ii Task 4, opt-in and purely additive (independent of `plugins`/`hardware` above,
+   *  though every current caller that wants this also wants `plugins: true` for `plugins.list`
+   *  enrichment). Forwards `normaHome: home` into `startIpcServer` so the plugin-lifecycle RPCs
+   *  (plugins.install/plugin.enable/disable/remove/setConsent, ipc/server.ts) have a normaHome to
+   *  read+write settings.json/the plugins dir against — server.test.ts's own `bootLifecycleServer`
+   *  wires the SAME option directly; this lets `gate-4d-ii.test.ts` get it through the shared
+   *  supervised-fixtures boot path instead of hand-rolling its own IpcServer wiring a second time. */
+  wireNormaHome?: boolean;
 }): Promise<SupervisedInstance> {
   const { home, socketPath, supervisorSettings, spawn, signalPid } = params;
   const store = new SessionStore(home);
@@ -229,6 +237,7 @@ export async function createSupervisedInstance(params: {
   const server = startIpcServer({
     socketPath, serverVersion: "test", tokens: authority, store, registry, supervisor, contrib,
     providerLink, hardware: hardwareBroker, peripheral, plugins,
+    normaHome: params.wireNormaHome ? home : undefined,
   });
 
   return { store, authority, registry, contrib, supervisor, server, providerLink, hardware: hardwareBroker, peripheral, plugins };
