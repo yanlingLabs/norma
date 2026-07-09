@@ -167,12 +167,12 @@ describe("battery-limiter ctx.hardware round-trip (real Bun child process, scrip
       expect(setOutcome.isError).toBe(false);
       expect(JSON.parse(setOutcome.output)).toEqual({ percent: 80 });
 
-      // Tile is only pushed once per registration cycle (createPlugin's `serve()` contract) — the
-      // in-process `lastKnownLimit` DID update (proven directly below via get_charge_limit's own
-      // round-trip, which reads the SAME module state), but no fresh tile.update follows a tool
-      // call. Confirms the SDK's documented "registration-time snapshot" behavior rather than
-      // silently assuming a push-on-change mechanism that doesn't exist.
-      expect(inst.contrib.get(pluginId)?.tile).toEqual({ title: "Battery Limiter", value: "unknown" });
+      // Phase 4d-i Task 5 (closes the 4b "battery-limiter tile shows unknown" bug): set_charge_limit's
+      // `run` now AWAITS `ctx.updateTile(...)` before returning (examples/battery-limiter/index.ts),
+      // so by the time `setPromise` above has resolved (its `plugin.toolResult` is sent strictly
+      // AFTER the tile.update ack is received — same ordered connection, no race), the live push has
+      // already landed in the contrib registry. No longer "registration-time snapshot only".
+      expect(inst.contrib.get(pluginId)?.tile).toEqual({ title: "Battery Limiter", value: "80%" });
 
       // --- get_charge_limit {} — a second, independent round-trip through the SAME real child ---
       const getPromise = inst.registry.execute(
@@ -191,6 +191,11 @@ describe("battery-limiter ctx.hardware round-trip (real Bun child process, scrip
       const getOutcome = await getPromise;
       expect(getOutcome.isError).toBe(false);
       expect(JSON.parse(getOutcome.output)).toEqual({ percent: 65 });
+
+      // get_charge_limit's own live push (same await-before-return ordering as set above) — the
+      // SECOND independent tile.update this connection has sent, proving the live push isn't a
+      // one-off tied to set_charge_limit specifically.
+      expect(inst.contrib.get(pluginId)?.tile).toEqual({ title: "Battery Limiter", value: "65%" });
     },
     20_000,
   );

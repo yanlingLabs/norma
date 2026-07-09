@@ -1,0 +1,12 @@
+{
+  "type": "plugin_tile_updated",
+  "sessionId": "$system",
+  "seq": 24,
+  "ts": 1700000000014,
+  "pluginId": "sample-echo",
+  "tile": {
+    "title": "Sample",
+    "value": "1",
+    "enabled": true
+  }
+}

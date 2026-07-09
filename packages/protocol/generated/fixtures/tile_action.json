@@ -1,0 +1,7 @@
+{
+  "type": "tile_action",
+  "sessionId": "$system",
+  "seq": 26,
+  "ts": 1700000000016,
+  "actionId": "reconnect"
+}

@@ -71,6 +71,9 @@ import {
   TileUpdateResult,
   ProviderRegisterParams,
   ProviderRegisterResult,
+  PluginContribEntrySchema,
+  PluginsContribParams,
+  PluginsContribResult,
   PluginToolResultParams,
   PluginToolResultResult,
   PluginRevokeTokenParams,
@@ -81,6 +84,10 @@ import {
   HardwareRequestResult,
   HardwareRespondParams,
   HardwareRespondResult,
+  ShortcutInvokeParams,
+  ShortcutInvokeResult,
+  TileActionParams,
+  TileActionResult,
   METHODS,
 } from "../src/methods";
 
@@ -264,6 +271,14 @@ describe("plugins.list schema", () => {
 
   test("McpServerStatusSchema.source is widened to include \"plugin\"", () => {
     expect(McpServerStatusSchema.parse({ name: "x", status: "connected", toolNames: [], source: "plugin" }).source).toBe("plugin");
+  });
+
+  test("Phase 4d-i Task 4: status is optional and accepts every SupervisorStatus value plus \"na\"", () => {
+    expect(PluginInfoSchema.parse({ name: "bare", skills: [], hasMcp: false, mcpEnabled: false, disabled: false }).status).toBeUndefined();
+    for (const status of ["starting", "running", "backoff", "circuit-open", "stopped", "na"] as const) {
+      expect(PluginInfoSchema.parse({ name: "demo", skills: [], hasMcp: false, mcpEnabled: true, disabled: false, status }).status).toBe(status);
+    }
+    expect(() => PluginInfoSchema.parse({ name: "demo", skills: [], hasMcp: false, mcpEnabled: true, disabled: false, status: "bogus" })).toThrow();
   });
 });
 
@@ -482,6 +497,42 @@ describe("plugin verbs (Phase 4b Task 1, spec §3)", () => {
   });
 });
 
+describe("plugins.contrib (Phase 4d Task 1, spec §6/§7 — read surface for PluginContribRegistry, NOT a plugin-role verb)", () => {
+  test("METHODS carries it", () => {
+    expect(METHODS.pluginsContrib).toBe("plugins.contrib");
+  });
+
+  test("PluginsContribParams is empty; PluginsContribResult wraps an array of entries", () => {
+    expect(PluginsContribParams.parse({})).toEqual({});
+    const r = PluginsContribResult.parse({
+      ok: true,
+      entries: [{ pluginId: "sample-echo", tile: { title: "Sample", value: "1" } }],
+    });
+    expect(r.entries).toHaveLength(1);
+  });
+
+  test("PluginContribEntrySchema: pluginId required, shortcuts/tile/provider all optional", () => {
+    const bare = PluginContribEntrySchema.parse({ pluginId: "sample-echo" });
+    expect(bare.shortcuts).toBeUndefined();
+    expect(bare.tile).toBeUndefined();
+    expect(bare.provider).toBeUndefined();
+
+    const full = PluginContribEntrySchema.parse({
+      pluginId: "sample-echo",
+      shortcuts: [{ id: "toggle", description: "toggle it" }],
+      tile: { title: "Sample", value: "1" },
+      provider: { kind: "noop" },
+    });
+    expect(full.shortcuts).toEqual([{ id: "toggle", description: "toggle it" }]);
+    expect(full.tile).toEqual({ title: "Sample", value: "1" });
+    expect(full.provider).toEqual({ kind: "noop" });
+
+    expect(() => PluginContribEntrySchema.parse({})).toThrow(); // pluginId required
+    // shortcuts reuses ShortcutRegisterParams's own field schema — an empty id is still rejected.
+    expect(() => PluginContribEntrySchema.parse({ pluginId: "p1", shortcuts: [{ id: "" }] })).toThrow();
+  });
+});
+
 describe("plugin.revokeToken (Phase 4b Task 2, spec §3 — harness-role admin verb, NOT one of the six plugin verbs)", () => {
   test("METHODS carries it; params require a non-empty pluginId; result is a plain ok", () => {
     expect(METHODS.pluginRevokeToken).toBe("plugin.revokeToken");
@@ -550,5 +601,40 @@ describe("hardware.request / hardware.respond (Phase 4c Task 1, spec §5)", () =
     expect(HardwareRespondParams.parse({ requestId: "req_1", error: "unsupported_value" }).error).toBe("unsupported_value");
     expect(() => HardwareRespondParams.parse({ requestId: "" })).toThrow();
     expect(HardwareRespondResult.parse({ ok: true })).toEqual({ ok: true });
+  });
+});
+
+describe("shortcut.invoke / tile.action (Phase 4d Task 2, spec §6/§7 — harness→plugin push)", () => {
+  test("METHODS carries both verbs", () => {
+    expect(METHODS.shortcutInvoke).toBe("shortcut.invoke");
+    expect(METHODS.tileAction).toBe("tile.action");
+  });
+
+  test("shortcut.invoke params: pluginId + shortcutId both required non-empty", () => {
+    expect(ShortcutInvokeParams.parse({ pluginId: "p1", shortcutId: "do-thing" })).toEqual({ pluginId: "p1", shortcutId: "do-thing" });
+    expect(() => ShortcutInvokeParams.parse({ pluginId: "", shortcutId: "do-thing" })).toThrow();
+    expect(() => ShortcutInvokeParams.parse({ pluginId: "p1", shortcutId: "" })).toThrow();
+    expect(() => ShortcutInvokeParams.parse({ pluginId: "p1" })).toThrow();
+  });
+
+  test("tile.action params: pluginId + actionId both required non-empty", () => {
+    expect(TileActionParams.parse({ pluginId: "p1", actionId: "reconnect" })).toEqual({ pluginId: "p1", actionId: "reconnect" });
+    expect(() => TileActionParams.parse({ pluginId: "", actionId: "reconnect" })).toThrow();
+    expect(() => TileActionParams.parse({ pluginId: "p1", actionId: "" })).toThrow();
+    expect(() => TileActionParams.parse({ pluginId: "p1" })).toThrow();
+  });
+
+  // Shared result union (methods.ts's PluginPushResult) — mirrors HardwareRequestResult's style:
+  // success carries no payload (the push either lands or it doesn't), failure is a typed code.
+  test("shortcut.invoke / tile.action result: ok | not_connected | unknown_plugin union", () => {
+    expect(ShortcutInvokeResult.parse({ ok: true })).toEqual({ ok: true });
+    expect(ShortcutInvokeResult.parse({ code: "not_connected" })).toEqual({ code: "not_connected" });
+    expect(ShortcutInvokeResult.parse({ code: "unknown_plugin" })).toEqual({ code: "unknown_plugin" });
+    expect(() => ShortcutInvokeResult.parse({ code: "bogus" })).toThrow();
+    expect(() => ShortcutInvokeResult.parse({})).toThrow();
+
+    expect(TileActionResult.parse({ ok: true })).toEqual({ ok: true });
+    expect(TileActionResult.parse({ code: "not_connected" })).toEqual({ code: "not_connected" });
+    expect(TileActionResult.parse({ code: "unknown_plugin" })).toEqual({ code: "unknown_plugin" });
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { SessionEvent } from "../src/events";
+import { SessionEvent, SYSTEM_SESSION_ID } from "../src/events";
 import { HelloParams, HelloResult, PROTOCOL_VERSION } from "../src/methods";
 
 describe("SessionEvent discriminated union", () => {
@@ -236,6 +236,59 @@ describe("SessionEvent discriminated union", () => {
     // argsJson has no min(1) — an argument-less verb still needs a wire representation ("{}"),
     // and zod's z.string() alone (matching plugin_tool_invoke's argsJson) allows the empty string too.
     expect(SessionEvent.safeParse({ ...t, type: "hardware_requested", requestId: "req_1", verb: "getChargeLimit", argsJson: "" }).success).toBe(true);
+  });
+
+  // Phase 4d Task 1 (spec §6/§7): core broadcasts this to every authed harness (ipc/server.ts's
+  // harnessConns loop) when a plugin's tile.update lands, and again with tile:null on disconnect
+  // — session-less, so sessionId is always the SYSTEM_SESSION_ID sentinel, and it extends Base
+  // (no threadId) rather than ThreadBase.
+  test("plugin_tile_updated round-trips; sessionId is the $system sentinel; tile:null (cleared) accepted", () => {
+    const e = {
+      seq: 5, sessionId: SYSTEM_SESSION_ID, ts: 1781270000000,
+      type: "plugin_tile_updated", pluginId: "sample-echo", tile: { title: "Sample", value: "1" },
+    } as const;
+    expect(SessionEvent.parse(e)).toEqual(e);
+    expect(e.sessionId).toBe("$system");
+
+    const cleared = { ...e, tile: null } as const;
+    expect(SessionEvent.parse(cleared)).toEqual(cleared);
+  });
+
+  test("plugin_tile_updated rejects an empty pluginId", () => {
+    const t = { seq: 1, sessionId: SYSTEM_SESSION_ID, ts: 1 };
+    expect(SessionEvent.safeParse({ ...t, type: "plugin_tile_updated", pluginId: "", tile: null }).success).toBe(false);
+  });
+
+  // Phase 4d Task 2 (spec §6/§7): the reverse direction — core pushes these directly to a
+  // plugin's own connection (`shortcut.invoke`/`tile.action`, methods.ts). Session-less like
+  // plugin_tile_updated, so sessionId is always the $system sentinel, and both extend Base (no
+  // threadId) rather than ThreadBase.
+  test("shortcut_invoke round-trips; sessionId is the $system sentinel", () => {
+    const e = {
+      seq: 6, sessionId: SYSTEM_SESSION_ID, ts: 1781270000001,
+      type: "shortcut_invoke", shortcutId: "toggle-mute",
+    } as const;
+    expect(SessionEvent.parse(e)).toEqual(e);
+    expect(e.sessionId).toBe("$system");
+  });
+
+  test("shortcut_invoke rejects an empty shortcutId", () => {
+    const t = { seq: 1, sessionId: SYSTEM_SESSION_ID, ts: 1 };
+    expect(SessionEvent.safeParse({ ...t, type: "shortcut_invoke", shortcutId: "" }).success).toBe(false);
+  });
+
+  test("tile_action round-trips; sessionId is the $system sentinel", () => {
+    const e = {
+      seq: 7, sessionId: SYSTEM_SESSION_ID, ts: 1781270000002,
+      type: "tile_action", actionId: "reconnect",
+    } as const;
+    expect(SessionEvent.parse(e)).toEqual(e);
+    expect(e.sessionId).toBe("$system");
+  });
+
+  test("tile_action rejects an empty actionId", () => {
+    const t = { seq: 1, sessionId: SYSTEM_SESSION_ID, ts: 1 };
+    expect(SessionEvent.safeParse({ ...t, type: "tile_action", actionId: "" }).success).toBe(false);
   });
 });
 

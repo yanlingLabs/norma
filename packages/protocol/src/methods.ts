@@ -142,6 +142,13 @@ export const PluginInfoSchema = z.object({
   tccPermissions: z.array(z.string()).optional(),
   /** manifest.permissions.hardware verbatim, for the "hardware access via Norma.app helper: <each>" lines. */
   hardwarePermissions: z.array(z.string()).optional(),
+  /** Phase 4d-i Task 4: live PluginSupervisor runtime status for Tier-2 (`platform`,
+   *  pluginSpawnEligible) plugins — the SAME `SupervisorStatus` the supervisor tracks
+   *  (supervisor.ts), surfaced here so a dashboard can tell running/crashed/circuit-open apart
+   *  from static manifest/consent data. `"na"` for Tier-1 (`capability`) plugins and legacy
+   *  plugins, which never run a process and so have no supervisor status to report. Optional so
+   *  older-shaped fixtures/servers still parse, same precedent as the Phase 4a Task 3 fields above. */
+  status: z.enum(["starting", "running", "backoff", "circuit-open", "stopped", "na"]).optional(),
 });
 export const PluginsListParams = z.object({});
 export const PluginsListResult = z.object({ ok: z.literal(true), plugins: z.array(PluginInfoSchema) });
@@ -318,6 +325,21 @@ export const TileUpdateResult = z.object({ ok: z.literal(true) });
 export const ProviderRegisterParams = z.object({ info: z.record(z.string(), z.unknown()) });
 export const ProviderRegisterResult = z.object({ ok: z.literal(true) });
 
+/** Phase 4d Task 1's read surface for `PluginContribRegistry` (core/src/plugins/contrib.ts):
+ *  one entry per plugin with at least one contribution recorded, mirroring `PluginContribState`
+ *  field-for-field. `shortcuts` reuses `ShortcutRegisterParams`'s own field schema rather than
+ *  duplicating it (same shape a plugin actually sent). NOT a plugin-role verb (a plugin never
+ *  needs to read the aggregate back over the wire) — ipc/server.ts's `PLUGIN_ALLOWED_METHODS`
+ *  deliberately does not include it; harness/admin connections call it directly. */
+export const PluginContribEntrySchema = z.object({
+  pluginId: z.string(),
+  shortcuts: ShortcutRegisterParams.shape.shortcuts.optional(),
+  tile: z.record(z.string(), z.unknown()).optional(),
+  provider: z.record(z.string(), z.unknown()).optional(),
+});
+export const PluginsContribParams = z.object({});
+export const PluginsContribResult = z.object({ ok: z.literal(true), entries: z.array(PluginContribEntrySchema) });
+
 /** A plugin's answer to a `plugin_tool_invoke` push (events.ts) — the PluginSupervisor's
  *  request/response correlation (Task 3), mirroring `PeripheralRespondParams`'s shape exactly
  *  (`peripheral.respond`'s provider-answers-a-push pattern) but without `alreadyResolved`: the
@@ -390,6 +412,30 @@ export const HardwareRespondParams = z.object({
 });
 export const HardwareRespondResult = z.object({ ok: z.literal(true) });
 
+// ---------------------------------------------------------------------------------------------
+// Phase 4d Task 2 (spec §6/§7): harness→core→plugin PUSH methods — the reverse of Task 1's
+// plugin→core→dashboard tile broadcast. A future UI fires a plugin's registered shortcut or a
+// tile-action button by calling one of these; core pushes a transient event to that plugin's own
+// connection, mirroring how `plugin_tool_invoke` is pushed today (ipc/server.ts). Both are
+// HARNESS-role (the app calls them, never a plugin) — deliberately NOT added to
+// PLUGIN_ALLOWED_METHODS.
+// ---------------------------------------------------------------------------------------------
+
+export const ShortcutInvokeParams = z.object({ pluginId: z.string().min(1), shortcutId: z.string().min(1) });
+export const TileActionParams = z.object({ pluginId: z.string().min(1), actionId: z.string().min(1) });
+/** Shared by both verbs below — mirrors `HardwareRequestResult`'s typed-union style (success vs.
+ *  typed failure codes, never a bare throw). There is no payload to round-trip on success: the
+ *  push either reaches the plugin's connection or it doesn't. `unknown_plugin` = `pluginId` isn't
+ *  a plugin core has any record of; `not_connected` = a known plugin with no live connection right
+ *  now. */
+export const PluginPushResult = z.union([
+  z.object({ ok: z.literal(true) }),
+  z.object({ code: z.literal("not_connected") }),
+  z.object({ code: z.literal("unknown_plugin") }),
+]);
+export const ShortcutInvokeResult = PluginPushResult;
+export const TileActionResult = PluginPushResult;
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -431,9 +477,12 @@ export const METHODS = {
   shortcutRegister: "shortcut.register",
   tileUpdate: "tile.update",
   providerRegister: "provider.register",
+  pluginsContrib: "plugins.contrib",
   pluginToolResult: "plugin.toolResult",
   pluginRevokeToken: "plugin.revokeToken",
   pluginRestart: "plugin.restart",
   hardwareRequest: "hardware.request",
   hardwareRespond: "hardware.respond",
+  shortcutInvoke: "shortcut.invoke",
+  tileAction: "tile.action",
 } as const;

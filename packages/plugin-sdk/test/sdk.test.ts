@@ -596,6 +596,94 @@ describe("ctx.hardware (Phase 4c Task 5, spec §5)", () => {
   });
 });
 
+// -------------------------------------------------------------------------------------------
+// Phase 4d-i Task 3: `ctx.updateTile()` live push + `onShortcut`/`onTileAction` dispatch. The
+// once-at-connect `tile.update` (from `def.tile`) is already covered by the "handshake order"
+// test above; these three tests cover the NEW surface — a mid-session live push via `ctx`, and
+// the two fire-and-forget event dispatches Task 2 added to the wire (`shortcut_invoke`,
+// `tile_action`) that 4b's dispatch loop never routed anywhere.
+// -------------------------------------------------------------------------------------------
+
+describe("Phase 4d-i Task 3: ctx.updateTile + onShortcut/onTileAction dispatch", () => {
+  let cleanups: Array<() => void>;
+  let tmpDir: string;
+  let sockPath: string;
+
+  beforeEach(() => {
+    cleanups = [];
+    tmpDir = mkdtempSync(join(tmpdir(), "norma-plugin-sdk-4d-"));
+    sockPath = join(tmpDir, "plugin.sock");
+  });
+  afterEach(() => {
+    for (const fn of cleanups.reverse()) {
+      try { fn(); } catch { /* best-effort teardown */ }
+    }
+  });
+
+  test("ctx.updateTile: a tool calling ctx.updateTile() sends a mid-session tile.update", async () => {
+    const server = startFakeServer(sockPath);
+    cleanups.push(() => server.stop());
+
+    const plugin = createPlugin({
+      tools: {
+        push: {
+          description: "pushes a live tile",
+          run: async (_args, ctx) => {
+            await ctx.updateTile({ title: "X", value: "9" });
+            return "ok";
+          },
+        },
+      },
+    });
+    cleanups.push(() => plugin.close());
+
+    await plugin.serve({ socketPath: sockPath, token: "tok", pluginId: "sample" });
+    // No `def.tile` here, so the only tile.update on the wire is the one the tool triggers.
+    expect(server.tiles).toEqual([]);
+
+    server.pushEvent({ type: "plugin_tool_invoke", requestId: "r1", tool: "push", argsJson: "{}" });
+    await waitFor(() => server.tiles.length >= 1);
+
+    expect(server.tiles).toEqual([{ title: "X", value: "9" }]);
+    await waitFor(() => server.toolResults.some((r) => r.requestId === "r1"));
+    const result = server.toolResults.find((r) => r.requestId === "r1")!;
+    expect(result.error).toBeUndefined();
+    expect(JSON.parse(result.resultJson!)).toEqual("ok");
+  });
+
+  test("onShortcut: a shortcut_invoke event dispatches to def.onShortcut(shortcutId)", async () => {
+    const server = startFakeServer(sockPath);
+    cleanups.push(() => server.stop());
+
+    const received: string[] = [];
+    const plugin = createPlugin({ onShortcut: (id) => { received.push(id); } });
+    cleanups.push(() => plugin.close());
+
+    await plugin.serve({ socketPath: sockPath, token: "tok", pluginId: "sample" });
+
+    server.pushEvent({ type: "shortcut_invoke", shortcutId: "s1" });
+
+    await waitFor(() => received.length >= 1);
+    expect(received).toEqual(["s1"]);
+  });
+
+  test("onTileAction: a tile_action event dispatches to def.onTileAction(actionId)", async () => {
+    const server = startFakeServer(sockPath);
+    cleanups.push(() => server.stop());
+
+    const received: string[] = [];
+    const plugin = createPlugin({ onTileAction: (id) => { received.push(id); } });
+    cleanups.push(() => plugin.close());
+
+    await plugin.serve({ socketPath: sockPath, token: "tok", pluginId: "sample" });
+
+    server.pushEvent({ type: "tile_action", actionId: "a1" });
+
+    await waitFor(() => received.length >= 1);
+    expect(received).toEqual(["a1"]);
+  });
+});
+
 describe("backoffDelayMs", () => {
   test("1s * 2^n, capped at 30s", () => {
     expect(backoffDelayMs(0)).toBe(1000);

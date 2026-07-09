@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { NewSessionEvent } from "@norma/protocol";
 
@@ -416,6 +416,91 @@ export class PluginSupervisor {
     }
   }
 
+  /** Boot-time cleanup for plugins that are no longer spawn-eligible (disabled or removed since
+   *  they last ran) but left a PID file behind from a previous core process — `reclaimOrphans`
+   *  only ever looks at PID files for the plugins IN ITS OWN input list (the currently-eligible
+   *  set about to be spawned this boot), so a plugin's leftover process from before it was
+   *  disabled/removed would never be found by that path and would linger forever. Call once at
+   *  daemon boot (daemon.ts), after the PluginStore is built, BEFORE `startAll`/`reclaimOrphans`
+   *  run (this method never touches `this.runtimes`, so call order relative to those two doesn't
+   *  matter for correctness, but "sweep stale ones away, then start the current set" is the
+   *  natural order).
+   *
+   *  Unlike `reclaimOrphans` (which is handed the plugins it should look for), this scans the
+   *  ENTIRE `<runDir>/plugins/*.pid` directory listing directly — that's the only way to find a
+   *  PID file for a plugin that isn't in `eligibleIds` at all (disabled, or its directory removed
+   *  outright). For every `<id>.pid` whose `id` is NOT in `eligibleIds`, identity is verified via
+   *  the SAME `ps -o lstart=` check `reclaimOrphans` uses (`processStartedAtFn`), and ONLY on a
+   *  verified match is the process terminated (`killProcess` — SIGTERM, then SIGKILL after
+   *  `killGraceMs` if still alive) and the PID file unlinked. Every other case — PID file missing/
+   *  unreadable, the recorded PID no longer alive, no recorded start time, `ps` unavailable, or a
+   *  start-time mismatch (PID reuse) — is a fail-safe NO-KILL, matching `reclaimOrphans`'s exact
+   *  posture: the stale file is cleaned up (nothing left to track) but a live process is never
+   *  signalled unless its identity is positively confirmed as ours. */
+  sweepOrphans(eligibleIds: readonly string[]): void {
+    const eligible = new Set(eligibleIds);
+
+    let entries: string[];
+    try {
+      entries = readdirSync(this.pluginsRunDir());
+    } catch {
+      return; // no run dir yet — nothing on disk to sweep
+    }
+
+    for (const entry of entries) {
+      if (!entry.endsWith(".pid")) continue;
+      const id = entry.slice(0, -".pid".length);
+      if (eligible.has(id)) continue; // still spawn-eligible — startAll/reclaimOrphans owns this one
+      if (this.runtimes.has(id)) continue; // already tracked (defensive — sweep runs before startAll)
+
+      let raw: string;
+      try {
+        raw = readFileSync(this.pidFilePath(id), "utf8");
+      } catch {
+        continue; // gone already
+      }
+
+      const parsed = parsePidFile(raw);
+      if (!parsed) {
+        this.removePidFile(id);
+        this.log(`plugin ${id}: sweepOrphans — unreadable/corrupt PID file removed (fail-safe, no signal sent)`);
+        continue;
+      }
+      const { pid } = parsed;
+
+      if (!this.isAliveFn(pid)) {
+        this.removePidFile(id);
+        this.log(`plugin ${id}: sweepOrphans — stale PID file removed (pid ${pid} not alive)`);
+        continue;
+      }
+
+      // Live PID for a plugin that's no longer spawn-eligible — but liveness alone never proves
+      // identity (PID reuse). Same verification `reclaimOrphans` performs before ever adopting.
+      const actualStartedAt = this.processStartedAtFn(pid);
+      if (parsed.startedAt === null) {
+        this.removePidFile(id);
+        this.log(`plugin ${id}: sweepOrphans — pid ${pid} is alive but unverifiable (no recorded start time — legacy/corrupt PID file) — removed without signalling (fail-safe)`);
+        continue;
+      }
+      if (actualStartedAt === null) {
+        this.removePidFile(id);
+        this.log(`plugin ${id}: sweepOrphans — cannot verify pid ${pid} identity (start-time check unavailable) — removed without signalling (fail-safe)`);
+        continue;
+      }
+      if (actualStartedAt !== parsed.startedAt) {
+        this.removePidFile(id);
+        this.log(`plugin ${id}: sweepOrphans — pid ${pid} start time mismatch (recorded "${parsed.startedAt}", actual "${actualStartedAt}") — PID reuse suspected, removed without signalling`);
+        continue;
+      }
+
+      // Verified: genuinely our orphaned process, left over from before this plugin was disabled
+      // or removed. Terminate it and clean up the file.
+      this.killProcess(pid);
+      this.removePidFile(id);
+      this.log(`plugin ${id}: sweepOrphans — terminating orphaned pid ${pid} (plugin no longer spawn-eligible)`);
+    }
+  }
+
   /** Full shutdown: every tracked plugin is killed (if a process is owned) and marked "stopped",
    *  every pending timer is cleared, every outstanding invoke is failed typed. Deliberately marks
    *  the generation settled BEFORE killing so the process's own (later) `exited` resolution never
@@ -507,6 +592,20 @@ export class PluginSupervisor {
 
   status(pluginId: string): SupervisorStatus {
     return this.runtimes.get(pluginId)?.status ?? "stopped";
+  }
+
+  /** Phase 4d Task 2 (spec §6/§7 harness→plugin push): fire-and-forget delivery of a transient
+   *  event (`shortcut_invoke`/`tile_action`) straight to a plugin's live connection — the SAME
+   *  `runtimes` lookup `invoke()` below uses, but with no request/response correlation (the caller
+   *  doesn't await an answer, unlike a tool invoke). `{code:"unknown_plugin"}` when this id was
+   *  never tracked at all (never `startAll`'d/reclaimed — core has no record of it);
+   *  `{code:"not_connected"}` when it IS tracked but isn't currently "running" with a live `conn`,
+   *  or the live conn's own `push()` reports the socket already dead; `{ok:true}` once handed off. */
+  pushToPlugin(pluginId: string, event: NewSessionEvent): { ok: true } | { code: "not_connected" } | { code: "unknown_plugin" } {
+    const rt = this.runtimes.get(pluginId);
+    if (!rt) return { code: "unknown_plugin" };
+    if (rt.status !== "running" || !rt.conn) return { code: "not_connected" };
+    return rt.conn.push(event) ? { ok: true } : { code: "not_connected" };
   }
 
   // -----------------------------------------------------------------------------------------

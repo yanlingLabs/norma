@@ -12,7 +12,9 @@ import {
   PeripheralRevokeParams, PeripheralRespondParams, DaemonStatusParams, QuotaStateParams,
   TrustListParams, TrustRemoveParams, PluginRevokeTokenParams, PluginRestartParams,
   PluginRegisterParams, ToolRegisterParams, ShortcutRegisterParams, TileUpdateParams,
-  ProviderRegisterParams, PluginToolResultParams, HardwareRequestParams, HardwareRespondParams,
+  ProviderRegisterParams, PluginsContribParams, PluginToolResultParams, HardwareRequestParams, HardwareRespondParams,
+  ShortcutInvokeParams, TileActionParams,
+  SYSTEM_SESSION_ID,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
@@ -29,6 +31,7 @@ import type { BackgroundTaskRegistry } from "../agent/bg-registry";
 import type { SkillStore } from "../agent/skills";
 import type { McpManager } from "../agent/mcp/manager";
 import type { PluginStore } from "../agent/plugins";
+import { pluginSpawnEligible } from "../agent/plugins";
 import type { ToolRegistry } from "../agent/tools/registry";
 import type { PluginSupervisor, PluginConn, InvokeError } from "../plugins/supervisor";
 import type { PluginContribRegistry } from "../plugins/contrib";
@@ -170,6 +173,40 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
     }
   };
 
+  // Phase 4d Task 1 (spec §6/§7): a monotonic counter for `plugin_tile_updated`'s `seq` field.
+  // `SessionStore.lastSeq(sessionId)` (what every OTHER transient event stamps itself with, e.g.
+  // `SessionHub.broadcastTransient`) requires a REAL, already-created session row and throws
+  // "unknown session" otherwise — there is no session backing `SYSTEM_SESSION_ID`, and minting a
+  // fake one just to read a counter would be its own footgun (a phantom row in session.list).
+  // NormaKit's dedupe gate is scoped to the currently ATTACHED session (`e.sessionId == attached`,
+  // NormaClient.swift) and `$system` can never equal a real attached session id, so this event
+  // always bypasses that gate regardless of its seq value — a locally-monotonic counter is
+  // sufficient (schema-valid, ordered) without needing the store at all.
+  let systemSeq = 0;
+
+  /** Broadcasts `plugin_tile_updated` to every authed harness — modeled EXACTLY on the
+   *  `session_created` broadcast above (same `harnessConns` set, same enqueue/encodeLine, same
+   *  swallow-on-dead-socket): a dashboard connection is never attached to any session, so this
+   *  goes out over the harness broadcast set rather than the per-session `SessionHub`. Reads the
+   *  CURRENT tile straight out of the registry (rather than taking one as a parameter) so both
+   *  call sites — `tile.update` (after `setTile`) and `close()` (after `clear`) — stay a single
+   *  line each and can never drift from what `plugins.contrib` would return for the same plugin. */
+  function broadcastTileUpdated(pluginId: string): void {
+    const tile = opts.contrib?.get(pluginId)?.tile ?? null;
+    const event = {
+      type: "plugin_tile_updated" as const,
+      sessionId: SYSTEM_SESSION_ID,
+      seq: ++systemSeq,
+      ts: Date.now(),
+      pluginId,
+      tile,
+    };
+    for (const conn of harnessConns) {
+      try { conn.writer.enqueue(encodeLine({ jsonrpc: "2.0", method: METHODS.event, params: event })); }
+      catch { /* dead socket — its close() handler will evict it from harnessConns */ }
+    }
+  }
+
   function parseParams<S extends z.ZodTypeAny>(schema: S, params: unknown): z.infer<S> {
     const result = schema.safeParse(params);
     if (!result.success) {
@@ -228,6 +265,12 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         if (socket.data.pluginId) {
           opts.registry?.unregisterByPrefix(`plugin__${socket.data.pluginId}__`);
           opts.supervisor?.notifyDisconnected(socket.data.pluginId);
+          // Phase 4d Task 1: a disconnected plugin's shortcuts/tile/provider info is stale the
+          // instant the connection drops (the SDK's serve() re-declares everything fresh on
+          // reconnect, Task 5's contract) — clear it out of the registry, then broadcast so any
+          // dashboard showing this plugin's tile drops the now-stale card (tile: null).
+          opts.contrib?.clear(socket.data.pluginId);
+          broadcastTileUpdated(socket.data.pluginId);
         }
       },
       async data(socket, chunk) {
@@ -371,7 +414,18 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       }
       case METHODS.pluginsList: {
         parseParams(PluginsListParams, params);
-        return { ok: true, plugins: opts.plugins?.list() ?? [] };
+        // Phase 4d-i Task 4: enrich each entry with live PluginSupervisor runtime status. Kept
+        // HERE (the ipc handler, which has `opts.supervisor`) rather than in PluginStore.list()
+        // (agent/plugins.ts), which stays pure fs/settings with no supervisor coupling. Tier-2
+        // (pluginSpawnEligible — platform tier, entry present, enabled, consented) plugins get the
+        // real SupervisorStatus (defaulting to "stopped" when this plugin was never tracked by the
+        // supervisor at all, e.g. no agentProvider so no PluginSupervisor was even built); Tier-1
+        // (capability) and legacy plugins never run a process, so they always report "na".
+        const plugins = (opts.plugins?.list() ?? []).map((p) => ({
+          ...p,
+          status: pluginSpawnEligible(p) ? (opts.supervisor?.status(p.name) ?? "stopped") : ("na" as const),
+        }));
+        return { ok: true, plugins };
       }
       case METHODS.approvalRespond: {
         const p = parseParams(ApprovalRespondParams, params);
@@ -574,7 +628,11 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
           socketPath: opts.socketPath,
           provider: opts.providerInfo ?? null,
           sessionsCount: opts.store.list().length,
-          pluginsCount: 0, // Phase 4
+          // Phase 4d-i Task 4: real installed-plugin count (was hardcoded 0). Installed count
+          // (opts.plugins?.list().length), not a running-Tier-2 count — matches the field name
+          // "pluginsCount" (installed plugins, mirroring skills.list/mcp.list which report
+          // everything discovered, not just currently-active entries).
+          pluginsCount: opts.plugins?.list().length ?? 0,
         };
       }
       case METHODS.quotaState: {
@@ -717,6 +775,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         const p = parseParams(TileUpdateParams, params);
         if (!socket.data.pluginId) throw new RpcFailure(ERR.UNAUTHORIZED, "tile.update requires an authenticated plugin connection");
         opts.contrib?.setTile(socket.data.pluginId, p.tile);
+        broadcastTileUpdated(socket.data.pluginId);
         return { ok: true };
       }
       case METHODS.providerRegister: {
@@ -724,6 +783,40 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         if (!socket.data.pluginId) throw new RpcFailure(ERR.UNAUTHORIZED, "provider.register requires an authenticated plugin connection");
         opts.contrib?.setProvider(socket.data.pluginId, p.info);
         return { ok: true };
+      }
+      case METHODS.pluginsContrib: {
+        parseParams(PluginsContribParams, params);
+        const entries = opts.contrib?.all().map(({ pluginId, state }) => ({ pluginId, ...state })) ?? [];
+        return { ok: true, entries };
+      }
+
+      // Phase 4d Task 2 (spec §6/§7): the reverse direction of the tile broadcast above — a
+      // future UI fires a plugin's registered shortcut or a tile-action button. HARNESS-role (not
+      // in PLUGIN_ALLOWED_METHODS, so a plugin connection is role-rejected before it ever reaches
+      // here). Both push a transient, session-less event straight to the target plugin's own
+      // connection via PluginSupervisor.pushToPlugin — the SAME runtimes lookup
+      // plugin_tool_invoke's dispatch uses (`supervisor.invoke`, above) — but fire-and-forget, no
+      // request/response correlation. `seq` reuses the SAME local `systemSeq` monotonic counter as
+      // `broadcastTileUpdated`'s plugin_tile_updated (store.lastSeq() throws for $system — see that
+      // counter's own doc comment). No supervisor wired in at all (no agentProvider) means core has
+      // no record of any plugin — degrades to unknown_plugin, same as a truly untracked id.
+      case METHODS.shortcutInvoke: {
+        const p = parseParams(ShortcutInvokeParams, params);
+        if (!opts.supervisor) return { code: "unknown_plugin" };
+        const event = {
+          type: "shortcut_invoke" as const, sessionId: SYSTEM_SESSION_ID, seq: ++systemSeq, ts: Date.now(),
+          shortcutId: p.shortcutId,
+        };
+        return opts.supervisor.pushToPlugin(p.pluginId, event);
+      }
+      case METHODS.tileAction: {
+        const p = parseParams(TileActionParams, params);
+        if (!opts.supervisor) return { code: "unknown_plugin" };
+        const event = {
+          type: "tile_action" as const, sessionId: SYSTEM_SESSION_ID, seq: ++systemSeq, ts: Date.now(),
+          actionId: p.actionId,
+        };
+        return opts.supervisor.pushToPlugin(p.pluginId, event);
       }
 
       default:

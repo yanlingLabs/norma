@@ -940,11 +940,139 @@ describe("daemon IPC", () => {
       expect(result.plugins).toHaveLength(1);
       expect(result.plugins[0]).toMatchObject({
         name: "demo", skills: ["greet"], hasMcp: true, mcpEnabled: true, disabled: false,
+        status: "na", // legacy plugin (no norma-plugin.json) — never tier "platform", never spawn-eligible
       });
       c.close();
     } finally {
       server.stop();
     }
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // Phase 4d-i Task 4: plugins.list enriches each entry with live PluginSupervisor runtime status
+  // — a dashboard can't otherwise tell a Tier-2 plugin's actual running/crashed/circuit-open state
+  // apart from static manifest/consent data. Tier-2 (`platform` + `entry`, pluginSpawnEligible) get
+  // the real SupervisorStatus; Tier-1 (`capability`) never runs a process, so always "na".
+  // ---------------------------------------------------------------------------------------------
+  describe("plugins.list supervisor status (Phase 4d-i Task 4)", () => {
+    test("Tier-2 plugin the supervisor reports \"running\" includes status:\"running\"; Tier-1 plugin includes status:\"na\"", async () => {
+      const home = mkdtempSync(join(tmpdir(), "norma-plugins-status-"));
+      // Tier-2 (platform) plugin — spawn-eligible: tier platform + entry + enabled + exec-consented.
+      mkdirSync(join(home, "plugins", "runner"), { recursive: true });
+      writeFileSync(join(home, "plugins", "runner", "norma-plugin.json"), JSON.stringify({
+        id: "runner", tier: "platform", entry: { command: "bun", args: ["index.ts"] },
+      }));
+      // Tier-1 (capability) plugin — never spawn-eligible, no process ever runs for it.
+      mkdirSync(join(home, "plugins", "toolbox"), { recursive: true });
+      writeFileSync(join(home, "plugins", "toolbox", "norma-plugin.json"), JSON.stringify({ id: "toolbox", tier: "capability" }));
+
+      const plugins = new PluginStore({
+        normaHome: home,
+        plugins: { enabled: ["runner", "toolbox"] },
+        consents: { runner: { exec: Date.now() } },
+      });
+
+      const secrets = new FileSecretStore(join(home, "test-secrets"));
+      const authority = new TokenAuthority(secrets);
+      const tokens = await authority.ensureTokens();
+      const store = new SessionStore(home);
+      const socketPath = join(home, "core.sock");
+      // Real PluginSupervisor, fake spawn/isAlivePid/signalPid — same injection precedent as
+      // "plugin.restart"'s bootRestartServer below.
+      const supervisor = new PluginSupervisor({
+        runDir: join(home, "run"),
+        socketPath,
+        mintToken: (id) => store.mintPluginToken(id),
+        spawn: () => ({ pid: 12345, kill: () => {}, exited: new Promise<number>(() => {}) }),
+        isAlivePid: () => false,
+        signalPid: () => {},
+      });
+      // Bring "runner" to "running" exactly like a real plugin process would over the wire:
+      // startAll spawns it (fake), notifyRegistered (a fake connection) flips it to "running".
+      supervisor.startAll([{ id: "runner", dir: join(home, "plugins", "runner"), entry: { command: "bun", args: ["index.ts"] } }]);
+      expect(supervisor.notifyRegistered("runner", { push: () => true })).toBe(true);
+      expect(supervisor.status("runner")).toBe("running");
+
+      const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, plugins, supervisor });
+      try {
+        const c = await TestClient.connect(socketPath);
+        await c.hello(tokens.harness, "plugin-status-lister");
+        const { result } = await c.request(METHODS.pluginsList, {});
+        expect(result.ok).toBe(true);
+        const byName = Object.fromEntries(result.plugins.map((p: any) => [p.name, p]));
+        expect(byName.runner).toMatchObject({ tier: "platform", status: "running" });
+        expect(byName.toolbox).toMatchObject({ tier: "capability", status: "na" });
+        c.close();
+      } finally {
+        supervisor.stopAll();
+        server.stop();
+      }
+    });
+
+    test("a spawn-eligible plugin the supervisor has never tracked reports status \"stopped\" (never \"na\")", async () => {
+      const home = mkdtempSync(join(tmpdir(), "norma-plugins-status-untracked-"));
+      mkdirSync(join(home, "plugins", "runner"), { recursive: true });
+      writeFileSync(join(home, "plugins", "runner", "norma-plugin.json"), JSON.stringify({
+        id: "runner", tier: "platform", entry: { command: "bun", args: ["index.ts"] },
+      }));
+      const plugins = new PluginStore({
+        normaHome: home, plugins: { enabled: ["runner"] }, consents: { runner: { exec: Date.now() } },
+      });
+      const secrets = new FileSecretStore(join(home, "test-secrets"));
+      const authority = new TokenAuthority(secrets);
+      const tokens = await authority.ensureTokens();
+      const store = new SessionStore(home);
+      const socketPath = join(home, "core.sock");
+      // A real supervisor IS wired, but startAll/reclaimOrphans was never called for "runner" — it
+      // has no runtime tracked at all (never spawned this process lifetime).
+      const supervisor = new PluginSupervisor({
+        runDir: join(home, "run"), socketPath, mintToken: (id) => store.mintPluginToken(id),
+        spawn: () => ({ pid: 1, kill: () => {}, exited: new Promise<number>(() => {}) }),
+        isAlivePid: () => false, signalPid: () => {},
+      });
+      const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, plugins, supervisor });
+      try {
+        const c = await TestClient.connect(socketPath);
+        await c.hello(tokens.harness, "plugin-status-untracked");
+        const { result } = await c.request(METHODS.pluginsList, {});
+        expect(result.plugins[0]).toMatchObject({ name: "runner", status: "stopped" });
+        c.close();
+      } finally {
+        server.stop();
+      }
+    });
+
+    test("no supervisor wired at all: Tier-1 plugin still \"na\"; a spawn-eligible (Tier-2-shaped) plugin falls back to \"stopped\"", async () => {
+      const home = mkdtempSync(join(tmpdir(), "norma-plugins-status-nosupervisor-"));
+      mkdirSync(join(home, "plugins", "toolbox"), { recursive: true });
+      writeFileSync(join(home, "plugins", "toolbox", "norma-plugin.json"), JSON.stringify({ id: "toolbox", tier: "capability" }));
+      mkdirSync(join(home, "plugins", "runner"), { recursive: true });
+      writeFileSync(join(home, "plugins", "runner", "norma-plugin.json"), JSON.stringify({
+        id: "runner", tier: "platform", entry: { command: "bun", args: ["index.ts"] },
+      }));
+      const plugins = new PluginStore({
+        normaHome: home, plugins: { enabled: ["toolbox", "runner"] }, consents: { runner: { exec: Date.now() } },
+      });
+      const secrets = new FileSecretStore(join(home, "test-secrets"));
+      const authority = new TokenAuthority(secrets);
+      const tokens = await authority.ensureTokens();
+      const store = new SessionStore(home);
+      const socketPath = join(home, "core.sock");
+      // No `supervisor` option passed at all — mirrors "plugins.list returns [] when no PluginStore
+      // is wired" above, but for the supervisor seam instead.
+      const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, plugins });
+      try {
+        const c = await TestClient.connect(socketPath);
+        await c.hello(tokens.harness, "plugin-status-nosup");
+        const { result } = await c.request(METHODS.pluginsList, {});
+        const byName = Object.fromEntries(result.plugins.map((p: any) => [p.name, p]));
+        expect(byName.toolbox).toMatchObject({ status: "na" });
+        expect(byName.runner).toMatchObject({ status: "stopped" });
+        c.close();
+      } finally {
+        server.stop();
+      }
+    });
   });
 
   // THE CONSENT SEAM: a plugin's skills are always live (SkillStore has no consent gate), but a
@@ -1669,6 +1797,30 @@ describe("daemon IPC", () => {
     c.close();
   });
 
+  test("daemon.status pluginsCount reflects the real installed-plugin count (Phase 4d-i Task 4 — was hardcoded 0)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "norma-daemon-status-plugins-"));
+    for (const name of ["alpha", "beta", "gamma"]) {
+      mkdirSync(join(home, "plugins", name), { recursive: true });
+      writeFileSync(join(home, "plugins", name, "plugin.json"), JSON.stringify({ description: name }));
+    }
+    const plugins = new PluginStore({ normaHome: home });
+    const secrets = new FileSecretStore(join(home, "test-secrets"));
+    const authority = new TokenAuthority(secrets);
+    const tokens = await authority.ensureTokens();
+    const store = new SessionStore(home);
+    const socketPath = join(home, "core.sock");
+    const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, plugins });
+    try {
+      const c = await TestClient.connect(socketPath);
+      await c.hello(tokens.harness, "status-plugins-count");
+      const status = (await c.request(METHODS.daemonStatus, {})).result;
+      expect(status.pluginsCount).toBe(3);
+      c.close();
+    } finally {
+      server.stop();
+    }
+  });
+
   test("quota.state shape: ok/zero usage when no real provider-wrapped QuotaManager is wired", async () => {
     await boot();
     const c = await TestClient.connect(daemon.socketPath);
@@ -2349,6 +2501,56 @@ describe("daemon IPC", () => {
       plugin.close(); srv.stop();
     });
 
+    // Phase 4d Task 1 (spec §6/§7): the live READ + broadcast side of PluginContribRegistry —
+    // plugins.contrib read RPC, plugin_tile_updated broadcast to every authed harness (a dashboard
+    // connection is never attached to a session, so this must NOT go through the per-session hub),
+    // and clearing a plugin's contributions (+ broadcasting tile:null) on disconnect.
+    test("tile.update broadcasts plugin_tile_updated to every authed harness; plugins.contrib reflects it; disconnect clears + broadcasts tile:null", async () => {
+      const srv = await bootBridgeServer();
+      const pluginId = "sample-echo";
+
+      // A harness (e.g. the dashboard) connects BEFORE the plugin pushes anything — mirrors the
+      // G2 session_created precedent: harnessConns, not hub attachments, is what this broadcasts
+      // through, so the harness needs no session.attach at all to receive it.
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "dashboard");
+
+      const plugin = await registerAndHello(srv, pluginId);
+      await plugin.request(METHODS.tileUpdate, { tile: { title: "Sample", value: "1" } });
+
+      const updated = await harness.waitForNotification((n) => n.method === METHODS.event && n.params.type === "plugin_tile_updated");
+      expect(updated.params.sessionId).toBe("$system"); // SYSTEM_SESSION_ID sentinel — session-less event
+      expect(updated.params.pluginId).toBe(pluginId);
+      expect(updated.params.tile).toEqual({ title: "Sample", value: "1" });
+      expect(updated.params.threadId).toBeUndefined(); // extends Base, not ThreadBase
+
+      const listed = await harness.request(METHODS.pluginsContrib, {});
+      expect(listed.result.entries).toEqual([{ pluginId, tile: { title: "Sample", value: "1" } }]);
+
+      harness.notifications.length = 0; // isolate the disconnect broadcast from the update above
+      plugin.close();
+
+      const cleared = await harness.waitForNotification((n) => n.method === METHODS.event && n.params.type === "plugin_tile_updated");
+      expect(cleared.params.pluginId).toBe(pluginId);
+      expect(cleared.params.tile).toBeNull();
+
+      const listedAfter = await harness.request(METHODS.pluginsContrib, {});
+      expect(listedAfter.result.entries).toEqual([]);
+
+      harness.close(); srv.stop();
+    });
+
+    // A plugin connection is role-gated to the six (now seven, +hardware.request) allowed verbs —
+    // plugins.contrib was deliberately left off PLUGIN_ALLOWED_METHODS (a plugin never needs to
+    // read the aggregate contrib state back over the wire; harness/admin connections do).
+    test("plugins.contrib is not plugin-role callable", async () => {
+      const srv = await bootBridgeServer();
+      const plugin = await registerAndHello(srv, "sample-echo");
+      const res = await plugin.request(METHODS.pluginsContrib, {});
+      expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      plugin.close(); srv.stop();
+    });
+
     test("disconnect unregisters every plugin__<id>__* tool and calls notifyDisconnected", async () => {
       const srv = await bootBridgeServer();
       const pluginId = "sample-echo";
@@ -2413,6 +2615,152 @@ describe("daemon IPC", () => {
         expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
       }
       c.close(); srv.stop();
+    });
+  });
+
+  // -----------------------------------------------------------------------------------------
+  // shortcut.invoke / tile.action (Phase 4d Task 2, spec §6/§7): the reverse direction of Task
+  // 1's plugin→core→dashboard tile broadcast above — a future UI fires a plugin's registered
+  // shortcut or a tile-action button; core pushes a transient, session-less event straight to
+  // that plugin's own connection. HARNESS-role (not in PLUGIN_ALLOWED_METHODS) — reuses the same
+  // PluginSupervisor runtimes lookup plugin_tool_invoke's dispatch uses (`pushToPlugin`, sibling
+  // of `invoke()` in "plugin tool bridge (Task 4)" above) but fire-and-forget: no
+  // request/response correlation, no awaited answer.
+  // -----------------------------------------------------------------------------------------
+  describe("shortcut.invoke / tile.action (Task 2, Phase 4d)", () => {
+    async function bootPushServer(): Promise<{
+      store: SessionStore; socketPath: string; harnessToken: string; supervisor: PluginSupervisor;
+      stop: () => void;
+    }> {
+      const home = mkdtempSync(join(tmpdir(), "norma-plugin-push-"));
+      const store = new SessionStore(home);
+      const socketPath = join(home, "core.sock");
+      const authority = new TokenAuthority(new FileSecretStore(join(home, "secrets.json")));
+      const tokens = await authority.ensureTokens();
+      let nextPid = 9000;
+      // Same fake-spawn injection as bootBridgeServer above — a "plugin process" here is really a
+      // scripted TestClient connecting over the real socket.
+      const supervisor = new PluginSupervisor({
+        runDir: join(home, "run"),
+        socketPath,
+        mintToken: (id) => store.mintPluginToken(id),
+        spawn: () => ({ pid: nextPid++, kill: () => {}, exited: new Promise<number>(() => {}) }),
+        isAlivePid: () => false,
+        signalPid: () => {},
+        settings: { registrationTimeoutMs: 5000, backoffCapMs: 100, circuitFailures: 5, circuitWindowMs: 600_000 },
+      });
+      const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, supervisor });
+      return {
+        store, socketPath, harnessToken: tokens.harness, supervisor,
+        stop: () => { supervisor.stopAll(); server.stop(); store.close(); },
+      };
+    }
+
+    /** Spawns (fake) + hellos + plugin.registers a plugin connection — mirrors
+     *  bootBridgeServer's registerAndHello above (duplicated here since that one is scoped inside
+     *  the "plugin tool bridge (Task 4)" describe block). */
+    async function registerAndHello(srv: Awaited<ReturnType<typeof bootPushServer>>, pluginId: string): Promise<TestClient> {
+      srv.supervisor.startAll([{ id: pluginId, dir: `/plugins/${pluginId}`, entry: { command: "bun", args: ["index.ts"] } }]);
+      const raw = srv.store.mintPluginToken(pluginId);
+      const plugin = await TestClient.connect(srv.socketPath);
+      const hello = await plugin.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: pluginId, pluginId,
+      });
+      if (!hello.result?.ok) throw new Error(`test setup: plugin hello failed: ${JSON.stringify(hello.error)}`);
+      const reg = await plugin.request(METHODS.pluginRegister, { pluginId });
+      expect(reg.result).toEqual({ ok: true });
+      expect(srv.supervisor.status(pluginId)).toBe("running");
+      return plugin;
+    }
+
+    test("shortcut.invoke pushes shortcut_invoke to the target plugin connection", async () => {
+      const srv = await bootPushServer();
+      const pluginId = "p1";
+      const plugin = await registerAndHello(srv, pluginId);
+
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "dashboard");
+
+      const res = await harness.request(METHODS.shortcutInvoke, { pluginId, shortcutId: "do-thing" });
+      expect(res.result).toEqual({ ok: true });
+
+      const invoked = await plugin.waitForNotification((n) => n.method === METHODS.event && n.params.type === "shortcut_invoke");
+      expect(invoked.params.shortcutId).toBe("do-thing");
+      expect(invoked.params.sessionId).toBe("$system"); // SYSTEM_SESSION_ID sentinel — session-less event
+      expect(invoked.params.threadId).toBeUndefined(); // extends Base, not ThreadBase
+
+      plugin.close(); harness.close(); srv.stop();
+    });
+
+    test("shortcut.invoke for a plugin with no live connection returns {code:'not_connected'}", async () => {
+      const srv = await bootPushServer();
+      const pluginId = "p1";
+      // Tracked by the supervisor (startAll) but never hello'd/plugin.registered — no live conn.
+      srv.supervisor.startAll([{ id: pluginId, dir: `/plugins/${pluginId}`, entry: { command: "bun" } }]);
+
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "dashboard");
+
+      const res = await harness.request(METHODS.shortcutInvoke, { pluginId, shortcutId: "do-thing" });
+      expect(res.result).toEqual({ code: "not_connected" });
+
+      harness.close(); srv.stop();
+    });
+
+    test("tile.action pushes tile_action to the target plugin connection", async () => {
+      const srv = await bootPushServer();
+      const pluginId = "p1";
+      const plugin = await registerAndHello(srv, pluginId);
+
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "dashboard");
+
+      const res = await harness.request(METHODS.tileAction, { pluginId, actionId: "reconnect" });
+      expect(res.result).toEqual({ ok: true });
+
+      const fired = await plugin.waitForNotification((n) => n.method === METHODS.event && n.params.type === "tile_action");
+      expect(fired.params.actionId).toBe("reconnect");
+      expect(fired.params.sessionId).toBe("$system");
+      expect(fired.params.threadId).toBeUndefined();
+
+      plugin.close(); harness.close(); srv.stop();
+    });
+
+    test("tile.action for a plugin with no live connection returns {code:'not_connected'}", async () => {
+      const srv = await bootPushServer();
+      const pluginId = "p1";
+      srv.supervisor.startAll([{ id: pluginId, dir: `/plugins/${pluginId}`, entry: { command: "bun" } }]);
+
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "dashboard");
+
+      const res = await harness.request(METHODS.tileAction, { pluginId, actionId: "reconnect" });
+      expect(res.result).toEqual({ code: "not_connected" });
+
+      harness.close(); srv.stop();
+    });
+
+    test("shortcut.invoke / tile.action for a completely unknown pluginId return {code:'unknown_plugin'}", async () => {
+      const srv = await bootPushServer();
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "dashboard");
+
+      const a = await harness.request(METHODS.shortcutInvoke, { pluginId: "never-heard-of-it", shortcutId: "do-thing" });
+      expect(a.result).toEqual({ code: "unknown_plugin" });
+      const b = await harness.request(METHODS.tileAction, { pluginId: "never-heard-of-it", actionId: "reconnect" });
+      expect(b.result).toEqual({ code: "unknown_plugin" });
+
+      harness.close(); srv.stop();
+    });
+
+    test("shortcut.invoke / tile.action are not plugin-role callable", async () => {
+      const srv = await bootPushServer();
+      const plugin = await registerAndHello(srv, "p1");
+      const a = await plugin.request(METHODS.shortcutInvoke, { pluginId: "p1", shortcutId: "do-thing" });
+      expect(a.error?.code).toBe(ERR.UNAUTHORIZED);
+      const b = await plugin.request(METHODS.tileAction, { pluginId: "p1", actionId: "reconnect" });
+      expect(b.error?.code).toBe(ERR.UNAUTHORIZED);
+      plugin.close(); srv.stop();
     });
   });
 });

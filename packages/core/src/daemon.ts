@@ -290,6 +290,13 @@ export async function startDaemon(opts: {
     const spawnablePlugins = allPlugins
       .filter(pluginSpawnEligible)
       .map((p) => ({ id: p.name, dir: join(normaHome, "plugins", p.name), entry: p.entry! }));
+    // Phase 4d-i Task 4: boot-time orphan-PID sweep, BEFORE startAll spawns the current set — a
+    // plugin disabled or removed since the last run may have left its process running under a
+    // stale <runDir>/plugins/<id>.pid; startAll/reclaimOrphans would never find it (they only look
+    // at PID files for plugins in `spawnablePlugins`), so this sweeps the FULL PID-file directory
+    // and cleans up anything not in the currently spawn-eligible set (verified via the same
+    // ps-lstart identity check, fail-safe no-kill on any mismatch — see sweepOrphans's doc comment).
+    pluginSupervisor.sweepOrphans(spawnablePlugins.map((p) => p.id));
     pluginSupervisor.startAll(spawnablePlugins);
 
     registerRequestDirTool(registry, {
