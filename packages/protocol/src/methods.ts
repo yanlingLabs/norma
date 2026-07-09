@@ -120,6 +120,12 @@ export const McpServerStatusSchema = z.object({
 export const McpListParams = z.object({ cwd: z.string().optional() });
 export const McpListResult = z.object({ ok: z.literal(true), servers: z.array(McpServerStatusSchema) });
 
+/** The `SupervisorStatus` union (core/plugins/supervisor.ts) plus `"na"` for Tier-1/legacy plugins
+ *  that never run a process — shared by `PluginInfoSchema.status` (below) and, from Phase 4d-ii
+ *  Task 2, `plugin.enable`'s result, which reports the SAME status right after its hot-apply
+ *  start (factored out here so the two can't drift apart). */
+export const PluginRuntimeStatusSchema = z.enum(["starting", "running", "backoff", "circuit-open", "stopped", "na"]);
+
 export const PluginInfoSchema = z.object({
   name: z.string(),
   description: z.string().optional(),
@@ -148,7 +154,7 @@ export const PluginInfoSchema = z.object({
    *  from static manifest/consent data. `"na"` for Tier-1 (`capability`) plugins and legacy
    *  plugins, which never run a process and so have no supervisor status to report. Optional so
    *  older-shaped fixtures/servers still parse, same precedent as the Phase 4a Task 3 fields above. */
-  status: z.enum(["starting", "running", "backoff", "circuit-open", "stopped", "na"]).optional(),
+  status: PluginRuntimeStatusSchema.optional(),
 });
 export const PluginsListParams = z.object({});
 export const PluginsListResult = z.object({ ok: z.literal(true), plugins: z.array(PluginInfoSchema) });
@@ -436,6 +442,73 @@ export const PluginPushResult = z.union([
 export const ShortcutInvokeResult = PluginPushResult;
 export const TileActionResult = PluginPushResult;
 
+// ---------------------------------------------------------------------------------------------
+// Plugin lifecycle (Phase 4d-ii Task 2, spec: harness-role RPCs so the app can install/enable/
+// disable/remove a plugin — and grant its consent — over the wire, applied HOT to the running
+// daemon (no restart required), instead of the CLI-only, file-based, restart-to-apply flow that
+// predates this task. Mirrors the CLI's own plugin-cli.ts flow (missingConsents/
+// buildConsentBlock/applyFreshPluginConsent/setPluginEnabled/grantPluginConsents/
+// removePluginFromSettings/removePluginDir, all @norma/core's plugins/lifecycle.ts) but wire-
+// shaped as typed result unions that never throw for an expected outcome — same precedent as
+// `HardwareRequestResult`/`PluginPushResult` above. NOT plugin-role verbs: a plugin can never
+// install/enable/disable/remove/consent itself or another plugin — ipc/server.ts's
+// PLUGIN_ALLOWED_METHODS deliberately omits all five, so a plugin connection is role-rejected
+// before dispatch for every one of them.
+// ---------------------------------------------------------------------------------------------
+
+/** Copies a local directory (`source`) into the daemon's plugins root — the RPC analog of the
+ *  CLI's `installPlugin` (git clone) for a caller that already has the plugin's contents on disk
+ *  (e.g. a dashboard-driven local install, or a git checkout the app did itself). `name` defaults
+ *  to `source`'s basename (`deriveInstallName`) when omitted. Installs DISABLED + UNCONSENTED —
+ *  NEVER touches settings.json (installPluginFromDir's own contract) — so the caller always gets
+ *  `requiredConsents`/`consentBlock` back to drive a consent sheet before the plugin can do
+ *  anything, exactly like `plugin.enable`'s `needs_consent` branch below. */
+export const PluginsInstallParams = z.object({ source: z.string().min(1), name: z.string().min(1).optional() });
+export const PluginsInstallResult = z.union([
+  z.object({
+    ok: z.literal(true), name: z.string(),
+    requiredConsents: z.array(z.string()), hasMcp: z.boolean(), consentBlock: z.array(z.string()),
+  }),
+  z.object({ code: z.literal("invalid_source") }),
+  z.object({ code: z.literal("already_installed"), name: z.string() }),
+]);
+
+/** Two-step consent flow, both over this ONE verb: called with no `consent` (or `consent:false`),
+ *  a plugin with outstanding required-but-ungranted consent classes returns `needs_consent` +
+ *  the full disclosure block (spec §1: "Consent text always shows the exec payload ... never
+ *  just a summary.") WITHOUT mutating settings at all — the caller shows that block to the user,
+ *  then re-calls with `consent:true` once they agree, which grants every required class fresh
+ *  (`applyFreshPluginConsent`) and enables. `status` on success is the SAME `SupervisorStatus`
+ *  union `PluginInfoSchema.status` reports (`"na"` for a non-Tier-2 plugin; `"stopped"` for a
+ *  Tier-2 plugin when this daemon has no supervisor wired at all — settings are still recorded,
+ *  there's just nothing to hot-spawn onto). */
+export const PluginEnableParams = z.object({ name: z.string().min(1), consent: z.boolean().optional() });
+export const PluginEnableResult = z.union([
+  z.object({ ok: z.literal(true), status: PluginRuntimeStatusSchema }),
+  z.object({ code: z.literal("needs_consent"), requiredConsents: z.array(z.string()), consentBlock: z.array(z.string()) }),
+  z.object({ code: z.literal("unknown_plugin") }),
+]);
+
+export const PluginDisableParams = z.object({ name: z.string().min(1) });
+export const PluginDisableResult = z.union([
+  z.object({ ok: z.literal(true) }),
+  z.object({ code: z.literal("unknown_plugin") }),
+]);
+
+export const PluginRemoveParams = z.object({ name: z.string().min(1) });
+export const PluginRemoveResult = z.union([
+  z.object({ ok: z.literal(true) }),
+  z.object({ code: z.literal("unknown_plugin") }),
+]);
+
+/** Records consent separately from enabling, for a UI that wants to disclose/collect consent as
+ *  its own step rather than folding it into `plugin.enable {consent:true}` (the common path). */
+export const PluginSetConsentParams = z.object({ name: z.string().min(1), classes: z.array(z.string()) });
+export const PluginSetConsentResult = z.union([
+  z.object({ ok: z.literal(true) }),
+  z.object({ code: z.literal("unknown_plugin") }),
+]);
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -485,4 +558,9 @@ export const METHODS = {
   hardwareRespond: "hardware.respond",
   shortcutInvoke: "shortcut.invoke",
   tileAction: "tile.action",
+  pluginsInstall: "plugins.install",
+  pluginEnable: "plugin.enable",
+  pluginDisable: "plugin.disable",
+  pluginRemove: "plugin.remove",
+  pluginSetConsent: "plugin.setConsent",
 } as const;

@@ -506,20 +506,37 @@ export class PluginSupervisor {
    *  the generation settled BEFORE killing so the process's own (later) `exited` resolution never
    *  reopens a backoff cycle for a supervisor that's going away. */
   stopAll(): void {
-    for (const [id, rt] of this.runtimes) {
-      if (rt.timer) {
-        clearTimeout(rt.timer);
-        rt.timer = undefined;
-      }
-      rt.settledGeneration = rt.generation;
-      if (rt.pid !== undefined) this.killProcess(rt.pid);
-      this.removePidFile(id);
-      rt.status = "stopped";
-      rt.conn = undefined;
-      rt.pid = undefined;
-      rt.proc = undefined;
-      this.failPendingInvokes(id);
+    for (const [id, rt] of this.runtimes) this.stopRuntime(id, rt);
+  }
+
+  /** Single-plugin stop (Phase 4d-ii Task 2: `plugin.disable`/`plugin.remove`'s hot-apply STOP) —
+   *  the same per-runtime teardown `stopAll()` applies to every tracked plugin, applied to just
+   *  `pluginId`, so disabling or removing one plugin over the wire kills its process NOW, on the
+   *  running daemon, without tearing down every other plugin the supervisor is tracking. A no-op
+   *  for an id the supervisor isn't currently tracking (never spawned this lifetime, or already
+   *  stopped) — nothing to stop. */
+  stop(pluginId: string): void {
+    const rt = this.runtimes.get(pluginId);
+    if (!rt) return;
+    this.stopRuntime(pluginId, rt);
+  }
+
+  /** Shared teardown for one runtime — extracted so `stopAll()` and the single-plugin `stop()`
+   *  above can never drift apart (same clear-timer / kill-process / remove-pidfile / fail-pending-
+   *  invokes sequence either way). */
+  private stopRuntime(id: string, rt: PluginRuntime): void {
+    if (rt.timer) {
+      clearTimeout(rt.timer);
+      rt.timer = undefined;
     }
+    rt.settledGeneration = rt.generation;
+    if (rt.pid !== undefined) this.killProcess(rt.pid);
+    this.removePidFile(id);
+    rt.status = "stopped";
+    rt.conn = undefined;
+    rt.pid = undefined;
+    rt.proc = undefined;
+    this.failPendingInvokes(id);
   }
 
   /** Manual restart — the small CLI/manager-UI rider (`norma plugin restart <id>`, spec: "restart

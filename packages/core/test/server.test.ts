@@ -1954,8 +1954,14 @@ describe("daemon IPC", () => {
       });
       const plugins = new PluginStore({ normaHome: home, consents: opts.consents });
 
+      // Phase 4d-ii Task 2: `normaHome` wired (harmless for every EXISTING test here — no
+      // settings.json exists at `home` unless a test writes one, so `livePlugins()`'s
+      // `loadSettings` throws and it falls back to the `plugins` snapshot above, same as before
+      // this change) — lets a dedicated regression test below prove `plugin.setConsent`'s hardware
+      // grant is honored by `hardware.request` immediately, without a restart.
       const server = startIpcServer({
         socketPath, serverVersion: "test", tokens: authority, store, peripheral, providerLink, hardware, plugins,
+        normaHome: home,
       });
       return {
         store, socketPath, harnessToken: tokens.harness, home,
@@ -2031,6 +2037,32 @@ describe("daemon IPC", () => {
       expect(res.result).toEqual({ code: "consent_denied", missing: "hardware" });
 
       plugin.close(); srv.stop();
+    });
+
+    test("Phase 4d-ii Task 2 regression: plugin.setConsent hot-grants hardware consent — a live plugin's hardware.request sees it immediately, no restart required", async () => {
+      const srv = await bootHardwareServer(); // no consents at all
+      seedBatteryPlugin(srv.home, "battery-limiter");
+      writeFileSync(join(srv.home, "settings.json"), JSON.stringify({
+        schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" },
+      }));
+      const plugin = await connectPlugin(srv.store, srv.socketPath, "battery-limiter");
+
+      const denied = await plugin.request(METHODS.hardwareRequest, { verb: "getChargeLimit" });
+      expect(denied.result).toEqual({ code: "consent_denied", missing: "hardware" });
+
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "cli-setconsent-hw");
+      const setConsent = await harness.request(METHODS.pluginSetConsent, { name: "battery-limiter", classes: ["hardware"] });
+      expect(setConsent.result).toEqual({ ok: true });
+
+      const provider = await connectProvider(srv.socketPath, srv.harnessToken, "hw-provider-2");
+      const reqPromise = plugin.request(METHODS.hardwareRequest, { verb: "getChargeLimit" });
+      const pushed = await provider.waitForNotification((n) => n.method === METHODS.event && n.params.type === "hardware_requested");
+      await provider.request(METHODS.hardwareRespond, { requestId: pushed.params.requestId, resultJson: '{"percent":80}' });
+      const res = await reqPromise;
+      expect(res.result).toEqual({ resultJson: '{"percent":80}' }); // no longer consent_denied — hot-granted, no restart
+
+      harness.close(); provider.close(); plugin.close(); srv.stop();
     });
 
     test("unconsented plugin (consented, but manifest doesn't declare the battery permission) → typed consent_denied naming the missing permission class", async () => {
@@ -2312,6 +2344,266 @@ describe("daemon IPC", () => {
       });
       const res = await c.request(METHODS.pluginRestart, { pluginId: "sample-echo" });
       expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      c.close(); srv.stop();
+    });
+  });
+
+  // -----------------------------------------------------------------------------------------
+  // Plugin lifecycle RPCs (Phase 4d-ii Task 2): plugins.install/plugin.enable/disable/remove/
+  // setConsent applied HOT to the running daemon — no restart, unlike the CLI's file-based flow.
+  // A real PluginSupervisor (fake spawn/isAlivePid/signalPid, same injection precedent as
+  // "plugin.restart"/"plugins.list supervisor status" above) + `normaHome` wired so the RPC
+  // handlers can read/write settings.json and the plugins directory directly.
+  // -----------------------------------------------------------------------------------------
+  describe("plugin lifecycle RPCs (Task 2)", () => {
+    async function bootLifecycleServer(): Promise<{
+      home: string; settingsPath: string; pluginsRoot: string;
+      store: SessionStore; socketPath: string; harnessToken: string;
+      supervisor: PluginSupervisor; stop: () => void;
+    }> {
+      const home = mkdtempSync(join(tmpdir(), "norma-plugin-lifecycle-"));
+      writeFileSync(join(home, "settings.json"), JSON.stringify({
+        schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" },
+      }));
+      // A Tier-2 (platform) plugin with an `entry` — requiredConsentClasses derives "exec" for
+      // any manifest with an entry point (plugin-manifest.ts), so this plugin always starts out
+      // needing consent, exercising the two-step enable flow below.
+      mkdirSync(join(home, "plugins", "runner"), { recursive: true });
+      writeFileSync(join(home, "plugins", "runner", "norma-plugin.json"), JSON.stringify({
+        id: "runner", tier: "platform", entry: { command: "bun", args: ["index.ts"] },
+      }));
+      const store = new SessionStore(home);
+      const socketPath = join(home, "core.sock");
+      const authority = new TokenAuthority(new FileSecretStore(join(home, "secrets.json")));
+      const tokens = await authority.ensureTokens();
+      const plugins = new PluginStore({ normaHome: home });
+      const supervisor = new PluginSupervisor({
+        runDir: join(home, "run"),
+        socketPath,
+        mintToken: (id) => store.mintPluginToken(id),
+        spawn: () => ({ pid: 9001, kill: () => {}, exited: new Promise<number>(() => {}) }),
+        isAlivePid: () => false,
+        signalPid: () => {},
+      });
+      const server = startIpcServer({
+        socketPath, serverVersion: "test", tokens: authority, store, plugins, supervisor, normaHome: home,
+      });
+      return {
+        home, settingsPath: join(home, "settings.json"), pluginsRoot: join(home, "plugins"),
+        store, socketPath, harnessToken: tokens.harness, supervisor,
+        stop: () => { supervisor.stopAll(); server.stop(); store.close(); },
+      };
+    }
+
+    test("(a) plugin.enable with outstanding consents and no `consent` flag -> needs_consent, settings UNCHANGED", async () => {
+      const srv = await bootLifecycleServer();
+      const before = readFileSync(srv.settingsPath, "utf8");
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "cli-enable");
+
+      const res = await c.request(METHODS.pluginEnable, { name: "runner" });
+      expect(res.result.code).toBe("needs_consent");
+      expect(res.result.requiredConsents).toEqual(["exec"]);
+      expect(res.result.consentBlock[0]).toBe("plugin runner requests:");
+      expect(res.result.consentBlock).toContain("entry: bun index.ts");
+      expect(readFileSync(srv.settingsPath, "utf8")).toBe(before); // no mutation
+
+      c.close(); srv.stop();
+    });
+
+    test("(b) plugin.enable {consent:true} grants consent, enables, hot-starts via the supervisor, and plugins.list reflects it", async () => {
+      const srv = await bootLifecycleServer();
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "cli-enable-consent");
+
+      const res = await c.request(METHODS.pluginEnable, { name: "runner", consent: true });
+      expect(res.result.ok).toBe(true);
+      expect(res.result.status).toBe("starting"); // hot-spawned NOW, awaiting registration
+      expect(srv.supervisor.status("runner")).toBe("starting"); // same supervisor instance — proves the RPC actually reached it
+
+      const settings = JSON.parse(readFileSync(srv.settingsPath, "utf8"));
+      expect(settings.plugins.enabled).toEqual(["runner"]);
+      expect(settings.plugins.consents.runner.exec).toBeGreaterThan(0);
+
+      const list = await c.request(METHODS.pluginsList, {});
+      const runner = list.result.plugins.find((p: any) => p.name === "runner");
+      expect(runner).toMatchObject({ disabled: false, mcpEnabled: true, status: "starting" });
+      expect(runner.consented).toEqual(["exec"]);
+
+      c.close(); srv.stop();
+    });
+
+    test("(c) plugin.disable strips `enabled` and hot-stops the running process", async () => {
+      const srv = await bootLifecycleServer();
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "cli-disable");
+      await c.request(METHODS.pluginEnable, { name: "runner", consent: true });
+      expect(srv.supervisor.status("runner")).toBe("starting");
+
+      const res = await c.request(METHODS.pluginDisable, { name: "runner" });
+      expect(res.result).toEqual({ ok: true });
+      expect(srv.supervisor.status("runner")).toBe("stopped"); // hot-stop reached the running supervisor
+
+      const settings = JSON.parse(readFileSync(srv.settingsPath, "utf8"));
+      expect(settings.plugins.enabled).toEqual([]);
+      expect(settings.plugins.disabled).toEqual(["runner"]);
+      // Deliberate divergence from the CLI's `norma plugin disable` (plugin-cli.ts, which strips
+      // the consent record too): this RPC's brief pins `setPluginEnabled(...,false)` ONLY — a
+      // re-`plugin.enable` after a disable does NOT need to re-consent. Pinned here so a future
+      // change can't silently start stripping consents without a test noticing.
+      expect(settings.plugins.consents.runner.exec).toBeGreaterThan(0);
+
+      const list = await c.request(METHODS.pluginsList, {});
+      expect(list.result.plugins.find((p: any) => p.name === "runner")).toMatchObject({ disabled: true, mcpEnabled: false });
+
+      c.close(); srv.stop();
+    });
+
+    test("plugin.disable on an unknown plugin -> unknown_plugin", async () => {
+      const srv = await bootLifecycleServer();
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "cli-disable-unknown");
+      const res = await c.request(METHODS.pluginDisable, { name: "ghost" });
+      expect(res.result).toEqual({ code: "unknown_plugin" });
+      c.close(); srv.stop();
+    });
+
+    test("(d) plugins.install copies a fixture dir and returns requiredConsents/hasMcp/consentBlock, never touching settings", async () => {
+      const srv = await bootLifecycleServer();
+      const src = mkdtempSync(join(tmpdir(), "norma-plugin-src-"));
+      writeFileSync(join(src, "norma-plugin.json"), JSON.stringify({ id: "fresh", tier: "platform", entry: { command: "bun" } }));
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "cli-install");
+
+      const before = readFileSync(srv.settingsPath, "utf8");
+      const res = await c.request(METHODS.pluginsInstall, { source: src, name: "fresh" });
+      expect(res.result.ok).toBe(true);
+      expect(res.result.name).toBe("fresh");
+      expect(res.result.requiredConsents).toEqual(["exec"]);
+      expect(res.result.hasMcp).toBe(false);
+      expect(res.result.consentBlock[0]).toBe("plugin fresh requests:");
+      expect(existsSync(join(srv.pluginsRoot, "fresh", "norma-plugin.json"))).toBe(true);
+      expect(readFileSync(srv.settingsPath, "utf8")).toBe(before); // installed disabled+unconsented — settings untouched
+
+      c.close(); srv.stop();
+    });
+
+    test("plugins.install derives the name from `source`'s basename when `name` is omitted", async () => {
+      const srv = await bootLifecycleServer();
+      const src = mkdtempSync(join(tmpdir(), "norma-plugin-derived-"));
+      writeFileSync(join(src, "plugin.json"), JSON.stringify({ name: "derived" }));
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "cli-install-derived");
+      const derivedName = src.split("/").pop()!;
+
+      const res = await c.request(METHODS.pluginsInstall, { source: src });
+      expect(res.result.ok).toBe(true);
+      expect(res.result.name).toBe(derivedName);
+      expect(existsSync(join(srv.pluginsRoot, derivedName, "plugin.json"))).toBe(true);
+
+      c.close(); srv.stop();
+    });
+
+    test("plugins.install on an already-installed name -> already_installed, no double copy", async () => {
+      const srv = await bootLifecycleServer();
+      const src = mkdtempSync(join(tmpdir(), "norma-plugin-src2-"));
+      writeFileSync(join(src, "norma-plugin.json"), JSON.stringify({ id: "runner", tier: "capability" }));
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "cli-install-dup");
+
+      const res = await c.request(METHODS.pluginsInstall, { source: src, name: "runner" });
+      expect(res.result).toEqual({ code: "already_installed", name: "runner" });
+      // the pre-existing fixture (tier: platform) was never clobbered by the capability-tier source
+      expect(JSON.parse(readFileSync(join(srv.pluginsRoot, "runner", "norma-plugin.json"), "utf8")).tier).toBe("platform");
+
+      c.close(); srv.stop();
+    });
+
+    test("plugins.install on a source with no manifest -> invalid_source, nothing copied", async () => {
+      const srv = await bootLifecycleServer();
+      const src = mkdtempSync(join(tmpdir(), "norma-plugin-empty-"));
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "cli-install-invalid");
+
+      const res = await c.request(METHODS.pluginsInstall, { source: src, name: "nope" });
+      expect(res.result).toEqual({ code: "invalid_source" });
+      expect(existsSync(join(srv.pluginsRoot, "nope"))).toBe(false);
+
+      c.close(); srv.stop();
+    });
+
+    test("(e) plugin.remove hot-stops, strips settings+consents, and deletes the plugin dir", async () => {
+      const srv = await bootLifecycleServer();
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "cli-remove");
+      await c.request(METHODS.pluginEnable, { name: "runner", consent: true });
+      expect(srv.supervisor.status("runner")).toBe("starting");
+
+      const res = await c.request(METHODS.pluginRemove, { name: "runner" });
+      expect(res.result).toEqual({ ok: true });
+      expect(srv.supervisor.status("runner")).toBe("stopped"); // hot-stop reached the supervisor before the dir was deleted
+      expect(existsSync(join(srv.pluginsRoot, "runner"))).toBe(false);
+
+      const settings = JSON.parse(readFileSync(srv.settingsPath, "utf8"));
+      expect(settings.plugins.enabled).toEqual([]);
+      expect(settings.plugins.disabled).toEqual([]);
+      expect(settings.plugins.consents).toEqual({});
+
+      c.close(); srv.stop();
+    });
+
+    test("plugin.remove on an unknown plugin -> unknown_plugin, no crash", async () => {
+      const srv = await bootLifecycleServer();
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "cli-remove-unknown");
+      const res = await c.request(METHODS.pluginRemove, { name: "ghost" });
+      expect(res.result).toEqual({ code: "unknown_plugin" });
+      c.close(); srv.stop();
+    });
+
+    test("plugin.setConsent grants a consent class without enabling", async () => {
+      const srv = await bootLifecycleServer();
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "cli-setconsent");
+
+      const res = await c.request(METHODS.pluginSetConsent, { name: "runner", classes: ["exec"] });
+      expect(res.result).toEqual({ ok: true });
+      const settings = JSON.parse(readFileSync(srv.settingsPath, "utf8"));
+      expect(settings.plugins.consents.runner.exec).toBeGreaterThan(0);
+      expect(settings.plugins.enabled ?? []).not.toContain("runner");
+
+      c.close(); srv.stop();
+    });
+
+    test("plugin.setConsent on an unknown plugin -> unknown_plugin", async () => {
+      const srv = await bootLifecycleServer();
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "cli-setconsent-unknown");
+      const res = await c.request(METHODS.pluginSetConsent, { name: "ghost", classes: ["exec"] });
+      expect(res.result).toEqual({ code: "unknown_plugin" });
+      c.close(); srv.stop();
+    });
+
+    test("(f) all five lifecycle RPCs are role-rejected for a plugin connection", async () => {
+      const srv = await bootLifecycleServer();
+      const raw = srv.store.mintPluginToken("runner");
+      const c = await TestClient.connect(srv.socketPath);
+      await c.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: "runner", pluginId: "runner",
+      });
+
+      const calls: Array<[string, unknown]> = [
+        [METHODS.pluginsInstall, { source: "/tmp/does-not-matter" }],
+        [METHODS.pluginEnable, { name: "runner" }],
+        [METHODS.pluginDisable, { name: "runner" }],
+        [METHODS.pluginRemove, { name: "runner" }],
+        [METHODS.pluginSetConsent, { name: "runner", classes: ["exec"] }],
+      ];
+      for (const [method, params] of calls) {
+        const res = await c.request(method, params);
+        expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      }
+
       c.close(); srv.stop();
     });
   });

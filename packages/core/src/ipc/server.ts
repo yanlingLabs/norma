@@ -1,4 +1,5 @@
 import { chmodSync } from "node:fs";
+import { join } from "node:path";
 import { z } from "zod";
 import {
   ERR, METHODS, PROTOCOL_VERSION, LineDecoder, encodeLine, parseIncoming,
@@ -14,6 +15,7 @@ import {
   PluginRegisterParams, ToolRegisterParams, ShortcutRegisterParams, TileUpdateParams,
   ProviderRegisterParams, PluginsContribParams, PluginToolResultParams, HardwareRequestParams, HardwareRespondParams,
   ShortcutInvokeParams, TileActionParams,
+  PluginsInstallParams, PluginEnableParams, PluginDisableParams, PluginRemoveParams, PluginSetConsentParams,
   SYSTEM_SESSION_ID,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
@@ -30,17 +32,21 @@ import type { TrustStore } from "../agent/trust";
 import type { BackgroundTaskRegistry } from "../agent/bg-registry";
 import type { SkillStore } from "../agent/skills";
 import type { McpManager } from "../agent/mcp/manager";
-import type { PluginStore } from "../agent/plugins";
+import { PluginStore, type PluginInfo } from "../agent/plugins";
 import { pluginSpawnEligible } from "../agent/plugins";
 import type { ToolRegistry } from "../agent/tools/registry";
-import type { PluginSupervisor, PluginConn, InvokeError } from "../plugins/supervisor";
+import type { PluginSupervisor, PluginConn, InvokeError, EligiblePlugin, SupervisorStatus } from "../plugins/supervisor";
 import type { PluginContribRegistry } from "../plugins/contrib";
 import type { PeripheralBroker } from "../peripheral/broker";
 import type { ProviderLink } from "../peripheral/provider-link";
 import type { HardwareBroker } from "../peripheral/hardware";
 import { verbClass } from "../peripheral/hardware";
 import type { QuotaManager } from "../providers/quota";
-import { addLocalDir } from "../settings";
+import { addLocalDir, loadSettings, saveSettings, type Settings } from "../settings";
+import {
+  deriveInstallName, installPluginFromDir, missingConsents, buildConsentBlock, applyFreshPluginConsent,
+  setPluginEnabled, grantPluginConsents, removePluginFromSettings, removePluginDir, type InstallPluginResult,
+} from "../plugins/lifecycle";
 
 interface ConnState {
   decoder: LineDecoder;
@@ -69,6 +75,18 @@ export interface IpcServerOptions {
   skills?: SkillStore;       // discovered SKILL.md skills; skills.list
   mcp?: McpManager;          // MCP servers started at boot; mcp.list
   plugins?: PluginStore;     // discovered ~/.norma/plugins/*; plugins.list
+  // Phase 4d-ii Task 2: `<normaHome>/settings.json` + `<normaHome>/plugins/` — the SAME
+  // convention `bootstrapNormaDir` (norma-dir.ts) and every other normaHome-taking store
+  // (PluginStore, SkillStore, ContextAssembler, …) already assumes. Lets the plugin-lifecycle
+  // RPCs below (plugins.install/plugin.enable/disable/remove/setConsent) read+write settings.json
+  // and the plugins directory directly, and re-derive a FRESH `PluginStore` per call (`livePlugins`
+  // below) instead of trusting `plugins` above, whose `enabled`/`disabled`/`consents` deps are a
+  // snapshot captured once at daemon boot and never updated — exactly the staleness this task's
+  // "applied HOT, no restart" requirement exists to fix. Optional: a server built without it (most
+  // existing tests) keeps working via `livePlugins`'s fallback to the boot-time `plugins` above;
+  // the five lifecycle RPCs themselves become a typed INTERNAL failure (never a crash) when a
+  // caller actually invokes them with no `normaHome` wired.
+  normaHome?: string;
   // Phase 4b Task 4 (spec §3): the plugin tool bridge. `registry` is the SAME ToolRegistry the
   // AgentEngine executes tool calls against (daemon.ts shares the one instance) — tool.register
   // registers `plugin__<pluginId>__<tool>` into it; the socket close() handler and the
@@ -216,6 +234,57 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       );
     }
     return result.data;
+  }
+
+  // -----------------------------------------------------------------------------------------
+  // Plugin lifecycle (Phase 4d-ii Task 2) support: a settings-current plugin view + hot-apply
+  // start/stop against the SAME PluginSupervisor `plugins.list`/`plugin.restart` already use.
+  // -----------------------------------------------------------------------------------------
+
+  /** A fresh, settings-current view of installed plugins — unlike `opts.plugins` (its
+   *  `enabled`/`disabled`/`consents` deps are a snapshot captured once at daemon boot and never
+   *  updated), this re-reads settings.json on every call so a `plugin.enable`/`disable`/
+   *  `setConsent` written moments ago — by this task's own RPCs, or a concurrent `norma plugin
+   *  ...` CLI invocation — is reflected immediately, without a daemon restart (the whole point of
+   *  this task). Falls back to the boot-time `opts.plugins` when `normaHome` isn't wired (keeps
+   *  every pre-existing test that passes a bare `plugins:` PluginStore, with no `normaHome`,
+   *  working unchanged) or when settings.json can't be read (defensive — never throws). */
+  function livePlugins(): PluginInfo[] {
+    if (!opts.normaHome) return opts.plugins?.list() ?? [];
+    let settings: Settings;
+    try {
+      settings = loadSettings(join(opts.normaHome, "settings.json"));
+    } catch {
+      return opts.plugins?.list() ?? [];
+    }
+    return new PluginStore({ normaHome: opts.normaHome, plugins: settings.plugins, consents: settings.plugins?.consents }).list();
+  }
+
+  /** `plugin.enable`'s hot-apply START — spawns a Tier-2 (platform, spawn-eligible) plugin's
+   *  process NOW, on the running daemon, instead of requiring a restart to pick up the settings
+   *  change just persisted. Reuses `PluginSupervisor.restart()` — the SAME single-plugin
+   *  spawn path `startAll` calls per-id (`spawnFresh`) — as the single-plugin "start": `restart`
+   *  already handles an id the supervisor has never tracked cleanly (its teardown-existing-runtime
+   *  branch is skipped, straight to a fresh spawn), so no separate "start" method was needed. `"na"`
+   *  for a non-Tier-2 plugin (capability/legacy, or no `entry`) — nothing to spawn, matching
+   *  `plugins.list`'s own status enrichment below. `"stopped"` for a Tier-2 plugin when this daemon
+   *  has no supervisor wired at all (no LLM provider) — settings are already recorded by the
+   *  caller; there's just nothing to hot-spawn onto, same "na"/"stopped" precedent `plugins.list`
+   *  already uses. */
+  function hotApplyStart(info: PluginInfo): SupervisorStatus | "na" {
+    if (!pluginSpawnEligible(info)) return "na";
+    if (!opts.supervisor || !opts.normaHome) return "stopped";
+    const config: EligiblePlugin = { id: info.name, dir: join(opts.normaHome, "plugins", info.name), entry: info.entry! };
+    opts.supervisor.restart(config);
+    return opts.supervisor.status(info.name);
+  }
+
+  /** `plugin.disable`/`plugin.remove`'s hot-apply STOP — kills a Tier-2 plugin's running process
+   *  (if any) NOW via the single-plugin `PluginSupervisor.stop()` (added this task — previously
+   *  only a whole-daemon `stopAll()` existed). A safe no-op when no supervisor is wired, or the
+   *  plugin was never tracked as running in the first place. */
+  function hotApplyStop(name: string): void {
+    opts.supervisor?.stop(name);
   }
 
   const server = Bun.listen<ConnState>({
@@ -421,7 +490,10 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         // real SupervisorStatus (defaulting to "stopped" when this plugin was never tracked by the
         // supervisor at all, e.g. no agentProvider so no PluginSupervisor was even built); Tier-1
         // (capability) and legacy plugins never run a process, so they always report "na".
-        const plugins = (opts.plugins?.list() ?? []).map((p) => ({
+        // Phase 4d-ii Task 2: `livePlugins()` (not the boot-time-stale `opts.plugins` directly) so
+        // a `plugin.enable`/`disable`/`setConsent` this same connection just called is reflected
+        // immediately — see that helper's doc comment above.
+        const plugins = livePlugins().map((p) => ({
           ...p,
           status: pluginSpawnEligible(p) ? (opts.supervisor?.status(p.name) ?? "stopped") : ("na" as const),
         }));
@@ -594,7 +666,11 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
           requester = { kind: "plugin", id: pluginId };
           const cls = verbClass(p.verb);
           if (cls) {
-            const info = opts.plugins?.list().find((pl) => pl.name === pluginId);
+            // Phase 4d-ii Task 2: livePlugins() (not the boot-time-stale opts.plugins directly) —
+            // otherwise a `plugin.setConsent`/`plugin.enable {consent:true}` grant of "hardware"
+            // consent would stay invisible to this gate until a daemon restart, quietly breaking
+            // this task's "applied HOT" promise for the hardware.request consent path specifically.
+            const info = livePlugins().find((pl) => pl.name === pluginId);
             if (!info?.hardwarePermissions.includes(cls)) {
               opts.hardware.auditDenied({ requester, verb: p.verb, code: "consent_denied", missing: cls });
               return { code: "consent_denied", missing: cls };
@@ -691,6 +767,105 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         const config = opts.supervisor.configFor(p.pluginId);
         if (!config) throw new RpcFailure(ERR.NOT_FOUND, `unknown plugin: ${p.pluginId}`);
         opts.supervisor.restart(config);
+        return { ok: true };
+      }
+
+      // -----------------------------------------------------------------------------------------
+      // Plugin lifecycle (Phase 4d-ii Task 2): install/enable/disable/remove/setConsent applied
+      // HOT to the running daemon — the over-the-wire counterpart to the CLI's file-based,
+      // restart-to-apply `norma plugin ...` flow (plugin-cli.ts). harness-role (like
+      // `plugin.restart`/`plugins.list` above — no extra role check needed here); NOT any of the
+      // six plugin-role verbs, so a plugin connection is role-rejected before dispatch
+      // (PLUGIN_ALLOWED_METHODS above deliberately omits all five). Every result is a typed union
+      // — none of these ever throw for an expected outcome (unknown plugin, bad source, needs
+      // consent, already installed) — same discipline as `hardware.request`'s HardwareRequestResult
+      // above; a thrown RpcFailure(INTERNAL) is reserved for genuine server misconfiguration (no
+      // `normaHome` wired at all, which only an incomplete test harness would hit — `daemon.ts`
+      // always wires it).
+      // -----------------------------------------------------------------------------------------
+      case METHODS.pluginsInstall: {
+        const p = parseParams(PluginsInstallParams, params);
+        if (!opts.normaHome) throw new RpcFailure(ERR.INTERNAL, "plugins.install is not available on this server (no normaHome configured)");
+        const pluginsRoot = join(opts.normaHome, "plugins");
+        let name: string;
+        try {
+          name = deriveInstallName(p.source, p.name);
+        } catch {
+          return { code: "invalid_source" };
+        }
+        let installed: InstallPluginResult;
+        try {
+          // Installs DISABLED + UNCONSENTED, never touches settings.json (installPluginFromDir's
+          // own contract) — the caller always gets requiredConsents/consentBlock back to drive a
+          // consent sheet before `plugin.enable {consent:true}` can let anything run.
+          installed = installPluginFromDir(p.source, name, pluginsRoot);
+        } catch (e) {
+          const message = (e as Error).message;
+          if (message.includes("already exists")) return { code: "already_installed", name };
+          return { code: "invalid_source" }; // no manifest, invalid/traversal name, unreadable source, ...
+        }
+        const info = livePlugins().find((pl) => pl.name === installed.name);
+        return {
+          ok: true,
+          name: installed.name,
+          requiredConsents: info?.requiredConsents ?? [],
+          hasMcp: info?.hasMcp ?? false,
+          consentBlock: info ? buildConsentBlock(info) : [`plugin ${installed.name} requests:`],
+        };
+      }
+      case METHODS.pluginEnable: {
+        const p = parseParams(PluginEnableParams, params);
+        const info = livePlugins().find((pl) => pl.name === p.name);
+        if (!info) return { code: "unknown_plugin" };
+        const missing = missingConsents(info.requiredConsents, info.consented);
+        if (missing.length > 0 && p.consent !== true) {
+          // No mutation — the caller shows this disclosure and re-calls with consent:true once
+          // the user agrees (the CLI's interactive `readLine` prompt, over the wire).
+          return { code: "needs_consent", requiredConsents: info.requiredConsents, consentBlock: buildConsentBlock(info) };
+        }
+        if (!opts.normaHome) throw new RpcFailure(ERR.INTERNAL, "plugin.enable is not available on this server (no normaHome configured)");
+        const settingsPath = join(opts.normaHome, "settings.json");
+        const settings = p.consent === true
+          ? applyFreshPluginConsent(() => loadSettings(settingsPath), p.name, info.requiredConsents, Date.now())
+          : setPluginEnabled(loadSettings(settingsPath), p.name, true);
+        saveSettings(settingsPath, settings);
+        const updated = livePlugins().find((pl) => pl.name === p.name) ?? info;
+        return { ok: true, status: hotApplyStart(updated) };
+      }
+      case METHODS.pluginDisable: {
+        const p = parseParams(PluginDisableParams, params);
+        const info = livePlugins().find((pl) => pl.name === p.name);
+        if (!info) return { code: "unknown_plugin" };
+        if (!opts.normaHome) throw new RpcFailure(ERR.INTERNAL, "plugin.disable is not available on this server (no normaHome configured)");
+        const settingsPath = join(opts.normaHome, "settings.json");
+        saveSettings(settingsPath, setPluginEnabled(loadSettings(settingsPath), p.name, false));
+        hotApplyStop(p.name);
+        return { ok: true };
+      }
+      case METHODS.pluginRemove: {
+        const p = parseParams(PluginRemoveParams, params);
+        const info = livePlugins().find((pl) => pl.name === p.name);
+        if (!info) return { code: "unknown_plugin" };
+        if (!opts.normaHome) throw new RpcFailure(ERR.INTERNAL, "plugin.remove is not available on this server (no normaHome configured)");
+        hotApplyStop(p.name); // stop the running process BEFORE the directory backing it disappears
+        const pluginsRoot = join(opts.normaHome, "plugins");
+        const settingsPath = join(opts.normaHome, "settings.json");
+        // removePluginFromSettings strips both enabled/disabled list membership AND the plugin's
+        // whole consent record (it composes stripPluginConsents internally — see lifecycle.ts).
+        const settings = removePluginFromSettings(loadSettings(settingsPath), p.name);
+        removePluginDir(pluginsRoot, p.name); // containment-checked; a genuine fs failure here is
+        // NOT swallowed — it propagates as an INTERNAL error rather than silently persisting a
+        // "removed" settings state while the directory is still on disk.
+        saveSettings(settingsPath, settings);
+        return { ok: true };
+      }
+      case METHODS.pluginSetConsent: {
+        const p = parseParams(PluginSetConsentParams, params);
+        const info = livePlugins().find((pl) => pl.name === p.name);
+        if (!info) return { code: "unknown_plugin" };
+        if (!opts.normaHome) throw new RpcFailure(ERR.INTERNAL, "plugin.setConsent is not available on this server (no normaHome configured)");
+        const settingsPath = join(opts.normaHome, "settings.json");
+        saveSettings(settingsPath, grantPluginConsents(loadSettings(settingsPath), p.name, p.classes, Date.now()));
         return { ok: true };
       }
 
