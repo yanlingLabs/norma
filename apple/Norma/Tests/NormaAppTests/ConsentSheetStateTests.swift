@@ -156,6 +156,50 @@ final class LocatePluginRootTests: XCTestCase {
         }
         XCTAssertNil(locatePluginRoot(in: tempDir))
     }
+
+    // Fix wave 2: Finder's "Compress" zips a folder as `{PluginDir/..., __MACOSX/...}` — the
+    // most common way a Mac user makes a zip. `__MACOSX` and dot-prefixed entries (`.DS_Store`,
+    // `.git`) must not count as a second "top-level subdirectory" candidate.
+
+    func testFindsManifestInSingleSubdirectoryAlongsideMACOSXDir() throws {
+        let sub = tempDir.appendingPathComponent("PluginDir", isDirectory: true)
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        FileManager.default.createFile(
+            atPath: sub.appendingPathComponent("norma-plugin.json").path, contents: Data("{}".utf8)
+        )
+
+        let macosx = tempDir.appendingPathComponent("__MACOSX", isDirectory: true)
+        try FileManager.default.createDirectory(at: macosx, withIntermediateDirectories: true)
+        FileManager.default.createFile(
+            atPath: macosx.appendingPathComponent("._PluginDir").path, contents: Data()
+        )
+
+        XCTAssertEqual(locatePluginRoot(in: tempDir)?.standardizedFileURL.path, sub.standardizedFileURL.path)
+    }
+
+    func testFindsManifestInSingleSubdirectoryAlongsideDotFile() throws {
+        let sub = tempDir.appendingPathComponent("PluginDir", isDirectory: true)
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        FileManager.default.createFile(
+            atPath: sub.appendingPathComponent("plugin.json").path, contents: Data("{}".utf8)
+        )
+
+        FileManager.default.createFile(
+            atPath: tempDir.appendingPathComponent(".DS_Store").path, contents: Data()
+        )
+
+        XCTAssertEqual(locatePluginRoot(in: tempDir)?.standardizedFileURL.path, sub.standardizedFileURL.path)
+    }
+
+    func testNilWhenOnlyMACOSXDirAndNoRealPluginDir() throws {
+        let macosx = tempDir.appendingPathComponent("__MACOSX", isDirectory: true)
+        try FileManager.default.createDirectory(at: macosx, withIntermediateDirectories: true)
+        FileManager.default.createFile(
+            atPath: macosx.appendingPathComponent("._something").path, contents: Data()
+        )
+
+        XCTAssertNil(locatePluginRoot(in: tempDir))
+    }
 }
 
 // -----------------------------------------------------------------------------------------------

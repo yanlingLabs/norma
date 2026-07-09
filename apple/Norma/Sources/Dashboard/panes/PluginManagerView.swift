@@ -155,16 +155,27 @@ enum PluginInstallError: Error, Equatable {
 /// `norma-plugin.json`/`plugin.json` manifest, else a single top-level subdirectory that does
 /// (the common "zip wraps everything in one folder" shape) — checked in that order. `nil` if
 /// neither matches (ambiguous or manifest-less zip contents).
+///
+/// `__MACOSX` and dot-prefixed entries (`.DS_Store`, `.git`, ...) are ignored when looking for
+/// candidates: Finder's "Compress" — the most common way a Mac user zips a folder — produces a
+/// zip containing both the real plugin folder AND a `__MACOSX` metadata folder, which would
+/// otherwise look like two top-level subdirectories and wrongly fail the single-subdirectory
+/// check below.
 func locatePluginRoot(in directory: URL, fileManager: FileManager = .default) -> URL? {
     func hasManifest(_ url: URL) -> Bool {
         fileManager.fileExists(atPath: url.appendingPathComponent("norma-plugin.json").path)
             || fileManager.fileExists(atPath: url.appendingPathComponent("plugin.json").path)
     }
+    func isIgnoredCandidate(_ url: URL) -> Bool {
+        let name = url.lastPathComponent
+        return name == "__MACOSX" || name.hasPrefix(".")
+    }
     if hasManifest(directory) { return directory }
     guard let entries = try? fileManager.contentsOfDirectory(
         at: directory, includingPropertiesForKeys: [.isDirectoryKey]
     ) else { return nil }
-    let subdirs = entries.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+    let candidates = entries.filter { !isIgnoredCandidate($0) }
+    let subdirs = candidates.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
     guard subdirs.count == 1, hasManifest(subdirs[0]) else { return nil }
     return subdirs[0]
 }
