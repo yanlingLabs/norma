@@ -307,12 +307,20 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
    *  branch is skipped, straight to a fresh spawn), so no separate "start" method was needed. `"na"`
    *  for a non-Tier-2 plugin (capability/legacy, or no `entry`) — nothing to spawn, matching
    *  `plugins.list`'s own status enrichment below. `"stopped"` for a Tier-2 plugin when this daemon
-   *  has no supervisor wired at all (no LLM provider) — settings are already recorded by the
-   *  caller; there's just nothing to hot-spawn onto, same "na"/"stopped" precedent `plugins.list`
-   *  already uses. */
+   *  has no agent runtime wired — settings are already recorded by the caller; there's just nothing
+   *  to hot-spawn onto, same "na"/"stopped" precedent `plugins.list` already uses. Gated on
+   *  `opts.registry`, NOT just `opts.supervisor`: since Phase 4d-cleanup Task 2 hoisted
+   *  `PluginSupervisor`'s construction out of daemon.ts's `if (agentProvider)` gate (so its
+   *  boot-time orphan sweep runs even with no provider configured), `opts.supervisor` is now ALWAYS
+   *  defined — it's no longer a reliable signal for "a provider is configured". `opts.registry`
+   *  still is: daemon.ts only builds a `ToolRegistry` (and mirrors it into `sharedRegistry`, what
+   *  becomes `opts.registry` here) inside that same `if (agentProvider)` block, exactly like
+   *  `tool.register` below already gates on `opts.registry` for the same reason. Without this, a
+   *  no-provider daemon would fall through to a REAL `opts.supervisor.restart()` spawn on
+   *  `plugin.enable` — settings-only recording is the correct behavior for that daemon shape. */
   function hotApplyStart(info: PluginInfo): SupervisorStatus | "na" {
     if (!pluginSpawnEligible(info)) return "na";
-    if (!opts.supervisor || !opts.normaHome) return "stopped";
+    if (!opts.supervisor || !opts.registry || !opts.normaHome) return "stopped";
     const config: EligiblePlugin = { id: info.name, dir: join(opts.normaHome, "plugins", info.name), entry: info.entry! };
     opts.supervisor.restart(config);
     return opts.supervisor.status(info.name);
@@ -321,7 +329,11 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
   /** `plugin.disable`/`plugin.remove`'s hot-apply STOP — kills a Tier-2 plugin's running process
    *  (if any) NOW via the single-plugin `PluginSupervisor.stop()` (added this task — previously
    *  only a whole-daemon `stopAll()` existed). A safe no-op when no supervisor is wired, or the
-   *  plugin was never tracked as running in the first place. */
+   *  plugin was never tracked as running in the first place — which, on a no-provider daemon (see
+   *  `hotApplyStart`'s doc comment), is always: `startAll` never ran, so there's never anything to
+   *  stop. Deliberately left ungated on `opts.registry`, unlike `hotApplyStart` — a stop can only
+   *  ever tear something down, never spawn, so widening when it runs is harmless cleanup, not a
+   *  new-process risk. */
   function hotApplyStop(name: string): void {
     opts.supervisor?.stop(name);
   }
