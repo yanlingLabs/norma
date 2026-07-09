@@ -1,4 +1,5 @@
 import XCTest
+import NormaKit
 @testable import Norma
 
 /// Task 2 (Phase 4d-iii): `pluginRowDisplay(...)` — the PURE `plugins.list` entry → row-display
@@ -176,5 +177,86 @@ final class PluginManagerModelTests: XCTestCase {
 
     func testRowIdIsThePluginName() {
         XCTAssertEqual(row(name: "sample-echo").id, "sample-echo")
+    }
+}
+
+// -----------------------------------------------------------------------------------------------
+// PluginManagerModel — async error-surfacing path (Fix wave 1, Task 2 review defect). A SEPARATE
+// `@MainActor` test class (not folded into `PluginManagerModelTests` above) so that class's 21
+// pure-`pluginRowDisplay` tests stay byte-for-byte untouched, per the fix brief. Uses the SAME
+// scripted-transport double every other test file in this target uses to drive a real (actor)
+// `NormaClient` end-to-end (`FeedScriptedTransport`/`feedLineJSON`/`feedWaitUntil`, defined in
+// `SessionFeedTests.swift`, same target) — `PluginManagerModel` takes a concrete `NormaClient`,
+// but that client is ALREADY mockable at the transport layer (see `PeripheralProviderTests.
+// connectedProvider()`/`HardwareBridgeTests.connectedBridge()`), so no new protocol seam is
+// introduced here.
+@MainActor
+final class PluginManagerModelAsyncTests: XCTestCase {
+    /// Opens + hellos a scripted `NormaClient`, mirroring `PeripheralProviderTests.
+    /// connectedProvider()`'s handshake exactly (send count 1 == `protocol.hello`).
+    private func connectedClient() async throws -> (NormaClient, FeedScriptedTransport) {
+        let t = FeedScriptedTransport()
+        let client = NormaClient(makeTransport: { t }, token: "tok", clientName: "plugin-manager-test")
+        async let c: Void = client.connect()
+        await feedWaitUntil { !t.sent.isEmpty }
+        let hello = feedLineJSON(t.sent[0])
+        t.feed(#"{"jsonrpc":"2.0","id":\#(hello["id"] as! Int),"result":{"ok":true}}"#)
+        try await c
+        return (client, t)
+    }
+
+    /// THE defect this fix wave closes: `enable`'s `.unknownPlugin` branch used to write
+    /// `errorText` directly, then unconditionally `await refresh()` — whose SUCCESS path
+    /// unconditionally nils `errorText` — wiping the action's error the instant `plugins.list`
+    /// (called independently of whether the action failed) came back clean. Pre-fix this test
+    /// fails (`model.errorText` ends up `nil`); post-fix the action error is the LAST write and
+    /// survives the trailing refresh.
+    func testFailedActionErrorSurvivesTrailingRefresh() async throws {
+        let (client, t) = try await connectedClient()
+        let model = PluginManagerModel(client: client)
+
+        async let action: Void = model.enable("ghost")
+
+        // Request #2 (after hello): `plugin.enable` — respond with the typed `unknown_plugin`
+        // failure result (methods.ts `PluginEnableResult`), NOT a thrown RpcError.
+        await feedWaitUntil { t.sent.count >= 2 }
+        let enableReq = feedLineJSON(t.sent[1])
+        t.feed(#"{"jsonrpc":"2.0","id":\#(enableReq["id"] as! Int),"result":{"code":"unknown_plugin"}}"#)
+
+        // Request #3: the action's trailing `refresh()` → `plugins.list` — succeeds with an empty
+        // list, exercising the exact "refresh succeeds independently of the action's failure" path
+        // that used to wipe the error.
+        await feedWaitUntil { t.sent.count >= 3 }
+        let listReq = feedLineJSON(t.sent[2])
+        t.feed(#"{"jsonrpc":"2.0","id":\#(listReq["id"] as! Int),"result":{"plugins":[]}}"#)
+
+        await action
+
+        XCTAssertEqual(model.errorText, "unknown plugin: ghost")
+        XCTAssertTrue(model.rows.isEmpty)
+        XCTAssertNil(model.pendingConsent)
+    }
+
+    /// A genuinely-successful action must still end with `errorText == nil` (clearing any stale
+    /// error) — the normal `refresh()` clear already does this; this test pins that it keeps doing
+    /// so under the fix (the fix only special-cases the FAILURE path).
+    func testSuccessfulActionClearsStaleError() async throws {
+        let (client, t) = try await connectedClient()
+        let model = PluginManagerModel(client: client)
+        model.errorText = "stale error from a previous action"
+
+        async let action: Void = model.disable("sample-echo")
+
+        await feedWaitUntil { t.sent.count >= 2 }
+        let disableReq = feedLineJSON(t.sent[1])
+        t.feed(#"{"jsonrpc":"2.0","id":\#(disableReq["id"] as! Int),"result":{"ok":true}}"#)
+
+        await feedWaitUntil { t.sent.count >= 3 }
+        let listReq = feedLineJSON(t.sent[2])
+        t.feed(#"{"jsonrpc":"2.0","id":\#(listReq["id"] as! Int),"result":{"plugins":[]}}"#)
+
+        await action
+
+        XCTAssertNil(model.errorText)
     }
 }

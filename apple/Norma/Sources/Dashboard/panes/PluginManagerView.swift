@@ -181,9 +181,20 @@ final class PluginManagerModel: ObservableObject {
         }
     }
 
+    // Fix wave 1 (Task 2 review, error-surfacing defect): `refresh()`'s success path
+    // unconditionally clears `errorText` — and `pluginsList()` succeeding is INDEPENDENT of
+    // whether the action itself failed, so a bare `errorText = ...; await refresh()` had the
+    // refresh wipe the action's error the instant it ran. Each action method below now captures
+    // its own failure into a local `actionError` instead of writing straight to `errorText`, calls
+    // `refresh()` (which still does the normal list-reload + stale-error-clear), and only THEN — if
+    // the action itself failed — sets `errorText` to the captured message, so it's the LAST write
+    // and survives the refresh. On an action success, `actionError` stays nil and refresh's own
+    // clear stands untouched. `.needsConsent` is deliberately NOT routed through `actionError` — it
+    // is a pending state, not a failure (see `pendingConsent`, left untouched by this fix).
     func enable(_ name: String) async {
         busyName = name
         defer { busyName = nil }
+        var actionError: String?
         do {
             switch try await client.pluginEnable(name: name) {
             case .ok:
@@ -191,49 +202,56 @@ final class PluginManagerModel: ObservableObject {
             case .needsConsent(let requiredConsents, let consentBlock):
                 pendingConsent = PendingConsent(name: name, requiredConsents: requiredConsents, consentBlock: consentBlock)
             case .unknownPlugin:
-                errorText = "unknown plugin: \(name)"
+                actionError = "unknown plugin: \(name)"
             }
         } catch {
-            errorText = "couldn't enable \(name) — try again"
+            actionError = "couldn't enable \(name) — try again"
         }
         await refresh()
+        if let actionError { errorText = actionError }
     }
 
     func disable(_ name: String) async {
         busyName = name
         defer { busyName = nil }
+        var actionError: String?
         do {
             if try await client.pluginDisable(name: name) == .unknownPlugin {
-                errorText = "unknown plugin: \(name)"
+                actionError = "unknown plugin: \(name)"
             }
         } catch {
-            errorText = "couldn't disable \(name) — try again"
+            actionError = "couldn't disable \(name) — try again"
         }
         await refresh()
+        if let actionError { errorText = actionError }
     }
 
     func remove(_ name: String) async {
         busyName = name
         defer { busyName = nil }
+        var actionError: String?
         do {
             if try await client.pluginRemove(name: name) == .unknownPlugin {
-                errorText = "unknown plugin: \(name)"
+                actionError = "unknown plugin: \(name)"
             }
         } catch {
-            errorText = "couldn't remove \(name) — try again"
+            actionError = "couldn't remove \(name) — try again"
         }
         await refresh()
+        if let actionError { errorText = actionError }
     }
 
     func restart(_ name: String) async {
         busyName = name
         defer { busyName = nil }
+        var actionError: String?
         do {
             try await client.pluginRestart(name: name)
         } catch {
-            errorText = "couldn't restart \(name) — try again"
+            actionError = "couldn't restart \(name) — try again"
         }
         await refresh()
+        if let actionError { errorText = actionError }
     }
 }
 
