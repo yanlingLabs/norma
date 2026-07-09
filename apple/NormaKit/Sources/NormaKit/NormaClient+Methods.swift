@@ -171,6 +171,16 @@ extension NormaClient {
         return try decodeLifecycleOutcome(r, method: "plugin.setConsent")
     }
 
+    /// `plugin.restart {pluginId}` (final-review Fix 1 / wired here for Phase 4d-iii Task 2's
+    /// PluginManagerView "Restart" action) — the manual-restart rider (`PluginSupervisor.restart`)
+    /// that recovers a Tier-2 plugin stuck in backoff/circuit-open without a daemon restart. Unlike
+    /// the 5 lifecycle RPCs above, the server has no typed failure result for this one — an unknown
+    /// plugin id throws a bare `RpcFailure(NOT_FOUND, ...)`, which `request(...)` already surfaces
+    /// as a thrown `RpcError`, so there's no outcome enum to decode here.
+    public func pluginRestart(name: String) async throws {
+        _ = try await request("plugin.restart", params: obj(["pluginId": .string(name)]))
+    }
+
     /// `shortcut.invoke {pluginId, shortcutId}` (Phase 4d-i Task 2) — pushes a `shortcut_invoke`
     /// event to that plugin's own live connection; fire-and-forget on the plugin side.
     public func shortcutInvoke(pluginId: String, shortcutId: String) async throws -> PluginPushOutcome {
@@ -366,9 +376,17 @@ extension NormaClient {
     /// optional on the wire (older-shaped fixtures/servers) — `tier`/`status` decode to `nil`,
     /// `requiredConsents`/`consented` decode to `[]`, `legacy` defaults to `false`, same
     /// permissive-decode precedent as the original 5 fields above.
+    ///
+    /// Phase 4d-iii Task 2: `version` (also `PluginInfoSchema`, always optional on the wire — a
+    /// manifest need not declare one) added for the Dashboard's PluginManagerView row display.
+    /// Appended at the END of the tuple (not interleaved) so this stays purely additive — every
+    /// existing label-based access (`.name`, `.tier`, etc.) is unaffected by a tuple's field
+    /// POSITION, only unlabeled positional destructuring would break, and none exists in this repo
+    /// (grepped before adding).
     public func pluginsList() async throws -> [(
         name: String, skills: [String], hasMcp: Bool, mcpEnabled: Bool, disabled: Bool,
-        tier: String?, requiredConsents: [String], consented: [String], legacy: Bool, status: String?
+        tier: String?, requiredConsents: [String], consented: [String], legacy: Bool, status: String?,
+        version: String?
     )] {
         let r = try await request("plugins.list", params: .object([:]))
         return (r["plugins"]?.arrayValue ?? []).compactMap { p in
@@ -383,7 +401,8 @@ extension NormaClient {
                 (p["requiredConsents"]?.arrayValue ?? []).compactMap { $0.stringValue },
                 (p["consented"]?.arrayValue ?? []).compactMap { $0.stringValue },
                 p["legacy"]?.boolValue ?? false,
-                p["status"]?.stringValue
+                p["status"]?.stringValue,
+                p["version"]?.stringValue
             )
         }
     }

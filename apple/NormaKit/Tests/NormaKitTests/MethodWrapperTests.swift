@@ -378,11 +378,12 @@ final class MethodWrapperTests: XCTestCase {
     func testPluginsListDecodesExtendedFields() async throws {
         let (client, t) = try await connected()
         let (req, plugins) = try await roundTrip(t, sentIndex: 1,
-            result: #"{"ok":true,"plugins":[{"name":"sample-echo","skills":["echo"],"hasMcp":false,"mcpEnabled":false,"disabled":false,"tier":"platform","requiredConsents":["network"],"consented":["network"],"legacy":false,"status":"running"},{"name":"legacy-plugin","skills":[],"hasMcp":false,"mcpEnabled":false,"disabled":true}]}"#
+            result: #"{"ok":true,"plugins":[{"name":"sample-echo","version":"1.2.0","skills":["echo"],"hasMcp":false,"mcpEnabled":false,"disabled":false,"tier":"platform","requiredConsents":["network"],"consented":["network"],"legacy":false,"status":"running"},{"name":"legacy-plugin","skills":[],"hasMcp":false,"mcpEnabled":false,"disabled":true}]}"#
         ) { try await client.pluginsList() }
         XCTAssertEqual(req["method"] as? String, "plugins.list")
         XCTAssertEqual(plugins.count, 2)
         XCTAssertEqual(plugins[0].name, "sample-echo")
+        XCTAssertEqual(plugins[0].version, "1.2.0")
         XCTAssertEqual(plugins[0].tier, "platform")
         XCTAssertEqual(plugins[0].requiredConsents, ["network"])
         XCTAssertEqual(plugins[0].consented, ["network"])
@@ -390,11 +391,38 @@ final class MethodWrapperTests: XCTestCase {
         XCTAssertEqual(plugins[0].status, "running")
 
         XCTAssertEqual(plugins[1].name, "legacy-plugin")
+        XCTAssertNil(plugins[1].version)
         XCTAssertNil(plugins[1].tier)
         XCTAssertEqual(plugins[1].requiredConsents, [])
         XCTAssertEqual(plugins[1].consented, [])
         XCTAssertFalse(plugins[1].legacy)
         XCTAssertNil(plugins[1].status)
+    }
+
+    /// Phase 4d-iii Task 2: `plugin.restart {pluginId}` — no typed outcome (the server throws a
+    /// bare `RpcFailure` for an unknown id, which surfaces as a thrown `RpcError` here); the happy
+    /// path just needs the right method/param key sent and no throw on `{ok:true}`.
+    func testPluginRestartSendsPluginIdAndSucceeds() async throws {
+        let (client, t) = try await connected()
+        let (req, _) = try await roundTrip(t, sentIndex: 1, result: #"{"ok":true}"#) {
+            try await client.pluginRestart(name: "sample-echo")
+        }
+        XCTAssertEqual(req["method"] as? String, "plugin.restart")
+        XCTAssertEqual((req["params"] as? [String: Any])?["pluginId"] as? String, "sample-echo")
+    }
+
+    func testPluginRestartUnknownPluginThrows() async throws {
+        let (client, t) = try await connected()
+        async let call: Void = client.pluginRestart(name: "ghost")
+        let sent = try await waitForSent(t, count: 2)
+        let req = decodeLine(sent[1])
+        t.feed(#"{"jsonrpc":"2.0","id":\#(req["id"] as! Int),"error":{"code":-32000,"message":"unknown plugin: ghost"}}"#)
+        do {
+            try await call
+            XCTFail("expected pluginRestart to throw for an unknown plugin")
+        } catch let error as RpcError {
+            XCTAssertEqual(error.message, "unknown plugin: ghost")
+        }
     }
 
     /// Phase 4d-ii Task 3: `plugin_tile_updated` is transient (bypasses the session-attach dedupe

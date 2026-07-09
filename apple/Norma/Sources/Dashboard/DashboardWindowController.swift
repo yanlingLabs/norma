@@ -52,7 +52,16 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
     /// Test-only read-through, same convention as `DetachedWindowController.windowForTesting`.
     var windowForTesting: NSWindow? { window }
 
-    init(client: NormaClient, directory: SessionDirectory, peripheral: PeripheralProvider, helperClient: HelperClient, onOpenSessionDetached: @escaping (String) -> Void, frame: NSRect) {
+    /// Phase 4d-iii Task 2: `initialPane` defaults to `defaultDashboardPane` so the pre-existing
+    /// "Dashboard…" call site (`AppDelegate.openDashboard`) is unaffected; the new "Manage
+    /// Plugins…" entry point passes `.pluginManager` instead — see `AppDelegate.openPluginManager`.
+    /// Phase 4d-iii Task 4: `shortcutRegistry` defaults to `nil` — under unit tests
+    /// (`testShowCreatesNativeChromeWindowAtFrame`, `DashboardTests.swift`) `AppDelegate` never
+    /// constructs a real `ShortcutRegistry` (it's built only outside `!isRunningUnitTests`, same
+    /// gate as `MultitouchTrigger`/`HotkeyTrigger`), so every existing call site that omits this
+    /// param keeps compiling unchanged. `ShortcutBindingEditorModel.capture(...)` still persists a
+    /// binding either way; only the live Carbon re-registration no-ops when this is `nil`.
+    init(client: NormaClient, directory: SessionDirectory, peripheral: PeripheralProvider, helperClient: HelperClient, shortcutRegistry: ShortcutRegistry? = nil, onOpenSessionDetached: @escaping (String) -> Void, frame: NSRect, initialPane: DashboardPane = defaultDashboardPane) {
         let window = NSWindow(
             contentRect: frame,
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -74,6 +83,16 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
 
         window.delegate = self
 
+        // Phase 4d-iii Task 2: constructed fresh here (not passed in like `peripheral`/
+        // `helperClient`, which outlive any single dashboard window) — the plugin list has no
+        // other owner across the app's lifetime, and `PluginManagerView.task` refreshes it on
+        // every appearance anyway, so a fresh model per window-open is the simplest correct thing.
+        let pluginManager = PluginManagerModel(client: client)
+        // Phase 4d-iii Task 4: same "constructed fresh here, per window-open" posture as
+        // `pluginManager` above — the tiles strip / shortcut editor have no other owner across the
+        // app's lifetime either, and both re-seed themselves (`.task`) on every appearance.
+        let tilesModel = TilesStripModel(client: client)
+        let shortcutsModel = ShortcutBindingEditorModel(client: client, shortcutRegistry: shortcutRegistry)
         let wiring = DashboardWiring(
             directory: directory,
             onOpenSessionDetached: onOpenSessionDetached,
@@ -82,9 +101,12 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
             trustList: { try await client.trustList() },
             trustRemove: { try await client.trustRemove(path: $0) },
             peripheral: peripheral,
-            helperClient: helperClient
+            helperClient: helperClient,
+            pluginManager: pluginManager,
+            tilesModel: tilesModel,
+            shortcutsModel: shortcutsModel
         )
-        window.contentView = NSHostingView(rootView: DashboardView(wiring: wiring))
+        window.contentView = NSHostingView(rootView: DashboardView(wiring: wiring, initialPane: initialPane))
         window.setFrame(frame, display: true)
     }
 

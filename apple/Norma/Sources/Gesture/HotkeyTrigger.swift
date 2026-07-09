@@ -19,7 +19,30 @@ final class HotkeyTrigger {
         UInt32(cmdKey | controlKey | optionKey)
     )
 
-    private static let handler: EventHandlerUPP = { _, _, _ in
+    private static let signature = "AIPT".fourCharCodeValue
+
+    /// `HotkeyTrigger`'s `InstallEventHandler` sits on the same shared `GetApplicationEventTarget()`
+    /// dispatch chain as `PeripheralProvider`'s panic handler and `ShortcutRegistry`'s plugin-shortcut
+    /// handler, so it can be handed hotkey-pressed events that aren't its own. Verify the fired
+    /// `EventHotKeyID.signature` before firing, and return `eventNotHandledErr` (not `noErr`) for
+    /// anything not `"AIPT"`, so the chain's other handlers still get a chance at it — same pattern
+    /// as `ShortcutRegistry.handler`.
+    private static let handler: EventHandlerUPP = { _, eventRef, _ in
+        guard let eventRef else { return OSStatus(eventNotHandledErr) }
+        var hotKeyID = EventHotKeyID()
+        let status = GetEventParameter(
+            eventRef,
+            EventParamName(kEventParamDirectObject),
+            EventParamType(typeEventHotKeyID),
+            nil,
+            MemoryLayout<EventHotKeyID>.size,
+            nil,
+            &hotKeyID
+        )
+        guard status == noErr else { return status }
+        guard hotKeyID.signature == HotkeyTrigger.signature else {
+            return OSStatus(eventNotHandledErr)
+        }
         DispatchQueue.main.async {
             TriggerHub.shared.fire(from: "hotkey")
         }
@@ -50,7 +73,7 @@ final class HotkeyTrigger {
             &handlerRef
         )
 
-        let hotKeyID = EventHotKeyID(signature: "AIPT".fourCharCodeValue, id: 1)
+        let hotKeyID = EventHotKeyID(signature: Self.signature, id: 1)
         let status = RegisterEventHotKey(
             currentSpec.keyCode,
             currentSpec.modifiers,

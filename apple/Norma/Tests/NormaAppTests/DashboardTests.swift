@@ -16,8 +16,10 @@ import NormaKit
 final class DashboardTests: XCTestCase {
     // MARK: - dashboardPaneOrder / defaultDashboardPane (PURE)
 
-    func testDashboardPaneOrderContainsAllFivePanesInSpecOrder() {
-        XCTAssertEqual(dashboardPaneOrder, [.sessions, .daemonStatus, .quota, .trust, .peripheral])
+    func testDashboardPaneOrderContainsAllSixPanesInSpecOrder() {
+        // Phase 4d-iii Task 2: `.pluginManager` appended at the END, every pre-existing pane keeps
+        // its position (see `dashboardPaneOrder`'s own doc comment).
+        XCTAssertEqual(dashboardPaneOrder, [.sessions, .daemonStatus, .quota, .trust, .peripheral, .pluginManager])
         XCTAssertEqual(Set(dashboardPaneOrder), Set(DashboardPane.allCases), "every case must appear exactly once")
     }
 

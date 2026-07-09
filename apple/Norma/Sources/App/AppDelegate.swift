@@ -26,6 +26,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `registerDetachedWindow`'s `onClosed`). `openDashboard()` below is what enforces the
     /// "second invocation focuses the existing window" contract off this single stored ref.
     private(set) var dashboardWindow: DashboardWindowController?
+    /// Phase 4d-iii Task 1: the plugin-shortcut multi-hotkey registry — additive to
+    /// `HotkeyTrigger.shared` (Hyper+Space summon) and `peripheralProvider`'s panic hotkey, never
+    /// touching either. `nil` under unit tests (constructed only inside `boot()`'s
+    /// `!isRunningUnitTests` gate below, same posture as `HotkeyTrigger.shared.start()`).
+    /// `private(set)` so the Task 4 shortcut-editor UI can call `.reload(_:)` on it after the user
+    /// edits a binding, without this file growing an editor-specific API.
+    private(set) var shortcutRegistry: ShortcutRegistry?
     private var stickiness: StickinessEngine?
     private var startTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
@@ -140,7 +147,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// constructing a second `DashboardWindowController`. Defensive, same posture as
     /// `openSessionInNewDetachedWindow`'s guard: no `appModel`/`peripheralProvider` (never booted)
     /// resolves to a log + no-op, never a crash or a half-wired window.
-    func openDashboard() {
+    /// Phase 4d-iii Task 2: `initialPane` lets `openPluginManager()` below reuse this exact body
+    /// (same "shared spawn body" posture as `openSessionInNewDetachedWindow`'s own `frame`
+    /// override) instead of duplicating the guard/construction. Only matters for a FRESH window —
+    /// a second invocation while one is already open just refocuses it via `show()` (singleton
+    /// behavior, unchanged), it does NOT re-select the pane on the already-open window.
+    func openDashboard(initialPane: DashboardPane = defaultDashboardPane) {
         if let dashboardWindow {
             dashboardWindow.show()
             return
@@ -155,12 +167,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             directory: model.directory,
             peripheral: peripheral,
             helperClient: helper,
+            shortcutRegistry: shortcutRegistry,
             onOpenSessionDetached: { [weak self] sid in self?.openSessionInNewDetachedWindow(sid) },
-            frame: centeredDashboardFrame(visibleFrame: visible)
+            frame: centeredDashboardFrame(visibleFrame: visible),
+            initialPane: initialPane
         )
         controller.onClosed = { [weak self] _ in self?.dashboardWindow = nil }
         dashboardWindow = controller
         controller.show()
+    }
+
+    /// Phase 4d-iii Task 2: the menu bar's "Manage Plugins…" entry — opens the SAME singleton
+    /// Dashboard window `openDashboard()` owns, landed on `.pluginManager` when a fresh window is
+    /// spawned (mirrors that method's own doc comment on the refocus-vs-fresh-window distinction).
+    func openPluginManager() {
+        openDashboard(initialPane: .pluginManager)
     }
 
     @discardableResult
@@ -332,6 +353,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             MultitouchTrigger.shared.start()
             HotkeyTrigger.shared.start()
 
+            // Phase 4d-iii Task 1: the plugin-shortcut hotkey registry. Additive — never touches
+            // `HotkeyTrigger.shared`'s own registration above. Bindings are edited by the Task 4
+            // shortcut-editor UI (not built yet); this just loads whatever's already persisted
+            // (empty on a fresh install) and arms it. A fired hotkey pushes straight to the owning
+            // plugin via NormaKit's `shortcut.invoke` RPC (`shortcutInvoke`) — fire-and-forget from
+            // the app's perspective, same posture as the menu bar's other client-call sites; a
+            // failure (plugin not connected, unknown plugin, RPC error) is logged, not surfaced,
+            // since there's no UI surface here to show it on.
+            let shortcuts = ShortcutRegistry()
+            shortcuts.onFire = { [weak model] pluginId, shortcutId in
+                guard let client = model?.client else { return }
+                Task {
+                    do {
+                        let outcome = try await client.shortcutInvoke(pluginId: pluginId, shortcutId: shortcutId)
+                        if outcome != .ok {
+                            OrbDebug.log("shortcutRegistry.onFire: shortcutInvoke pluginId=\(pluginId) shortcutId=\(shortcutId) outcome=\(outcome)")
+                        }
+                    } catch {
+                        OrbDebug.log("shortcutRegistry.onFire: shortcutInvoke failed pluginId=\(pluginId) shortcutId=\(shortcutId) error=\(error)")
+                    }
+                }
+            }
+            shortcuts.reload(ShortcutSettingsStore.load())
+            shortcutRegistry = shortcuts
+
             // Task 4 (2f): the panic hotkey/screen-lock observer and the TCC-change poll are
             // real Carbon/DistributedNotificationCenter/Timer registrations — same
             // `!isRunningUnitTests` gate as the two triggers above, for the same reason (a real
@@ -391,6 +437,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             openCli: { [weak self] in self?.cliLauncher.openCli() },
             openNormaApp: { [weak self] in self?.openStandaloneNormaWindow() },
             openDashboard: { [weak self] in self?.openDashboard() },
+            openPluginManager: { [weak self] in self?.openPluginManager() },
             panic: { [weak peripheral] in peripheral?.panic() },
             quit: { NSApp.terminate(nil) }
         )

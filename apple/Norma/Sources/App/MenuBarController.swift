@@ -8,6 +8,7 @@ final class MenuBarController {
     private let openCli: () -> Void
     private let openNormaApp: () -> Void
     private let openDashboard: () -> Void
+    private let openPluginManager: () -> Void
     private let panicAction: () -> Void
     private let quitApplication: () -> Void
     // Task 3 (2e-iv): internal (not private), same stored-`let` pattern as `stateItem` below, so
@@ -22,6 +23,9 @@ final class MenuBarController {
     // Task 5 (2f-ii): the Dashboard entry — same section/adjacency convention as `openCliItem`/
     // `openNormaAppItem` (2e-iv), mirrored exactly.
     let dashboardItem = NSMenuItem(title: "Dashboard…", action: #selector(didOpenDashboard), keyEquivalent: "")
+    // Phase 4d-iii Task 2: "Manage Plugins…" — same 4-touch-point precedent as `dashboardItem`,
+    // placed right after it (opens the Dashboard window focused on `.pluginManager`).
+    let pluginManagerItem = NSMenuItem(title: "Manage Plugins…", action: #selector(didOpenPluginManager), keyEquivalent: "")
     // Task 4 (2f): the red "Stop Norma's Control" panic item — mounted/unmounted (not just
     // shown/hidden, unlike `orbItem`'s title-flip via `setOrbVisible`) with the active-lease count.
     // `internal`, same testability posture as `openCliItem`/`openNormaAppItem` above.
@@ -37,6 +41,7 @@ final class MenuBarController {
         openCli: @escaping () -> Void,
         openNormaApp: @escaping () -> Void,
         openDashboard: @escaping () -> Void,
+        openPluginManager: @escaping () -> Void,
         panic: @escaping () -> Void,
         quit: @escaping () -> Void
     ) {
@@ -46,6 +51,7 @@ final class MenuBarController {
         self.openCli = openCli
         self.openNormaApp = openNormaApp
         self.openDashboard = openDashboard
+        self.openPluginManager = openPluginManager
         self.panicAction = panic
         self.quitApplication = quit
     }
@@ -70,6 +76,8 @@ final class MenuBarController {
         menu.addItem(openNormaAppItem)
         dashboardItem.target = self
         menu.addItem(dashboardItem)
+        pluginManagerItem.target = self
+        menu.addItem(pluginManagerItem)
         menu.addItem(preQuitSeparator)
         quitItem.target = self
         menu.addItem(quitItem)
@@ -115,6 +123,7 @@ final class MenuBarController {
     @objc private func didOpenCli() { openCli() }
     @objc private func didOpenNormaApp() { openNormaApp() }
     @objc private func didOpenDashboard() { openDashboard() }
+    @objc private func didOpenPluginManager() { openPluginManager() }
     @objc private func didPanic() { panicAction() }
     @objc private func didQuit() { quitApplication() }
 }
