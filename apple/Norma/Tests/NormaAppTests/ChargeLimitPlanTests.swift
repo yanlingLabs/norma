@@ -4,28 +4,29 @@ import XCTest
 /// for the battery charge-limit decision. This file, plus HelperSources/SMCController.swift, are
 /// given dual membership in the app test target (see project.yml) precisely so this pure function
 /// is directly testable without pulling in the untestable IOKit surface or the XPC plumbing.
+///
+/// Gate-fix (2026-07-09): rewritten for the CHTE charge-manager loop. `CHWA` is absent on modern
+/// Apple Silicon, so the old binary "80 or 100 only, 81...99 unsupported" model is gone — any
+/// percent 50...99 is representable via the software monitoring loop (`chargeControlDecision`,
+/// tested separately in ChargeControlDecisionTests.swift).
 final class ChargeLimitPlanTests: XCTestCase {
 
     // MARK: Apple Silicon
 
-    func test_appleSilicon_50_isCHWAOn() {
-        XCTAssertEqual(chargeLimitPlan(percent: 50, appleSilicon: true), .writeCHWA(true))
+    func test_appleSilicon_50_isLimit50() {
+        XCTAssertEqual(chargeLimitPlan(percent: 50, appleSilicon: true), .appleSiliconLimit(percent: 50))
     }
 
-    func test_appleSilicon_80_isCHWAOn() {
-        XCTAssertEqual(chargeLimitPlan(percent: 80, appleSilicon: true), .writeCHWA(true))
+    func test_appleSilicon_80_isLimit80() {
+        XCTAssertEqual(chargeLimitPlan(percent: 80, appleSilicon: true), .appleSiliconLimit(percent: 80))
     }
 
-    func test_appleSilicon_100_isCHWAOff() {
-        XCTAssertEqual(chargeLimitPlan(percent: 100, appleSilicon: true), .writeCHWA(false))
+    func test_appleSilicon_99_isLimit99() {
+        XCTAssertEqual(chargeLimitPlan(percent: 99, appleSilicon: true), .appleSiliconLimit(percent: 99))
     }
 
-    func test_appleSilicon_81_isUnsupported() {
-        XCTAssertEqual(chargeLimitPlan(percent: 81, appleSilicon: true), .unsupportedValue)
-    }
-
-    func test_appleSilicon_99_isUnsupported() {
-        XCTAssertEqual(chargeLimitPlan(percent: 99, appleSilicon: true), .unsupportedValue)
+    func test_appleSilicon_100_isDisable() {
+        XCTAssertEqual(chargeLimitPlan(percent: 100, appleSilicon: true), .appleSiliconDisable)
     }
 
     func test_appleSilicon_49_isInvalidRange() {
