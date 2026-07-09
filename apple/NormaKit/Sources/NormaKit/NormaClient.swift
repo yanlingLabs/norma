@@ -236,6 +236,9 @@ extension SessionEvent {
         case .peripheralCallRequested(let v): return v.seq
         case .pluginToolInvoke(let v): return v.seq
         case .hardwareRequested(let v): return v.seq
+        case .pluginTileUpdated(let v): return v.seq
+        case .shortcutInvoke(let v): return v.seq
+        case .tileAction(let v): return v.seq
         }
     }
 
@@ -275,6 +278,9 @@ extension SessionEvent {
         case .peripheralCallRequested(let v): return v.sessionId
         case .pluginToolInvoke(let v): return v.sessionId
         case .hardwareRequested(let v): return v.sessionId
+        case .pluginTileUpdated(let v): return v.sessionId
+        case .shortcutInvoke(let v): return v.sessionId
+        case .tileAction(let v): return v.sessionId
         }
     }
 }
