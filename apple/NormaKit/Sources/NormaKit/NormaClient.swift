@@ -39,6 +39,19 @@ public actor NormaClient {
     /// The session this client is currently attached to (nil when detached).
     public var attachedSession: String? { attachedSessionId }
 
+    // Phase 4d-ii Task 3: live plugin tile state, keyed by pluginId — updated in `route()` on
+    // every `plugin_tile_updated` event (transient, bypasses the session-attach gate below, same
+    // as assistant_delta/hardwareRequested/etc.). A plugin's entry is REMOVED (not set to nil) the
+    // moment its `tile` field is null on the wire — a plugin disconnect or explicit clear — so
+    // `tiles.keys` is always exactly "plugins with something to show right now", which is what the
+    // 4d-iii PluginManagerView will render as tile cards. Actor-isolated storage (read via
+    // `await client.tiles`), same access pattern as `attachedSession` above; the existing `events`
+    // stream is the change-signal a UI observes to know when to re-read this snapshot.
+    private var tilesStore: [String: [String: SessionEvent.JSONValue]] = [:]
+
+    /// Snapshot of every plugin's current live tile (Phase 4d-ii Task 3). See `tilesStore` above.
+    public var tiles: [String: [String: SessionEvent.JSONValue]] { tilesStore }
+
     public init(
         makeTransport: @escaping @Sendable () -> NormaTransport,
         token: String,
@@ -127,10 +140,22 @@ public actor NormaClient {
             // Transient events bypass dedupe/lastSeq entirely (their seq = server lastSeq at
             // broadcast time, not their own; a naive `seq <= lastSeq` drop would kill every one
             // of these — assistant_delta streaming, the peripheral-lease v1 events, (Phase 4b
-            // Task 1) plugin_tool_invoke, and (Phase 4c Task 1) hardware_requested, all
-            // runtime-only and must never be resurrected by replay).
+            // Task 1) plugin_tool_invoke, (Phase 4c Task 1) hardware_requested, and (Phase 4d-i,
+            // routed app-side by Phase 4d-ii Task 3) plugin_tile_updated, all runtime-only and
+            // must never be resurrected by replay — plugin_tile_updated also carries the
+            // `sessionId:"$system"` sentinel, never a real attached session).
             switch e {
-            case .assistantDelta, .leaseGranted, .leaseLost, .peripheralCallRequested, .pluginToolInvoke, .hardwareRequested:
+            case .assistantDelta, .leaseGranted, .leaseLost, .peripheralCallRequested, .pluginToolInvoke, .hardwareRequested, .pluginTileUpdated:
+                // Update the tiles store BEFORE yielding, so a consumer that reads `tiles`
+                // immediately after observing this event via `events` sees the mutation already
+                // applied (no race between the two).
+                if case .pluginTileUpdated(let v) = e {
+                    if let tile = v.tile {
+                        tilesStore[v.pluginId] = tile
+                    } else {
+                        tilesStore.removeValue(forKey: v.pluginId)
+                    }
+                }
                 eventsCont.yield(.session(e))
                 return
             default:

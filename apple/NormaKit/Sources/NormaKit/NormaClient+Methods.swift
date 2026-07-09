@@ -1,9 +1,206 @@
 import Foundation
 import NormaProtocol
 
+// MARK: - Plugin lifecycle result types (Phase 4d-ii Task 3)
+//
+// Wire results for the 5 lifecycle RPCs + shortcut.invoke/tile.action are typed unions that never
+// throw for an EXPECTED outcome (methods.ts: PluginsInstallResult/PluginEnableResult/
+// PluginDisableResult/PluginRemoveResult/PluginSetConsentResult/PluginPushResult — same discipline
+// as HardwareRequestResult). Mapped here to Swift enums rather than thrown errors, so a caller can
+// switch exhaustively on an expected business outcome instead of catching for it; `RpcError` is
+// reserved for genuine protocol misuse (malformed/unrecognized result shape), mirroring how the
+// rest of this file throws `RpcError(code: -3, ...)` only for "the server sent nonsense".
+
+/// `plugins.install {source, name?}` result (methods.ts `PluginsInstallResult`).
+public enum PluginsInstallOutcome: Equatable, Sendable {
+    case ok(name: String, requiredConsents: [String], hasMcp: Bool, consentBlock: [String])
+    case invalidSource
+    case alreadyInstalled(name: String)
+}
+
+/// `plugin.enable {name, consent?}` result (methods.ts `PluginEnableResult`) — the two-step
+/// consent flow: no/false `consent` with outstanding required classes returns `.needsConsent`
+/// (no mutation); re-calling with `consent: true` grants + enables, returning `.ok(status:)`.
+public enum PluginEnableOutcome: Equatable, Sendable {
+    case ok(status: String)
+    case needsConsent(requiredConsents: [String], consentBlock: [String])
+    case unknownPlugin
+}
+
+/// Shared by `plugin.disable`/`plugin.remove`/`plugin.setConsent` — all three wire results are
+/// `{ok:true}` | `{code:"unknown_plugin"}` (methods.ts).
+public enum PluginLifecycleOutcome: Equatable, Sendable {
+    case ok
+    case unknownPlugin
+}
+
+/// Shared by `shortcut.invoke`/`tile.action` (methods.ts `PluginPushResult`) — the push either
+/// reached the plugin's live connection or it didn't; there is no payload to round-trip.
+public enum PluginPushOutcome: Equatable, Sendable {
+    case ok
+    case notConnected
+    case unknownPlugin
+}
+
+/// One entry of `plugins.contrib`'s result (methods.ts `PluginContribEntrySchema`) — a plugin's
+/// currently-registered shortcuts/tile/provider contribution, mirrored field-for-field.
+public struct PluginShortcutInfo: Equatable, Sendable {
+    public let id: String
+    public let description: String?
+    public let defaultKeybinding: String?
+}
+
+public struct PluginContribEntry: Equatable, Sendable {
+    public let pluginId: String
+    public let shortcuts: [PluginShortcutInfo]
+    public let tile: [String: JSONValue]?
+    public let provider: [String: JSONValue]?
+}
+
+extension JSONValue {
+    /// Not in JSONValue.swift's core accessor set (stringValue/boolValue/intValue/arrayValue) —
+    /// added here since `plugins.contrib`'s `tile`/`provider` fields are opaque JSON objects
+    /// (`z.record(...)` on the wire) that need to come back as `[String: JSONValue]` rather than
+    /// a further-decoded shape core doesn't validate either.
+    var objectValue: [String: JSONValue]? { if case .object(let o) = self { return o }; return nil }
+}
+
 extension NormaClient {
     private func obj(_ pairs: [String: JSONValue?]) -> JSONValue {
         .object(pairs.compactMapValues { $0 })
+    }
+
+    /// `{code:"unknown_plugin"}` | `{ok:true}` decode shared by disable/remove/setConsent.
+    private func decodeLifecycleOutcome(_ r: JSONValue, method: String) throws -> PluginLifecycleOutcome {
+        if let code = r["code"]?.stringValue {
+            if code == "unknown_plugin" { return .unknownPlugin }
+            throw RpcError(code: -3, message: "unknown code from server for \(method): \(code)")
+        }
+        guard r["ok"]?.boolValue == true else {
+            throw RpcError(code: -3, message: "invalid result from server for \(method)")
+        }
+        return .ok
+    }
+
+    /// `{code:"not_connected"|"unknown_plugin"}` | `{ok:true}` decode shared by shortcut.invoke/tile.action.
+    private func decodePushOutcome(_ r: JSONValue, method: String) throws -> PluginPushOutcome {
+        if let code = r["code"]?.stringValue {
+            switch code {
+            case "not_connected": return .notConnected
+            case "unknown_plugin": return .unknownPlugin
+            default: throw RpcError(code: -3, message: "unknown code from server for \(method): \(code)")
+            }
+        }
+        guard r["ok"]?.boolValue == true else {
+            throw RpcError(code: -3, message: "invalid result from server for \(method)")
+        }
+        return .ok
+    }
+
+    /// `plugins.install {source, name?}` (Phase 4d-ii Task 2) — copies a local directory into the
+    /// daemon's plugins root, installed DISABLED + UNCONSENTED; the `.ok` case's
+    /// `requiredConsents`/`consentBlock` drive a consent sheet before `pluginEnable(consent:true)`.
+    public func pluginsInstall(source: String, name: String? = nil) async throws -> PluginsInstallOutcome {
+        let r = try await request("plugins.install", params: obj([
+            "source": .string(source), "name": name.map { .string($0) },
+        ]))
+        if let code = r["code"]?.stringValue {
+            switch code {
+            case "invalid_source": return .invalidSource
+            case "already_installed":
+                guard let n = r["name"]?.stringValue else {
+                    throw RpcError(code: -3, message: "invalid result from server for plugins.install")
+                }
+                return .alreadyInstalled(name: n)
+            default:
+                throw RpcError(code: -3, message: "unknown code from server for plugins.install: \(code)")
+            }
+        }
+        guard let n = r["name"]?.stringValue else {
+            throw RpcError(code: -3, message: "invalid result from server for plugins.install")
+        }
+        return .ok(
+            name: n,
+            requiredConsents: (r["requiredConsents"]?.arrayValue ?? []).compactMap { $0.stringValue },
+            hasMcp: r["hasMcp"]?.boolValue ?? false,
+            consentBlock: (r["consentBlock"]?.arrayValue ?? []).compactMap { $0.stringValue }
+        )
+    }
+
+    /// `plugin.enable {name, consent?}` (Phase 4d-ii Task 2) — see `PluginEnableOutcome`.
+    public func pluginEnable(name: String, consent: Bool? = nil) async throws -> PluginEnableOutcome {
+        let r = try await request("plugin.enable", params: obj([
+            "name": .string(name), "consent": consent.map { .bool($0) },
+        ]))
+        if let code = r["code"]?.stringValue {
+            switch code {
+            case "needs_consent":
+                return .needsConsent(
+                    requiredConsents: (r["requiredConsents"]?.arrayValue ?? []).compactMap { $0.stringValue },
+                    consentBlock: (r["consentBlock"]?.arrayValue ?? []).compactMap { $0.stringValue }
+                )
+            case "unknown_plugin": return .unknownPlugin
+            default: throw RpcError(code: -3, message: "unknown code from server for plugin.enable: \(code)")
+            }
+        }
+        guard let status = r["status"]?.stringValue else {
+            throw RpcError(code: -3, message: "invalid result from server for plugin.enable")
+        }
+        return .ok(status: status)
+    }
+
+    /// `plugin.disable {name}` (Phase 4d-ii Task 2) — fresh-consent semantics: hot-stops any
+    /// running process AND strips the recorded consent (re-enabling requires consenting again).
+    public func pluginDisable(name: String) async throws -> PluginLifecycleOutcome {
+        let r = try await request("plugin.disable", params: obj(["name": .string(name)]))
+        return try decodeLifecycleOutcome(r, method: "plugin.disable")
+    }
+
+    /// `plugin.remove {name}` (Phase 4d-ii Task 2) — hot-stops, then strips settings/consent/dir.
+    public func pluginRemove(name: String) async throws -> PluginLifecycleOutcome {
+        let r = try await request("plugin.remove", params: obj(["name": .string(name)]))
+        return try decodeLifecycleOutcome(r, method: "plugin.remove")
+    }
+
+    /// `plugin.setConsent {name, classes}` (Phase 4d-ii Task 2) — records consent WITHOUT
+    /// enabling; the common path is `pluginEnable(consent:true)` instead.
+    public func pluginSetConsent(name: String, classes: [String]) async throws -> PluginLifecycleOutcome {
+        let r = try await request("plugin.setConsent", params: obj([
+            "name": .string(name), "classes": .array(classes.map { .string($0) }),
+        ]))
+        return try decodeLifecycleOutcome(r, method: "plugin.setConsent")
+    }
+
+    /// `shortcut.invoke {pluginId, shortcutId}` (Phase 4d-i Task 2) — pushes a `shortcut_invoke`
+    /// event to that plugin's own live connection; fire-and-forget on the plugin side.
+    public func shortcutInvoke(pluginId: String, shortcutId: String) async throws -> PluginPushOutcome {
+        let r = try await request("shortcut.invoke", params: obj([
+            "pluginId": .string(pluginId), "shortcutId": .string(shortcutId),
+        ]))
+        return try decodePushOutcome(r, method: "shortcut.invoke")
+    }
+
+    /// `tile.action {pluginId, actionId}` (Phase 4d-i Task 2) — pushes a `tile_action` event to
+    /// that plugin's own live connection; fire-and-forget on the plugin side.
+    public func tileAction(pluginId: String, actionId: String) async throws -> PluginPushOutcome {
+        let r = try await request("tile.action", params: obj([
+            "pluginId": .string(pluginId), "actionId": .string(actionId),
+        ]))
+        return try decodePushOutcome(r, method: "tile.action")
+    }
+
+    /// `plugins.contrib` (Phase 4d-i Task 1) — read surface for every plugin's currently-registered
+    /// shortcuts/tile/provider contribution (harness/admin only, not plugin-role).
+    public func pluginsContrib() async throws -> [PluginContribEntry] {
+        let r = try await request("plugins.contrib", params: .object([:]))
+        return (r["entries"]?.arrayValue ?? []).compactMap { e in
+            guard let pluginId = e["pluginId"]?.stringValue else { return nil }
+            let shortcuts = (e["shortcuts"]?.arrayValue ?? []).compactMap { s -> PluginShortcutInfo? in
+                guard let id = s["id"]?.stringValue else { return nil }
+                return PluginShortcutInfo(id: id, description: s["description"]?.stringValue, defaultKeybinding: s["default"]?.stringValue)
+            }
+            return PluginContribEntry(pluginId: pluginId, shortcuts: shortcuts, tile: e["tile"]?.objectValue, provider: e["provider"]?.objectValue)
+        }
     }
 
     public func createSession(scope: String, cwd: String? = nil, approvalPolicy: String? = nil) async throws -> (sessionId: String, trusted: Bool) {
@@ -163,12 +360,31 @@ extension NormaClient {
         }
     }
 
-    public func pluginsList() async throws -> [(name: String, skills: [String], hasMcp: Bool, mcpEnabled: Bool, disabled: Bool)] {
+    /// `plugins.list` — extended (Phase 4d-ii Task 3) to decode `tier`/`requiredConsents`/
+    /// `consented`/`legacy`/`status` (methods.ts `PluginInfoSchema`), fields the wire has carried
+    /// since Phase 4a Task 3 / 4d-i Task 4 but this wrapper previously dropped on the floor. All
+    /// optional on the wire (older-shaped fixtures/servers) — `tier`/`status` decode to `nil`,
+    /// `requiredConsents`/`consented` decode to `[]`, `legacy` defaults to `false`, same
+    /// permissive-decode precedent as the original 5 fields above.
+    public func pluginsList() async throws -> [(
+        name: String, skills: [String], hasMcp: Bool, mcpEnabled: Bool, disabled: Bool,
+        tier: String?, requiredConsents: [String], consented: [String], legacy: Bool, status: String?
+    )] {
         let r = try await request("plugins.list", params: .object([:]))
         return (r["plugins"]?.arrayValue ?? []).compactMap { p in
             guard let n = p["name"]?.stringValue else { return nil }
-            return (n, (p["skills"]?.arrayValue ?? []).compactMap { $0.stringValue },
-                    p["hasMcp"]?.boolValue ?? false, p["mcpEnabled"]?.boolValue ?? false, p["disabled"]?.boolValue ?? false)
+            return (
+                n,
+                (p["skills"]?.arrayValue ?? []).compactMap { $0.stringValue },
+                p["hasMcp"]?.boolValue ?? false,
+                p["mcpEnabled"]?.boolValue ?? false,
+                p["disabled"]?.boolValue ?? false,
+                p["tier"]?.stringValue,
+                (p["requiredConsents"]?.arrayValue ?? []).compactMap { $0.stringValue },
+                (p["consented"]?.arrayValue ?? []).compactMap { $0.stringValue },
+                p["legacy"]?.boolValue ?? false,
+                p["status"]?.stringValue
+            )
         }
     }
 

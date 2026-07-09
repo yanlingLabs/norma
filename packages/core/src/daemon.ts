@@ -386,6 +386,11 @@ export async function startDaemon(opts: {
     bg: bgRegistry,
     skills: skillStore,
     plugins: pluginStore,
+    // Phase 4d-ii Task 2: lets the plugin-lifecycle RPCs (plugins.install/plugin.enable/disable/
+    // remove/setConsent) read+write settings.json and the plugins directory directly, and re-read
+    // both fresh on every call (`livePlugins`, ipc/server.ts) instead of trusting `pluginStore`
+    // above's boot-time snapshot.
+    normaHome,
     mcp: mcp ?? undefined,
     // Phase 4b Task 4: the plugin tool bridge. `registry`/`supervisor` are undefined together
     // whenever agentProvider is null (see `sharedRegistry`'s doc comment above); `contrib` is
