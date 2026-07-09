@@ -1,4 +1,4 @@
-import { createPlugin, type PluginContext } from "@norma/plugin-sdk";
+import { createPlugin } from "@norma/plugin-sdk";
 
 /**
  * sample-echo — the reference Tier-2 (`platform`) plugin (Phase 4b Task 6, design spec §3/§4).
@@ -23,16 +23,13 @@ import { createPlugin, type PluginContext } from "@norma/plugin-sdk";
  * pushes a live `ctx.updateTile` mid-session, proving that path is a genuine "any time after
  * connect" push, not just a once-at-connect paint.
  *
- * `onShortcut`/`onTileAction` need `ctx.updateTile` too, but the SDK only ever calls them as
- * `(id: string) => void` — no `ctx` argument (plugin-sdk/src/index.ts's `PluginDefinition`, as
- * landed by Task 3). `ctx` itself is a single stable object `createPlugin` builds once and hands
- * to every tool's `run(args, ctx)`, so `echo`'s handler stashes it into `live` the first time it
- * runs; `onShortcut`/`onTileAction` reuse that stashed reference (`live?.updateTile(...)`, safe
- * no-op before any tool has ever been called — no wire event fires before the gate invokes `echo`
- * at least once, so `live` is always set by the time either handler needs it in practice).
+ * `onShortcut`/`onTileAction` need `ctx.updateTile` too, and the SDK now passes it directly: both
+ * callbacks receive `(id, ctx)` (plugin-sdk/src/index.ts's `PluginDefinition`, fix wave 1) — the
+ * same fixed-shape `ctx` object every tool's `run(args, ctx)` gets, dispatched fresh from
+ * `createPlugin`'s closure rather than requiring a plugin to stash one from a prior tool call.
+ * That means a shortcut/tile-action fired BEFORE any tool call still works.
  */
 let n = 0;
-let live: PluginContext | undefined;
 
 function echoTile(): Record<string, unknown> {
   return { title: "echo", value: String(n) };
@@ -48,7 +45,6 @@ const plugin = createPlugin({
         required: ["text"],
       },
       run: async (args, ctx) => {
-        live = ctx;
         const { text } = args as { text: string };
         n++;
         await ctx.updateTile(echoTile());
@@ -70,16 +66,16 @@ const plugin = createPlugin({
     },
   },
   tile: echoTile,
-  // Fire-and-forget (no reply, no ctx — see the module doc comment above): bumps the same counter
-  // `echo` does, then pushes the fresh tile through the stashed `live` context.
-  onShortcut: (_id) => {
+  // Fire-and-forget (no reply — see the module doc comment above): bumps the same counter
+  // `echo` does, then pushes the fresh tile through the ctx the SDK hands directly.
+  onShortcut: (_id, ctx) => {
     n++;
-    live?.updateTile(echoTile()).catch(() => {});
+    void ctx.updateTile(echoTile());
   },
   // Fire-and-forget, same posture as onShortcut above: resets the counter back to 0.
-  onTileAction: (_id) => {
+  onTileAction: (_id, ctx) => {
     n = 0;
-    live?.updateTile(echoTile()).catch(() => {});
+    void ctx.updateTile(echoTile());
   },
 });
 

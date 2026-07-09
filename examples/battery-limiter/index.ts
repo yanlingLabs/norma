@@ -68,7 +68,7 @@ const plugin = createPlugin({
         lastKnownLimit = extractPercent(result) ?? percent;
         // Phase 4d-i Task 5: live push so a dashboard reflects the new limit immediately, not just
         // at this plugin's next reconnect — see the module doc comment above.
-        await ctx.updateTile({ title: "Battery limit", value: currentValue() });
+        await ctx.updateTile({ title: "Battery Limiter", value: currentValue() });
         return result;
       },
     },
@@ -82,7 +82,7 @@ const plugin = createPlugin({
         // Phase 4d-i Task 5: live push, same as set_charge_limit above — reflects whatever is
         // currently known even when `observed` came back undefined (a malformed provider reply
         // never regresses the tile to something worse than the last live push already showed).
-        await ctx.updateTile({ title: "Battery limit", value: currentValue() });
+        await ctx.updateTile({ title: "Battery Limiter", value: currentValue() });
         return result;
       },
     },

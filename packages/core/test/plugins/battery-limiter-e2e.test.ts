@@ -172,7 +172,7 @@ describe("battery-limiter ctx.hardware round-trip (real Bun child process, scrip
       // so by the time `setPromise` above has resolved (its `plugin.toolResult` is sent strictly
       // AFTER the tile.update ack is received — same ordered connection, no race), the live push has
       // already landed in the contrib registry. No longer "registration-time snapshot only".
-      expect(inst.contrib.get(pluginId)?.tile).toEqual({ title: "Battery limit", value: "80%" });
+      expect(inst.contrib.get(pluginId)?.tile).toEqual({ title: "Battery Limiter", value: "80%" });
 
       // --- get_charge_limit {} — a second, independent round-trip through the SAME real child ---
       const getPromise = inst.registry.execute(
@@ -195,7 +195,7 @@ describe("battery-limiter ctx.hardware round-trip (real Bun child process, scrip
       // get_charge_limit's own live push (same await-before-return ordering as set above) — the
       // SECOND independent tile.update this connection has sent, proving the live push isn't a
       // one-off tied to set_charge_limit specifically.
-      expect(inst.contrib.get(pluginId)?.tile).toEqual({ title: "Battery limit", value: "65%" });
+      expect(inst.contrib.get(pluginId)?.tile).toEqual({ title: "Battery Limiter", value: "65%" });
     },
     20_000,
   );

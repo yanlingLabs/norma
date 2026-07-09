@@ -40,10 +40,12 @@ import {
  *      `plugin_tile_updated` with `tile: null` (Task 1's disconnect-clear) and `plugins.contrib` no
  *      longer lists the plugin at all.
  *
- * `examples/sample-echo/index.ts`'s own module doc comment explains WHY `onShortcut`/
- * `onTileAction` can push a live tile at all despite the SDK never handing them a `ctx` argument
- * (they reuse a `ctx` stashed by `echo`'s own `run` — hence (b) runs before (c)/(d) below, exactly
- * matching this gate's own ordering).
+ * `examples/sample-echo/index.ts`'s own module doc comment explains how `onShortcut`/
+ * `onTileAction` push a live tile: the SDK hands both callbacks a `ctx` argument directly (fix
+ * wave 1, plugin-sdk's `PluginDefinition`), so neither depends on a prior tool call having run
+ * first. (b) still runs before (c)/(d) below, but only so each step builds on the previous one's
+ * counter value (0 -> 1 -> 2 -> 0) for an unambiguous per-step assertion, not because `ctx`
+ * availability requires it.
  */
 
 /** Minimal raw test client speaking NDJSON JSON-RPC — same shape as server.test.ts's own
@@ -174,9 +176,10 @@ describe("4d-i gate: live tiles + shortcut/tile-action round-trip (real sample-e
       expect(afterShortcut.params.tile).toEqual({ title: "echo", value: "2" });
 
       // --- (d) tile.action -> the real child's onTileAction ran (tile resets) ---
-      // Notifications cleared FIRST: the reset value ("0") is IDENTICAL to (a)'s initial paint —
-      // without clearing, waitForNotification would match that stale entry and this step would
-      // silently prove nothing.
+      // Notifications cleared FIRST: at this point the array holds step (c)'s stale entry (value
+      // "2", the shortcut-bump broadcast) — without clearing, waitForNotification would match that
+      // stale entry immediately, and the assertion below would fail loudly on a value mismatch
+      // ("2" vs the expected "0"), not silently prove nothing.
       harness.notifications.length = 0;
       const tileActionRes = await harness.request(METHODS.tileAction, { pluginId, actionId: "reset" });
       expect(tileActionRes.result).toEqual({ ok: true });

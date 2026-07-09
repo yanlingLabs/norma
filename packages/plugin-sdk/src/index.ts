@@ -84,10 +84,16 @@ export interface PluginDefinition {
    *  was deferred to Phase 4d). As of Phase 4d-i Task 3 it IS invoked: whenever core pushes a
    *  `shortcut_invoke {shortcutId}` event to this plugin's connection (Phase 4d-i Task 2's
    *  harness->plugin push — a future UI firing one of this plugin's registered shortcuts), the
-   *  dispatch loop in `connectOnce` calls `onShortcut(shortcutId)`. Fire-and-forget: there is no
-   *  reply back to core for this event (unlike `plugin_tool_invoke`, which always gets a
-   *  `plugin.toolResult`), so a throw inside this callback is NOT caught/reported anywhere —
-   *  same posture as any other synchronous callback a plugin author supplies.
+   *  dispatch loop in `connectOnce` calls `onShortcut(shortcutId, ctx)`. The second arg, `ctx`, is
+   *  the same fixed-shape helper bag `PluginToolDef.run` receives (`hardware`/`updateTile`) — it
+   *  lets a shortcut fired BEFORE any tool call still push a live tile update, rather than having
+   *  to stash `ctx` from a prior tool invocation. Additive-only over the original single-arg
+   *  `onShortcut(id)` shape, same structural-variance reasoning as `PluginToolDef.run`'s `ctx`
+   *  (see that doc comment): a handler that ignores it keeps compiling and running unchanged.
+   *  Fire-and-forget: there is no reply back to core for this event (unlike `plugin_tool_invoke`,
+   *  which always gets a `plugin.toolResult`), so a throw inside this callback is NOT
+   *  caught/reported anywhere — same posture as any other synchronous callback a plugin author
+   *  supplies.
    *
    *  Independently of dispatch, if this is set, `serve()` also registers whatever shortcut ids
    *  the plugin's own `norma-plugin.json` (`contributes.shortcuts`, design spec §1/§6 — "plugins
@@ -96,15 +102,15 @@ export interface PluginDefinition {
    *  supervisor spawns each plugin process cwd'd into its own plugin directory) — never a
    *  `packages/core` import, and never throws: a missing/malformed manifest or an empty/absent
    *  `shortcuts` list just means nothing gets registered this cycle. */
-  onShortcut?: (id: string) => void;
+  onShortcut?: (id: string, ctx: PluginContext) => void;
   /** Phase 4d-i Task 3: invoked whenever core pushes a `tile_action {actionId}` event to this
    *  plugin's connection (Phase 4d-i Task 2's harness->plugin push — a future UI clicking one of
-   *  this plugin's declarative tile's action buttons). Same fire-and-forget posture as
-   *  `onShortcut` above — no reply is sent back to core for this event, and dispatch never
-   *  registers anything on this callback's behalf (there's no manifest-declared analog to
+   *  this plugin's declarative tile's action buttons). Same second-arg `ctx` and fire-and-forget
+   *  posture as `onShortcut` above — no reply is sent back to core for this event, and dispatch
+   *  never registers anything on this callback's behalf (there's no manifest-declared analog to
    *  `contributes.shortcuts` for tile actions; the tile's own shape, returned from `tile()`
    *  below, is what declares its actions). */
-  onTileAction?: (actionId: string) => void;
+  onTileAction?: (actionId: string, ctx: PluginContext) => void;
   /** When set, `serve()` calls this and pushes one `tile.update` immediately after registration
    *  completes — including after every reconnect (core restarts wipe its in-memory contrib
    *  registry, so a stale tile would otherwise linger until the plugin's next voluntary push).
@@ -347,10 +353,10 @@ export function createPlugin(def: PluginDefinition): Plugin {
             } else if (msg.method === METHODS.event && msg.params?.type === "shortcut_invoke") {
               // Fire-and-forget (Phase 4d-i Task 3): no plugin.toolResult-style reply for this
               // event, unlike plugin_tool_invoke above — core doesn't wait on it.
-              def.onShortcut?.(msg.params.shortcutId);
+              def.onShortcut?.(msg.params.shortcutId, ctx);
             } else if (msg.method === METHODS.event && msg.params?.type === "tile_action") {
               // Fire-and-forget, same posture as shortcut_invoke above.
-              def.onTileAction?.(msg.params.actionId);
+              def.onTileAction?.(msg.params.actionId, ctx);
             }
             // every other event type (or notification) is skipped.
           }
