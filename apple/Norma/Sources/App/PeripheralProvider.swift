@@ -121,7 +121,30 @@ final class PeripheralProvider: ObservableObject {
     /// this weak static is set by `registerPanicSurfaces()` and cleared by `unregisterPanicSurfaces()`.
     private static weak var current: PeripheralProvider?
 
-    private static let hotkeyHandler: EventHandlerUPP = { _, _, _ in
+    private static let signature = "NmPn".fourCharCodeValue
+
+    /// `PeripheralProvider`'s panic `InstallEventHandler` sits on the same shared
+    /// `GetApplicationEventTarget()` dispatch chain as `HotkeyTrigger`'s summon handler and
+    /// `ShortcutRegistry`'s plugin-shortcut handler, so it can be handed hotkey-pressed events
+    /// that aren't its own. Verify the fired `EventHotKeyID.signature` before panicking, and
+    /// return `eventNotHandledErr` (not `noErr`) for anything not `"NmPn"`, so the chain's other
+    /// handlers still get a chance at it — same pattern as `ShortcutRegistry.handler`.
+    private static let hotkeyHandler: EventHandlerUPP = { _, eventRef, _ in
+        guard let eventRef else { return OSStatus(eventNotHandledErr) }
+        var hotKeyID = EventHotKeyID()
+        let status = GetEventParameter(
+            eventRef,
+            EventParamName(kEventParamDirectObject),
+            EventParamType(typeEventHotKeyID),
+            nil,
+            MemoryLayout<EventHotKeyID>.size,
+            nil,
+            &hotKeyID
+        )
+        guard status == noErr else { return status }
+        guard hotKeyID.signature == PeripheralProvider.signature else {
+            return OSStatus(eventNotHandledErr)
+        }
         DispatchQueue.main.async {
             PeripheralProvider.current?.panic()
         }
@@ -360,7 +383,7 @@ final class PeripheralProvider: ObservableObject {
             var eventSpec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventHotKeyPressed))
             InstallEventHandler(GetApplicationEventTarget(), Self.hotkeyHandler, 1, &eventSpec, nil, &hotKeyHandlerRef)
         }
-        let hotKeyID = EventHotKeyID(signature: "NmPn".fourCharCodeValue, id: 1)
+        let hotKeyID = EventHotKeyID(signature: Self.signature, id: 1)
         let modifiers = UInt32(controlKey | optionKey | cmdKey)
         let status = RegisterEventHotKey(UInt32(kVK_Escape), modifiers, hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
         if status != noErr {
