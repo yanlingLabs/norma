@@ -71,6 +71,9 @@ import {
   TileUpdateResult,
   ProviderRegisterParams,
   ProviderRegisterResult,
+  PluginContribEntrySchema,
+  PluginsContribParams,
+  PluginsContribResult,
   PluginToolResultParams,
   PluginToolResultResult,
   PluginRevokeTokenParams,
@@ -479,6 +482,42 @@ describe("plugin verbs (Phase 4b Task 1, spec §3)", () => {
       .toBe("plugin sample-echo crashed during echo");
     expect(() => PluginToolResultParams.parse({ requestId: "" })).toThrow();
     expect(PluginToolResultResult.parse({ ok: true })).toEqual({ ok: true });
+  });
+});
+
+describe("plugins.contrib (Phase 4d Task 1, spec §6/§7 — read surface for PluginContribRegistry, NOT a plugin-role verb)", () => {
+  test("METHODS carries it", () => {
+    expect(METHODS.pluginsContrib).toBe("plugins.contrib");
+  });
+
+  test("PluginsContribParams is empty; PluginsContribResult wraps an array of entries", () => {
+    expect(PluginsContribParams.parse({})).toEqual({});
+    const r = PluginsContribResult.parse({
+      ok: true,
+      entries: [{ pluginId: "sample-echo", tile: { title: "Sample", value: "1" } }],
+    });
+    expect(r.entries).toHaveLength(1);
+  });
+
+  test("PluginContribEntrySchema: pluginId required, shortcuts/tile/provider all optional", () => {
+    const bare = PluginContribEntrySchema.parse({ pluginId: "sample-echo" });
+    expect(bare.shortcuts).toBeUndefined();
+    expect(bare.tile).toBeUndefined();
+    expect(bare.provider).toBeUndefined();
+
+    const full = PluginContribEntrySchema.parse({
+      pluginId: "sample-echo",
+      shortcuts: [{ id: "toggle", description: "toggle it" }],
+      tile: { title: "Sample", value: "1" },
+      provider: { kind: "noop" },
+    });
+    expect(full.shortcuts).toEqual([{ id: "toggle", description: "toggle it" }]);
+    expect(full.tile).toEqual({ title: "Sample", value: "1" });
+    expect(full.provider).toEqual({ kind: "noop" });
+
+    expect(() => PluginContribEntrySchema.parse({})).toThrow(); // pluginId required
+    // shortcuts reuses ShortcutRegisterParams's own field schema — an empty id is still rejected.
+    expect(() => PluginContribEntrySchema.parse({ pluginId: "p1", shortcuts: [{ id: "" }] })).toThrow();
   });
 });
 

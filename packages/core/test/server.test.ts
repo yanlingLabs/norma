@@ -2349,6 +2349,56 @@ describe("daemon IPC", () => {
       plugin.close(); srv.stop();
     });
 
+    // Phase 4d Task 1 (spec §6/§7): the live READ + broadcast side of PluginContribRegistry —
+    // plugins.contrib read RPC, plugin_tile_updated broadcast to every authed harness (a dashboard
+    // connection is never attached to a session, so this must NOT go through the per-session hub),
+    // and clearing a plugin's contributions (+ broadcasting tile:null) on disconnect.
+    test("tile.update broadcasts plugin_tile_updated to every authed harness; plugins.contrib reflects it; disconnect clears + broadcasts tile:null", async () => {
+      const srv = await bootBridgeServer();
+      const pluginId = "sample-echo";
+
+      // A harness (e.g. the dashboard) connects BEFORE the plugin pushes anything — mirrors the
+      // G2 session_created precedent: harnessConns, not hub attachments, is what this broadcasts
+      // through, so the harness needs no session.attach at all to receive it.
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "dashboard");
+
+      const plugin = await registerAndHello(srv, pluginId);
+      await plugin.request(METHODS.tileUpdate, { tile: { title: "Sample", value: "1" } });
+
+      const updated = await harness.waitForNotification((n) => n.method === METHODS.event && n.params.type === "plugin_tile_updated");
+      expect(updated.params.sessionId).toBe("$system"); // SYSTEM_SESSION_ID sentinel — session-less event
+      expect(updated.params.pluginId).toBe(pluginId);
+      expect(updated.params.tile).toEqual({ title: "Sample", value: "1" });
+      expect(updated.params.threadId).toBeUndefined(); // extends Base, not ThreadBase
+
+      const listed = await harness.request(METHODS.pluginsContrib, {});
+      expect(listed.result.entries).toEqual([{ pluginId, tile: { title: "Sample", value: "1" } }]);
+
+      harness.notifications.length = 0; // isolate the disconnect broadcast from the update above
+      plugin.close();
+
+      const cleared = await harness.waitForNotification((n) => n.method === METHODS.event && n.params.type === "plugin_tile_updated");
+      expect(cleared.params.pluginId).toBe(pluginId);
+      expect(cleared.params.tile).toBeNull();
+
+      const listedAfter = await harness.request(METHODS.pluginsContrib, {});
+      expect(listedAfter.result.entries).toEqual([]);
+
+      harness.close(); srv.stop();
+    });
+
+    // A plugin connection is role-gated to the six (now seven, +hardware.request) allowed verbs —
+    // plugins.contrib was deliberately left off PLUGIN_ALLOWED_METHODS (a plugin never needs to
+    // read the aggregate contrib state back over the wire; harness/admin connections do).
+    test("plugins.contrib is not plugin-role callable", async () => {
+      const srv = await bootBridgeServer();
+      const plugin = await registerAndHello(srv, "sample-echo");
+      const res = await plugin.request(METHODS.pluginsContrib, {});
+      expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      plugin.close(); srv.stop();
+    });
+
     test("disconnect unregisters every plugin__<id>__* tool and calls notifyDisconnected", async () => {
       const srv = await bootBridgeServer();
       const pluginId = "sample-echo";

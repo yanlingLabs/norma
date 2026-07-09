@@ -12,7 +12,8 @@ import {
   PeripheralRevokeParams, PeripheralRespondParams, DaemonStatusParams, QuotaStateParams,
   TrustListParams, TrustRemoveParams, PluginRevokeTokenParams, PluginRestartParams,
   PluginRegisterParams, ToolRegisterParams, ShortcutRegisterParams, TileUpdateParams,
-  ProviderRegisterParams, PluginToolResultParams, HardwareRequestParams, HardwareRespondParams,
+  ProviderRegisterParams, PluginsContribParams, PluginToolResultParams, HardwareRequestParams, HardwareRespondParams,
+  SYSTEM_SESSION_ID,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
@@ -170,6 +171,40 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
     }
   };
 
+  // Phase 4d Task 1 (spec §6/§7): a monotonic counter for `plugin_tile_updated`'s `seq` field.
+  // `SessionStore.lastSeq(sessionId)` (what every OTHER transient event stamps itself with, e.g.
+  // `SessionHub.broadcastTransient`) requires a REAL, already-created session row and throws
+  // "unknown session" otherwise — there is no session backing `SYSTEM_SESSION_ID`, and minting a
+  // fake one just to read a counter would be its own footgun (a phantom row in session.list).
+  // NormaKit's dedupe gate is scoped to the currently ATTACHED session (`e.sessionId == attached`,
+  // NormaClient.swift) and `$system` can never equal a real attached session id, so this event
+  // always bypasses that gate regardless of its seq value — a locally-monotonic counter is
+  // sufficient (schema-valid, ordered) without needing the store at all.
+  let systemSeq = 0;
+
+  /** Broadcasts `plugin_tile_updated` to every authed harness — modeled EXACTLY on the
+   *  `session_created` broadcast above (same `harnessConns` set, same enqueue/encodeLine, same
+   *  swallow-on-dead-socket): a dashboard connection is never attached to any session, so this
+   *  goes out over the harness broadcast set rather than the per-session `SessionHub`. Reads the
+   *  CURRENT tile straight out of the registry (rather than taking one as a parameter) so both
+   *  call sites — `tile.update` (after `setTile`) and `close()` (after `clear`) — stay a single
+   *  line each and can never drift from what `plugins.contrib` would return for the same plugin. */
+  function broadcastTileUpdated(pluginId: string): void {
+    const tile = opts.contrib?.get(pluginId)?.tile ?? null;
+    const event = {
+      type: "plugin_tile_updated" as const,
+      sessionId: SYSTEM_SESSION_ID,
+      seq: ++systemSeq,
+      ts: Date.now(),
+      pluginId,
+      tile,
+    };
+    for (const conn of harnessConns) {
+      try { conn.writer.enqueue(encodeLine({ jsonrpc: "2.0", method: METHODS.event, params: event })); }
+      catch { /* dead socket — its close() handler will evict it from harnessConns */ }
+    }
+  }
+
   function parseParams<S extends z.ZodTypeAny>(schema: S, params: unknown): z.infer<S> {
     const result = schema.safeParse(params);
     if (!result.success) {
@@ -228,6 +263,12 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         if (socket.data.pluginId) {
           opts.registry?.unregisterByPrefix(`plugin__${socket.data.pluginId}__`);
           opts.supervisor?.notifyDisconnected(socket.data.pluginId);
+          // Phase 4d Task 1: a disconnected plugin's shortcuts/tile/provider info is stale the
+          // instant the connection drops (the SDK's serve() re-declares everything fresh on
+          // reconnect, Task 5's contract) — clear it out of the registry, then broadcast so any
+          // dashboard showing this plugin's tile drops the now-stale card (tile: null).
+          opts.contrib?.clear(socket.data.pluginId);
+          broadcastTileUpdated(socket.data.pluginId);
         }
       },
       async data(socket, chunk) {
@@ -717,6 +758,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         const p = parseParams(TileUpdateParams, params);
         if (!socket.data.pluginId) throw new RpcFailure(ERR.UNAUTHORIZED, "tile.update requires an authenticated plugin connection");
         opts.contrib?.setTile(socket.data.pluginId, p.tile);
+        broadcastTileUpdated(socket.data.pluginId);
         return { ok: true };
       }
       case METHODS.providerRegister: {
@@ -724,6 +766,11 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         if (!socket.data.pluginId) throw new RpcFailure(ERR.UNAUTHORIZED, "provider.register requires an authenticated plugin connection");
         opts.contrib?.setProvider(socket.data.pluginId, p.info);
         return { ok: true };
+      }
+      case METHODS.pluginsContrib: {
+        parseParams(PluginsContribParams, params);
+        const entries = opts.contrib?.all().map(({ pluginId, state }) => ({ pluginId, ...state })) ?? [];
+        return { ok: true, entries };
       }
 
       default:

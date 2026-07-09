@@ -318,6 +318,21 @@ export const TileUpdateResult = z.object({ ok: z.literal(true) });
 export const ProviderRegisterParams = z.object({ info: z.record(z.string(), z.unknown()) });
 export const ProviderRegisterResult = z.object({ ok: z.literal(true) });
 
+/** Phase 4d Task 1's read surface for `PluginContribRegistry` (core/src/plugins/contrib.ts):
+ *  one entry per plugin with at least one contribution recorded, mirroring `PluginContribState`
+ *  field-for-field. `shortcuts` reuses `ShortcutRegisterParams`'s own field schema rather than
+ *  duplicating it (same shape a plugin actually sent). NOT a plugin-role verb (a plugin never
+ *  needs to read the aggregate back over the wire) — ipc/server.ts's `PLUGIN_ALLOWED_METHODS`
+ *  deliberately does not include it; harness/admin connections call it directly. */
+export const PluginContribEntrySchema = z.object({
+  pluginId: z.string(),
+  shortcuts: ShortcutRegisterParams.shape.shortcuts.optional(),
+  tile: z.record(z.string(), z.unknown()).optional(),
+  provider: z.record(z.string(), z.unknown()).optional(),
+});
+export const PluginsContribParams = z.object({});
+export const PluginsContribResult = z.object({ ok: z.literal(true), entries: z.array(PluginContribEntrySchema) });
+
 /** A plugin's answer to a `plugin_tool_invoke` push (events.ts) — the PluginSupervisor's
  *  request/response correlation (Task 3), mirroring `PeripheralRespondParams`'s shape exactly
  *  (`peripheral.respond`'s provider-answers-a-push pattern) but without `alreadyResolved`: the
@@ -431,6 +446,7 @@ export const METHODS = {
   shortcutRegister: "shortcut.register",
   tileUpdate: "tile.update",
   providerRegister: "provider.register",
+  pluginsContrib: "plugins.contrib",
   pluginToolResult: "plugin.toolResult",
   pluginRevokeToken: "plugin.revokeToken",
   pluginRestart: "plugin.restart",

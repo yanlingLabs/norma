@@ -8,11 +8,13 @@ import { ShortcutRegisterParams, TileUpdateParams, ProviderRegisterParams } from
  * central shortcuts + tiles, spec §6/§7) is the reader.
  *
  * Deliberately dumb: no validation beyond the wire schemas ipc/server.ts's `parseParams` already
- * applied, no events, no broadcast (unlike `PluginSupervisor`'s connection-scoped `plugin_tool_
- * invoke` push, none of these three verbs need a live round-trip back to the plugin) — "last
- * write wins" per plugin id, exactly like a plugin process re-declaring its own shortcuts/tile/
- * provider info on every reconnect (the SDK's `serve()` re-registers everything on reconnect,
- * Task 5's contract).
+ * applied, and the registry itself never broadcasts anything (unlike `PluginSupervisor`'s
+ * connection-scoped `plugin_tool_invoke` push) — "last write wins" per plugin id, exactly like a
+ * plugin process re-declaring its own shortcuts/tile/provider info on every reconnect (the SDK's
+ * `serve()` re-registers everything on reconnect, Task 5's contract). Phase 4d Task 1 adds the
+ * live read side: `plugins.contrib` (ipc/server.ts) reads `all()`/`get()` directly, and the
+ * `plugin_tile_updated` broadcast + `clear()`-on-disconnect are driven entirely by the SERVER
+ * (which owns `harnessConns`) — this registry stays a passive store with no `onChange` hook.
  */
 export interface PluginContribState {
   shortcuts?: z.infer<typeof ShortcutRegisterParams>["shortcuts"];
@@ -42,6 +44,15 @@ export class PluginContribRegistry {
 
   setProvider(pluginId: string, provider: PluginContribState["provider"]): void {
     this.entry(pluginId).provider = provider;
+  }
+
+  /** Drops a plugin's contributions entirely — Phase 4d Task 1: called on socket close() so a
+   *  disconnected plugin's stale tile/shortcuts/provider info no longer shows up in `all()`/
+   *  `get()`. Stays a passive store operation: the SERVER (ipc/server.ts) is responsible for
+   *  broadcasting the resulting `plugin_tile_updated {tile:null}` — this registry has no
+   *  visibility into `harnessConns` and deliberately never calls out on its own. */
+  clear(pluginId: string): void {
+    this.byPlugin.delete(pluginId);
   }
 
   get(pluginId: string): PluginContribState | undefined {

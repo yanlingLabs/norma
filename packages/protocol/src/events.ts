@@ -6,6 +6,17 @@ const Base = z.object({
   ts: z.number().int().nonnegative(), // epoch ms
 });
 
+/** Sentinel `sessionId` for events that aren't scoped to any session (Phase 4d Task 1's
+ *  `plugin_tile_updated`, spec §6/§7): a dashboard connection is never "attached" to a session
+ *  (there's nothing to `session.attach` to for a plugin tile), so these events are broadcast
+ *  server-side by looping every authed harness connection (ipc/server.ts's `harnessConns`, the
+ *  same mechanism `session_created` already uses) rather than through the per-session
+ *  `SessionHub`. `Base.sessionId` requires `min(1)`, so a session-less event still needs SOME
+ *  non-empty string to satisfy the schema — `$system` is reserved for exactly that (never a real
+ *  session id: `SessionStore.createSession` always mints `s_<12-hex-chars>`, so a literal `$`
+ *  prefix can never collide with a real session's id). */
+export const SYSTEM_SESSION_ID = "$system";
+
 export const SessionCreatedEvent = Base.extend({
   type: z.literal("session_created"),
   scope: z.string().min(1),
@@ -185,6 +196,18 @@ export const HardwareRequestedEvent = ThreadBase.extend({
   argsJson: z.string(),
 });
 
+/** TRANSIENT (broadcast-only, never appended to the session log/replayed on attach — there's no
+ *  session to attach to; see `SYSTEM_SESSION_ID` above) — Phase 4d Task 1's live tile push. Core
+ *  broadcasts this to every authed harness (ipc/server.ts's `broadcastTileUpdated`) whenever a
+ *  plugin's `tile.update` lands in `PluginContribRegistry`, and again with `tile: null` when the
+ *  plugin disconnects (its tile is cleared, and dashboards must drop the now-stale card). Extends
+ *  `Base` directly (NOT `ThreadBase`) — a plugin's declarative tile isn't scoped to any thread. */
+export const PluginTileUpdatedEvent = Base.extend({
+  type: z.literal("plugin_tile_updated"),
+  pluginId: z.string().min(1),
+  tile: z.record(z.string(), z.unknown()).nullable(),
+});
+
 export const SessionEvent = z.discriminatedUnion("type", [
   SessionCreatedEvent,
   HarnessAttachedEvent,
@@ -219,6 +242,7 @@ export const SessionEvent = z.discriminatedUnion("type", [
   PeripheralCallRequestedEvent,
   PluginToolInvokeEvent,
   HardwareRequestedEvent,
+  PluginTileUpdatedEvent,
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 

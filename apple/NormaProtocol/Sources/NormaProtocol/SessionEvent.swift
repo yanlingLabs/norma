@@ -34,6 +34,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
     case peripheralCallRequested(PeripheralCallRequested)
     case pluginToolInvoke(PluginToolInvoke)
     case hardwareRequested(HardwareRequested)
+    case pluginTileUpdated(PluginTileUpdated)
 
     public struct SessionCreated: Codable, Equatable, Sendable {
         public let seq: Int
@@ -387,6 +388,57 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         public let argsJson: String
     }
 
+    /// An opaque JSON value — mirrors TS's `z.record(z.string(), z.unknown())` (the wire shape of
+    /// a plugin's `tile.update` payload, PluginTileUpdated's `tile` field below): core does not
+    /// validate a tile's contents beyond "is an object", so Swift can't type it any more
+    /// concretely than "some JSON value" either.
+    public indirect enum JSONValue: Codable, Equatable, Sendable {
+        case string(String)
+        case number(Double)
+        case bool(Bool)
+        case object([String: JSONValue])
+        case array([JSONValue])
+        case null
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.singleValueContainer()
+            if c.decodeNil() { self = .null; return }
+            if let v = try? c.decode(Bool.self) { self = .bool(v); return }
+            if let v = try? c.decode(Double.self) { self = .number(v); return }
+            if let v = try? c.decode(String.self) { self = .string(v); return }
+            if let v = try? c.decode([String: JSONValue].self) { self = .object(v); return }
+            if let v = try? c.decode([JSONValue].self) { self = .array(v); return }
+            throw DecodingError.dataCorruptedError(in: c, debugDescription: "unsupported JSON value")
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.singleValueContainer()
+            switch self {
+            case .string(let v): try c.encode(v)
+            case .number(let v): try c.encode(v)
+            case .bool(let v): try c.encode(v)
+            case .object(let v): try c.encode(v)
+            case .array(let v): try c.encode(v)
+            case .null: try c.encodeNil()
+            }
+        }
+    }
+
+    /// TRANSIENT (broadcast-only, never appended to the session log/replayed on attach — there's
+    /// no session to attach to; `sessionId` is always the `$system` sentinel) — Phase 4d Task 1's
+    /// live tile push. Core broadcasts this to every authed harness when a plugin's `tile.update`
+    /// lands, and again with `tile: nil` when the plugin disconnects (dashboards drop the
+    /// now-stale card). Extends the plain `{seq, sessionId, ts}` base directly, NOT the
+    /// thread-scoped shape other events use — a plugin's declarative tile isn't scoped to a
+    /// thread.
+    public struct PluginTileUpdated: Codable, Equatable, Sendable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let pluginId: String
+        public let tile: [String: JSONValue]?
+    }
+
     private enum Discriminator: String, Codable {
         case session_created
         case harness_attached
@@ -421,6 +473,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         case peripheral_call_requested
         case plugin_tool_invoke
         case hardware_requested
+        case plugin_tile_updated
     }
 
     private enum TypeKey: String, CodingKey { case type }
@@ -461,6 +514,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         case .peripheral_call_requested: self = .peripheralCallRequested(try PeripheralCallRequested(from: decoder))
         case .plugin_tool_invoke:   self = .pluginToolInvoke(try PluginToolInvoke(from: decoder))
         case .hardware_requested:   self = .hardwareRequested(try HardwareRequested(from: decoder))
+        case .plugin_tile_updated:  self = .pluginTileUpdated(try PluginTileUpdated(from: decoder))
         }
     }
 
@@ -598,6 +652,10 @@ public enum SessionEvent: Codable, Equatable, Sendable {
             try v.encode(to: encoder)
             var c = encoder.container(keyedBy: TypeKey.self)
             try c.encode(Discriminator.hardware_requested.rawValue, forKey: .type)
+        case .pluginTileUpdated(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.plugin_tile_updated.rawValue, forKey: .type)
         }
     }
 }
