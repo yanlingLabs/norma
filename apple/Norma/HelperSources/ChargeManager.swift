@@ -65,9 +65,17 @@ final class ChargeManager {
     /// Applies `chargeLimitPlan(percent:appleSilicon:)` and executes the resulting plan. Throws
     /// `.invalidRange` (HelperService maps this to the `invalid_range` errorJson) or an
     /// `SMCController.SMCError` (mapped to `smc_error`).
-    func setTarget(_ percent: Int) throws {
+    ///
+    /// Returns the resolved `(percent, enforcing, mechanism)` computed atomically inside this same
+    /// lock, so a caller building a reply (`HelperService.setChargeLimit`) never needs a follow-up
+    /// `getTarget()`/`mechanism` read that could interleave with a concurrent `setTarget` and report
+    /// a different request's result (TOCTOU).
+    @discardableResult
+    func setTarget(_ percent: Int) throws -> (percent: Int, enforcing: Bool, mechanism: String) {
         try queue.sync {
-            let plan = chargeLimitPlan(percent: percent, appleSilicon: smc.isAppleSilicon())
+            let appleSilicon = smc.isAppleSilicon()
+            let mechanism = appleSilicon ? "CHTE" : "BCLM"
+            let plan = chargeLimitPlan(percent: percent, appleSilicon: appleSilicon)
             switch plan {
             case .invalidRange:
                 throw ChargeManagerError.invalidRange
@@ -77,19 +85,25 @@ final class ChargeManager {
                 Self.persist(targetPercent: target)
                 self.startTimerLocked()
                 try self.applyLockedThrowing()
+                return (percent: target, enforcing: true, mechanism: mechanism)
 
             case .appleSiliconDisable:
+                // Write the SMC key FIRST: if `writeCHTE(false)` throws, state/timer/persistence
+                // are left untouched so the disable can be retried, instead of committing
+                // "disabled" while charging is still physically inhibited with no recovery path.
+                try self.smc.writeCHTE(false)
                 self._targetPercent = nil
                 Self.persist(targetPercent: nil)
                 self.stopTimerLocked()
-                try self.smc.writeCHTE(false)
                 self._inhibitingNow = false
+                return (percent: 100, enforcing: false, mechanism: mechanism)
 
             case .writeBCLM(let value):
                 try self.smc.writeBCLM(value)
                 self._targetPercent = Int(value)
                 Self.persist(targetPercent: Int(value))
                 self.stopTimerLocked()
+                return (percent: Int(value), enforcing: Int(value) != 100, mechanism: mechanism)
             }
         }
     }

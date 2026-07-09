@@ -45,12 +45,12 @@ final class HelperService: NSObject, NormaHelperProtocol {
 
     func setChargeLimit(_ percent: Int, reply: @escaping (String?, String?) -> Void) {
         do {
-            try chargeManager.setTarget(percent)
-            // `percent == 100` is the "no limit" convention `chargeLimitPlan` uses throughout
-            // (both `.appleSiliconDisable` and an Intel `writeBCLM(100)` land here) — derive
-            // `enforcing` from the resulting target rather than tracking a separate flag.
-            let (target, _, _) = chargeManager.getTarget()
-            reply(Self.setResultJson(percent: target, mechanism: chargeManager.mechanism, enforcing: target != 100), nil)
+            // `setTarget` resolves (percent, enforcing, mechanism) atomically inside its own lock
+            // and returns them directly — reading them back via a separate `getTarget()`/`mechanism`
+            // call here would risk a concurrent `setChargeLimit` interleaving and reporting a
+            // different request's result (TOCTOU).
+            let result = try chargeManager.setTarget(percent)
+            reply(Self.setResultJson(percent: result.percent, mechanism: result.mechanism, enforcing: result.enforcing), nil)
         } catch ChargeManager.ChargeManagerError.invalidRange {
             reply(nil, Self.errorJson(code: "invalid_range", message: "percent must be between 50 and 100"))
         } catch {
