@@ -2465,4 +2465,150 @@ describe("daemon IPC", () => {
       c.close(); srv.stop();
     });
   });
+
+  // -----------------------------------------------------------------------------------------
+  // shortcut.invoke / tile.action (Phase 4d Task 2, spec §6/§7): the reverse direction of Task
+  // 1's plugin→core→dashboard tile broadcast above — a future UI fires a plugin's registered
+  // shortcut or a tile-action button; core pushes a transient, session-less event straight to
+  // that plugin's own connection. HARNESS-role (not in PLUGIN_ALLOWED_METHODS) — reuses the same
+  // PluginSupervisor runtimes lookup plugin_tool_invoke's dispatch uses (`pushToPlugin`, sibling
+  // of `invoke()` in "plugin tool bridge (Task 4)" above) but fire-and-forget: no
+  // request/response correlation, no awaited answer.
+  // -----------------------------------------------------------------------------------------
+  describe("shortcut.invoke / tile.action (Task 2, Phase 4d)", () => {
+    async function bootPushServer(): Promise<{
+      store: SessionStore; socketPath: string; harnessToken: string; supervisor: PluginSupervisor;
+      stop: () => void;
+    }> {
+      const home = mkdtempSync(join(tmpdir(), "norma-plugin-push-"));
+      const store = new SessionStore(home);
+      const socketPath = join(home, "core.sock");
+      const authority = new TokenAuthority(new FileSecretStore(join(home, "secrets.json")));
+      const tokens = await authority.ensureTokens();
+      let nextPid = 9000;
+      // Same fake-spawn injection as bootBridgeServer above — a "plugin process" here is really a
+      // scripted TestClient connecting over the real socket.
+      const supervisor = new PluginSupervisor({
+        runDir: join(home, "run"),
+        socketPath,
+        mintToken: (id) => store.mintPluginToken(id),
+        spawn: () => ({ pid: nextPid++, kill: () => {}, exited: new Promise<number>(() => {}) }),
+        isAlivePid: () => false,
+        signalPid: () => {},
+        settings: { registrationTimeoutMs: 5000, backoffCapMs: 100, circuitFailures: 5, circuitWindowMs: 600_000 },
+      });
+      const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, supervisor });
+      return {
+        store, socketPath, harnessToken: tokens.harness, supervisor,
+        stop: () => { supervisor.stopAll(); server.stop(); store.close(); },
+      };
+    }
+
+    /** Spawns (fake) + hellos + plugin.registers a plugin connection — mirrors
+     *  bootBridgeServer's registerAndHello above (duplicated here since that one is scoped inside
+     *  the "plugin tool bridge (Task 4)" describe block). */
+    async function registerAndHello(srv: Awaited<ReturnType<typeof bootPushServer>>, pluginId: string): Promise<TestClient> {
+      srv.supervisor.startAll([{ id: pluginId, dir: `/plugins/${pluginId}`, entry: { command: "bun", args: ["index.ts"] } }]);
+      const raw = srv.store.mintPluginToken(pluginId);
+      const plugin = await TestClient.connect(srv.socketPath);
+      const hello = await plugin.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: pluginId, pluginId,
+      });
+      if (!hello.result?.ok) throw new Error(`test setup: plugin hello failed: ${JSON.stringify(hello.error)}`);
+      const reg = await plugin.request(METHODS.pluginRegister, { pluginId });
+      expect(reg.result).toEqual({ ok: true });
+      expect(srv.supervisor.status(pluginId)).toBe("running");
+      return plugin;
+    }
+
+    test("shortcut.invoke pushes shortcut_invoke to the target plugin connection", async () => {
+      const srv = await bootPushServer();
+      const pluginId = "p1";
+      const plugin = await registerAndHello(srv, pluginId);
+
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "dashboard");
+
+      const res = await harness.request(METHODS.shortcutInvoke, { pluginId, shortcutId: "do-thing" });
+      expect(res.result).toEqual({ ok: true });
+
+      const invoked = await plugin.waitForNotification((n) => n.method === METHODS.event && n.params.type === "shortcut_invoke");
+      expect(invoked.params.shortcutId).toBe("do-thing");
+      expect(invoked.params.sessionId).toBe("$system"); // SYSTEM_SESSION_ID sentinel — session-less event
+      expect(invoked.params.threadId).toBeUndefined(); // extends Base, not ThreadBase
+
+      plugin.close(); harness.close(); srv.stop();
+    });
+
+    test("shortcut.invoke for a plugin with no live connection returns {code:'not_connected'}", async () => {
+      const srv = await bootPushServer();
+      const pluginId = "p1";
+      // Tracked by the supervisor (startAll) but never hello'd/plugin.registered — no live conn.
+      srv.supervisor.startAll([{ id: pluginId, dir: `/plugins/${pluginId}`, entry: { command: "bun" } }]);
+
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "dashboard");
+
+      const res = await harness.request(METHODS.shortcutInvoke, { pluginId, shortcutId: "do-thing" });
+      expect(res.result).toEqual({ code: "not_connected" });
+
+      harness.close(); srv.stop();
+    });
+
+    test("tile.action pushes tile_action to the target plugin connection", async () => {
+      const srv = await bootPushServer();
+      const pluginId = "p1";
+      const plugin = await registerAndHello(srv, pluginId);
+
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "dashboard");
+
+      const res = await harness.request(METHODS.tileAction, { pluginId, actionId: "reconnect" });
+      expect(res.result).toEqual({ ok: true });
+
+      const fired = await plugin.waitForNotification((n) => n.method === METHODS.event && n.params.type === "tile_action");
+      expect(fired.params.actionId).toBe("reconnect");
+      expect(fired.params.sessionId).toBe("$system");
+      expect(fired.params.threadId).toBeUndefined();
+
+      plugin.close(); harness.close(); srv.stop();
+    });
+
+    test("tile.action for a plugin with no live connection returns {code:'not_connected'}", async () => {
+      const srv = await bootPushServer();
+      const pluginId = "p1";
+      srv.supervisor.startAll([{ id: pluginId, dir: `/plugins/${pluginId}`, entry: { command: "bun" } }]);
+
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "dashboard");
+
+      const res = await harness.request(METHODS.tileAction, { pluginId, actionId: "reconnect" });
+      expect(res.result).toEqual({ code: "not_connected" });
+
+      harness.close(); srv.stop();
+    });
+
+    test("shortcut.invoke / tile.action for a completely unknown pluginId return {code:'unknown_plugin'}", async () => {
+      const srv = await bootPushServer();
+      const harness = await TestClient.connect(srv.socketPath);
+      await harness.hello(srv.harnessToken, "dashboard");
+
+      const a = await harness.request(METHODS.shortcutInvoke, { pluginId: "never-heard-of-it", shortcutId: "do-thing" });
+      expect(a.result).toEqual({ code: "unknown_plugin" });
+      const b = await harness.request(METHODS.tileAction, { pluginId: "never-heard-of-it", actionId: "reconnect" });
+      expect(b.result).toEqual({ code: "unknown_plugin" });
+
+      harness.close(); srv.stop();
+    });
+
+    test("shortcut.invoke / tile.action are not plugin-role callable", async () => {
+      const srv = await bootPushServer();
+      const plugin = await registerAndHello(srv, "p1");
+      const a = await plugin.request(METHODS.shortcutInvoke, { pluginId: "p1", shortcutId: "do-thing" });
+      expect(a.error?.code).toBe(ERR.UNAUTHORIZED);
+      const b = await plugin.request(METHODS.tileAction, { pluginId: "p1", actionId: "reconnect" });
+      expect(b.error?.code).toBe(ERR.UNAUTHORIZED);
+      plugin.close(); srv.stop();
+    });
+  });
 });

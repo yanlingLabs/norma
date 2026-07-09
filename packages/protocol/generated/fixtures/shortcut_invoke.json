@@ -1,0 +1,7 @@
+{
+  "type": "shortcut_invoke",
+  "sessionId": "$system",
+  "seq": 25,
+  "ts": 1700000000015,
+  "shortcutId": "toggle-mute"
+}

@@ -509,6 +509,20 @@ export class PluginSupervisor {
     return this.runtimes.get(pluginId)?.status ?? "stopped";
   }
 
+  /** Phase 4d Task 2 (spec §6/§7 harness→plugin push): fire-and-forget delivery of a transient
+   *  event (`shortcut_invoke`/`tile_action`) straight to a plugin's live connection — the SAME
+   *  `runtimes` lookup `invoke()` below uses, but with no request/response correlation (the caller
+   *  doesn't await an answer, unlike a tool invoke). `{code:"unknown_plugin"}` when this id was
+   *  never tracked at all (never `startAll`'d/reclaimed — core has no record of it);
+   *  `{code:"not_connected"}` when it IS tracked but isn't currently "running" with a live `conn`,
+   *  or the live conn's own `push()` reports the socket already dead; `{ok:true}` once handed off. */
+  pushToPlugin(pluginId: string, event: NewSessionEvent): { ok: true } | { code: "not_connected" } | { code: "unknown_plugin" } {
+    const rt = this.runtimes.get(pluginId);
+    if (!rt) return { code: "unknown_plugin" };
+    if (rt.status !== "running" || !rt.conn) return { code: "not_connected" };
+    return rt.conn.push(event) ? { ok: true } : { code: "not_connected" };
+  }
+
   // -----------------------------------------------------------------------------------------
   // Tool invoke correlation — mirrors PeripheralBroker.call()/respond() almost verbatim.
   // -----------------------------------------------------------------------------------------

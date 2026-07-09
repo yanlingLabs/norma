@@ -13,6 +13,7 @@ import {
   TrustListParams, TrustRemoveParams, PluginRevokeTokenParams, PluginRestartParams,
   PluginRegisterParams, ToolRegisterParams, ShortcutRegisterParams, TileUpdateParams,
   ProviderRegisterParams, PluginsContribParams, PluginToolResultParams, HardwareRequestParams, HardwareRespondParams,
+  ShortcutInvokeParams, TileActionParams,
   SYSTEM_SESSION_ID,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
@@ -771,6 +772,35 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         parseParams(PluginsContribParams, params);
         const entries = opts.contrib?.all().map(({ pluginId, state }) => ({ pluginId, ...state })) ?? [];
         return { ok: true, entries };
+      }
+
+      // Phase 4d Task 2 (spec §6/§7): the reverse direction of the tile broadcast above — a
+      // future UI fires a plugin's registered shortcut or a tile-action button. HARNESS-role (not
+      // in PLUGIN_ALLOWED_METHODS, so a plugin connection is role-rejected before it ever reaches
+      // here). Both push a transient, session-less event straight to the target plugin's own
+      // connection via PluginSupervisor.pushToPlugin — the SAME runtimes lookup
+      // plugin_tool_invoke's dispatch uses (`supervisor.invoke`, above) — but fire-and-forget, no
+      // request/response correlation. `seq` reuses the SAME local `systemSeq` monotonic counter as
+      // `broadcastTileUpdated`'s plugin_tile_updated (store.lastSeq() throws for $system — see that
+      // counter's own doc comment). No supervisor wired in at all (no agentProvider) means core has
+      // no record of any plugin — degrades to unknown_plugin, same as a truly untracked id.
+      case METHODS.shortcutInvoke: {
+        const p = parseParams(ShortcutInvokeParams, params);
+        if (!opts.supervisor) return { code: "unknown_plugin" };
+        const event = {
+          type: "shortcut_invoke" as const, sessionId: SYSTEM_SESSION_ID, seq: ++systemSeq, ts: Date.now(),
+          shortcutId: p.shortcutId,
+        };
+        return opts.supervisor.pushToPlugin(p.pluginId, event);
+      }
+      case METHODS.tileAction: {
+        const p = parseParams(TileActionParams, params);
+        if (!opts.supervisor) return { code: "unknown_plugin" };
+        const event = {
+          type: "tile_action" as const, sessionId: SYSTEM_SESSION_ID, seq: ++systemSeq, ts: Date.now(),
+          actionId: p.actionId,
+        };
+        return opts.supervisor.pushToPlugin(p.pluginId, event);
       }
 
       default:

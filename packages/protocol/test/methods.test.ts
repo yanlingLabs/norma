@@ -84,6 +84,10 @@ import {
   HardwareRequestResult,
   HardwareRespondParams,
   HardwareRespondResult,
+  ShortcutInvokeParams,
+  ShortcutInvokeResult,
+  TileActionParams,
+  TileActionResult,
   METHODS,
 } from "../src/methods";
 
@@ -589,5 +593,40 @@ describe("hardware.request / hardware.respond (Phase 4c Task 1, spec §5)", () =
     expect(HardwareRespondParams.parse({ requestId: "req_1", error: "unsupported_value" }).error).toBe("unsupported_value");
     expect(() => HardwareRespondParams.parse({ requestId: "" })).toThrow();
     expect(HardwareRespondResult.parse({ ok: true })).toEqual({ ok: true });
+  });
+});
+
+describe("shortcut.invoke / tile.action (Phase 4d Task 2, spec §6/§7 — harness→plugin push)", () => {
+  test("METHODS carries both verbs", () => {
+    expect(METHODS.shortcutInvoke).toBe("shortcut.invoke");
+    expect(METHODS.tileAction).toBe("tile.action");
+  });
+
+  test("shortcut.invoke params: pluginId + shortcutId both required non-empty", () => {
+    expect(ShortcutInvokeParams.parse({ pluginId: "p1", shortcutId: "do-thing" })).toEqual({ pluginId: "p1", shortcutId: "do-thing" });
+    expect(() => ShortcutInvokeParams.parse({ pluginId: "", shortcutId: "do-thing" })).toThrow();
+    expect(() => ShortcutInvokeParams.parse({ pluginId: "p1", shortcutId: "" })).toThrow();
+    expect(() => ShortcutInvokeParams.parse({ pluginId: "p1" })).toThrow();
+  });
+
+  test("tile.action params: pluginId + actionId both required non-empty", () => {
+    expect(TileActionParams.parse({ pluginId: "p1", actionId: "reconnect" })).toEqual({ pluginId: "p1", actionId: "reconnect" });
+    expect(() => TileActionParams.parse({ pluginId: "", actionId: "reconnect" })).toThrow();
+    expect(() => TileActionParams.parse({ pluginId: "p1", actionId: "" })).toThrow();
+    expect(() => TileActionParams.parse({ pluginId: "p1" })).toThrow();
+  });
+
+  // Shared result union (methods.ts's PluginPushResult) — mirrors HardwareRequestResult's style:
+  // success carries no payload (the push either lands or it doesn't), failure is a typed code.
+  test("shortcut.invoke / tile.action result: ok | not_connected | unknown_plugin union", () => {
+    expect(ShortcutInvokeResult.parse({ ok: true })).toEqual({ ok: true });
+    expect(ShortcutInvokeResult.parse({ code: "not_connected" })).toEqual({ code: "not_connected" });
+    expect(ShortcutInvokeResult.parse({ code: "unknown_plugin" })).toEqual({ code: "unknown_plugin" });
+    expect(() => ShortcutInvokeResult.parse({ code: "bogus" })).toThrow();
+    expect(() => ShortcutInvokeResult.parse({})).toThrow();
+
+    expect(TileActionResult.parse({ ok: true })).toEqual({ ok: true });
+    expect(TileActionResult.parse({ code: "not_connected" })).toEqual({ code: "not_connected" });
+    expect(TileActionResult.parse({ code: "unknown_plugin" })).toEqual({ code: "unknown_plugin" });
   });
 });

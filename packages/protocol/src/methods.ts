@@ -405,6 +405,30 @@ export const HardwareRespondParams = z.object({
 });
 export const HardwareRespondResult = z.object({ ok: z.literal(true) });
 
+// ---------------------------------------------------------------------------------------------
+// Phase 4d Task 2 (spec §6/§7): harness→core→plugin PUSH methods — the reverse of Task 1's
+// plugin→core→dashboard tile broadcast. A future UI fires a plugin's registered shortcut or a
+// tile-action button by calling one of these; core pushes a transient event to that plugin's own
+// connection, mirroring how `plugin_tool_invoke` is pushed today (ipc/server.ts). Both are
+// HARNESS-role (the app calls them, never a plugin) — deliberately NOT added to
+// PLUGIN_ALLOWED_METHODS.
+// ---------------------------------------------------------------------------------------------
+
+export const ShortcutInvokeParams = z.object({ pluginId: z.string().min(1), shortcutId: z.string().min(1) });
+export const TileActionParams = z.object({ pluginId: z.string().min(1), actionId: z.string().min(1) });
+/** Shared by both verbs below — mirrors `HardwareRequestResult`'s typed-union style (success vs.
+ *  typed failure codes, never a bare throw). There is no payload to round-trip on success: the
+ *  push either reaches the plugin's connection or it doesn't. `unknown_plugin` = `pluginId` isn't
+ *  a plugin core has any record of; `not_connected` = a known plugin with no live connection right
+ *  now. */
+export const PluginPushResult = z.union([
+  z.object({ ok: z.literal(true) }),
+  z.object({ code: z.literal("not_connected") }),
+  z.object({ code: z.literal("unknown_plugin") }),
+]);
+export const ShortcutInvokeResult = PluginPushResult;
+export const TileActionResult = PluginPushResult;
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -452,4 +476,6 @@ export const METHODS = {
   pluginRestart: "plugin.restart",
   hardwareRequest: "hardware.request",
   hardwareRespond: "hardware.respond",
+  shortcutInvoke: "shortcut.invoke",
+  tileAction: "tile.action",
 } as const;

@@ -258,6 +258,38 @@ describe("SessionEvent discriminated union", () => {
     const t = { seq: 1, sessionId: SYSTEM_SESSION_ID, ts: 1 };
     expect(SessionEvent.safeParse({ ...t, type: "plugin_tile_updated", pluginId: "", tile: null }).success).toBe(false);
   });
+
+  // Phase 4d Task 2 (spec §6/§7): the reverse direction — core pushes these directly to a
+  // plugin's own connection (`shortcut.invoke`/`tile.action`, methods.ts). Session-less like
+  // plugin_tile_updated, so sessionId is always the $system sentinel, and both extend Base (no
+  // threadId) rather than ThreadBase.
+  test("shortcut_invoke round-trips; sessionId is the $system sentinel", () => {
+    const e = {
+      seq: 6, sessionId: SYSTEM_SESSION_ID, ts: 1781270000001,
+      type: "shortcut_invoke", shortcutId: "toggle-mute",
+    } as const;
+    expect(SessionEvent.parse(e)).toEqual(e);
+    expect(e.sessionId).toBe("$system");
+  });
+
+  test("shortcut_invoke rejects an empty shortcutId", () => {
+    const t = { seq: 1, sessionId: SYSTEM_SESSION_ID, ts: 1 };
+    expect(SessionEvent.safeParse({ ...t, type: "shortcut_invoke", shortcutId: "" }).success).toBe(false);
+  });
+
+  test("tile_action round-trips; sessionId is the $system sentinel", () => {
+    const e = {
+      seq: 7, sessionId: SYSTEM_SESSION_ID, ts: 1781270000002,
+      type: "tile_action", actionId: "reconnect",
+    } as const;
+    expect(SessionEvent.parse(e)).toEqual(e);
+    expect(e.sessionId).toBe("$system");
+  });
+
+  test("tile_action rejects an empty actionId", () => {
+    const t = { seq: 1, sessionId: SYSTEM_SESSION_ID, ts: 1 };
+    expect(SessionEvent.safeParse({ ...t, type: "tile_action", actionId: "" }).success).toBe(false);
+  });
 });
 
 describe("hello method schemas", () => {

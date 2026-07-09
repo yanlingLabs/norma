@@ -50,6 +50,8 @@ const fixtures: Record<string, unknown> = {
   plugin_tool_invoke: { type: "plugin_tool_invoke", sessionId: "s_1", threadId: "main", seq: 22, ts: 1700000000012, requestId: "req_2", tool: "echo", argsJson: '{"text":"hi"}' },
   hardware_requested: { type: "hardware_requested", sessionId: "s_1", threadId: "main", seq: 23, ts: 1700000000013, requestId: "req_3", verb: "setChargeLimit", argsJson: '{"percent":80}' },
   plugin_tile_updated: { type: "plugin_tile_updated", sessionId: "$system", seq: 24, ts: 1700000000014, pluginId: "sample-echo", tile: { title: "Sample", value: "1", enabled: true } },
+  shortcut_invoke: { type: "shortcut_invoke", sessionId: "$system", seq: 25, ts: 1700000000015, shortcutId: "toggle-mute" },
+  tile_action: { type: "tile_action", sessionId: "$system", seq: 26, ts: 1700000000016, actionId: "reconnect" },
 };
 for (const [name, value] of Object.entries(fixtures)) {
   SessionEvent.parse(value); // fixtures must be valid by construction

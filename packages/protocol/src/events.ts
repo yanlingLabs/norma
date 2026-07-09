@@ -208,6 +208,25 @@ export const PluginTileUpdatedEvent = Base.extend({
   tile: z.record(z.string(), z.unknown()).nullable(),
 });
 
+/** TRANSIENT (broadcast-only, never persisted to the session log/replayed on attach — there's no
+ *  session to attach to; `sessionId` is always the `$system` sentinel) — Phase 4d Task 2's
+ *  harness→plugin push: core sends this directly to a plugin's own connection when a future UI
+ *  fires one of that plugin's registered shortcuts (`shortcut.invoke`, methods.ts). Extends `Base`
+ *  directly (NOT `ThreadBase`), same reasoning as `PluginTileUpdatedEvent` above — this push isn't
+ *  scoped to any thread. */
+export const ShortcutInvokeEvent = Base.extend({
+  type: z.literal("shortcut_invoke"),
+  shortcutId: z.string().min(1),
+});
+
+/** TRANSIENT — see `ShortcutInvokeEvent` above. Phase 4d Task 2's other harness→plugin push: core
+ *  sends this when a future UI clicks one of the plugin's declarative tile's action buttons
+ *  (`tile.action`, methods.ts). */
+export const TileActionEvent = Base.extend({
+  type: z.literal("tile_action"),
+  actionId: z.string().min(1),
+});
+
 export const SessionEvent = z.discriminatedUnion("type", [
   SessionCreatedEvent,
   HarnessAttachedEvent,
@@ -243,6 +262,8 @@ export const SessionEvent = z.discriminatedUnion("type", [
   PluginToolInvokeEvent,
   HardwareRequestedEvent,
   PluginTileUpdatedEvent,
+  ShortcutInvokeEvent,
+  TileActionEvent,
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 
