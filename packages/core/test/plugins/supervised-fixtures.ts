@@ -171,6 +171,15 @@ export async function createSupervisedInstance(params: {
    *  scripted provider connection, instead of the raw-RPC/no-real-plugin-process coverage
    *  `server.test.ts`'s "hardware.request / hardware.respond" suite already has. */
   hardware?: boolean;
+  /** Phase 4d-i Task 5, opt-in and purely additive (independent of `hardware` above — a no-op
+   *  when `hardware` is already true, since that path already builds one). Wires a real
+   *  `PluginStore` alone (reads `home`'s already-written settings.json, same construction as the
+   *  `hardware: true` path) WITHOUT the provider-link/hardware-broker/peripheral-broker machinery
+   *  — needed only so `plugins.list` (Task 4's supervisor-status enrichment) has a store to
+   *  enrich. `gate-4d-i.test.ts` uses this instead of `hardware: true` since it never touches
+   *  `ctx.hardware()` at all — standing up that extra plumbing for it would be pure noise, same
+   *  precedent as `hardware`'s own doc comment below. */
+  plugins?: boolean;
 }): Promise<SupervisedInstance> {
   const { home, socketPath, supervisorSettings, spawn, signalPid } = params;
   const store = new SessionStore(home);
@@ -202,6 +211,12 @@ export async function createSupervisedInstance(params: {
       pushToProvider: (e) => providerLink!.push(e),
     });
     hardwareBroker = new HardwareBroker({ audit, pushToProvider: (e) => providerLink!.push(e) });
+    const settings = loadSettings(join(home, "settings.json"));
+    plugins = new PluginStore({
+      normaHome: home, plugins: settings.plugins, consents: settings.plugins?.consents,
+      log: (m) => { if (process.env.NORMA_TEST_DEBUG) console.error(`[plugins] ${m}`); },
+    });
+  } else if (params.plugins) {
     const settings = loadSettings(join(home, "settings.json"));
     plugins = new PluginStore({
       normaHome: home, plugins: settings.plugins, consents: settings.plugins?.consents,

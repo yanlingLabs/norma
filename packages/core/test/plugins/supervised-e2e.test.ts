@@ -48,7 +48,22 @@ describe("supervised e2e: sample-echo (real Bun child process)", () => {
         `plugin__${pluginId}__{echo,sleep} registered`,
       );
 
-      // 3. Echo round-trip: registry.execute pushes plugin_tool_invoke over the REAL socket to
+      // 3. Tile contribution: examples/sample-echo/index.ts declares `tile: () => ({...})` — the
+      // SDK pushes tile.update once, right after registration; poll since it can race the tool
+      // registrations above (both fire off the same registration cycle, no ordering guarantee
+      // between them). Checked BEFORE the echo round-trip below — Phase 4d-i Task 5: `echo`'s
+      // `run` now ALSO pushes a live `ctx.updateTile` (the "battery-limiter tile shows unknown"
+      // fix's sibling, proven end to end by gate-4d-i.test.ts), so asserting the tile here first
+      // pins down the one-time INITIAL paint deterministically, before that later push could win
+      // a wire race against it and flip the value out from under this assertion.
+      await waitFor(
+        () => srv!.contrib.get(pluginId)?.tile !== undefined,
+        2_000,
+        `tile.update landed in the contrib registry for ${pluginId}`,
+      );
+      expect(srv.contrib.get(pluginId)?.tile).toEqual({ title: "echo", value: "0" });
+
+      // 4. Echo round-trip: registry.execute pushes plugin_tool_invoke over the REAL socket to
       // the REAL child, which runs its `echo` handler and answers with plugin.toolResult — the
       // full PluginSupervisor.invoke() correlation path, no fake connection involved.
       const outcome = await srv.registry.execute(
@@ -64,16 +79,6 @@ describe("supervised e2e: sample-echo (real Bun child process)", () => {
       expect(parsed.pluginPid).not.toBe(process.pid); // really a separate spawned process
       expect(isPidAlive(parsed.pluginPid)).toBe(true);
       const childPid = parsed.pluginPid;
-
-      // 4. Tile contribution: examples/sample-echo/index.ts declares `tile: () => ({...})` — the
-      // SDK pushes tile.update once, right after registration; poll since it can race the echo
-      // round-trip above (both fire off the same registration cycle, no ordering guarantee).
-      await waitFor(
-        () => srv!.contrib.get(pluginId)?.tile !== undefined,
-        2_000,
-        `tile.update landed in the contrib registry for ${pluginId}`,
-      );
-      expect(srv.contrib.get(pluginId)?.tile).toEqual({ title: "Sample Echo", value: "ready" });
 
       // 5. Clean teardown: stop() (supervisor.stopAll() + server.stop() + store.close()) SIGTERMs
       // the real child; the SDK's own signal handler closes its socket and calls process.exit(0).

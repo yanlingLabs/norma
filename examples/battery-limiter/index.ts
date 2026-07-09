@@ -18,12 +18,19 @@ import { createPlugin } from "@norma/plugin-sdk";
  * returning an error-shaped value, so a failure naturally becomes a typed `plugin.toolResult
  * {error}` — no try/catch needed here, same "let it throw" posture as sample-echo's `boom` tool.
  *
- * `lastKnownLimit` is plain in-process module state (nothing persisted). The SDK pushes exactly ONE
- * `tile.update` per registration cycle (`createPlugin(...).serve()` — see its doc comment: "after
- * EVERY reconnect", never on every state change afterward), so the tile reflects "the last limit
- * THIS plugin process itself observed" as of its most recent (re)registration — a fresh process (or
- * one that's never successfully called either tool yet) reports "unknown", not a stale/guessed
- * value.
+ * `lastKnownLimit` is plain in-process module state (nothing persisted). `tile()` still paints
+ * exactly ONE `tile.update` per registration cycle (`createPlugin(...).serve()` — see its doc
+ * comment: "after EVERY reconnect") — a fresh process (or one that's never successfully called
+ * either tool yet) reports "unknown" at connect time, not a stale/guessed value.
+ *
+ * Phase 4d-i Task 5 (closes the 4b "battery-limiter tile shows unknown" bug): that once-at-connect
+ * paint used to be the ONLY tile push this plugin ever made — set_charge_limit could update
+ * `lastKnownLimit` all it wanted, but nothing ever told a live dashboard, so the tile stayed
+ * "unknown" (or whatever it showed at connect) for the plugin's entire connection lifetime. Both
+ * tools below now ALSO call `ctx.updateTile` after they run, using the SAME `currentValue()`
+ * formatting `tile()` uses, so a dashboard sees the real value the moment either tool call
+ * resolves — proven end to end (real spawned child, no scripted stand-in beyond the hardware
+ * provider boundary) by `packages/core/test/plugins/battery-limiter-e2e.test.ts`.
  */
 let lastKnownLimit: number | undefined;
 
@@ -33,6 +40,15 @@ function extractPercent(result: unknown): number | undefined {
     if (typeof p === "number") return p;
   }
   return undefined;
+}
+
+/** Shared by `tile()`'s initial paint and both tools' live `ctx.updateTile` push below — "off"
+ *  reads better than "100%" for a disabled/uncapped limit (brief: "the limit percent, or \"off\"
+ *  when 100/disabled"), everything else is `<percent>%`, and an as-yet-unobserved limit is
+ *  "unknown", same as before this task. */
+function currentValue(): string {
+  if (lastKnownLimit === undefined) return "unknown";
+  return lastKnownLimit >= 100 ? "off" : `${lastKnownLimit}%`;
 }
 
 const plugin = createPlugin({
@@ -50,6 +66,9 @@ const plugin = createPlugin({
         // The provider's own reply is the source of truth when it echoes back a `percent`
         // (confirms what actually got set); fall back to the requested value otherwise.
         lastKnownLimit = extractPercent(result) ?? percent;
+        // Phase 4d-i Task 5: live push so a dashboard reflects the new limit immediately, not just
+        // at this plugin's next reconnect — see the module doc comment above.
+        await ctx.updateTile({ title: "Battery limit", value: currentValue() });
         return result;
       },
     },
@@ -60,13 +79,17 @@ const plugin = createPlugin({
         const result = await ctx.hardware("getChargeLimit");
         const observed = extractPercent(result);
         if (observed !== undefined) lastKnownLimit = observed;
+        // Phase 4d-i Task 5: live push, same as set_charge_limit above — reflects whatever is
+        // currently known even when `observed` came back undefined (a malformed provider reply
+        // never regresses the tile to something worse than the last live push already showed).
+        await ctx.updateTile({ title: "Battery limit", value: currentValue() });
         return result;
       },
     },
   },
   tile: () => ({
     title: "Battery Limiter",
-    value: lastKnownLimit !== undefined ? `${lastKnownLimit}%` : "unknown",
+    value: currentValue(),
   }),
 });
 
