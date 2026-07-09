@@ -1,4 +1,6 @@
 import AppKit
+import Carbon.HIToolbox
+import NormaKit
 import XCTest
 @testable import Norma
 
@@ -91,5 +93,194 @@ final class CarbonModifiersTests: XCTestCase {
         // `.capsLock`/`.function`/etc. have no Carbon hotkey-modifier equivalent this codebase
         // tracks — only control/option/shift/command are mapped.
         XCTAssertEqual(carbonModifiers(from: [.capsLock, .function]), 0)
+    }
+}
+
+// -----------------------------------------------------------------------------------------------
+// Final-review fix wave (4d-iii Task 4): the system-wide-keyboard-hijack fix. Escape-to-cancel and
+// "require a real modifier" close the hole where "click to set" then Esc-to-back-out registered a
+// modifier-less GLOBAL Carbon hotkey on Escape; the reserved-combo check closes the hole where a
+// plugin shortcut could shadow Norma's own summon/panic hotkeys.
+// -----------------------------------------------------------------------------------------------
+
+/// `hasRequiredModifier(_:)` — the capture-path gate against arming a modifier-less or shift-only
+/// GLOBAL Carbon hotkey. PURE, no live event tap needed, same posture as `BindingConflictTests`.
+final class HasRequiredModifierTests: XCTestCase {
+    /// (a) modifiers==0 must be rejected — the exact shape a canceled/no-modifier capture produces.
+    func testNoModifiersIsRejected() {
+        XCTAssertFalse(hasRequiredModifier(0))
+    }
+
+    /// (b) shift-only is too weak on its own — control/option/command are the only modifiers this
+    /// gate accepts as "real".
+    func testShiftOnlyIsRejected() {
+        XCTAssertFalse(hasRequiredModifier(UInt32(shiftKey)))
+    }
+
+    /// (c) control alone (no other modifier) is accepted.
+    func testControlAloneIsAccepted() {
+        XCTAssertTrue(hasRequiredModifier(UInt32(controlKey)))
+    }
+
+    func testOptionAloneIsAccepted() {
+        XCTAssertTrue(hasRequiredModifier(UInt32(optionKey)))
+    }
+
+    func testCommandAloneIsAccepted() {
+        XCTAssertTrue(hasRequiredModifier(UInt32(cmdKey)))
+    }
+
+    /// Shift is fine ALONGSIDE a real modifier — only shift ALONE (or nothing) is rejected.
+    func testShiftAlongsideARealModifierIsAccepted() {
+        XCTAssertTrue(hasRequiredModifier(UInt32(shiftKey | controlKey)))
+    }
+}
+
+/// `isReservedCombo(keyCode:modifiers:)` — rejects a capture equal to Norma's own summon hotkey
+/// (`HotkeyTrigger.swift`'s fixed default) or panic hotkey (`PeripheralProvider.swift`'s fixed
+/// combo). PURE, no live event tap needed.
+final class IsReservedComboTests: XCTestCase {
+    /// (e) the summon combo (`HotkeyTrigger.swift`: keyCode 49 / `kVK_Space`,
+    /// `cmdKey | controlKey | optionKey`) is reserved.
+    func testSummonComboIsReserved() {
+        XCTAssertTrue(isReservedCombo(keyCode: UInt32(kVK_Space), modifiers: UInt32(cmdKey | controlKey | optionKey)))
+    }
+
+    /// (e) the panic combo (`PeripheralProvider.swift`: `kVK_Escape`,
+    /// `controlKey | optionKey | cmdKey`) is reserved.
+    func testPanicComboIsReserved() {
+        XCTAssertTrue(isReservedCombo(keyCode: UInt32(kVK_Escape), modifiers: UInt32(controlKey | optionKey | cmdKey)))
+    }
+
+    /// (e) an ordinary plugin-shortcut combo (⌃⌥K) is NOT reserved.
+    func testControlOptionKIsNotReserved() {
+        XCTAssertFalse(isReservedCombo(keyCode: UInt32(kVK_ANSI_K), modifiers: UInt32(controlKey | optionKey)))
+    }
+
+    /// Same keyCode as the summon combo but missing a modifier isn't a match — this is an
+    /// exact-combo check, not a "shares the key" check.
+    func testSameKeyCodeAsSummonButFewerModifiersIsNotReserved() {
+        XCTAssertFalse(isReservedCombo(keyCode: UInt32(kVK_Space), modifiers: UInt32(cmdKey)))
+    }
+}
+
+/// `ShortcutBindingEditorModel.capture(...)`'s full three-gate chain (`hasRequiredModifier` →
+/// `isReservedCombo` → `bindingConflict`), exercised end to end against a real (never-connected)
+/// `NormaClient` — `capture(...)` never touches the client, only `UserDefaults`/`ShortcutRegistry`
+/// (`nil` here, same as under `AppDelegate.boot()`'s unit-test gate), so `NormaClientTestFactory.
+/// make()` (`DashboardTests.swift`, same target) is enough to satisfy the model's initializer
+/// without a live connection.
+@MainActor
+final class ShortcutBindingEditorModelCaptureTests: XCTestCase {
+    private func freshDefaults(_ name: String) -> (defaults: UserDefaults, cleanup: () -> Void) {
+        let suiteName = "ShortcutBindingEditorModelCaptureTests.\(name).\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        return (defaults, { defaults.removePersistentDomain(forName: suiteName) })
+    }
+
+    private func model(defaults: UserDefaults) -> ShortcutBindingEditorModel {
+        ShortcutBindingEditorModel(client: NormaClientTestFactory.make(), shortcutRegistry: nil, defaults: defaults)
+    }
+
+    /// (a) modifiers==0 → no binding produced (nothing persisted), and the rejection surfaces via
+    /// `conflictMessage` (the editor's existing inline-message idiom) rather than being swallowed.
+    func testModifierlessCaptureProducesNoBindingAndSurfacesAHint() {
+        let (defaults, cleanup) = freshDefaults("modifierless")
+        defer { cleanup() }
+        let m = model(defaults: defaults)
+
+        m.capture(pluginId: "com.example.a", shortcutId: "toggle", keyCode: UInt32(kVK_ANSI_K), modifiers: 0)
+
+        XCTAssertEqual(ShortcutSettingsStore.load(from: defaults), [])
+        XCTAssertNotNil(m.conflictMessage)
+    }
+
+    /// (b) shift-only → same: rejected, nothing persisted.
+    func testShiftOnlyCaptureProducesNoBinding() {
+        let (defaults, cleanup) = freshDefaults("shiftonly")
+        defer { cleanup() }
+        let m = model(defaults: defaults)
+
+        m.capture(pluginId: "com.example.a", shortcutId: "toggle", keyCode: UInt32(kVK_ANSI_K), modifiers: UInt32(shiftKey))
+
+        XCTAssertEqual(ShortcutSettingsStore.load(from: defaults), [])
+        XCTAssertNotNil(m.conflictMessage)
+    }
+
+    /// (c) control+key → accepted: persisted, `conflictMessage` cleared.
+    func testControlComboCaptureIsAcceptedAndPersisted() {
+        let (defaults, cleanup) = freshDefaults("accepted")
+        defer { cleanup() }
+        let m = model(defaults: defaults)
+
+        m.capture(pluginId: "com.example.a", shortcutId: "toggle", keyCode: UInt32(kVK_ANSI_K), modifiers: UInt32(controlKey))
+
+        XCTAssertEqual(
+            ShortcutSettingsStore.load(from: defaults),
+            [ShortcutBinding(pluginId: "com.example.a", shortcutId: "toggle", keyCode: UInt32(kVK_ANSI_K), modifiers: UInt32(controlKey))]
+        )
+        XCTAssertNil(m.conflictMessage)
+    }
+
+    /// (f) a reserved combo is rejected via the actual capture path, not just `isReservedCombo` in
+    /// isolation. Uses the SUMMON combo specifically: the panic combo is Escape-based, and a live
+    /// Escape keypress never reaches `capture(...)` at all — `KeyCaptureNSView.keyDown` cancels it
+    /// first (see that view's doc comment) — so the summon combo is the one that genuinely exercises
+    /// this guard end to end through `capture(...)`.
+    func testSummonComboCaptureIsRejectedAsReserved() {
+        let (defaults, cleanup) = freshDefaults("reserved")
+        defer { cleanup() }
+        let m = model(defaults: defaults)
+
+        m.capture(pluginId: "com.example.a", shortcutId: "toggle", keyCode: UInt32(kVK_Space), modifiers: UInt32(cmdKey | controlKey | optionKey))
+
+        XCTAssertEqual(ShortcutSettingsStore.load(from: defaults), [])
+        XCTAssertEqual(m.conflictMessage, "That combo is reserved by Norma.")
+    }
+}
+
+/// `KeyCaptureNSView.keyDown`'s Escape-cancel rule — exercised directly (no window/responder chain
+/// needed: `mouseDown`/`keyDown` are just method calls, and `window?.makeFirstResponder(self)`
+/// no-ops safely with `window` nil).
+final class KeyCaptureNSViewEscapeCancelTests: XCTestCase {
+    private func syntheticMouseDownEvent() -> NSEvent {
+        NSEvent.mouseEvent(
+            with: .leftMouseDown, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1
+        )!
+    }
+
+    private func syntheticKeyEvent(keyCode: UInt16, modifierFlags: NSEvent.ModifierFlags = []) -> NSEvent {
+        NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: modifierFlags, timestamp: 0,
+            windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "",
+            isARepeat: false, keyCode: keyCode
+        )!
+    }
+
+    /// (d) Escape during an active capture cancels it — no binding, `onCapture` never invoked.
+    func testEscapeDuringCaptureCancelsWithoutInvokingOnCapture() {
+        let view = KeyCaptureNSView()
+        var captured: (UInt32, UInt32)?
+        view.onCapture = { keyCode, modifiers in captured = (keyCode, modifiers) }
+
+        view.mouseDown(with: syntheticMouseDownEvent()) // arms capture
+        view.keyDown(with: syntheticKeyEvent(keyCode: UInt16(kVK_Escape)))
+
+        XCTAssertNil(captured, "Escape must cancel the capture, not become the binding")
+    }
+
+    /// A non-Escape keypress during capture is unaffected by the Escape-cancel rule — it still
+    /// reaches `onCapture` (downstream gates in `ShortcutBindingEditorModel.capture` handle
+    /// modifier/reserved-combo validation from there).
+    func testNonEscapeKeyDuringCaptureStillInvokesOnCapture() {
+        let view = KeyCaptureNSView()
+        var captured: (UInt32, UInt32)?
+        view.onCapture = { keyCode, modifiers in captured = (keyCode, modifiers) }
+
+        view.mouseDown(with: syntheticMouseDownEvent())
+        view.keyDown(with: syntheticKeyEvent(keyCode: UInt16(kVK_ANSI_K), modifierFlags: .control))
+
+        XCTAssertNotNil(captured)
     }
 }

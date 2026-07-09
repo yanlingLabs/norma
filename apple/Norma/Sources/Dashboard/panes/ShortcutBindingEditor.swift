@@ -35,6 +35,44 @@ func carbonModifiers(from flags: NSEvent.ModifierFlags) -> UInt32 {
     return result
 }
 
+/// True when `modifiers` includes at least one of the three modifiers a GLOBAL Carbon hotkey
+/// actually needs to be safe to arm: control, option, or command. Shift alone (or no modifier at
+/// all) is too weak — a modifier-less or shift-only capture would register a hotkey that swallows
+/// an ordinary keystroke (or Escape) system-wide, not just while Norma's window is focused.
+/// `ShortcutBindingEditorModel.capture(...)` rejects any candidate that fails this before it ever
+/// reaches `bindingConflict`. PURE — directly testable, same posture as `bindingConflict` above.
+func hasRequiredModifier(_ modifiers: UInt32) -> Bool {
+    modifiers & UInt32(controlKey | optionKey | cmdKey) != 0
+}
+
+/// Norma's own two global hotkeys, read straight off their owning files (not guessed): the summon
+/// combo — `HotkeyTrigger.swift`'s hardcoded default, keyCode `49` (`kVK_Space`) +
+/// `cmdKey | controlKey | optionKey`; `AppDelegate.boot()` always calls
+/// `HotkeyTrigger.shared.start()` with no arguments, so there is no live remap to read — this IS
+/// the current binding — and the panic combo — `PeripheralProvider.swift`'s
+/// `registerPanicHotkey()`, `kVK_Escape` + `controlKey | optionKey | cmdKey`, likewise fixed,
+/// never remapped.
+private let summonReservedCombo: (keyCode: UInt32, modifiers: UInt32) = (
+    UInt32(kVK_Space), UInt32(cmdKey | controlKey | optionKey)
+)
+private let panicReservedCombo: (keyCode: UInt32, modifiers: UInt32) = (
+    UInt32(kVK_Escape), UInt32(controlKey | optionKey | cmdKey)
+)
+
+/// True when `(keyCode, modifiers)` matches one of Norma's own reserved global hotkeys above.
+/// Binding a plugin shortcut to either would silently shadow it the moment it's armed — shadowing
+/// panic specifically is a safety issue (the user's one guaranteed hard-stop), not just an
+/// inconvenience. The panic entry here is defense-in-depth for the PERSISTED-binding path: a live
+/// Escape keypress during capture is already caught earlier by `KeyCaptureNSView.keyDown`'s
+/// unconditional Escape-cancels-the-capture rule below, so it can never reach this check via a real
+/// keypress — but a binding could still arrive here some other way (e.g. a future import/restore
+/// path), so the guard stays. PURE — directly testable, no live event tap needed, same posture as
+/// `bindingConflict` above.
+func isReservedCombo(keyCode: UInt32, modifiers: UInt32) -> Bool {
+    (keyCode == summonReservedCombo.keyCode && modifiers == summonReservedCombo.modifiers)
+        || (keyCode == panicReservedCombo.keyCode && modifiers == panicReservedCombo.modifiers)
+}
+
 // -----------------------------------------------------------------------------------------------
 // ShortcutBindingEditorModel — the pane's live view-model for the shortcut list (same
 // `@MainActor`/`ObservableObject` posture as `PluginManagerModel`/`TilesStripModel`, and the same
@@ -89,12 +127,25 @@ final class ShortcutBindingEditorModel: ObservableObject {
         }
     }
 
-    /// The key-capture control's callback: builds the candidate binding, conflict-checks it against
-    /// every OTHER (pluginId, shortcutId)'s persisted binding via the pure `bindingConflict` above.
-    /// On conflict: sets `conflictMessage`, changes nothing else. On success: replaces this pair's
-    /// prior binding (if any) in the persisted list, saves, reloads the live `ShortcutRegistry`, and
-    /// updates `rows` in place so the display string refreshes without a full `refresh()` round-trip.
+    /// The key-capture control's callback. Three gates, in order, before anything is persisted:
+    /// (1) `hasRequiredModifier` — reject a modifier-less or shift-only combo outright (a real
+    /// keypress can still reach here with `modifiers == 0`/shift-only since `KeyCaptureNSView` only
+    /// special-cases Escape, not weak modifiers — see that view's doc comment); (2) `isReservedCombo`
+    /// — reject a combo that shadows Norma's own summon/panic hotkeys; (3) `bindingConflict` — the
+    /// pre-existing conflict check against every OTHER (pluginId, shortcutId)'s persisted binding.
+    /// Any rejection sets `conflictMessage` and changes nothing else. On success: replaces this
+    /// pair's prior binding (if any) in the persisted list, saves, reloads the live
+    /// `ShortcutRegistry`, and updates `rows` in place so the display string refreshes without a
+    /// full `refresh()` round-trip.
     func capture(pluginId: String, shortcutId: String, keyCode: UInt32, modifiers: UInt32) {
+        guard hasRequiredModifier(modifiers) else {
+            conflictMessage = "Use a modifier combo like \u{2303}\u{2325}K."
+            return
+        }
+        guard !isReservedCombo(keyCode: keyCode, modifiers: modifiers) else {
+            conflictMessage = "That combo is reserved by Norma."
+            return
+        }
         let candidate = ShortcutBinding(pluginId: pluginId, shortcutId: shortcutId, keyCode: keyCode, modifiers: modifiers)
         var bindings = ShortcutSettingsStore.load(from: defaults)
         guard !bindingConflict(existing: bindings, new: candidate) else {
@@ -132,8 +183,20 @@ final class KeyCaptureNSView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        guard isCapturing else { return }
+        guard isCapturing else {
+            // Not capturing — this isn't ours to swallow; a stray keystroke while this view
+            // happens to retain first responder outside an active capture must still reach the
+            // normal responder chain.
+            super.keyDown(with: event)
+            return
+        }
         isCapturing = false
+        // Escape backs OUT of capture rather than becoming the binding — unconditionally, not just
+        // when bare. Without this, "click to set" then Esc-to-back-out registers a modifier-less
+        // GLOBAL Carbon hotkey on Escape (`onCapture?(53, 0)`), which — before it's even rejected
+        // downstream by `hasRequiredModifier` — has already primed the exact combo `isReservedCombo`
+        // guards against for the panic hotkey. No persistence, no callback, full stop.
+        guard UInt32(event.keyCode) != UInt32(kVK_Escape) else { return }
         onCapture?(UInt32(event.keyCode), carbonModifiers(from: event.modifierFlags))
     }
 
