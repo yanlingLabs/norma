@@ -410,6 +410,14 @@ final class PluginManagerModel: ObservableObject {
 
 struct PluginManagerView: View {
     @ObservedObject var model: PluginManagerModel
+    /// Task 4 (4d-iii): the live tiles strip's own view-model — same "constructed fresh per
+    /// dashboard window, injected here" posture as `model` above (`DashboardWindowController.init`).
+    @ObservedObject var tilesModel: TilesStripModel
+    /// Task 4 (4d-iii): the shortcut binding editor's own view-model — same posture as `tilesModel`.
+    @ObservedObject var shortcutsModel: ShortcutBindingEditorModel
+    /// Task 4 (4d-iii): the bottom helper-approval row reads this directly — same `@ObservedObject`
+    /// posture `PeripheralPane` already uses for the SAME instance (`DashboardWiring.helperClient`).
+    @ObservedObject var helperClient: HelperClient
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -418,18 +426,19 @@ struct PluginManagerView: View {
                 Text(errorText).foregroundStyle(.red).font(.system(size: 12)).padding(.horizontal)
             }
             ScrollView {
-                VStack(alignment: .leading, spacing: 2) {
-                    if model.rows.isEmpty {
-                        Text("No plugins installed")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal)
-                    }
-                    ForEach(model.rows) { row in
-                        pluginRow(row)
-                        Divider()
-                    }
+                VStack(alignment: .leading, spacing: 12) {
+                    TilesStripView(model: tilesModel)
+                        .padding(.horizontal)
+                    Divider()
+                    pluginListSection
+                    Divider()
+                    ShortcutBindingEditor(model: shortcutsModel)
+                        .padding(.horizontal)
+                    Divider()
+                    HelperApprovalRow(helperClient: helperClient)
+                        .padding(.horizontal)
                 }
+                .padding(.top, 8)
                 .padding(.bottom, 8)
             }
         }
@@ -445,6 +454,25 @@ struct PluginManagerView: View {
                 onConfirm: { Task { await model.confirmConsent() } },
                 onCancel: { model.cancelConsent() }
             )
+        }
+    }
+
+    /// Task 2's original plugin-list rendering, extracted verbatim into its own section (Task 4) —
+    /// no longer wrapped in its OWN `ScrollView` (it now shares the pane-wide one above, alongside
+    /// the tiles strip / shortcut editor / helper row).
+    private var pluginListSection: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Installed Plugins").font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary).padding(.horizontal)
+            if model.rows.isEmpty {
+                Text("No plugins installed")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal)
+            }
+            ForEach(model.rows) { row in
+                pluginRow(row)
+                Divider()
+            }
         }
     }
 

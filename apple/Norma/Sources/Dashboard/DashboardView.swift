@@ -69,6 +69,11 @@ struct DashboardWiring {
     /// "already-decoupled view-model" posture as `peripheral`/`helperClient` above, not a
     /// `NormaClient` of its own.
     let pluginManager: PluginManagerModel
+    /// Phase 4d-iii Task 4: the live tiles strip's own view-model — same posture as `pluginManager`.
+    let tilesModel: TilesStripModel
+    /// Phase 4d-iii Task 4: the shortcut binding editor's own view-model — same posture as
+    /// `pluginManager`/`tilesModel`.
+    let shortcutsModel: ShortcutBindingEditorModel
 }
 
 /// The Dashboard window's root content: a fixed-width left pane list + the selected pane's
@@ -147,7 +152,12 @@ struct DashboardView: View {
         case .peripheral:
             PeripheralPane(provider: wiring.peripheral, helperClient: wiring.helperClient)
         case .pluginManager:
-            PluginManagerView(model: wiring.pluginManager)
+            PluginManagerView(
+                model: wiring.pluginManager,
+                tilesModel: wiring.tilesModel,
+                shortcutsModel: wiring.shortcutsModel,
+                helperClient: wiring.helperClient
+            )
         }
     }
 }

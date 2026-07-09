@@ -167,6 +167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             directory: model.directory,
             peripheral: peripheral,
             helperClient: helper,
+            shortcutRegistry: shortcutRegistry,
             onOpenSessionDetached: { [weak self] sid in self?.openSessionInNewDetachedWindow(sid) },
             frame: centeredDashboardFrame(visibleFrame: visible),
             initialPane: initialPane

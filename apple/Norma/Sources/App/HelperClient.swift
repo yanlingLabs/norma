@@ -1,5 +1,6 @@
 import Foundation
 import ServiceManagement
+import SwiftUI
 
 // -----------------------------------------------------------------------------------------------
 // HelperApprovalStatus / helperStatusDisplay — the testable core of this file (Task 4, Phase 4c).
@@ -53,6 +54,31 @@ func helperStatusDisplay(_ status: HelperApprovalStatus) -> HelperStatusDisplay 
         return HelperStatusDisplay(stateText: "Helper not found", showsOpenSettingsButton: false)
     case .unknown:
         return HelperStatusDisplay(stateText: "Helper status unknown", showsOpenSettingsButton: true)
+    }
+}
+
+/// The helper-approval status row's SwiftUI rendering — state text + "Open System Settings" button
+/// (shown only when `helperStatusDisplay` says there's something actionable). Extracted (Phase
+/// 4d-iii Task 4) from `PeripheralPane`'s original private `helperStatusRow` computed property so
+/// the Plugin Manager pane's own helper-approval row can REUSE this exact component instead of
+/// reimplementing it — `PeripheralPane` now instantiates this too, in place of its old inline body.
+struct HelperApprovalRow: View {
+    @ObservedObject var helperClient: HelperClient
+
+    var body: some View {
+        let display = helperStatusDisplay(helperClient.status)
+        return HStack {
+            Text(display.stateText)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            Spacer()
+            if display.showsOpenSettingsButton {
+                Button("Open System Settings") {
+                    SMAppService.openSystemSettingsLoginItems()
+                }
+                .font(.system(size: 12))
+            }
+        }
     }
 }
 

@@ -1,0 +1,152 @@
+import NormaKit
+import SwiftUI
+
+/// Task 4 (4d-iii): the Plugin Manager's live tiles strip — seeded from `pluginsContrib()`'s
+/// currently-registered tile per plugin on open, then kept current by POLLING the actor-isolated
+/// `client.tiles` snapshot (NOT a second `for await client.events` consumer). `client.events` is a
+/// single-consumer `AsyncStream` and the Dashboard's `NormaClient` is the app's shared MAIN client
+/// (see `DashboardWindowController`'s own doc comment) — its `events` stream is already being
+/// drained by `AppModel`/`SessionFeed`'s own `for await` pump. A second reader on the same stream
+/// would SPLIT delivery (each event goes to whichever waiter happens to receive it), silently
+/// stealing roughly half the orb's events whenever the dashboard is open. `client.tiles` has no
+/// such hazard: it's kept current by `NormaClient.route()`'s OWN internal transport pump (which
+/// writes `tilesStore` BEFORE yielding to `events` — see `NormaClient.swift`), so reading the
+/// snapshot is always as fresh as the last update regardless of who else drains `events`.
+@MainActor
+final class TilesStripModel: ObservableObject {
+    /// One rendered tile, keyed by plugin id (`Identifiable` for `ForEach`).
+    struct PluginTile: Identifiable, Equatable {
+        var id: String { pluginId }
+        let pluginId: String
+        var data: TileData
+    }
+
+    private let client: NormaClient
+    @Published private(set) var tiles: [PluginTile] = []
+
+    /// Merged working set — NOT simply overwritten from `client.tiles` each poll (see `poll()`'s
+    /// doc comment for why a blind overwrite would wrongly drop a tile seeded from
+    /// `pluginsContrib()` that hasn't been re-pushed live since this client connected).
+    private var known: [String: TileData] = [:]
+    /// Every plugin id ever OBSERVED present in a `client.tiles` poll — once an id is "live
+    /// tracked", its later absence from a poll is a REAL removal (the plugin pushed `tile: nil`,
+    /// which `NormaClient.route()` evicts from `tilesStore`); a seed-only id (declared via
+    /// `pluginsContrib()` but never yet seen in a live poll) staying absent from `client.tiles`
+    /// means nothing on its own — it may simply not have pushed anything since this app session's
+    /// client connected.
+    private var liveTrackedIds: Set<String> = []
+
+    init(client: NormaClient) {
+        self.client = client
+    }
+
+    /// Call once from the view's `.task` — seeds, then polls forever until the surrounding Task is
+    /// cancelled (SwiftUI cancels a `.task`'s Task automatically when the view disappears, so this
+    /// needs no manual stop/deinit bookkeeping).
+    func start() async {
+        await seed()
+        while !Task.isCancelled {
+            await poll()
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+    }
+
+    private func seed() async {
+        guard let entries = try? await client.pluginsContrib() else { return }
+        known = [:]
+        for entry in entries {
+            guard let tileDict = entry.tile, let data = TileData(from: tileDict) else { continue }
+            known[entry.pluginId] = data
+        }
+        publish()
+    }
+
+    /// Upserts every id present in the live snapshot (marking it "live tracked" along the way);
+    /// evicts a "live tracked" id that's now absent (a genuine `tile: nil` removal). A seed-only id
+    /// that's simply never appeared live is left untouched — see `liveTrackedIds`'s doc comment.
+    private func poll() async {
+        let snapshot = await client.tiles
+        for (pluginId, tile) in snapshot {
+            liveTrackedIds.insert(pluginId)
+            if let data = TileData(from: tile) {
+                known[pluginId] = data
+            } else {
+                known.removeValue(forKey: pluginId)
+            }
+        }
+        for pluginId in liveTrackedIds where snapshot[pluginId] == nil {
+            known.removeValue(forKey: pluginId)
+        }
+        publish()
+    }
+
+    private func publish() {
+        tiles = known.sorted { $0.key < $1.key }.map { PluginTile(pluginId: $0.key, data: $0.value) }
+    }
+
+    /// A tile action button's tap — pushes `tile.action {pluginId, actionId}` to the plugin's own
+    /// live connection. Fire-and-forget from the UI's perspective, same posture as
+    /// `ShortcutRegistry.onFire`'s `shortcutInvoke` call (AppDelegate.swift) — no result to render,
+    /// a failure just means the plugin wasn't connected to receive it.
+    func fireAction(pluginId: String, actionId: String) async {
+        _ = try? await client.tileAction(pluginId: pluginId, actionId: actionId)
+    }
+}
+
+/// The strip itself: a horizontal scroller of plugin tile cards. Adaptive colors only (`.quaternary`
+/// background, `.primary`/`.secondary` text) — same opaque-window idiom as the rest of this pane
+/// (`PluginManagerView`'s own tier badge / status dot rendering).
+struct TilesStripView: View {
+    @ObservedObject var model: TilesStripModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Live Tiles").font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
+            if model.tiles.isEmpty {
+                Text("No live tiles").font(.system(size: 12)).foregroundStyle(.secondary)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 10) {
+                        ForEach(model.tiles) { tile in
+                            tileCard(tile)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+        }
+        .task { await model.start() }
+    }
+
+    private func tileCard(_ tile: TilesStripModel.PluginTile) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 4) {
+                if let icon = tile.data.icon {
+                    Image(systemName: icon).font(.system(size: 12)).foregroundStyle(.secondary)
+                }
+                Text(tile.data.title)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+            }
+            if let value = tile.data.value {
+                Text(value).font(.system(size: 16, weight: .semibold))
+            }
+            if let progress = tile.data.progress {
+                ProgressView(value: min(max(progress, 0), 1))
+            }
+            if !tile.data.actions.isEmpty {
+                HStack(spacing: 8) {
+                    ForEach(tile.data.actions, id: \.id) { action in
+                        Button(action.label) {
+                            Task { await model.fireAction(pluginId: tile.pluginId, actionId: action.id) }
+                        }
+                        .font(.system(size: 11))
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .frame(width: 150, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(.quaternary))
+    }
+}
