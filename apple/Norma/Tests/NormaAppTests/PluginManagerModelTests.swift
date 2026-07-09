@@ -257,7 +257,9 @@ final class PluginManagerModelAsyncTests: XCTestCase {
 
         XCTAssertEqual(model.errorText, "unknown plugin: ghost")
         XCTAssertTrue(model.rows.isEmpty)
-        XCTAssertNil(model.pendingConsent)
+        // Re-targeted from the deleted `pendingConsent` field (Task 2 review fix wave): an
+        // `.unknownPlugin` outcome must not spuriously open the consent sheet either.
+        XCTAssertNil(model.consentSheet)
     }
 
     /// A genuinely-successful action must still end with `errorText == nil` (clearing any stale

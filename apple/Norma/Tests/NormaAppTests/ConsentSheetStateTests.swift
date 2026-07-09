@@ -200,6 +200,20 @@ final class LocatePluginRootTests: XCTestCase {
 
         XCTAssertNil(locatePluginRoot(in: tempDir))
     }
+
+    // Fix wave (Task 2 review, symlink guard): `fileExists` follows symlinks, so a manifest name
+    // that's actually a symlink (pointing anywhere on disk) would otherwise be accepted. The
+    // symlink's TARGET is a real file — `fileExists` on the manifest path is `true` either way, so
+    // this only exercises the guard (vs. a dangling symlink, where `fileExists` alone already
+    // returns `false` and the guard is never reached).
+    func testNilWhenManifestIsASymlink() throws {
+        let realFile = tempDir.appendingPathComponent("real-manifest.json")
+        FileManager.default.createFile(atPath: realFile.path, contents: Data("{}".utf8))
+        let manifestLink = tempDir.appendingPathComponent("norma-plugin.json")
+        try FileManager.default.createSymbolicLink(at: manifestLink, withDestinationURL: realFile)
+
+        XCTAssertNil(locatePluginRoot(in: tempDir))
+    }
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -248,7 +262,9 @@ final class PluginManagerModelConsentTests: XCTestCase {
         XCTAssertEqual(model.consentSheet?.pluginName, "demo")
         XCTAssertEqual(model.consentSheet?.requiredConsents, ["exec"])
         XCTAssertEqual(model.consentSheet?.consentBlock, ["plugin demo requests:", "  exec: mcp: node server.js"])
-        XCTAssertEqual(model.pendingConsent?.name, "demo")
+        // (Deleted `pendingConsent`'s own `?.name` assertion here, Task 2 review fix wave — it
+        // checked strictly less than the three `consentSheet` assertions immediately above, which
+        // already fully cover this outcome.)
     }
 
     /// `confirmConsent()` re-calls `plugin.enable` with `consent:true` for the sheet's plugin —
@@ -275,7 +291,6 @@ final class PluginManagerModelConsentTests: XCTestCase {
         await action
 
         XCTAssertNil(model.consentSheet)
-        XCTAssertNil(model.pendingConsent)
         XCTAssertNil(model.errorText)
     }
 
@@ -289,8 +304,36 @@ final class PluginManagerModelConsentTests: XCTestCase {
         model.cancelConsent()
 
         XCTAssertNil(model.consentSheet)
-        XCTAssertNil(model.pendingConsent)
         XCTAssertEqual(t.sent.count, 1) // hello only
+    }
+
+    /// Fix wave (Task 2 review, consent double-submit guard): a second `confirmConsent()` call
+    /// landing while the first is still in flight (its `plugin.enable` RPC not yet resolved) is a
+    /// no-op — `isConfirmingConsent` guards re-entry, so at most ONE `plugin.enable` RPC is ever
+    /// sent per grant, independent of the view's own `.disabled(busy)` on the button.
+    func testConfirmConsentIgnoresReentryWhileFirstCallInFlight() async throws {
+        let (client, t) = try await connectedClient()
+        let model = PluginManagerModel(client: client)
+        model.consentSheet = ConsentSheetState(pluginName: "demo", consentBlock: ["plugin demo requests:"], requiredConsents: ["exec"])
+
+        async let action1: Void = model.confirmConsent()
+        async let action2: Void = model.confirmConsent()
+
+        await feedWaitUntil { t.sent.count >= 2 }
+        let enableReq = feedLineJSON(t.sent[1])
+        XCTAssertEqual(enableReq["method"] as? String, "plugin.enable")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(enableReq["id"] as! Int),"result":{"status":"running"}}"#)
+
+        await feedWaitUntil { t.sent.count >= 3 }
+        let listReq = feedLineJSON(t.sent[2])
+        t.feed(#"{"jsonrpc":"2.0","id":\#(listReq["id"] as! Int),"result":{"plugins":[]}}"#)
+
+        _ = await (action1, action2)
+
+        // hello + the ONE plugin.enable + its trailing plugins.list refresh — the second
+        // `confirmConsent()` call sent nothing at all.
+        XCTAssertEqual(t.sent.count, 3)
+        XCTAssertNil(model.consentSheet)
     }
 
     /// `install(source:)`'s `.ok` result opens the SAME sheet type — even a plugin needing zero
