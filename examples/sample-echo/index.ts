@@ -32,7 +32,7 @@ import { createPlugin } from "@norma/plugin-sdk";
 let n = 0;
 
 function echoTile(): Record<string, unknown> {
-  return { title: "echo", value: String(n) };
+  return { title: "echo", value: String(n), actions: [{ id: "reset", label: "Reset" }] };
 }
 
 const plugin = createPlugin({
