@@ -200,23 +200,33 @@ func locatePluginRoot(in directory: URL, fileManager: FileManager = .default) ->
 /// unzip, freezing the UI on a large archive. Setting `terminationHandler` BEFORE `run()` and
 /// resuming a continuation from it (rather than blocking on `waitUntilExit()`) means no thread —
 /// MainActor's or otherwise — sits blocked while `/usr/bin/unzip` runs; the caller just suspends.
+///
+/// On failure (either `run()` throwing, or a non-zero exit) `tempDir` is removed here before
+/// rethrowing — the caller never gets a URL to it in that case, so it couldn't clean it up
+/// itself. `installFrom`'s own `defer`-based cleanup only ever has to handle the URL this
+/// function actually returns (extraction succeeded).
 func extractPluginZip(at zipURL: URL, fileManager: FileManager = .default) async throws -> URL {
     let tempDir = fileManager.temporaryDirectory
         .appendingPathComponent("norma-plugin-install-\(UUID().uuidString)", isDirectory: true)
     try fileManager.createDirectory(at: tempDir, withIntermediateDirectories: true)
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-    process.arguments = ["-q", zipURL.path, "-d", tempDir.path]
-    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-        process.terminationHandler = { _ in continuation.resume() }
-        do {
-            try process.run()
-        } catch {
-            process.terminationHandler = nil
-            continuation.resume(throwing: error)
+    do {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        process.arguments = ["-q", zipURL.path, "-d", tempDir.path]
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            process.terminationHandler = { _ in continuation.resume() }
+            do {
+                try process.run()
+            } catch {
+                process.terminationHandler = nil
+                continuation.resume(throwing: error)
+            }
         }
+        guard process.terminationStatus == 0 else { throw PluginInstallError.unzipFailed }
+    } catch {
+        try? fileManager.removeItem(at: tempDir)
+        throw error
     }
-    guard process.terminationStatus == 0 else { throw PluginInstallError.unzipFailed }
     return tempDir
 }
 
