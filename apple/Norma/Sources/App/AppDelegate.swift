@@ -149,11 +149,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// resolves to a log + no-op, never a crash or a half-wired window.
     /// Phase 4d-iii Task 2: `initialPane` lets `openPluginManager()` below reuse this exact body
     /// (same "shared spawn body" posture as `openSessionInNewDetachedWindow`'s own `frame`
-    /// override) instead of duplicating the guard/construction. Only matters for a FRESH window —
-    /// a second invocation while one is already open just refocuses it via `show()` (singleton
-    /// behavior, unchanged), it does NOT re-select the pane on the already-open window.
+    /// override) instead of duplicating the guard/construction.
+    /// Phase 4d-cleanup Task 3 fix 1: a second invocation while one is already open ALSO retargets
+    /// the pane now (`DashboardWindowController.selectPane(_:)`, below) before refocusing via
+    /// `show()` — previously this only refocused the window without ever switching panes, so
+    /// "Manage Plugins…" fired against an already-open Dashboard silently did nothing pane-wise.
     func openDashboard(initialPane: DashboardPane = defaultDashboardPane) {
         if let dashboardWindow {
+            // Phase 4d-cleanup Task 3 fix 1: retarget the pane BEFORE refocusing, so "Manage
+            // Plugins…" on an already-open Dashboard actually lands on the plugin pane instead of
+            // just refocusing whatever pane was already showing (the bug this fixes).
+            dashboardWindow.selectPane(initialPane)
             dashboardWindow.show()
             return
         }
@@ -375,7 +381,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
             }
-            shortcuts.reload(ShortcutSettingsStore.load())
+            // Phase 4d-cleanup Task 3 fix 2: boot time has no editor UI to surface a per-binding
+            // arm failure against (unlike `ShortcutBindingEditorModel.capture`'s `conflictMessage`)
+            // — just log how many failed, same posture as this file's other silent-failure paths.
+            let failedAtBoot = shortcuts.reload(ShortcutSettingsStore.load())
+            if !failedAtBoot.isEmpty {
+                OrbDebug.log("boot: \(failedAtBoot.count) plugin shortcut hotkey(s) failed to arm (key may be in use by another app)")
+            }
             shortcutRegistry = shortcuts
 
             // Task 4 (2f): the panic hotkey/screen-lock observer and the TCC-change poll are

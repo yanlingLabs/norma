@@ -2,6 +2,18 @@ import AppKit
 import Carbon.HIToolbox
 import Foundation
 
+/// Phase 4d-cleanup Task 3 fix 2: the seam `ShortcutBindingEditorModel` calls `reload` through —
+/// lets a unit test inject a fake that scripts a non-empty failed-arm result without touching real
+/// Carbon (`ShortcutRegistry` itself has no dedicated `RegisterEventHotKey` unit tests, same as
+/// `HotkeyTrigger`/`PeripheralProvider` — see `ShortcutRegistryTests.swift`'s own doc comment).
+@MainActor
+protocol ShortcutHotkeyReloading: AnyObject {
+    /// Brings the live registration set to exactly `bindings`; returns the subset of `bindings`
+    /// whose `RegisterEventHotKey` call failed this call (empty = every binding is now armed).
+    @discardableResult
+    func reload(_ bindings: [ShortcutBinding]) -> [ShortcutBinding]
+}
+
 /// Multi-shortcut Carbon hotkey registry (Phase 4d-iii Task 1) — the plugin-shortcut counterpart
 /// to `HotkeyTrigger.shared`'s single summon hotkey and `PeripheralProvider`'s single panic
 /// hotkey. Registers ONE distinct `EventHotKeyRef` per `ShortcutBinding`, keyed by a unique
@@ -9,7 +21,7 @@ import Foundation
 /// owning plugin via `onFire`. Purely additive: never touches either of those two files' own
 /// registrations, which keep their own signatures (`"AIPT"`/`"NmPn"`) and hotKeyRefs untouched.
 @MainActor
-final class ShortcutRegistry {
+final class ShortcutRegistry: ShortcutHotkeyReloading {
     /// Fired on the main queue when one of the registered hotkeys is pressed. `AppDelegate` wires
     /// this straight to NormaKit's `client.shortcutInvoke(pluginId:shortcutId:)`.
     var onFire: ((_ pluginId: String, _ shortcutId: String) -> Void)?
@@ -77,15 +89,21 @@ final class ShortcutRegistry {
     /// currently armed that isn't in the new set, registers whatever's new. Net externally-visible
     /// effect is identical to a full unregister-all-then-register-all — computed via the pure
     /// `reloadDiff` below so bindings that didn't change aren't needlessly torn down and re-armed.
-    func reload(_ bindings: [ShortcutBinding]) {
+    ///
+    /// Phase 4d-cleanup Task 3 fix 2: returns the subset of the newly-registered bindings
+    /// (`diff.toAdd`) whose `RegisterEventHotKey` call failed — a binding that was already armed
+    /// and is unchanged in `bindings` is never re-registered, so it can't newly fail here; a
+    /// binding that previously failed to register was never added to `entries`, so it always shows
+    /// up as "new" (`diff.toAdd`) on the next `reload` that includes it, giving every retry a fair
+    /// shot. Empty return = every binding in `bindings` is now armed.
+    @discardableResult
+    func reload(_ bindings: [ShortcutBinding]) -> [ShortcutBinding] {
         let current = entries.values.map(\.binding)
         let diff = reloadDiff(old: current, new: bindings)
         for binding in diff.toRemove {
             unregister(binding)
         }
-        for binding in diff.toAdd {
-            register(binding)
-        }
+        return diff.toAdd.filter { !register($0) }
     }
 
     /// Full teardown: every armed hotkey unregistered, the shared event handler removed.
@@ -108,7 +126,10 @@ final class ShortcutRegistry {
         entries.removeValue(forKey: id)
     }
 
-    private func register(_ binding: ShortcutBinding) {
+    /// Returns `true` on a successful `RegisterEventHotKey` (recorded in `entries`), `false` on
+    /// failure (nothing recorded — see `reload(_:)`'s doc comment on why that matters for retries).
+    @discardableResult
+    private func register(_ binding: ShortcutBinding) -> Bool {
         if handlerRef == nil {
             var eventSpec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventHotKeyPressed))
             InstallEventHandler(GetApplicationEventTarget(), Self.handler, 1, &eventSpec, nil, &handlerRef)
@@ -120,10 +141,12 @@ final class ShortcutRegistry {
         let status = RegisterEventHotKey(binding.keyCode, binding.modifiers, hotKeyID, GetApplicationEventTarget(), 0, &ref)
         if status == noErr, let ref {
             entries[id] = (ref, binding)
+            return true
         } else {
             // Common culprits: another app holds the same combo, or the OS reserved it as a
             // system shortcut (same note as `HotkeyTrigger`'s own failure log).
             NSLog("[ShortcutRegistry] RegisterEventHotKey failed status=\(status) pluginId=\(binding.pluginId) shortcutId=\(binding.shortcutId) keyCode=\(binding.keyCode) modifiers=\(binding.modifiers)")
+            return false
         }
     }
 }

@@ -159,6 +159,24 @@ final class DashboardTests: XCTestCase {
         XCTAssertEqual(peripheralLeaseAgeText(expiresAt: 10_000, nowMs: 10_000), "expired")
     }
 
+    // MARK: - DashboardSelectionModel (PURE — Phase 4d-cleanup Task 3 fix 1)
+
+    func testDashboardSelectionModelDefaultsToDefaultDashboardPane() {
+        let model = DashboardSelectionModel()
+        XCTAssertEqual(model.selection, defaultDashboardPane)
+    }
+
+    func testDashboardSelectionModelInitialPaneOverridesTheDefault() {
+        let model = DashboardSelectionModel(initialPane: .pluginManager)
+        XCTAssertEqual(model.selection, .pluginManager)
+    }
+
+    func testDashboardSelectionModelSelectionIsSettable() {
+        let model = DashboardSelectionModel()
+        model.selection = .trust
+        XCTAssertEqual(model.selection, .trust)
+    }
+
     // MARK: - DashboardWindowController construction (wiring smoke test)
 
     func testShowCreatesNativeChromeWindowAtFrame() {
@@ -185,6 +203,36 @@ final class DashboardTests: XCTestCase {
         XCTAssertEqual(window.title, "Dashboard")
     }
 
+    /// `selectPane(_:)` retargets the controller's `DashboardSelectionModel` — the mechanism the
+    /// refocus-branch fix below relies on.
+    func testSelectPaneUpdatesTheControllersSelectionModel() {
+        let client = NormaClientTestFactory.make()
+        let directory = SessionDirectory(lister: { [] })
+        let peripheral = PeripheralProvider(client: client)
+        let helperClient = HelperClient()
+        let frame = NSRect(x: 100, y: 80, width: 800, height: 560)
+        let controller = DashboardWindowController(client: client, directory: directory, peripheral: peripheral, helperClient: helperClient, onOpenSessionDetached: { _ in }, frame: frame)
+        defer { controller.close() }
+
+        XCTAssertEqual(controller.selectionForTesting, defaultDashboardPane)
+        controller.selectPane(.pluginManager)
+        XCTAssertEqual(controller.selectionForTesting, .pluginManager)
+    }
+
+    /// A fresh window still seeds its selection model with `initialPane` at construction (the
+    /// non-refocus half of the fix — unchanged behavior, kept as regression coverage).
+    func testFreshWindowSeedsSelectionModelWithInitialPane() {
+        let client = NormaClientTestFactory.make()
+        let directory = SessionDirectory(lister: { [] })
+        let peripheral = PeripheralProvider(client: client)
+        let helperClient = HelperClient()
+        let frame = NSRect(x: 100, y: 80, width: 800, height: 560)
+        let controller = DashboardWindowController(client: client, directory: directory, peripheral: peripheral, helperClient: helperClient, onOpenSessionDetached: { _ in }, frame: frame, initialPane: .pluginManager)
+        defer { controller.close() }
+
+        XCTAssertEqual(controller.selectionForTesting, .pluginManager)
+    }
+
     // MARK: - AppDelegate.openDashboard() singleton wiring
 
     /// Defensive-guard precedent (matches `openSessionInNewDetachedWindow`'s own guard): never
@@ -206,6 +254,26 @@ final class DashboardTests: XCTestCase {
         }
         delegate.openDashboard()
         XCTAssertTrue(delegate.dashboardWindow === first, "a second invocation must reuse the existing controller")
+        delegate.dashboardWindow?.close()
+    }
+
+    /// The regression this fix targets: "Manage Plugins…" (`initialPane: .pluginManager`) fired
+    /// while the Dashboard is ALREADY open must switch the already-open window to that pane, not
+    /// just refocus it while leaving whatever pane was showing untouched.
+    func testOpenDashboardRefocusSwitchesPaneOnAnAlreadyOpenWindow() {
+        let delegate = AppDelegate()
+        XCTAssertTrue(delegate.boot())
+        delegate.openDashboard()
+        guard let first = delegate.dashboardWindow else {
+            XCTFail("openDashboard() must construct a controller when booted")
+            return
+        }
+        XCTAssertEqual(first.selectionForTesting, defaultDashboardPane)
+
+        delegate.openDashboard(initialPane: .pluginManager)
+
+        XCTAssertTrue(delegate.dashboardWindow === first, "a second invocation must reuse the existing controller")
+        XCTAssertEqual(delegate.dashboardWindow?.selectionForTesting, .pluginManager, "refocusing must also retarget the pane")
         delegate.dashboardWindow?.close()
     }
 

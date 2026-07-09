@@ -1,6 +1,30 @@
 import NormaKit
 import SwiftUI
 
+// MARK: - Pure reconcile-eviction helpers (Phase 4d-cleanup Task 3 fix 3) — no `NormaClient`/
+// `Task.sleep` involved, table-tested directly.
+
+/// The reconcile-eviction decision for one tile id in `TilesStripModel.known`. A "live tracked" id
+/// (ever observed in a `client.tiles` poll) is NEVER evicted here regardless of `contribIds` — its
+/// eviction is already handled by `poll()`'s own live-removal branch when the plugin pushes
+/// `tile: nil`. A SEED-ONLY id (declared via `pluginsContrib()` at `seed()` time, never yet seen in
+/// a live poll) is evicted only once it's ALSO absent from a FRESH `pluginsContrib()` snapshot —
+/// the server clears a plugin's contrib entry on disconnect, so seed-only + gone-from-contrib
+/// together mean the plugin that seeded this tile has genuinely disconnected. A seed-only id still
+/// present in the fresh snapshot is just a connected-but-quiet plugin (hasn't pushed a live tile
+/// this session) — kept.
+func shouldEvictSeedOnly(id: String, liveTracked: Set<String>, contribIds: Set<String>) -> Bool {
+    guard !liveTracked.contains(id) else { return false }
+    return !contribIds.contains(id)
+}
+
+/// True on every Nth poll tick (1-indexed: tick `every`, `2*every`, …) — the gate `poll()` uses to
+/// run the (comparatively expensive, RPC-backed) reconcile pass every ~10th tick instead of every
+/// single one. Pure so the cadence itself is testable without a live 500ms sleep loop.
+func isReconcileTick(_ tick: Int, every: Int = 10) -> Bool {
+    every > 0 && tick > 0 && tick % every == 0
+}
+
 /// Task 4 (4d-iii): the Plugin Manager's live tiles strip — seeded from `pluginsContrib()`'s
 /// currently-registered tile per plugin on open, then kept current by POLLING the actor-isolated
 /// `client.tiles` snapshot (NOT a second `for await client.events` consumer). `client.events` is a
@@ -35,6 +59,9 @@ final class TilesStripModel: ObservableObject {
     /// means nothing on its own — it may simply not have pushed anything since this app session's
     /// client connected.
     private var liveTrackedIds: Set<String> = []
+    /// Phase 4d-cleanup Task 3 fix 3: counts `poll()` invocations (NOT wall-clock time) — drives
+    /// `isReconcileTick`'s "every ~10th tick" gate for the seed-only reconcile pass below.
+    private var pollTickCount = 0
 
     init(client: NormaClient) {
         self.client = client
@@ -63,8 +90,14 @@ final class TilesStripModel: ObservableObject {
 
     /// Upserts every id present in the live snapshot (marking it "live tracked" along the way);
     /// evicts a "live tracked" id that's now absent (a genuine `tile: nil` removal). A seed-only id
-    /// that's simply never appeared live is left untouched — see `liveTrackedIds`'s doc comment.
+    /// that's simply never appeared live is left untouched by this part — see `liveTrackedIds`'s
+    /// doc comment — but is periodically swept by `reconcileSeedOnlyTiles()` below (Phase
+    /// 4d-cleanup Task 3 fix 3), since without it a tile seeded from `pluginsContrib()` that never
+    /// once appears in a live poll (e.g. the plugin was already disconnected by the time this
+    /// window opened, or disconnects before ever pushing a tile) would never be evicted at all —
+    /// the live-removal branch just above only ever looks at `liveTrackedIds`.
     private func poll() async {
+        pollTickCount += 1
         let snapshot = await client.tiles
         for (pluginId, tile) in snapshot {
             liveTrackedIds.insert(pluginId)
@@ -77,7 +110,26 @@ final class TilesStripModel: ObservableObject {
         for pluginId in liveTrackedIds where snapshot[pluginId] == nil {
             known.removeValue(forKey: pluginId)
         }
+        if isReconcileTick(pollTickCount) {
+            await reconcileSeedOnlyTiles()
+        }
         publish()
+    }
+
+    /// Runs every ~10th `poll()` tick (~5s at the 500ms cadence in `start()`): fetches a fresh
+    /// `pluginsContrib()` snapshot and evicts any seed-only tile `shouldEvictSeedOnly` says is now
+    /// genuinely gone. A failed fetch (daemon hiccup) is a no-op for this pass — the next tick
+    /// tries again, same fail-soft posture as `seed()`/`fireAction`.
+    private func reconcileSeedOnlyTiles() async {
+        guard let entries = try? await client.pluginsContrib() else { return }
+        let contribIds = Set(entries.map(\.pluginId))
+        let liveTracked = liveTrackedIds
+        // Snapshot the keys first — mutating `known` while iterating its own `.keys` view is
+        // unsafe; iterating a plain `[String]` copy instead lets the loop body evict freely.
+        let idsToCheck = Array(known.keys)
+        for id in idsToCheck where shouldEvictSeedOnly(id: id, liveTracked: liveTracked, contribIds: contribIds) {
+            known.removeValue(forKey: id)
+        }
     }
 
     private func publish() {
