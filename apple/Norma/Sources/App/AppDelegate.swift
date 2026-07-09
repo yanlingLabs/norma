@@ -147,7 +147,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// constructing a second `DashboardWindowController`. Defensive, same posture as
     /// `openSessionInNewDetachedWindow`'s guard: no `appModel`/`peripheralProvider` (never booted)
     /// resolves to a log + no-op, never a crash or a half-wired window.
-    func openDashboard() {
+    /// Phase 4d-iii Task 2: `initialPane` lets `openPluginManager()` below reuse this exact body
+    /// (same "shared spawn body" posture as `openSessionInNewDetachedWindow`'s own `frame`
+    /// override) instead of duplicating the guard/construction. Only matters for a FRESH window —
+    /// a second invocation while one is already open just refocuses it via `show()` (singleton
+    /// behavior, unchanged), it does NOT re-select the pane on the already-open window.
+    func openDashboard(initialPane: DashboardPane = defaultDashboardPane) {
         if let dashboardWindow {
             dashboardWindow.show()
             return
@@ -163,11 +168,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             peripheral: peripheral,
             helperClient: helper,
             onOpenSessionDetached: { [weak self] sid in self?.openSessionInNewDetachedWindow(sid) },
-            frame: centeredDashboardFrame(visibleFrame: visible)
+            frame: centeredDashboardFrame(visibleFrame: visible),
+            initialPane: initialPane
         )
         controller.onClosed = { [weak self] _ in self?.dashboardWindow = nil }
         dashboardWindow = controller
         controller.show()
+    }
+
+    /// Phase 4d-iii Task 2: the menu bar's "Manage Plugins…" entry — opens the SAME singleton
+    /// Dashboard window `openDashboard()` owns, landed on `.pluginManager` when a fresh window is
+    /// spawned (mirrors that method's own doc comment on the refocus-vs-fresh-window distinction).
+    func openPluginManager() {
+        openDashboard(initialPane: .pluginManager)
     }
 
     @discardableResult
@@ -423,6 +436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             openCli: { [weak self] in self?.cliLauncher.openCli() },
             openNormaApp: { [weak self] in self?.openStandaloneNormaWindow() },
             openDashboard: { [weak self] in self?.openDashboard() },
+            openPluginManager: { [weak self] in self?.openPluginManager() },
             panic: { [weak peripheral] in peripheral?.panic() },
             quit: { NSApp.terminate(nil) }
         )

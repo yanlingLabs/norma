@@ -52,7 +52,10 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
     /// Test-only read-through, same convention as `DetachedWindowController.windowForTesting`.
     var windowForTesting: NSWindow? { window }
 
-    init(client: NormaClient, directory: SessionDirectory, peripheral: PeripheralProvider, helperClient: HelperClient, onOpenSessionDetached: @escaping (String) -> Void, frame: NSRect) {
+    /// Phase 4d-iii Task 2: `initialPane` defaults to `defaultDashboardPane` so the pre-existing
+    /// "Dashboard…" call site (`AppDelegate.openDashboard`) is unaffected; the new "Manage
+    /// Plugins…" entry point passes `.pluginManager` instead — see `AppDelegate.openPluginManager`.
+    init(client: NormaClient, directory: SessionDirectory, peripheral: PeripheralProvider, helperClient: HelperClient, onOpenSessionDetached: @escaping (String) -> Void, frame: NSRect, initialPane: DashboardPane = defaultDashboardPane) {
         let window = NSWindow(
             contentRect: frame,
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -74,6 +77,11 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
 
         window.delegate = self
 
+        // Phase 4d-iii Task 2: constructed fresh here (not passed in like `peripheral`/
+        // `helperClient`, which outlive any single dashboard window) — the plugin list has no
+        // other owner across the app's lifetime, and `PluginManagerView.task` refreshes it on
+        // every appearance anyway, so a fresh model per window-open is the simplest correct thing.
+        let pluginManager = PluginManagerModel(client: client)
         let wiring = DashboardWiring(
             directory: directory,
             onOpenSessionDetached: onOpenSessionDetached,
@@ -82,9 +90,10 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
             trustList: { try await client.trustList() },
             trustRemove: { try await client.trustRemove(path: $0) },
             peripheral: peripheral,
-            helperClient: helperClient
+            helperClient: helperClient,
+            pluginManager: pluginManager
         )
-        window.contentView = NSHostingView(rootView: DashboardView(wiring: wiring))
+        window.contentView = NSHostingView(rootView: DashboardView(wiring: wiring, initialPane: initialPane))
         window.setFrame(frame, display: true)
     }
 

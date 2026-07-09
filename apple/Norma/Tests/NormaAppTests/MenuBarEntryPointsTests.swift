@@ -18,6 +18,7 @@ final class MenuBarEntryPointsTests: XCTestCase {
         openCli: @escaping () -> Void = {},
         openNormaApp: @escaping () -> Void = {},
         openDashboard: @escaping () -> Void = {},
+        openPluginManager: @escaping () -> Void = {},
         panic: @escaping () -> Void = {}
     ) -> MenuBarController {
         MenuBarController(
@@ -27,6 +28,7 @@ final class MenuBarEntryPointsTests: XCTestCase {
             openCli: openCli,
             openNormaApp: openNormaApp,
             openDashboard: openDashboard,
+            openPluginManager: openPluginManager,
             panic: panic,
             quit: {}
         )
@@ -65,7 +67,7 @@ final class MenuBarEntryPointsTests: XCTestCase {
 
     // MARK: - Task 5 (2f-ii): "Dashboard…" — same section, mirrors Open CLI/Open Norma App exactly.
 
-    func testMenuContainsDashboardRightAfterOpenNormaAppThenPreQuitSeparator() {
+    func testMenuContainsDashboardRightAfterOpenNormaAppThenPluginManagerThenPreQuitSeparator() {
         let controller = makeController()
         controller.install()
 
@@ -74,15 +76,19 @@ final class MenuBarEntryPointsTests: XCTestCase {
 
         guard let appIdx = titles.firstIndex(of: "Open Norma App"),
               let dashboardIdx = titles.firstIndex(of: "Dashboard…"),
+              let pluginManagerIdx = titles.firstIndex(of: "Manage Plugins…"),
               let quitIdx = titles.firstIndex(of: "Quit Norma") else {
-            XCTFail("expected Open Norma App, Dashboard…, and Quit Norma present, got \(titles)")
+            XCTFail("expected Open Norma App, Dashboard…, Manage Plugins…, and Quit Norma present, got \(titles)")
             return
         }
 
         XCTAssertEqual(dashboardIdx, appIdx + 1, "Dashboard… must be adjacent to Open Norma App, no separator between them")
-        // The pre-existing pre-Quit separator is preserved between Dashboard… and Quit Norma.
-        XCTAssertEqual(quitIdx, dashboardIdx + 2)
-        XCTAssertTrue(items[dashboardIdx + 1].isSeparatorItem)
+        // Phase 4d-iii Task 2: "Manage Plugins…" is adjacent to Dashboard…, same posture as
+        // Dashboard… itself being adjacent to Open Norma App — no separator between them either.
+        XCTAssertEqual(pluginManagerIdx, dashboardIdx + 1, "Manage Plugins… must be adjacent to Dashboard…, no separator between them")
+        // The pre-existing pre-Quit separator is preserved between Manage Plugins… and Quit Norma.
+        XCTAssertEqual(quitIdx, pluginManagerIdx + 2)
+        XCTAssertTrue(items[pluginManagerIdx + 1].isSeparatorItem)
     }
 
     func testDashboardItemFiresInjectedClosure() {
@@ -98,6 +104,37 @@ final class MenuBarEntryPointsTests: XCTestCase {
         XCTAssertEqual(fired, 1)
     }
 
+    func testPluginManagerItemFiresInjectedClosure() {
+        var fired = 0
+        let controller = makeController(openPluginManager: { fired += 1 })
+        controller.install()
+
+        let item = controller.pluginManagerItem
+        XCTAssertNotNil(item.target)
+        XCTAssertNotNil(item.action)
+        NSApp.sendAction(item.action!, to: item.target, from: item)
+
+        XCTAssertEqual(fired, 1)
+    }
+
+    /// Firing "Manage Plugins…" must never fire "Dashboard…" (and vice versa) — same independence
+    /// guarantee as `testOpenCliAndOpenNormaAppClosuresAreIndependent`.
+    func testDashboardAndPluginManagerClosuresAreIndependent() {
+        var dashboardFired = 0
+        var pluginManagerFired = 0
+        let controller = makeController(
+            openDashboard: { dashboardFired += 1 },
+            openPluginManager: { pluginManagerFired += 1 }
+        )
+        controller.install()
+
+        let pluginManagerItem = controller.pluginManagerItem
+        NSApp.sendAction(pluginManagerItem.action!, to: pluginManagerItem.target, from: pluginManagerItem)
+
+        XCTAssertEqual(pluginManagerFired, 1)
+        XCTAssertEqual(dashboardFired, 0)
+    }
+
     func testInstallIsIdempotentForNewItems() {
         // Matches install()'s existing `guard statusItem == nil else { return }` idempotence —
         // a second install() call must not duplicate the new items either.
@@ -108,6 +145,7 @@ final class MenuBarEntryPointsTests: XCTestCase {
         XCTAssertEqual(titles.filter { $0 == "Open CLI" }.count, 1)
         XCTAssertEqual(titles.filter { $0 == "Open Norma App" }.count, 1)
         XCTAssertEqual(titles.filter { $0 == "Dashboard…" }.count, 1)
+        XCTAssertEqual(titles.filter { $0 == "Manage Plugins…" }.count, 1)
     }
 
     // MARK: - Closure firing
