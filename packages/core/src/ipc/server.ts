@@ -1,4 +1,4 @@
-import { chmodSync } from "node:fs";
+import { chmodSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import {
@@ -242,23 +242,61 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
   // start/stop against the SAME PluginSupervisor `plugins.list`/`plugin.restart` already use.
   // -----------------------------------------------------------------------------------------
 
+  // Phase 4d-cleanup Task 1: `livePlugins()` used to re-derive a brand-new `PluginStore().list()`
+  // (readdirSync of the plugins dir + a `loadManifest` per plugin) on EVERY call — including every
+  // consented `hardware.request` (a hot path: one call per plugin tool invocation that touches
+  // hardware), not just the plugin-lifecycle RPCs it exists for. Cache the derived list, keyed on
+  // the mtimeMs of settings.json + the plugins dir — every lifecycle RPC below writes settings.json
+  // (pluginsInstall additionally creates a new dir entry under plugins/, bumping ITS mtime too), so
+  // a key mismatch reliably detects any settings/install/remove change and forces a re-derive,
+  // preserving the 4d-ii "applied HOT, no restart" staleness fix. `statSync(...).mtimeMs` has only
+  // whole-millisecond resolution, so two writes inside the same millisecond could in principle
+  // alias onto an unchanged key — rather than rely on that granularity alone, every lifecycle RPC
+  // handler that writes ALSO calls `invalidateLivePluginsCache()` explicitly at the point it
+  // mutates, making the mtime key a fast-path/fallback guard, not the sole one.
+  let livePluginsCache: { key: string; list: PluginInfo[] } | null = null;
+
+  function statMtimeOrZero(path: string): number {
+    try { return statSync(path).mtimeMs; } catch { return 0; } // missing file/dir -> key component 0
+  }
+
+  /** The cache key: settings.json's mtime (every lifecycle write touches it) + the plugins dir's
+   *  mtime (install/remove touch it — enable/disable/setConsent don't, but they always write
+   *  settings.json, which is enough on its own to change this key). */
+  function livePluginsCacheKey(normaHome: string): string {
+    return `${statMtimeOrZero(join(normaHome, "settings.json"))}:${statMtimeOrZero(join(normaHome, "plugins"))}`;
+  }
+
+  /** Called at the end of every plugin-lifecycle RPC handler that mutates settings.json or the
+   *  plugins directory (pluginsInstall/pluginEnable/pluginDisable/pluginRemove/pluginSetConsent) —
+   *  see the mtime-aliasing note above for why this explicit invalidation exists alongside the
+   *  mtime key rather than instead of it. */
+  function invalidateLivePluginsCache(): void {
+    livePluginsCache = null;
+  }
+
   /** A fresh, settings-current view of installed plugins — unlike `opts.plugins` (its
    *  `enabled`/`disabled`/`consents` deps are a snapshot captured once at daemon boot and never
-   *  updated), this re-reads settings.json on every call so a `plugin.enable`/`disable`/
+   *  updated), this re-reads settings.json on every CACHE-MISS call so a `plugin.enable`/`disable`/
    *  `setConsent` written moments ago — by this task's own RPCs, or a concurrent `norma plugin
    *  ...` CLI invocation — is reflected immediately, without a daemon restart (the whole point of
    *  this task). Falls back to the boot-time `opts.plugins` when `normaHome` isn't wired (keeps
    *  every pre-existing test that passes a bare `plugins:` PluginStore, with no `normaHome`,
-   *  working unchanged) or when settings.json can't be read (defensive — never throws). */
+   *  working unchanged) or when settings.json can't be read (defensive — never throws); neither
+   *  fallback path is cached (nothing stable to key on). */
   function livePlugins(): PluginInfo[] {
     if (!opts.normaHome) return opts.plugins?.list() ?? [];
+    const key = livePluginsCacheKey(opts.normaHome);
+    if (livePluginsCache && livePluginsCache.key === key) return livePluginsCache.list;
     let settings: Settings;
     try {
       settings = loadSettings(join(opts.normaHome, "settings.json"));
     } catch {
       return opts.plugins?.list() ?? [];
     }
-    return new PluginStore({ normaHome: opts.normaHome, plugins: settings.plugins, consents: settings.plugins?.consents }).list();
+    const list = new PluginStore({ normaHome: opts.normaHome, plugins: settings.plugins, consents: settings.plugins?.consents }).list();
+    livePluginsCache = { key, list };
+    return list;
   }
 
   /** `plugin.enable`'s hot-apply START — spawns a Tier-2 (platform, spawn-eligible) plugin's
@@ -805,6 +843,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
           if (message.includes("already exists")) return { code: "already_installed", name };
           return { code: "invalid_source" }; // no manifest, invalid/traversal name, unreadable source, ...
         }
+        invalidateLivePluginsCache(); // installFromDir just created a new plugins/<name> dir
         const info = livePlugins().find((pl) => pl.name === installed.name);
         return {
           ok: true,
@@ -830,6 +869,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
           ? applyFreshPluginConsent(() => loadSettings(settingsPath), p.name, info.requiredConsents, Date.now())
           : setPluginEnabled(loadSettings(settingsPath), p.name, true);
         saveSettings(settingsPath, settings);
+        invalidateLivePluginsCache();
         const updated = livePlugins().find((pl) => pl.name === p.name) ?? info;
         return { ok: true, status: hotApplyStart(updated) };
       }
@@ -843,6 +883,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         // design spec — lifecycle.ts's stripPluginConsents doc, settings.ts:38-40): re-enabling
         // a disabled plugin must require consenting again, so strip its consent record here too.
         saveSettings(settingsPath, stripPluginConsents(setPluginEnabled(loadSettings(settingsPath), p.name, false), p.name));
+        invalidateLivePluginsCache();
         hotApplyStop(p.name);
         return { ok: true };
       }
@@ -861,6 +902,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         // NOT swallowed — it propagates as an INTERNAL error rather than silently persisting a
         // "removed" settings state while the directory is still on disk.
         saveSettings(settingsPath, settings);
+        invalidateLivePluginsCache();
         return { ok: true };
       }
       case METHODS.pluginSetConsent: {
@@ -870,6 +912,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         if (!opts.normaHome) throw new RpcFailure(ERR.INTERNAL, "plugin.setConsent is not available on this server (no normaHome configured)");
         const settingsPath = join(opts.normaHome, "settings.json");
         saveSettings(settingsPath, grantPluginConsents(loadSettings(settingsPath), p.name, p.classes, Date.now()));
+        invalidateLivePluginsCache();
         return { ok: true };
       }
 

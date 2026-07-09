@@ -323,6 +323,77 @@ export class PluginSupervisor {
     }
   }
 
+  /** Shared read-pidfile → parse → alive-check → lstart-identity-verify ladder — the common core
+   *  of `reclaimOrphans` (adopts a verified orphan) and `sweepOrphans` (terminates one), extracted
+   *  so the two verification ladders (previously ~45 near-identical lines each) can't drift apart.
+   *  Every failure mode along the way is a fail-safe "clean up the stale/corrupt/unverifiable PID
+   *  file, never signal a PID we can't positively identify as ours" — see `reclaimOrphans`'s
+   *  PID-REUSE HARDENING note below for why. `logPrefix` is folded into the log line only, so each
+   *  call site's existing log text stays byte-identical (`reclaimOrphans` passes `""`; `sweepOrphans`
+   *  passes `"sweepOrphans — "`, matching what each already logged before this refactor) — this is
+   *  a pure extraction, not a behavior change.
+   *
+   *  Returns:
+   *   - `"skip"` — no PID file on disk at all; nothing to reclaim or sweep, nothing logged (matches
+   *     both original bare `continue`s on a `readFileSync` failure).
+   *   - `"cleaned"` — a PID file existed but failed verification (corrupt, dead, unverifiable, or a
+   *     start-time mismatch); already removed via `removePidFile`, reason already logged.
+   *   - `{ pid }` — genuinely verified: same pid, same recorded start time as the live process. The
+   *     PID file is left ON DISK either way — the caller decides its fate (`reclaimOrphans` adopts
+   *     the running process and keeps tracking it, never touching the file; `sweepOrphans`
+   *     terminates the process and removes the file itself), exactly as each did before this
+   *     extraction. */
+  private verifyOrphan(id: string, logPrefix: string): { pid: number } | "cleaned" | "skip" {
+    let raw: string;
+    try {
+      raw = readFileSync(this.pidFilePath(id), "utf8");
+    } catch {
+      return "skip"; // no PID file on disk — nothing to reclaim/sweep
+    }
+
+    const parsed = parsePidFile(raw);
+    if (!parsed) {
+      this.removePidFile(id);
+      this.log(`plugin ${id}: ${logPrefix}unreadable/corrupt PID file removed (fail-safe, no signal sent)`);
+      return "cleaned";
+    }
+    const { pid } = parsed;
+
+    if (!this.isAliveFn(pid)) {
+      this.removePidFile(id);
+      this.log(`plugin ${id}: ${logPrefix}stale PID file removed (pid ${pid} not alive)`);
+      return "cleaned";
+    }
+
+    // Live PID — but liveness alone never proves identity (PID reuse). Verify start time.
+    const actualStartedAt = this.processStartedAtFn(pid);
+    if (parsed.startedAt === null) {
+      // Legacy bare-PID file (pre-fix) or a JSON file this core itself failed to stamp at spawn
+      // time — unverifiable either way. Fail safe: never signal a PID we can't confirm is ours.
+      this.removePidFile(id);
+      this.log(`plugin ${id}: ${logPrefix}pid ${pid} is alive but unverifiable (no recorded start time — legacy/corrupt PID file) — removed without signalling (fail-safe)`);
+      return "cleaned";
+    }
+    if (actualStartedAt === null) {
+      // Can't read the live process's start time right now (ps unavailable/erroring) — no basis
+      // for comparison, so don't guess. Fail safe: never signal.
+      this.removePidFile(id);
+      this.log(`plugin ${id}: ${logPrefix}cannot verify pid ${pid} identity (start-time check unavailable) — removed without signalling (fail-safe)`);
+      return "cleaned";
+    }
+    if (actualStartedAt !== parsed.startedAt) {
+      // Recorded vs. actual start time mismatch — the OS almost certainly recycled this PID to
+      // an unrelated process since our plugin last ran. Never signal it.
+      this.removePidFile(id);
+      this.log(`plugin ${id}: ${logPrefix}pid ${pid} start time mismatch (recorded "${parsed.startedAt}", actual "${actualStartedAt}") — PID reuse suspected, removed without signalling`);
+      return "cleaned";
+    }
+
+    // Verified: same pid, same recorded start time as the live process — this is genuinely our
+    // orphaned plugin process.
+    return { pid };
+  }
+
   /** Boot-time orphan reclaim (design spec §3): for each plugin, if `<runDir>/plugins/<id>.pid`
    *  names a still-alive process that VERIFIES as the same process we spawned, adopt it into a
    *  "starting" runtime and give it the SAME re-registration window a fresh spawn gets
@@ -353,50 +424,9 @@ export class PluginSupervisor {
     for (const config of plugins) {
       if (this.runtimes.has(config.id)) continue;
 
-      let raw: string;
-      try {
-        raw = readFileSync(this.pidFilePath(config.id), "utf8");
-      } catch {
-        continue; // no PID file on disk — nothing to reclaim
-      }
-
-      const parsed = parsePidFile(raw);
-      if (!parsed) {
-        this.removePidFile(config.id);
-        this.log(`plugin ${config.id}: unreadable/corrupt PID file removed (fail-safe, no signal sent)`);
-        continue;
-      }
-      const { pid } = parsed;
-
-      if (!this.isAliveFn(pid)) {
-        this.removePidFile(config.id);
-        this.log(`plugin ${config.id}: stale PID file removed (pid ${pid} not alive)`);
-        continue;
-      }
-
-      // Live PID — but liveness alone never proves identity (PID reuse). Verify start time.
-      const actualStartedAt = this.processStartedAtFn(pid);
-      if (parsed.startedAt === null) {
-        // Legacy bare-PID file (pre-fix) or a JSON file this core itself failed to stamp at spawn
-        // time — unverifiable either way. Fail safe: never signal a PID we can't confirm is ours.
-        this.removePidFile(config.id);
-        this.log(`plugin ${config.id}: pid ${pid} is alive but unverifiable (no recorded start time — legacy/corrupt PID file) — removed without signalling (fail-safe)`);
-        continue;
-      }
-      if (actualStartedAt === null) {
-        // Can't read the live process's start time right now (ps unavailable/erroring) — no basis
-        // for comparison, so don't guess. Fail safe: never signal.
-        this.removePidFile(config.id);
-        this.log(`plugin ${config.id}: cannot verify pid ${pid} identity (start-time check unavailable) — removed without signalling (fail-safe)`);
-        continue;
-      }
-      if (actualStartedAt !== parsed.startedAt) {
-        // Recorded vs. actual start time mismatch — the OS almost certainly recycled this PID to
-        // an unrelated process since our plugin last ran. Never signal it.
-        this.removePidFile(config.id);
-        this.log(`plugin ${config.id}: pid ${pid} start time mismatch (recorded "${parsed.startedAt}", actual "${actualStartedAt}") — PID reuse suspected, removed without signalling`);
-        continue;
-      }
+      const verified = this.verifyOrphan(config.id, "");
+      if (verified === "skip" || verified === "cleaned") continue;
+      const { pid } = verified;
 
       // Verified: same pid, same recorded start time as the live process — this is genuinely our
       // orphaned plugin process. Adopt it exactly as before this hardening fix.
@@ -453,45 +483,9 @@ export class PluginSupervisor {
       if (eligible.has(id)) continue; // still spawn-eligible — startAll/reclaimOrphans owns this one
       if (this.runtimes.has(id)) continue; // already tracked (defensive — sweep runs before startAll)
 
-      let raw: string;
-      try {
-        raw = readFileSync(this.pidFilePath(id), "utf8");
-      } catch {
-        continue; // gone already
-      }
-
-      const parsed = parsePidFile(raw);
-      if (!parsed) {
-        this.removePidFile(id);
-        this.log(`plugin ${id}: sweepOrphans — unreadable/corrupt PID file removed (fail-safe, no signal sent)`);
-        continue;
-      }
-      const { pid } = parsed;
-
-      if (!this.isAliveFn(pid)) {
-        this.removePidFile(id);
-        this.log(`plugin ${id}: sweepOrphans — stale PID file removed (pid ${pid} not alive)`);
-        continue;
-      }
-
-      // Live PID for a plugin that's no longer spawn-eligible — but liveness alone never proves
-      // identity (PID reuse). Same verification `reclaimOrphans` performs before ever adopting.
-      const actualStartedAt = this.processStartedAtFn(pid);
-      if (parsed.startedAt === null) {
-        this.removePidFile(id);
-        this.log(`plugin ${id}: sweepOrphans — pid ${pid} is alive but unverifiable (no recorded start time — legacy/corrupt PID file) — removed without signalling (fail-safe)`);
-        continue;
-      }
-      if (actualStartedAt === null) {
-        this.removePidFile(id);
-        this.log(`plugin ${id}: sweepOrphans — cannot verify pid ${pid} identity (start-time check unavailable) — removed without signalling (fail-safe)`);
-        continue;
-      }
-      if (actualStartedAt !== parsed.startedAt) {
-        this.removePidFile(id);
-        this.log(`plugin ${id}: sweepOrphans — pid ${pid} start time mismatch (recorded "${parsed.startedAt}", actual "${actualStartedAt}") — PID reuse suspected, removed without signalling`);
-        continue;
-      }
+      const verified = this.verifyOrphan(id, "sweepOrphans — ");
+      if (verified === "skip" || verified === "cleaned") continue;
+      const { pid } = verified;
 
       // Verified: genuinely our orphaned process, left over from before this plugin was disabled
       // or removed. Terminate it and clean up the file.

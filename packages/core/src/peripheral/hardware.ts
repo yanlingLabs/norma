@@ -156,8 +156,14 @@ export class HardwareBroker {
 
   /** Audit a denied hardware request (consent gate rejection before broker.request() is called).
    *  Writes the same uniform `{kind:"hardware", verb, requester, outcome}` shape as the broker's
-   *  internal auditHardware method — used by the ipc consent handler on both early-return paths
-   *  (missing permission class, missing hardware consent, and unknown verb that bypasses consent). */
+   *  internal auditHardware method — used by the ipc consent handler (ipc/server.ts's
+   *  hardware.request case) on its two `"consent_denied"` early-return paths: the plugin's manifest
+   *  doesn't declare the permission class the verb needs, or it does but the plugin hasn't been
+   *  granted "hardware" consent yet. `code: "unknown_verb"` is accepted here for API completeness
+   *  (and so it's directly testable) but is never actually reached from the ipc handler — an
+   *  unrecognized verb never gets this far in the first place, because `request()` above checks
+   *  `verbClass(req.verb)` itself and self-audits the `unknown_verb` outcome via `auditHardware`
+   *  before this method would ever be called for it. */
   auditDenied(req: { requester: HardwareRequester; verb: string; code: "consent_denied" | "unknown_verb"; missing?: string }): void {
     const outcome: HardwareRequestError =
       req.code === "consent_denied"

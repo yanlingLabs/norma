@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, realpathSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1333,6 +1333,35 @@ describe("daemon IPC", () => {
   });
 
   // -----------------------------------------------------------------------------------------
+  // Phase 4d-cleanup Task 2: PluginSupervisor construction + the boot-time orphan-PID sweep are
+  // hoisted OUT of `if (agentProvider)` in daemon.ts — a daemon booted with the agent DISABLED
+  // (no provider configured, or a test injecting `agentProvider: null`, as here) must still reclaim
+  // stale <runDir>/plugins/<id>.pid files left by a previous run, not just a daemon with an active
+  // provider. Exercises the REAL `startDaemon` wiring end to end (no injected fakes for
+  // isAlivePid/spawn — daemon.ts's own PluginSupervisor construction doesn't expose that seam), so
+  // the PID file uses a definitely-dead pid: the sweep's "not alive" branch removes it without ever
+  // needing the `ps -o lstart=` identity check, so this doesn't depend on any real process at all.
+  // -----------------------------------------------------------------------------------------
+  test("Phase 4d-cleanup Task 2: a daemon booted with NO agent provider still sweeps a stale orphaned plugin PID file at boot", async () => {
+    const home = mkdtempSync(join(tmpdir(), "norma-daemon-no-provider-sweep-"));
+    const pidDir = join(home, "run", "plugins");
+    mkdirSync(pidDir, { recursive: true });
+    const pidFile = join(pidDir, "ghost-plugin.pid");
+    // A definitely-dead pid (no plugin named "ghost-plugin" is installed at all, so it's not in
+    // the spawn-eligible set regardless — this is exactly the "plugin disabled/removed since last
+    // run" case sweepOrphans exists for).
+    writeFileSync(pidFile, JSON.stringify({ pid: 999999, pluginId: "ghost-plugin", startedAt: "Thu Jan  1 00:00:00 1970" }));
+    expect(existsSync(pidFile)).toBe(true);
+
+    const secrets = new FileSecretStore(join(home, "test-secrets"));
+    daemon = await startDaemon({ home, secrets, agentProvider: null }); // no provider — the case under test
+
+    // The sweep ran synchronously, before startDaemon's returned promise resolves (it's hoisted
+    // ahead of every `await` gated on agentProvider) — no polling/waitFor needed.
+    expect(existsSync(pidFile)).toBe(false);
+  });
+
+  // -----------------------------------------------------------------------------------------
   // Peripheral lease v1 (Phase 2f). `boot()` wires the REAL PeripheralBroker/AuditLog/
   // ProviderLink daemon.ts builds — these tests exercise the production wiring, not fakes.
   // -----------------------------------------------------------------------------------------
@@ -2581,6 +2610,39 @@ describe("daemon IPC", () => {
       await c.hello(srv.harnessToken, "cli-setconsent-unknown");
       const res = await c.request(METHODS.pluginSetConsent, { name: "ghost", classes: ["exec"] });
       expect(res.result).toEqual({ code: "unknown_plugin" });
+      c.close(); srv.stop();
+    });
+
+    // -----------------------------------------------------------------------------------------
+    // Phase 4d-cleanup Task 1: livePlugins() now caches the derived PluginInfo[] keyed on
+    // settings.json's + the plugins dir's mtime, instead of re-deriving a fresh PluginStore().list()
+    // (readdirSync + per-plugin loadManifest) on EVERY call — a hot path for `hardware.request`.
+    // This proves the cache-HIT path: two `plugins.list` calls with no settings/plugin-dir write in
+    // between only derive once. Not tautological — it spies on `node:fs`'s `readdirSync`, the REAL
+    // I/O `PluginStore.list()` performs (agent/plugins.ts:79), and counts calls against the
+    // PLUGINS ROOT specifically (list() also readdirSync's each plugin's own skills/ subdir, so a
+    // raw total call count would over-count per plugin fixture) — if the cache were a no-op (always
+    // re-deriving), this would see 2 root-dir listings, not 1.
+    // -----------------------------------------------------------------------------------------
+    test("livePlugins() cache-hit: two plugins.list calls with no settings/plugin-dir write between them only derive (readdirSync the plugins root) ONCE", async () => {
+      const srv = await bootLifecycleServer();
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "cache-hit-check");
+
+      const fs = await import("node:fs");
+      const spy = spyOn(fs, "readdirSync");
+      try {
+        const first = await c.request(METHODS.pluginsList, {});
+        expect(first.result.plugins).toHaveLength(1); // the "runner" fixture bootLifecycleServer seeds
+        const second = await c.request(METHODS.pluginsList, {});
+        expect(second.result).toEqual(first.result); // same settings-current view either way
+
+        const rootListings = spy.mock.calls.filter((args) => args[0] === srv.pluginsRoot);
+        expect(rootListings).toHaveLength(1); // the second call was served from cache — no re-derive
+      } finally {
+        spy.mockRestore();
+      }
+
       c.close(); srv.stop();
     });
 
