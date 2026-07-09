@@ -254,4 +254,188 @@ final class MethodWrapperTests: XCTestCase {
         }
         XCTAssertEqual(m.seq, 9)
     }
+
+    // MARK: - Phase 4d-ii Task 3: plugin lifecycle + contrib + shortcut/tile-action wrappers
+
+    func testPluginsInstallOutcomes() async throws {
+        let (client, t) = try await connected()
+
+        let (req1, ok) = try await roundTrip(t, sentIndex: 1,
+            result: #"{"ok":true,"name":"sample-echo","requiredConsents":["network"],"hasMcp":false,"consentBlock":["plugin sample-echo requests:","- network access"]}"#
+        ) { try await client.pluginsInstall(source: "/tmp/sample-echo", name: "sample-echo") }
+        XCTAssertEqual(req1["method"] as? String, "plugins.install")
+        XCTAssertEqual((req1["params"] as? [String: Any])?["source"] as? String, "/tmp/sample-echo")
+        XCTAssertEqual((req1["params"] as? [String: Any])?["name"] as? String, "sample-echo")
+        XCTAssertEqual(ok, .ok(name: "sample-echo", requiredConsents: ["network"], hasMcp: false, consentBlock: ["plugin sample-echo requests:", "- network access"]))
+
+        let (req2, invalid) = try await roundTrip(t, sentIndex: 2, result: #"{"code":"invalid_source"}"#) {
+            try await client.pluginsInstall(source: "/nonexistent")
+        }
+        XCTAssertNil((req2["params"] as? [String: Any])?["name"]) // omitted `name` param dropped, not sent as null
+        XCTAssertEqual(invalid, .invalidSource)
+
+        let (_, already) = try await roundTrip(t, sentIndex: 3, result: #"{"code":"already_installed","name":"sample-echo"}"#) {
+            try await client.pluginsInstall(source: "/tmp/sample-echo")
+        }
+        XCTAssertEqual(already, .alreadyInstalled(name: "sample-echo"))
+    }
+
+    func testPluginEnableOutcomesIncludingNeedsConsent() async throws {
+        let (client, t) = try await connected()
+
+        let (req1, needsConsent) = try await roundTrip(t, sentIndex: 1,
+            result: #"{"code":"needs_consent","requiredConsents":["network"],"consentBlock":["plugin sample-echo requests:","- network access"]}"#
+        ) { try await client.pluginEnable(name: "sample-echo") }
+        XCTAssertEqual(req1["method"] as? String, "plugin.enable")
+        XCTAssertNil((req1["params"] as? [String: Any])?["consent"])
+        XCTAssertEqual(needsConsent, .needsConsent(requiredConsents: ["network"], consentBlock: ["plugin sample-echo requests:", "- network access"]))
+
+        let (req2, ok) = try await roundTrip(t, sentIndex: 2, result: #"{"ok":true,"status":"running"}"#) {
+            try await client.pluginEnable(name: "sample-echo", consent: true)
+        }
+        XCTAssertEqual((req2["params"] as? [String: Any])?["consent"] as? Bool, true)
+        XCTAssertEqual(ok, .ok(status: "running"))
+
+        let (_, unknown) = try await roundTrip(t, sentIndex: 3, result: #"{"code":"unknown_plugin"}"#) {
+            try await client.pluginEnable(name: "ghost")
+        }
+        XCTAssertEqual(unknown, .unknownPlugin)
+    }
+
+    func testPluginDisableRemoveSetConsentOutcomes() async throws {
+        let (client, t) = try await connected()
+
+        let (req1, disableOk) = try await roundTrip(t, sentIndex: 1, result: #"{"ok":true}"#) {
+            try await client.pluginDisable(name: "sample-echo")
+        }
+        XCTAssertEqual(req1["method"] as? String, "plugin.disable")
+        XCTAssertEqual(disableOk, .ok)
+
+        let (_, disableUnknown) = try await roundTrip(t, sentIndex: 2, result: #"{"code":"unknown_plugin"}"#) {
+            try await client.pluginDisable(name: "ghost")
+        }
+        XCTAssertEqual(disableUnknown, .unknownPlugin)
+
+        let (req3, removeOk) = try await roundTrip(t, sentIndex: 3, result: #"{"ok":true}"#) {
+            try await client.pluginRemove(name: "sample-echo")
+        }
+        XCTAssertEqual(req3["method"] as? String, "plugin.remove")
+        XCTAssertEqual(removeOk, .ok)
+
+        let (req4, setConsentOk) = try await roundTrip(t, sentIndex: 4, result: #"{"ok":true}"#) {
+            try await client.pluginSetConsent(name: "sample-echo", classes: ["network", "filesystem"])
+        }
+        XCTAssertEqual(req4["method"] as? String, "plugin.setConsent")
+        XCTAssertEqual((req4["params"] as? [String: Any])?["classes"] as? [String], ["network", "filesystem"])
+        XCTAssertEqual(setConsentOk, .ok)
+    }
+
+    func testShortcutInvokeAndTileActionOutcomes() async throws {
+        let (client, t) = try await connected()
+
+        let (req1, ok) = try await roundTrip(t, sentIndex: 1, result: #"{"ok":true}"#) {
+            try await client.shortcutInvoke(pluginId: "sample-echo", shortcutId: "toggle")
+        }
+        XCTAssertEqual(req1["method"] as? String, "shortcut.invoke")
+        XCTAssertEqual((req1["params"] as? [String: Any])?["shortcutId"] as? String, "toggle")
+        XCTAssertEqual(ok, .ok)
+
+        let (_, notConnected) = try await roundTrip(t, sentIndex: 2, result: #"{"code":"not_connected"}"#) {
+            try await client.shortcutInvoke(pluginId: "sample-echo", shortcutId: "toggle")
+        }
+        XCTAssertEqual(notConnected, .notConnected)
+
+        let (req3, tileOk) = try await roundTrip(t, sentIndex: 3, result: #"{"ok":true}"#) {
+            try await client.tileAction(pluginId: "sample-echo", actionId: "refresh")
+        }
+        XCTAssertEqual(req3["method"] as? String, "tile.action")
+        XCTAssertEqual(tileOk, .ok)
+
+        let (_, unknownPlugin) = try await roundTrip(t, sentIndex: 4, result: #"{"code":"unknown_plugin"}"#) {
+            try await client.tileAction(pluginId: "ghost", actionId: "refresh")
+        }
+        XCTAssertEqual(unknownPlugin, .unknownPlugin)
+    }
+
+    func testPluginsContribDecodesShortcutsTileAndProvider() async throws {
+        let (client, t) = try await connected()
+        let (req, entries) = try await roundTrip(t, sentIndex: 1,
+            result: #"{"ok":true,"entries":[{"pluginId":"sample-echo","shortcuts":[{"id":"toggle","description":"Toggle","default":"cmd+t"}],"tile":{"title":"Sample","value":"1"}},{"pluginId":"provider-plugin","provider":{"ready":true}}]}"#
+        ) { try await client.pluginsContrib() }
+        XCTAssertEqual(req["method"] as? String, "plugins.contrib")
+        XCTAssertEqual(entries.count, 2)
+        XCTAssertEqual(entries[0].pluginId, "sample-echo")
+        XCTAssertEqual(entries[0].shortcuts.first?.id, "toggle")
+        XCTAssertEqual(entries[0].shortcuts.first?.description, "Toggle")
+        XCTAssertEqual(entries[0].shortcuts.first?.defaultKeybinding, "cmd+t")
+        XCTAssertEqual(entries[0].tile?["title"], .string("Sample"))
+        XCTAssertNil(entries[0].provider)
+        XCTAssertEqual(entries[1].pluginId, "provider-plugin")
+        XCTAssertTrue(entries[1].shortcuts.isEmpty)
+        XCTAssertEqual(entries[1].provider?["ready"], .bool(true))
+    }
+
+    func testPluginsListDecodesExtendedFields() async throws {
+        let (client, t) = try await connected()
+        let (req, plugins) = try await roundTrip(t, sentIndex: 1,
+            result: #"{"ok":true,"plugins":[{"name":"sample-echo","skills":["echo"],"hasMcp":false,"mcpEnabled":false,"disabled":false,"tier":"platform","requiredConsents":["network"],"consented":["network"],"legacy":false,"status":"running"},{"name":"legacy-plugin","skills":[],"hasMcp":false,"mcpEnabled":false,"disabled":true}]}"#
+        ) { try await client.pluginsList() }
+        XCTAssertEqual(req["method"] as? String, "plugins.list")
+        XCTAssertEqual(plugins.count, 2)
+        XCTAssertEqual(plugins[0].name, "sample-echo")
+        XCTAssertEqual(plugins[0].tier, "platform")
+        XCTAssertEqual(plugins[0].requiredConsents, ["network"])
+        XCTAssertEqual(plugins[0].consented, ["network"])
+        XCTAssertFalse(plugins[0].legacy)
+        XCTAssertEqual(plugins[0].status, "running")
+
+        XCTAssertEqual(plugins[1].name, "legacy-plugin")
+        XCTAssertNil(plugins[1].tier)
+        XCTAssertEqual(plugins[1].requiredConsents, [])
+        XCTAssertEqual(plugins[1].consented, [])
+        XCTAssertFalse(plugins[1].legacy)
+        XCTAssertNil(plugins[1].status)
+    }
+
+    /// Phase 4d-ii Task 3: `plugin_tile_updated` is transient (bypasses the session-attach dedupe
+    /// gate, like assistant_delta/hardwareRequested/etc. above) AND routes into the client's
+    /// `tiles` store, keyed by pluginId — set on a non-null `tile`, REMOVED entirely on `tile:null`
+    /// (a plugin disconnecting/clearing its tile), never left as a stored `nil`. The store mutation
+    /// happens before the event is yielded to `events` (NormaClient.swift's `route()`), so
+    /// consuming the event via the iterator first guarantees `tiles` already reflects it — avoids
+    /// racing the actor's async pump.
+    func testPluginTileUpdatedEventUpdatesAndClearsTilesStore() async throws {
+        let (client, t) = try await connected()
+        var iter = client.events.makeAsyncIterator()
+
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"plugin_tile_updated","sessionId":"$system","seq":1,"ts":1,"pluginId":"sample-echo","tile":{"title":"Sample","value":"1","enabled":true}}}"#)
+        guard case .session(.pluginTileUpdated(let v1)) = await iter.next() else {
+            return XCTFail("plugin_tile_updated not delivered (transient bypass broken?)")
+        }
+        XCTAssertEqual(v1.pluginId, "sample-echo")
+        var tiles = await client.tiles
+        XCTAssertEqual(tiles["sample-echo"]?["title"], .string("Sample"))
+        XCTAssertEqual(tiles["sample-echo"]?["enabled"], .bool(true))
+        XCTAssertNil(tiles["battery-limiter"])
+
+        // A second plugin's tile merges in alongside the first (doesn't replace the store).
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"plugin_tile_updated","sessionId":"$system","seq":2,"ts":2,"pluginId":"battery-limiter","tile":{"title":"Battery Limiter","value":"80%"}}}"#)
+        guard case .session(.pluginTileUpdated) = await iter.next() else {
+            return XCTFail("second plugin_tile_updated not delivered")
+        }
+        tiles = await client.tiles
+        XCTAssertEqual(tiles.count, 2)
+        XCTAssertEqual(tiles["battery-limiter"]?["value"], .string("80%"))
+
+        // tile:null REMOVES just that plugin's entry from the store, leaving the other untouched.
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"plugin_tile_updated","sessionId":"$system","seq":3,"ts":3,"pluginId":"sample-echo","tile":null}}"#)
+        guard case .session(.pluginTileUpdated(let cleared)) = await iter.next() else {
+            return XCTFail("clearing plugin_tile_updated not delivered")
+        }
+        XCTAssertNil(cleared.tile)
+        tiles = await client.tiles
+        XCTAssertNil(tiles["sample-echo"])
+        XCTAssertEqual(tiles.count, 1)
+        XCTAssertEqual(tiles["battery-limiter"]?["value"], .string("80%"))
+    }
 }
