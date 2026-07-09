@@ -63,23 +63,57 @@ export interface PluginContext {
    *  plain `throw new Error(...)` inside its own body would. Never swallows a failure into a
    *  success-shaped return. */
   hardware(verb: string, args?: unknown): Promise<unknown>;
+  /** Phase 4d-i Task 3: a plugin's own escape hatch to push a FRESH tile MID-SESSION, over the
+   *  SAME `request()` seam `hardware` above uses (`tile.update`, same wire shape `def.tile()`'s
+   *  once-at-connect push already sends — see `PluginDefinition.tile`'s doc comment). This is
+   *  additive to, not a replacement for, that once-at-connect paint: `def.tile` still fires once
+   *  right after every (re)registration (so a freshly-(re)connected core always has SOMETHING
+   *  rather than nothing until the plugin's next voluntary event), and a tool handler (or any
+   *  other in-process code holding this `ctx`) can call `updateTile` any time thereafter to push
+   *  an updated value — e.g. the 4b "battery-limiter tile shows unknown" bug, where the tile could
+   *  only ever be painted once at connect and had no way to reflect a value that changes over the
+   *  life of the connection. Resolves/rejects exactly like `hardware()` (not-connected rejection,
+   *  10s default timeout, reconnect-safe pending-map cleanup) since it's the same `request()` call
+   *  underneath. */
+  updateTile(tile: Record<string, unknown>): Promise<void>;
 }
 
 export interface PluginDefinition {
   tools?: Record<string, PluginToolDef>;
-  /** Shortcut invocation routing is Phase 4d — in 4b this callback is accepted and stored (so
-   *  4d's wiring is a pure addition, never a breaking API change) but never invoked. What DOES
-   *  happen in 4b: if this is set, `serve()` registers whatever shortcut ids the plugin's own
-   *  `norma-plugin.json` (`contributes.shortcuts`, design spec §1/§6 — "plugins declare shortcut
-   *  IDs in the manifest") declares, via `shortcut.register`, on every (re)registration. Reading
-   *  the manifest is a plain `fs.readFileSync` off `process.cwd()` (the supervisor spawns each
-   *  plugin process cwd'd into its own plugin directory) — never a `packages/core` import, and
-   *  never throws: a missing/malformed manifest or an empty/absent `shortcuts` list just means
-   *  nothing gets registered this cycle. */
+  /** In 4b this callback was accepted and stored but never invoked (shortcut invocation routing
+   *  was deferred to Phase 4d). As of Phase 4d-i Task 3 it IS invoked: whenever core pushes a
+   *  `shortcut_invoke {shortcutId}` event to this plugin's connection (Phase 4d-i Task 2's
+   *  harness->plugin push — a future UI firing one of this plugin's registered shortcuts), the
+   *  dispatch loop in `connectOnce` calls `onShortcut(shortcutId)`. Fire-and-forget: there is no
+   *  reply back to core for this event (unlike `plugin_tool_invoke`, which always gets a
+   *  `plugin.toolResult`), so a throw inside this callback is NOT caught/reported anywhere —
+   *  same posture as any other synchronous callback a plugin author supplies.
+   *
+   *  Independently of dispatch, if this is set, `serve()` also registers whatever shortcut ids
+   *  the plugin's own `norma-plugin.json` (`contributes.shortcuts`, design spec §1/§6 — "plugins
+   *  declare shortcut IDs in the manifest") declares, via `shortcut.register`, on every
+   *  (re)registration. Reading the manifest is a plain `fs.readFileSync` off `process.cwd()` (the
+   *  supervisor spawns each plugin process cwd'd into its own plugin directory) — never a
+   *  `packages/core` import, and never throws: a missing/malformed manifest or an empty/absent
+   *  `shortcuts` list just means nothing gets registered this cycle. */
   onShortcut?: (id: string) => void;
+  /** Phase 4d-i Task 3: invoked whenever core pushes a `tile_action {actionId}` event to this
+   *  plugin's connection (Phase 4d-i Task 2's harness->plugin push — a future UI clicking one of
+   *  this plugin's declarative tile's action buttons). Same fire-and-forget posture as
+   *  `onShortcut` above — no reply is sent back to core for this event, and dispatch never
+   *  registers anything on this callback's behalf (there's no manifest-declared analog to
+   *  `contributes.shortcuts` for tile actions; the tile's own shape, returned from `tile()`
+   *  below, is what declares its actions). */
+  onTileAction?: (actionId: string) => void;
   /** When set, `serve()` calls this and pushes one `tile.update` immediately after registration
    *  completes — including after every reconnect (core restarts wipe its in-memory contrib
-   *  registry, so a stale tile would otherwise linger until the plugin's next voluntary push). */
+   *  registry, so a stale tile would otherwise linger until the plugin's next voluntary push).
+   *  This is the ONE-TIME initial paint only. For pushing a fresh tile mid-session (the value
+   *  changes while the connection stays up — e.g. the 4b "battery-limiter tile shows unknown"
+   *  bug, where the tile had no way to reflect a value that changes over the life of the
+   *  connection), see `PluginContext.updateTile` (Phase 4d-i Task 3): a tool `run` handler (or
+   *  any other in-process code holding a `ctx`) can call `ctx.updateTile(tile)` any time after
+   *  connect to push a live update, independently of this once-at-connect paint. */
   tile?: () => Record<string, unknown>;
 }
 
@@ -258,7 +292,16 @@ export function createPlugin(def: PluginDefinition): Plugin {
     );
   }
 
-  const ctx: PluginContext = { hardware: hardwareRequest };
+  /** `PluginContext.updateTile` — see that method's doc comment for the full contract. Same
+   *  `request()` seam as `hardwareRequest` above; `request()` resolves with the RPC `result`
+   *  (`{ok: true}` for `tile.update`, mirroring `def.tile`'s once-at-connect push a few lines
+   *  below in `connectOnce`) which this discards, resolving `Promise<void>` instead — a plugin
+   *  author pushing a live tile cares that the push completed, not the ack's shape. */
+  async function updateTile(tile: Record<string, unknown>): Promise<void> {
+    await request(METHODS.tileUpdate, { tile });
+  }
+
+  const ctx: PluginContext = { hardware: hardwareRequest, updateTile };
 
   async function handleInvoke(ev: { requestId: string; tool: string; argsJson: string }): Promise<void> {
     const toolDef = def.tools?.[ev.tool];
@@ -301,9 +344,15 @@ export function createPlugin(def: PluginDefinition): Plugin {
               else p.resolve(msg.result);
             } else if (msg.method === METHODS.event && msg.params?.type === "plugin_tool_invoke") {
               handleInvoke(msg.params).catch(() => {});
+            } else if (msg.method === METHODS.event && msg.params?.type === "shortcut_invoke") {
+              // Fire-and-forget (Phase 4d-i Task 3): no plugin.toolResult-style reply for this
+              // event, unlike plugin_tool_invoke above — core doesn't wait on it.
+              def.onShortcut?.(msg.params.shortcutId);
+            } else if (msg.method === METHODS.event && msg.params?.type === "tile_action") {
+              // Fire-and-forget, same posture as shortcut_invoke above.
+              def.onTileAction?.(msg.params.actionId);
             }
-            // every other event type (or notification) is skipped — 4b's dispatch loop only
-            // answers plugin_tool_invoke; shortcut.invoke routing is Phase 4d.
+            // every other event type (or notification) is skipped.
           }
         },
         drain() {
