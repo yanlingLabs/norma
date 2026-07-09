@@ -197,6 +197,26 @@ func extractPluginZip(at zipURL: URL, fileManager: FileManager = .default) throw
 }
 
 // -----------------------------------------------------------------------------------------------
+// Settle-loop pure decision (4d gate-fix loop 1, live-gate refresh-timing UX fix #1): a lifecycle
+// RPC (`plugin.enable`/`plugin.restart`/...) resolves BEFORE the daemon's `PluginSupervisor`
+// finishes actually bringing the plugin's process up — so the row the action's own trailing
+// `refresh()` renders can still read "starting" for roughly a second afterward, with nothing left
+// to re-poll it. `PluginManagerModel.startSettling(_:)` re-`refresh()`s roughly once a second until
+// this returns `false`; PURE and table-tested directly (`PluginManagerModelTests`) rather than
+// buried in the loop itself.
+// -----------------------------------------------------------------------------------------------
+
+/// `true` while the settle loop should keep polling: the row is STILL `"starting"` and under the
+/// 15s bound. `false` for every other status (`running`/`stopped`/`backoff`/`circuit-open`/`na`, or
+/// `nil` — e.g. the row vanished after a `remove`) regardless of elapsed time, and for `"starting"`
+/// itself once 15s have elapsed (a generous ceiling — if the plugin is still `"starting"` after
+/// that, repeated polling won't fix it). `elapsedSeconds == 15` itself stops (strict `<`, not
+/// `<=`) — the bound is inclusive of everything up to but not including the 15s mark.
+func settleShouldContinue(status: String?, elapsedSeconds: Double) -> Bool {
+    status == "starting" && elapsedSeconds < 15
+}
+
+// -----------------------------------------------------------------------------------------------
 // PluginManagerModel — the pane's live view-model (`@MainActor`/`ObservableObject`, same posture
 // as `PeripheralProvider`): owns the plugin list + drives the 4 lifecycle actions, each followed by
 // a `refresh()` so the row list always reflects the daemon's just-applied state.
@@ -233,6 +253,22 @@ final class PluginManagerModel: ObservableObject {
     /// Task 3: true while `install(source:)` is in flight — lets the view disable the "Install
     /// Plugin…" button so a second pick can't race the first.
     @Published private(set) var installing = false
+    /// 4d gate-fix loop 1: raw `plugins.list` status strings, keyed by name — kept alongside `rows`
+    /// (which only stores the user-facing `statusText`/`statusColorKind`) so `startSettling`'s poll
+    /// loop can compare against the wire's own vocabulary (`"starting"`, ...) via
+    /// `settleShouldContinue` rather than reverse-engineering it from display text. Only updated on
+    /// a SUCCESSFUL `refresh()` — same "stays stale on failure" posture as `rows` itself (below).
+    private var statusByName: [String: String?] = [:]
+    /// 4d gate-fix loop 1: the in-flight settle loop, if any — `startSettling(_:)` cancels/replaces
+    /// it (only one row is ever `busyName` at a time, so an old loop's target is moot the moment a
+    /// new action starts); `stopSettling()` is the pane's `.onDisappear` cancellation path.
+    private var settleTask: Task<Void, Never>?
+    /// 4d gate-fix loop 1 (UX fix #2): fires at the end of EVERY `refresh()` — the manual "Refresh"
+    /// click, each action's own follow-up refresh, AND every settle-loop tick — so the pane can keep
+    /// sibling models (the shortcut editor, primarily) in sync with the plugin list's latest state
+    /// without a second, independently-timed poll of their own. `PluginManagerView` wires this to
+    /// `shortcutsModel.refresh()`.
+    var onRefreshed: (() -> Void)?
 
     init(client: NormaClient) {
         self.client = client
@@ -248,10 +284,44 @@ final class PluginManagerModel: ObservableObject {
                     legacy: p.legacy, status: p.status, disabled: p.disabled
                 )
             }
+            statusByName = Dictionary(uniqueKeysWithValues: plugins.map { ($0.name, $0.status) })
             errorText = nil
         } catch {
             errorText = "couldn't load plugins — try Refresh"
         }
+        onRefreshed?()
+    }
+
+    /// 4d gate-fix loop 1 (UX fix #1): starts (cancelling any prior) a bounded settle loop for
+    /// `name` — re-`refresh()`s roughly once a second until `settleShouldContinue` says stop. Called
+    /// unconditionally at the end of every lifecycle action below (enable/confirmConsent/restart —
+    /// where a real "starting" transition is expected — and disable/remove too, for symmetric
+    /// settling: their target status is never `"starting"`, so `settleShouldContinue` stops those
+    /// loops on the very first check, before any extra `refresh()` fires). Checks the ALREADY-fresh
+    /// `statusByName` (set by the caller's own preceding `refresh()`) before its first sleep, so an
+    /// action whose row is already settled never schedules a redundant poll.
+    private func startSettling(_ name: String) {
+        settleTask?.cancel()
+        let started = Date()
+        settleTask = Task { @MainActor [weak self] in
+            while true {
+                guard let self else { return }
+                if Task.isCancelled { return }
+                let status = self.statusByName[name] ?? nil
+                let elapsed = Date().timeIntervalSince(started)
+                guard settleShouldContinue(status: status, elapsedSeconds: elapsed) else { return }
+                try? await Task.sleep(for: .seconds(1))
+                if Task.isCancelled { return }
+                await self.refresh()
+            }
+        }
+    }
+
+    /// 4d gate-fix loop 1: cancels any in-flight settle loop without waiting for it — wired to the
+    /// pane's `.onDisappear` (a disappearing pane has no row left to update anyway).
+    func stopSettling() {
+        settleTask?.cancel()
+        settleTask = nil
     }
 
     // Fix wave 1 (Task 2 review, error-surfacing defect): `refresh()`'s success path
@@ -287,6 +357,7 @@ final class PluginManagerModel: ObservableObject {
         }
         await refresh()
         if let actionError { errorText = actionError }
+        startSettling(name)
     }
 
     func disable(_ name: String) async {
@@ -302,6 +373,7 @@ final class PluginManagerModel: ObservableObject {
         }
         await refresh()
         if let actionError { errorText = actionError }
+        startSettling(name)
     }
 
     func remove(_ name: String) async {
@@ -317,6 +389,7 @@ final class PluginManagerModel: ObservableObject {
         }
         await refresh()
         if let actionError { errorText = actionError }
+        startSettling(name)
     }
 
     func restart(_ name: String) async {
@@ -330,6 +403,7 @@ final class PluginManagerModel: ObservableObject {
         }
         await refresh()
         if let actionError { errorText = actionError }
+        startSettling(name)
     }
 
     /// Task 3 (4d-iii): install a plugin from a local folder, or an already-extracted zip's
@@ -391,6 +465,7 @@ final class PluginManagerModel: ObservableObject {
         }
         await refresh()
         if let actionError { errorText = actionError }
+        startSettling(name)
     }
 
     /// The consent sheet's "Cancel" — dismisses without ever calling `pluginEnable`; the plugin
@@ -442,7 +517,24 @@ struct PluginManagerView: View {
                 .padding(.bottom, 8)
             }
         }
-        .task { await model.refresh() }
+        .task {
+            // 4d gate-fix loop 1 (UX fix #2): wired BEFORE the first `refresh()` call below so
+            // every refresh from here on — this initial one, the manual "Refresh" button, every
+            // action's own trailing refresh, and every settle-loop tick — also re-syncs the
+            // shortcut editor. `[weak shortcutsModel]` matches this file's existing weak-capture
+            // idiom for cross-model closures (see `DetachedWindowController`'s `Task { @MainActor
+            // [weak self] in ... }` pattern elsewhere in the app); `model`/`shortcutsModel` are
+            // siblings with the SAME lifetime (both owned by this window's `DashboardWiring`), so
+            // this isn't defending against a real dangling case today, just future-proofing.
+            model.onRefreshed = { [weak shortcutsModel] in
+                guard let shortcutsModel else { return }
+                Task { @MainActor in await shortcutsModel.refresh() }
+            }
+            await model.refresh()
+        }
+        // 4d gate-fix loop 1 (UX fix #1): tears down any in-flight settle loop when the pane
+        // disappears (window closes) — a disappearing pane has no row left to update anyway.
+        .onDisappear { model.stopSettling() }
         // Task 3 (4d-iii): the GUI consent sheet — presented from BOTH triggers `model.consentSheet`
         // can be set from (`enable(_:)`'s needsConsent path, or a successful `install(source:)`).
         // Dismissing any other way (Esc/swipe) also nils the binding via SwiftUI's own `.sheet`

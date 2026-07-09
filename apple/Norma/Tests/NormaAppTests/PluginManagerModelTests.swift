@@ -178,6 +178,29 @@ final class PluginManagerModelTests: XCTestCase {
     func testRowIdIsThePluginName() {
         XCTAssertEqual(row(name: "sample-echo").id, "sample-echo")
     }
+
+    // MARK: - `settleShouldContinue` (4d gate-fix loop 1, UX fix #1): the settle loop's PURE
+    // CONTINUE/STOP decision — continues only while a row is STILL "starting" and under the 15s
+    // bound; stops for every other status (or `nil`) regardless of elapsed time, and for "starting"
+    // itself once the bound is reached.
+
+    func testSettleContinuesWhileStartingUnder15Seconds() {
+        XCTAssertTrue(settleShouldContinue(status: "starting", elapsedSeconds: 0))
+        XCTAssertTrue(settleShouldContinue(status: "starting", elapsedSeconds: 14.9))
+    }
+
+    func testSettleStopsOnceStartingReaches15Seconds() {
+        // Exact boundary: `elapsedSeconds == 15` must stop (strict `<`, not `<=`).
+        XCTAssertFalse(settleShouldContinue(status: "starting", elapsedSeconds: 15))
+        XCTAssertFalse(settleShouldContinue(status: "starting", elapsedSeconds: 20))
+    }
+
+    func testSettleStopsForEveryNonStartingStatusRegardlessOfElapsed() {
+        for status in ["running", "stopped", "backoff", "circuit-open", "na", nil] {
+            XCTAssertFalse(settleShouldContinue(status: status, elapsedSeconds: 0), "status \(status ?? "nil") must stop immediately")
+            XCTAssertFalse(settleShouldContinue(status: status, elapsedSeconds: 10), "status \(status ?? "nil") must stay stopped")
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -258,5 +281,26 @@ final class PluginManagerModelAsyncTests: XCTestCase {
         await action
 
         XCTAssertNil(model.errorText)
+    }
+
+    /// UX fix #2 (4d gate-fix loop 1): `onRefreshed` is the hook `PluginManagerView` wires to
+    /// `shortcutsModel.refresh()` (and every settle-loop tick funnels through it too) so a newly
+    /// installed plugin's declared shortcuts show up without the dashboard being closed/reopened —
+    /// this pins that it fires at the end of a `refresh()` call, independent of the view.
+    func testOnRefreshedFiresAfterRefresh() async throws {
+        let (client, t) = try await connectedClient()
+        let model = PluginManagerModel(client: client)
+        var fireCount = 0
+        model.onRefreshed = { fireCount += 1 }
+
+        async let refresh: Void = model.refresh()
+
+        await feedWaitUntil { t.sent.count >= 2 }
+        let listReq = feedLineJSON(t.sent[1])
+        t.feed(#"{"jsonrpc":"2.0","id":\#(listReq["id"] as! Int),"result":{"plugins":[]}}"#)
+
+        await refresh
+
+        XCTAssertEqual(fireCount, 1)
     }
 }
