@@ -3,41 +3,49 @@ import IOKit
 
 // MARK: - chargeLimitPlan (THE testable core)
 
-/// What `HelperService.setChargeLimit` should do for a given requested percent, on a given chip
+/// What `ChargeManager.setTarget` should do for a given requested percent, on a given chip
 /// family. This is the SINGLE source of truth for the charge-limit decision table — everything
-/// else (range validation, which SMC key to hit, what value to write) flows from this pure
-/// function. `HelperService`/`SMCController` only ever *execute* a `ChargeLimitPlan`; they never
+/// else (range validation, which SMC key to hit / which loop to run) flows from this pure
+/// function. `ChargeManager`/`SMCController` only ever *execute* a `ChargeLimitPlan`; they never
 /// re-derive or duplicate this decision.
+///
+/// Gate-fix (2026-07-09): the previous model (`writeCHWA`, binary 80/100-only) does not hold on
+/// Apple Silicon — `CHWA` is absent (`kSMCKeyNotFound`) on this hardware generation. The replacement
+/// mechanism, `CHTE`, is a binary charge-inhibit flag rather than a firmware-held percent register,
+/// so an arbitrary percent cap is enforced by a software monitoring loop (`ChargeManager`) instead
+/// of a single SMC write — see `.superpowers/sdd/4c-m4-charge-limit-research.md`. Because the cap is
+/// now software-enforced, the old "81...99 unsupported" restriction no longer applies.
 enum ChargeLimitPlan: Equatable {
-    /// Apple Silicon: write the CHWA (charge-hold-when-away, "80% limit") key.
-    case writeCHWA(Bool)
-    /// Intel: write the BCLM (battery-charge-level-max) key to an explicit percent.
+    /// Apple Silicon: enforce via the CHTE charge-manager loop (target 50...99).
+    case appleSiliconLimit(percent: Int)
+    /// Apple Silicon: 100 -> no limit. Stop the loop and ensure CHTE = 0 (allow charging).
+    case appleSiliconDisable
+    /// Intel: write the BCLM (battery-charge-level-max) key to an explicit percent — unchanged,
+    /// real firmware-held percent register.
     case writeBCLM(UInt8)
-    /// Apple Silicon only supports 80 or 100; anything strictly between is not representable.
-    case unsupportedValue
     /// Outside the valid 50...100 range, on either chip family.
     case invalidRange
 }
 
-/// Pure decision table — no IOKit, no state, no side effects. Table (from task-3-brief.md):
-///   Apple Silicon: 50-80 -> writeCHWA(true); 100 -> writeCHWA(false); 81-99 -> unsupportedValue
+/// Pure decision table — no IOKit, no state, no side effects.
+///   Apple Silicon: 50-99 -> appleSiliconLimit(percent); 100 -> appleSiliconDisable
 ///   Intel:         50-100 -> writeBCLM(percent)
 ///   Anywhere:      <50 or >100 -> invalidRange (checked FIRST, before any chip-specific branch)
 func chargeLimitPlan(percent: Int, appleSilicon: Bool) -> ChargeLimitPlan {
     guard percent >= 50 && percent <= 100 else { return .invalidRange }
+    if appleSilicon { return percent == 100 ? .appleSiliconDisable : .appleSiliconLimit(percent: percent) }
+    return .writeBCLM(UInt8(percent))
+}
 
-    if appleSilicon {
-        switch percent {
-        case 50...80:
-            return .writeCHWA(true)
-        case 100:
-            return .writeCHWA(false)
-        default: // 81...99
-            return .unsupportedValue
-        }
-    } else {
-        return .writeBCLM(UInt8(percent))
-    }
+// MARK: - chargeControlDecision (the pure loop core)
+
+/// Should charging be inhibited right now? Hysteresis prevents flapping in-band. Pure, no I/O —
+/// this is the testable heart of `ChargeManager`'s monitoring loop (the loop itself, and the SMC
+/// calls it drives, are thin untested glue — see `ChargeManager.swift`).
+func chargeControlDecision(soc: Int, target: Int, currentlyInhibited: Bool, hysteresis: Int) -> Bool {
+    if soc >= target { return true }                 // at/above target -> inhibit
+    if soc <= target - hysteresis { return false }    // comfortably below -> allow
+    return currentlyInhibited                          // in the band -> hold current state
 }
 
 // MARK: - SMCController
@@ -73,20 +81,52 @@ final class SMCController {
         return rc == 0 && value == 1
     }
 
-    func writeCHWA(_ on: Bool) throws {
-        try withConnection { try self.write(key: "CHWA", bytes: [on ? 1 : 0]) }
+    /// `CHTE` (`ui32`, little-endian) — the Tahoe-era Apple Silicon charge-inhibit key. `1` = hold
+    /// (stop taking charge), `0` = allow normal charging. NOT a percent register — see
+    /// `ChargeLimitPlan`/`ChargeManager` for how a percent cap is built on top of this binary flag.
+    /// `CHWA` (the old "charge-hold-when-away" key this replaces) is absent on this hardware
+    /// generation (`kSMCKeyNotFound`) and intentionally has no read/write path here anymore — do
+    /// not reintroduce it.
+    func writeCHTE(_ inhibit: Bool) throws {
+        try withConnection { try self.writeUInt32LE(key: "CHTE", value: inhibit ? 1 : 0) }
+    }
+
+    /// Nonzero ⇒ charging is currently inhibited.
+    func readCHTE() throws -> Bool {
+        try withConnection { (try self.readUInt32LE(key: "CHTE")) != 0 }
     }
 
     func writeBCLM(_ percent: UInt8) throws {
         try withConnection { try self.write(key: "BCLM", bytes: [percent]) }
     }
 
-    func readCHWA() throws -> Bool {
-        try withConnection { (try self.read(key: "CHWA")).first ?? 0 != 0 }
-    }
-
     func readBCLM() throws -> UInt8 {
         try withConnection { (try self.read(key: "BCLM")).first ?? 100 }
+    }
+
+    /// State-of-charge percent, read from `AppleSmartBattery`'s `CurrentCapacity` (IORegistry, not
+    /// SMC) — this is the value `ChargeManager`'s loop compares against the target. `nil` when the
+    /// service/property is unavailable; callers must NOT thrash state on a transient miss.
+    func readStateOfChargePercent() -> Int? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        var props: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(service, &props, kCFAllocatorDefault, 0) == kIOReturnSuccess,
+              let dict = props?.takeRetainedValue() as? [String: Any] else { return nil }
+        return dict["CurrentCapacity"] as? Int
+    }
+
+    /// Instantaneous charge current in mA, read from SMC `B0AC` (`si16`, little-endian, signed).
+    /// `AppleSmartBattery`'s `Amperage`/`IsCharging` (IORegistry) are known-stale on this hardware
+    /// (frozen across a whole polling session) — this is the fast, live signal used for
+    /// telemetry/manual live-gate verification. Not wired into any XPC resultJson (Task 6's shapes
+    /// don't include it); `nil` when unavailable.
+    func readChargeCurrentMilliamps() -> Int? {
+        guard let bytes = try? withConnection({ try self.read(key: "B0AC") }), bytes.count >= 2 else { return nil }
+        var value = Int(bytes[0]) | (Int(bytes[1]) << 8)
+        if value >= 0x8000 { value -= 0x10000 }
+        return value
     }
 
     // MARK: Connection lifecycle
@@ -145,6 +185,27 @@ final class SMCController {
         input.bytes = Self.pack(bytes)
         let output = try call(input)
         guard output.result == Self.successStatus else { throw SMCError.keyNotFound(key) }
+    }
+
+    /// Little-endian `ui32` write, e.g. `CHTE`.
+    private func writeUInt32LE(key: String, value: UInt32) throws {
+        let bytes: [UInt8] = [
+            UInt8(value & 0xff),
+            UInt8((value >> 8) & 0xff),
+            UInt8((value >> 16) & 0xff),
+            UInt8((value >> 24) & 0xff),
+        ]
+        try write(key: key, bytes: bytes)
+    }
+
+    /// Little-endian `ui32` read, e.g. `CHTE`.
+    private func readUInt32LE(key: String) throws -> UInt32 {
+        let bytes = try read(key: key)
+        var value: UInt32 = 0
+        for (index, byte) in bytes.prefix(4).enumerated() {
+            value |= UInt32(byte) << (8 * index)
+        }
+        return value
     }
 
     private func keyInfo(for key: String) throws -> SMCKeyInfoData {
@@ -219,10 +280,12 @@ private struct SMCPLimitData {
 }
 
 private struct SMCKeyInfoData {
-    // The real AppleSMC struct declares this as `IOByteCount`, which resolves to `UInt64` on
-    // today's 64-bit-only macOS SDKs (confirmed against IOTypes.h) — using `UInt32` here would
-    // silently desync this struct's layout from what AppleSMC.kext actually expects.
-    var dataSize: UInt64 = 0
+    // Empirically confirmed against real hardware (gate-fix 2026-07-09): the kernel wire layout
+    // for this field is 32-bit, not the 64-bit `IOByteCount` the original comment here assumed.
+    // With `UInt64` (84-byte `SMCParamStruct`) every AppleSMC call returned `kIOReturnBadArgument`
+    // (0xE00002C2); switching to `UInt32` (plus the `padding` field below) yields the correct
+    // 80-byte struct and calls return rc=0. See `.superpowers/sdd/4c-m4-charge-limit-research.md`.
+    var dataSize: UInt32 = 0
     var dataType: UInt32 = 0
     var dataAttributes: UInt8 = 0
 }
@@ -246,9 +309,18 @@ private struct SMCParamStruct {
     var vers = SMCVersion()
     var pLimitData = SMCPLimitData()
     var keyInfo = SMCKeyInfoData()
+    // Classic SMCKit field — without this explicit padding between `keyInfo` and `result` the
+    // struct is 76 bytes, not the AppleSMC-required 80. Confirmed empirically (gate-fix 2026-07-09).
+    var padding: UInt16 = 0
     var result: UInt8 = 0
     var status: UInt8 = 0
     var data8: UInt8 = 0
     var data32: UInt32 = 0
     var bytes: SMCBytes = smcZeroBytes()
 }
+
+/// Regression guard for the 80-byte AppleSMC parameter-struct requirement above. Exposed at
+/// internal (default) scope — rather than widening `SMCParamStruct` itself out of file-private
+/// scope — specifically so `NormaAppTests` (which gives this file dual target membership; see
+/// project.yml) can pin the size without touching AppleSMC's private wire-struct visibility.
+let smcParamStructByteSize = MemoryLayout<SMCParamStruct>.size

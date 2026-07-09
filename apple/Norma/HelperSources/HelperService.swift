@@ -2,13 +2,23 @@ import Foundation
 
 /// Accepts new `NSXPCConnection`s for the `com.norma.helper` mach service and pins each one to
 /// processes signed by team 37N77U9RSZ, per task-3-brief.md's exact requirement string.
+///
+/// Owns the ONE shared `ChargeManager` for the daemon's lifetime (per Task 6 of the gate-fix
+/// plan) and hands the same instance to every `HelperService` it exports — the manager's target
+/// state, timer, and SMC connection must not be duplicated per-connection.
 final class HelperServiceDelegate: NSObject, NSXPCListenerDelegate {
     private static let codeSigningRequirement =
         "anchor apple generic and certificate leaf[subject.OU] = \"37N77U9RSZ\""
 
+    private let chargeManager: ChargeManager
+
+    init(chargeManager: ChargeManager) {
+        self.chargeManager = chargeManager
+    }
+
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
         newConnection.exportedInterface = NSXPCInterface(with: NormaHelperProtocol.self)
-        newConnection.exportedObject = HelperService()
+        newConnection.exportedObject = HelperService(chargeManager: chargeManager)
         // `NSXPCConnection.setCodeSigningRequirement(_:)` (macOS 13+) has no synchronous
         // "reject" return value — the only failure mode it can raise is an NSException for a
         // malformed requirement *string*, which can't happen here since the string above is a
@@ -23,54 +33,48 @@ final class HelperServiceDelegate: NSObject, NSXPCListenerDelegate {
     }
 }
 
-/// The exported XPC object. Translates `ChargeLimitPlan` decisions (from the pure
-/// `chargeLimitPlan` in SMCController.swift) into SMC writes and (resultJson, errorJson) replies.
+/// The exported XPC object. Translates `ChargeManager`/`ChargeLimitPlan` decisions into
+/// (resultJson, errorJson) replies. Holds no state of its own — the shared `ChargeManager`
+/// (owned by `HelperServiceDelegate`, one per daemon, not per-connection) does all the work.
 final class HelperService: NSObject, NormaHelperProtocol {
-    private let smc = SMCController()
+    private let chargeManager: ChargeManager
 
-    func setChargeLimit(_ percent: Int, reply: @escaping (String?, String?) -> Void) {
-        let plan = chargeLimitPlan(percent: percent, appleSilicon: smc.isAppleSilicon())
-        switch plan {
-        case .invalidRange:
-            reply(nil, Self.errorJson(code: "invalid_range", message: "percent must be between 50 and 100"))
-        case .unsupportedValue:
-            reply(nil, Self.errorJson(code: "unsupported_value", message: "Apple Silicon supports 80 or 100 only"))
-        case .writeCHWA(let on):
-            do {
-                try smc.writeCHWA(on)
-                reply(Self.resultJson(percent: percent, mechanism: "CHWA"), nil)
-            } catch {
-                reply(nil, Self.errorJson(code: "smc_error", message: "\(error)"))
-            }
-        case .writeBCLM(let value):
-            do {
-                try smc.writeBCLM(value)
-                reply(Self.resultJson(percent: percent, mechanism: "BCLM"), nil)
-            } catch {
-                reply(nil, Self.errorJson(code: "smc_error", message: "\(error)"))
-            }
-        }
+    init(chargeManager: ChargeManager) {
+        self.chargeManager = chargeManager
     }
 
-    func getChargeLimit(reply: @escaping (String?, String?) -> Void) {
-        let appleSilicon = smc.isAppleSilicon()
+    func setChargeLimit(_ percent: Int, reply: @escaping (String?, String?) -> Void) {
         do {
-            if appleSilicon {
-                let on = try smc.readCHWA()
-                reply(Self.resultJson(percent: on ? 80 : 100, mechanism: "CHWA"), nil)
-            } else {
-                let percent = try smc.readBCLM()
-                reply(Self.resultJson(percent: Int(percent), mechanism: "BCLM"), nil)
-            }
+            // `setTarget` resolves (percent, enforcing, mechanism) atomically inside its own lock
+            // and returns them directly — reading them back via a separate `getTarget()`/`mechanism`
+            // call here would risk a concurrent `setChargeLimit` interleaving and reporting a
+            // different request's result (TOCTOU).
+            let result = try chargeManager.setTarget(percent)
+            reply(Self.setResultJson(percent: result.percent, mechanism: result.mechanism, enforcing: result.enforcing), nil)
+        } catch ChargeManager.ChargeManagerError.invalidRange {
+            reply(nil, Self.errorJson(code: "invalid_range", message: "percent must be between 50 and 100"))
         } catch {
             reply(nil, Self.errorJson(code: "smc_error", message: "\(error)"))
         }
     }
 
+    func getChargeLimit(reply: @escaping (String?, String?) -> Void) {
+        let (percent, inhibitingNow, soc) = chargeManager.getTarget()
+        reply(Self.getResultJson(percent: percent, inhibitingNow: inhibitingNow, soc: soc, mechanism: chargeManager.mechanism), nil)
+    }
+
     // MARK: - JSON payloads
 
-    private struct ResultPayload: Encodable {
+    private struct SetResultPayload: Encodable {
         let percent: Int
+        let mechanism: String
+        let enforcing: Bool
+    }
+
+    private struct GetResultPayload: Encodable {
+        let percent: Int
+        let inhibiting_now: Bool
+        let soc: Int?
         let mechanism: String
     }
 
@@ -79,8 +83,12 @@ final class HelperService: NSObject, NormaHelperProtocol {
         let message: String
     }
 
-    private static func resultJson(percent: Int, mechanism: String) -> String {
-        encode(ResultPayload(percent: percent, mechanism: mechanism))
+    private static func setResultJson(percent: Int, mechanism: String, enforcing: Bool) -> String {
+        encode(SetResultPayload(percent: percent, mechanism: mechanism, enforcing: enforcing))
+    }
+
+    private static func getResultJson(percent: Int, inhibitingNow: Bool, soc: Int?, mechanism: String) -> String {
+        encode(GetResultPayload(percent: percent, inhibiting_now: inhibitingNow, soc: soc, mechanism: mechanism))
     }
 
     private static func errorJson(code: String, message: String) -> String {
