@@ -940,11 +940,139 @@ describe("daemon IPC", () => {
       expect(result.plugins).toHaveLength(1);
       expect(result.plugins[0]).toMatchObject({
         name: "demo", skills: ["greet"], hasMcp: true, mcpEnabled: true, disabled: false,
+        status: "na", // legacy plugin (no norma-plugin.json) — never tier "platform", never spawn-eligible
       });
       c.close();
     } finally {
       server.stop();
     }
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // Phase 4d-i Task 4: plugins.list enriches each entry with live PluginSupervisor runtime status
+  // — a dashboard can't otherwise tell a Tier-2 plugin's actual running/crashed/circuit-open state
+  // apart from static manifest/consent data. Tier-2 (`platform` + `entry`, pluginSpawnEligible) get
+  // the real SupervisorStatus; Tier-1 (`capability`) never runs a process, so always "na".
+  // ---------------------------------------------------------------------------------------------
+  describe("plugins.list supervisor status (Phase 4d-i Task 4)", () => {
+    test("Tier-2 plugin the supervisor reports \"running\" includes status:\"running\"; Tier-1 plugin includes status:\"na\"", async () => {
+      const home = mkdtempSync(join(tmpdir(), "norma-plugins-status-"));
+      // Tier-2 (platform) plugin — spawn-eligible: tier platform + entry + enabled + exec-consented.
+      mkdirSync(join(home, "plugins", "runner"), { recursive: true });
+      writeFileSync(join(home, "plugins", "runner", "norma-plugin.json"), JSON.stringify({
+        id: "runner", tier: "platform", entry: { command: "bun", args: ["index.ts"] },
+      }));
+      // Tier-1 (capability) plugin — never spawn-eligible, no process ever runs for it.
+      mkdirSync(join(home, "plugins", "toolbox"), { recursive: true });
+      writeFileSync(join(home, "plugins", "toolbox", "norma-plugin.json"), JSON.stringify({ id: "toolbox", tier: "capability" }));
+
+      const plugins = new PluginStore({
+        normaHome: home,
+        plugins: { enabled: ["runner", "toolbox"] },
+        consents: { runner: { exec: Date.now() } },
+      });
+
+      const secrets = new FileSecretStore(join(home, "test-secrets"));
+      const authority = new TokenAuthority(secrets);
+      const tokens = await authority.ensureTokens();
+      const store = new SessionStore(home);
+      const socketPath = join(home, "core.sock");
+      // Real PluginSupervisor, fake spawn/isAlivePid/signalPid — same injection precedent as
+      // "plugin.restart"'s bootRestartServer below.
+      const supervisor = new PluginSupervisor({
+        runDir: join(home, "run"),
+        socketPath,
+        mintToken: (id) => store.mintPluginToken(id),
+        spawn: () => ({ pid: 12345, kill: () => {}, exited: new Promise<number>(() => {}) }),
+        isAlivePid: () => false,
+        signalPid: () => {},
+      });
+      // Bring "runner" to "running" exactly like a real plugin process would over the wire:
+      // startAll spawns it (fake), notifyRegistered (a fake connection) flips it to "running".
+      supervisor.startAll([{ id: "runner", dir: join(home, "plugins", "runner"), entry: { command: "bun", args: ["index.ts"] } }]);
+      expect(supervisor.notifyRegistered("runner", { push: () => true })).toBe(true);
+      expect(supervisor.status("runner")).toBe("running");
+
+      const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, plugins, supervisor });
+      try {
+        const c = await TestClient.connect(socketPath);
+        await c.hello(tokens.harness, "plugin-status-lister");
+        const { result } = await c.request(METHODS.pluginsList, {});
+        expect(result.ok).toBe(true);
+        const byName = Object.fromEntries(result.plugins.map((p: any) => [p.name, p]));
+        expect(byName.runner).toMatchObject({ tier: "platform", status: "running" });
+        expect(byName.toolbox).toMatchObject({ tier: "capability", status: "na" });
+        c.close();
+      } finally {
+        supervisor.stopAll();
+        server.stop();
+      }
+    });
+
+    test("a spawn-eligible plugin the supervisor has never tracked reports status \"stopped\" (never \"na\")", async () => {
+      const home = mkdtempSync(join(tmpdir(), "norma-plugins-status-untracked-"));
+      mkdirSync(join(home, "plugins", "runner"), { recursive: true });
+      writeFileSync(join(home, "plugins", "runner", "norma-plugin.json"), JSON.stringify({
+        id: "runner", tier: "platform", entry: { command: "bun", args: ["index.ts"] },
+      }));
+      const plugins = new PluginStore({
+        normaHome: home, plugins: { enabled: ["runner"] }, consents: { runner: { exec: Date.now() } },
+      });
+      const secrets = new FileSecretStore(join(home, "test-secrets"));
+      const authority = new TokenAuthority(secrets);
+      const tokens = await authority.ensureTokens();
+      const store = new SessionStore(home);
+      const socketPath = join(home, "core.sock");
+      // A real supervisor IS wired, but startAll/reclaimOrphans was never called for "runner" — it
+      // has no runtime tracked at all (never spawned this process lifetime).
+      const supervisor = new PluginSupervisor({
+        runDir: join(home, "run"), socketPath, mintToken: (id) => store.mintPluginToken(id),
+        spawn: () => ({ pid: 1, kill: () => {}, exited: new Promise<number>(() => {}) }),
+        isAlivePid: () => false, signalPid: () => {},
+      });
+      const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, plugins, supervisor });
+      try {
+        const c = await TestClient.connect(socketPath);
+        await c.hello(tokens.harness, "plugin-status-untracked");
+        const { result } = await c.request(METHODS.pluginsList, {});
+        expect(result.plugins[0]).toMatchObject({ name: "runner", status: "stopped" });
+        c.close();
+      } finally {
+        server.stop();
+      }
+    });
+
+    test("no supervisor wired at all: Tier-1 plugin still \"na\"; a spawn-eligible (Tier-2-shaped) plugin falls back to \"stopped\"", async () => {
+      const home = mkdtempSync(join(tmpdir(), "norma-plugins-status-nosupervisor-"));
+      mkdirSync(join(home, "plugins", "toolbox"), { recursive: true });
+      writeFileSync(join(home, "plugins", "toolbox", "norma-plugin.json"), JSON.stringify({ id: "toolbox", tier: "capability" }));
+      mkdirSync(join(home, "plugins", "runner"), { recursive: true });
+      writeFileSync(join(home, "plugins", "runner", "norma-plugin.json"), JSON.stringify({
+        id: "runner", tier: "platform", entry: { command: "bun", args: ["index.ts"] },
+      }));
+      const plugins = new PluginStore({
+        normaHome: home, plugins: { enabled: ["toolbox", "runner"] }, consents: { runner: { exec: Date.now() } },
+      });
+      const secrets = new FileSecretStore(join(home, "test-secrets"));
+      const authority = new TokenAuthority(secrets);
+      const tokens = await authority.ensureTokens();
+      const store = new SessionStore(home);
+      const socketPath = join(home, "core.sock");
+      // No `supervisor` option passed at all — mirrors "plugins.list returns [] when no PluginStore
+      // is wired" above, but for the supervisor seam instead.
+      const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, plugins });
+      try {
+        const c = await TestClient.connect(socketPath);
+        await c.hello(tokens.harness, "plugin-status-nosup");
+        const { result } = await c.request(METHODS.pluginsList, {});
+        const byName = Object.fromEntries(result.plugins.map((p: any) => [p.name, p]));
+        expect(byName.toolbox).toMatchObject({ status: "na" });
+        expect(byName.runner).toMatchObject({ status: "stopped" });
+        c.close();
+      } finally {
+        server.stop();
+      }
+    });
   });
 
   // THE CONSENT SEAM: a plugin's skills are always live (SkillStore has no consent gate), but a
@@ -1667,6 +1795,30 @@ describe("daemon IPC", () => {
     const status = (await c.request(METHODS.daemonStatus, {})).result;
     expect(status.provider).toEqual({ id: "fake", model: "fake-1" });
     c.close();
+  });
+
+  test("daemon.status pluginsCount reflects the real installed-plugin count (Phase 4d-i Task 4 — was hardcoded 0)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "norma-daemon-status-plugins-"));
+    for (const name of ["alpha", "beta", "gamma"]) {
+      mkdirSync(join(home, "plugins", name), { recursive: true });
+      writeFileSync(join(home, "plugins", name, "plugin.json"), JSON.stringify({ description: name }));
+    }
+    const plugins = new PluginStore({ normaHome: home });
+    const secrets = new FileSecretStore(join(home, "test-secrets"));
+    const authority = new TokenAuthority(secrets);
+    const tokens = await authority.ensureTokens();
+    const store = new SessionStore(home);
+    const socketPath = join(home, "core.sock");
+    const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, plugins });
+    try {
+      const c = await TestClient.connect(socketPath);
+      await c.hello(tokens.harness, "status-plugins-count");
+      const status = (await c.request(METHODS.daemonStatus, {})).result;
+      expect(status.pluginsCount).toBe(3);
+      c.close();
+    } finally {
+      server.stop();
+    }
   });
 
   test("quota.state shape: ok/zero usage when no real provider-wrapped QuotaManager is wired", async () => {

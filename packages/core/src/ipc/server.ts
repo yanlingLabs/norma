@@ -31,6 +31,7 @@ import type { BackgroundTaskRegistry } from "../agent/bg-registry";
 import type { SkillStore } from "../agent/skills";
 import type { McpManager } from "../agent/mcp/manager";
 import type { PluginStore } from "../agent/plugins";
+import { pluginSpawnEligible } from "../agent/plugins";
 import type { ToolRegistry } from "../agent/tools/registry";
 import type { PluginSupervisor, PluginConn, InvokeError } from "../plugins/supervisor";
 import type { PluginContribRegistry } from "../plugins/contrib";
@@ -413,7 +414,18 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       }
       case METHODS.pluginsList: {
         parseParams(PluginsListParams, params);
-        return { ok: true, plugins: opts.plugins?.list() ?? [] };
+        // Phase 4d-i Task 4: enrich each entry with live PluginSupervisor runtime status. Kept
+        // HERE (the ipc handler, which has `opts.supervisor`) rather than in PluginStore.list()
+        // (agent/plugins.ts), which stays pure fs/settings with no supervisor coupling. Tier-2
+        // (pluginSpawnEligible — platform tier, entry present, enabled, consented) plugins get the
+        // real SupervisorStatus (defaulting to "stopped" when this plugin was never tracked by the
+        // supervisor at all, e.g. no agentProvider so no PluginSupervisor was even built); Tier-1
+        // (capability) and legacy plugins never run a process, so they always report "na".
+        const plugins = (opts.plugins?.list() ?? []).map((p) => ({
+          ...p,
+          status: pluginSpawnEligible(p) ? (opts.supervisor?.status(p.name) ?? "stopped") : ("na" as const),
+        }));
+        return { ok: true, plugins };
       }
       case METHODS.approvalRespond: {
         const p = parseParams(ApprovalRespondParams, params);
@@ -616,7 +628,11 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
           socketPath: opts.socketPath,
           provider: opts.providerInfo ?? null,
           sessionsCount: opts.store.list().length,
-          pluginsCount: 0, // Phase 4
+          // Phase 4d-i Task 4: real installed-plugin count (was hardcoded 0). Installed count
+          // (opts.plugins?.list().length), not a running-Tier-2 count — matches the field name
+          // "pluginsCount" (installed plugins, mirroring skills.list/mcp.list which report
+          // everything discovered, not just currently-active entries).
+          pluginsCount: opts.plugins?.list().length ?? 0,
         };
       }
       case METHODS.quotaState: {

@@ -272,6 +272,14 @@ describe("plugins.list schema", () => {
   test("McpServerStatusSchema.source is widened to include \"plugin\"", () => {
     expect(McpServerStatusSchema.parse({ name: "x", status: "connected", toolNames: [], source: "plugin" }).source).toBe("plugin");
   });
+
+  test("Phase 4d-i Task 4: status is optional and accepts every SupervisorStatus value plus \"na\"", () => {
+    expect(PluginInfoSchema.parse({ name: "bare", skills: [], hasMcp: false, mcpEnabled: false, disabled: false }).status).toBeUndefined();
+    for (const status of ["starting", "running", "backoff", "circuit-open", "stopped", "na"] as const) {
+      expect(PluginInfoSchema.parse({ name: "demo", skills: [], hasMcp: false, mcpEnabled: true, disabled: false, status }).status).toBe(status);
+    }
+    expect(() => PluginInfoSchema.parse({ name: "demo", skills: [], hasMcp: false, mcpEnabled: true, disabled: false, status: "bogus" })).toThrow();
+  });
 });
 
 describe("ask_user.respond / task.list schemas", () => {

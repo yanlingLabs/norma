@@ -787,6 +787,154 @@ describe("reclaimOrphans", () => {
 });
 
 // -------------------------------------------------------------------------------------------
+// Boot-time orphan-PID sweep (Phase 4d-i Task 4). Unlike `reclaimOrphans` (handed the plugins it
+// should look for), `sweepOrphans` scans the FULL <runDir>/plugins/*.pid directory listing and
+// targets whatever ISN'T in the currently spawn-eligible set at all (disabled/removed since the
+// PID file was written) — the exact case `reclaimOrphans` can never catch on its own.
+// -------------------------------------------------------------------------------------------
+
+describe("sweepOrphans", () => {
+  test("no run dir on disk yet -> no-op, never throws", () => {
+    const { supervisor } = makeSupervisor();
+    expect(() => supervisor.sweepOrphans([])).not.toThrow();
+  });
+
+  test("run dir exists but is empty -> no-op", () => {
+    const { supervisor, dir } = makeSupervisor();
+    mkdirSync(join(dir, "plugins"), { recursive: true });
+    expect(() => supervisor.sweepOrphans([])).not.toThrow();
+  });
+
+  test("a PID file for a plugin still in eligibleIds is left untouched — startAll/reclaimOrphans owns it, not the sweep", () => {
+    const signals: Array<{ pid: number; sig: string }> = [];
+    const { supervisor, dir } = makeSupervisor({
+      isAlivePid: (pid) => pid === 424_242,
+      signalPid: (pid, sig) => signals.push({ pid, sig }),
+    });
+    writeOrphanPidFile(dir, "still-enabled", 424_242);
+    supervisor.sweepOrphans(["still-enabled"]);
+    expect(existsSync(join(dir, "plugins", "still-enabled.pid"))).toBe(true);
+    expect(signals).toEqual([]);
+  });
+
+  test("dead PID for a now-disabled plugin -> file cleaned up, no signal sent", () => {
+    const signals: Array<{ pid: number; sig: string }> = [];
+    const { supervisor, dir } = makeSupervisor({
+      isAlivePid: () => false,
+      signalPid: (pid, sig) => signals.push({ pid, sig }),
+    });
+    writeOrphanPidFile(dir, "now-disabled", 999_999);
+    supervisor.sweepOrphans([]); // "now-disabled" is not in the eligible set
+    expect(existsSync(join(dir, "plugins", "now-disabled.pid"))).toBe(false);
+    expect(signals).toEqual([]);
+  });
+
+  test("malformed PID file content -> treated as dead, cleaned up, no signal", () => {
+    const signals: Array<{ pid: number; sig: string }> = [];
+    const { supervisor, dir } = makeSupervisor({
+      isAlivePid: () => true, // would be "alive" if ever checked
+      signalPid: (pid, sig) => signals.push({ pid, sig }),
+    });
+    mkdirSync(join(dir, "plugins"), { recursive: true });
+    const pidPath = join(dir, "plugins", "now-disabled.pid");
+    writeFileSync(pidPath, "not-a-pid");
+    supervisor.sweepOrphans([]);
+    expect(existsSync(pidPath)).toBe(false);
+    expect(signals).toEqual([]);
+  });
+
+  test("live PID with VERIFIED matching identity for a now-disabled plugin -> terminated (SIGTERM) and PID file removed", () => {
+    const signals: Array<{ pid: number; sig: string }> = [];
+    const { supervisor, dir } = makeSupervisor({
+      isAlivePid: (pid) => pid === 424_242,
+      signalPid: (pid, sig) => signals.push({ pid, sig }),
+    });
+    writeOrphanPidFile(dir, "now-disabled", 424_242); // recorded startedAt matches the default processStartedAt fixture
+    supervisor.sweepOrphans([]); // "now-disabled" not in the eligible set
+    expect(signals).toEqual([{ pid: 424_242, sig: "SIGTERM" }]);
+    expect(existsSync(join(dir, "plugins", "now-disabled.pid"))).toBe(false);
+  });
+
+  test("live PID but MISMATCHED start time (PID reuse suspected) -> fail-safe NO-KILL, file still cleaned up", () => {
+    const signals: Array<{ pid: number; sig: string }> = [];
+    const { supervisor, dir } = makeSupervisor({
+      isAlivePid: (pid) => pid === 424_242,
+      signalPid: (pid, sig) => signals.push({ pid, sig }),
+      processStartedAt: () => "the-actual-live-process-start-time",
+    });
+    // Recorded start time (from a previous, now-dead incarnation) does NOT match the live
+    // process's actual start time -> the OS almost certainly reused this pid for something else.
+    writeOrphanPidFile(dir, "now-disabled", 424_242, "a-stale-recorded-start-time");
+    supervisor.sweepOrphans([]);
+    expect(signals).toEqual([]); // the innocent live process is left alone — never signalled
+    expect(existsSync(join(dir, "plugins", "now-disabled.pid"))).toBe(false);
+  });
+
+  test("processStartedAt unavailable (ps errors, returns null) -> fail-safe NO-KILL, file cleaned", () => {
+    const signals: Array<{ pid: number; sig: string }> = [];
+    const { supervisor, dir } = makeSupervisor({
+      isAlivePid: (pid) => pid === 424_242,
+      signalPid: (pid, sig) => signals.push({ pid, sig }),
+      processStartedAt: () => null, // simulates ps being unavailable/erroring in this environment
+    });
+    writeOrphanPidFile(dir, "now-disabled", 424_242, FAKE_STARTED_AT);
+    supervisor.sweepOrphans([]);
+    expect(signals).toEqual([]);
+    expect(existsSync(join(dir, "plugins", "now-disabled.pid"))).toBe(false);
+  });
+
+  test("recorded startedAt of null (this core itself never stamped it) -> unverifiable, fail-safe NO-KILL", () => {
+    const signals: Array<{ pid: number; sig: string }> = [];
+    const { supervisor, dir } = makeSupervisor({
+      isAlivePid: (pid) => pid === 424_242,
+      signalPid: (pid, sig) => signals.push({ pid, sig }),
+      processStartedAt: () => FAKE_STARTED_AT, // ps works fine NOW, but the recorded value is null
+    });
+    writeOrphanPidFile(dir, "now-disabled", 424_242, null);
+    supervisor.sweepOrphans([]);
+    expect(signals).toEqual([]);
+    expect(existsSync(join(dir, "plugins", "now-disabled.pid"))).toBe(false);
+  });
+
+  test("legacy bare-PID file (pre-fix format) with a LIVE pid -> unverifiable, fail-safe NO-KILL, file cleaned", () => {
+    const signals: Array<{ pid: number; sig: string }> = [];
+    const { supervisor, dir } = makeSupervisor({
+      isAlivePid: (pid) => pid === 424_242, // genuinely alive — old code would have killed it outright
+      signalPid: (pid, sig) => signals.push({ pid, sig }),
+    });
+    mkdirSync(join(dir, "plugins"), { recursive: true });
+    const pidPath = join(dir, "plugins", "now-disabled.pid");
+    writeFileSync(pidPath, "424242"); // bare PID — the pre-fix on-disk format
+    supervisor.sweepOrphans([]);
+    expect(signals).toEqual([]); // never signalled — no innocent-PID kill from a legacy file
+    expect(existsSync(pidPath)).toBe(false);
+  });
+
+  test("a mixed sweep: a still-eligible plugin's PID file is left alone, a disabled plugin's verified orphan is swept", () => {
+    const signals: Array<{ pid: number; sig: string }> = [];
+    const { supervisor, dir } = makeSupervisor({
+      isAlivePid: (pid) => pid === 111 || pid === 222,
+      signalPid: (pid, sig) => signals.push({ pid, sig }),
+    });
+    writeOrphanPidFile(dir, "still-enabled", 111);
+    writeOrphanPidFile(dir, "now-disabled", 222);
+    supervisor.sweepOrphans(["still-enabled"]);
+    expect(existsSync(join(dir, "plugins", "still-enabled.pid"))).toBe(true); // untouched
+    expect(existsSync(join(dir, "plugins", "now-disabled.pid"))).toBe(false); // swept
+    expect(signals).toEqual([{ pid: 222, sig: "SIGTERM" }]);
+  });
+
+  test("non-.pid files in the run dir are ignored", () => {
+    const { supervisor, dir } = makeSupervisor();
+    mkdirSync(join(dir, "plugins"), { recursive: true });
+    const stray = join(dir, "plugins", "README.txt");
+    writeFileSync(stray, "not a pid file");
+    expect(() => supervisor.sweepOrphans([])).not.toThrow();
+    expect(existsSync(stray)).toBe(true);
+  });
+});
+
+// -------------------------------------------------------------------------------------------
 // PID file lifecycle.
 // -------------------------------------------------------------------------------------------
 

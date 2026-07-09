@@ -142,6 +142,13 @@ export const PluginInfoSchema = z.object({
   tccPermissions: z.array(z.string()).optional(),
   /** manifest.permissions.hardware verbatim, for the "hardware access via Norma.app helper: <each>" lines. */
   hardwarePermissions: z.array(z.string()).optional(),
+  /** Phase 4d-i Task 4: live PluginSupervisor runtime status for Tier-2 (`platform`,
+   *  pluginSpawnEligible) plugins — the SAME `SupervisorStatus` the supervisor tracks
+   *  (supervisor.ts), surfaced here so a dashboard can tell running/crashed/circuit-open apart
+   *  from static manifest/consent data. `"na"` for Tier-1 (`capability`) plugins and legacy
+   *  plugins, which never run a process and so have no supervisor status to report. Optional so
+   *  older-shaped fixtures/servers still parse, same precedent as the Phase 4a Task 3 fields above. */
+  status: z.enum(["starting", "running", "backoff", "circuit-open", "stopped", "na"]).optional(),
 });
 export const PluginsListParams = z.object({});
 export const PluginsListResult = z.object({ ok: z.literal(true), plugins: z.array(PluginInfoSchema) });
