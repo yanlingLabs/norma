@@ -2433,7 +2433,7 @@ describe("daemon IPC", () => {
       c.close(); srv.stop();
     });
 
-    test("(c) plugin.disable strips `enabled` and hot-stops the running process", async () => {
+    test("(c) plugin.disable strips `enabled`, strips consent, and hot-stops the running process", async () => {
       const srv = await bootLifecycleServer();
       const c = await TestClient.connect(srv.socketPath);
       await c.hello(srv.harnessToken, "cli-disable");
@@ -2447,11 +2447,11 @@ describe("daemon IPC", () => {
       const settings = JSON.parse(readFileSync(srv.settingsPath, "utf8"));
       expect(settings.plugins.enabled).toEqual([]);
       expect(settings.plugins.disabled).toEqual(["runner"]);
-      // Deliberate divergence from the CLI's `norma plugin disable` (plugin-cli.ts, which strips
-      // the consent record too): this RPC's brief pins `setPluginEnabled(...,false)` ONLY — a
-      // re-`plugin.enable` after a disable does NOT need to re-consent. Pinned here so a future
-      // change can't silently start stripping consents without a test noticing.
-      expect(settings.plugins.consents.runner.exec).toBeGreaterThan(0);
+      // Matches the CLI's `norma plugin disable` (main.ts, which composes
+      // stripPluginConsents(setPluginEnabled(...))) and the design spec's fresh-consent semantics
+      // (lifecycle.ts's stripPluginConsents doc, settings.ts:38-40): disable deletes the plugin's
+      // whole consent record, so re-`plugin.enable` after a disable requires consenting again.
+      expect(settings.plugins.consents?.runner).toBeUndefined();
 
       const list = await c.request(METHODS.pluginsList, {});
       expect(list.result.plugins.find((p: any) => p.name === "runner")).toMatchObject({ disabled: true, mcpEnabled: false });

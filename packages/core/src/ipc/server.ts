@@ -45,7 +45,8 @@ import type { QuotaManager } from "../providers/quota";
 import { addLocalDir, loadSettings, saveSettings, type Settings } from "../settings";
 import {
   deriveInstallName, installPluginFromDir, missingConsents, buildConsentBlock, applyFreshPluginConsent,
-  setPluginEnabled, grantPluginConsents, removePluginFromSettings, removePluginDir, type InstallPluginResult,
+  setPluginEnabled, grantPluginConsents, removePluginFromSettings, removePluginDir, stripPluginConsents,
+  type InstallPluginResult,
 } from "../plugins/lifecycle";
 
 interface ConnState {
@@ -838,7 +839,10 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         if (!info) return { code: "unknown_plugin" };
         if (!opts.normaHome) throw new RpcFailure(ERR.INTERNAL, "plugin.disable is not available on this server (no normaHome configured)");
         const settingsPath = join(opts.normaHome, "settings.json");
-        saveSettings(settingsPath, setPluginEnabled(loadSettings(settingsPath), p.name, false));
+        // Fresh-consent semantics on disable (matches the CLI's `norma plugin disable` and the
+        // design spec — lifecycle.ts's stripPluginConsents doc, settings.ts:38-40): re-enabling
+        // a disabled plugin must require consenting again, so strip its consent record here too.
+        saveSettings(settingsPath, stripPluginConsents(setPluginEnabled(loadSettings(settingsPath), p.name, false), p.name));
         hotApplyStop(p.name);
         return { ok: true };
       }
