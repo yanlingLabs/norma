@@ -13,7 +13,7 @@ export function registerToolSearchTool(r: ToolRegistry): void {
       maxResults: z.number().int().positive().max(20).optional(),
     }),
     run({ query, maxResults }, ctx) {
-      const index = r.deferredIndex(ctx.cwd, ctx.loadedTools, ctx.deferThreshold);
+      const index = r.deferredIndex(ctx.cwd, ctx.loadedTools, ctx.deferThreshold, ctx.builtinDeferral, ctx.deferExternals);
       let matches: Array<{ name: string; description: string }>;
       if (query.startsWith("select:")) {
         const wanted = query.slice("select:".length).split(",").map((s: string) => s.trim()).filter(Boolean);

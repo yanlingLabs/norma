@@ -108,6 +108,15 @@ describe("loadSettings", () => {
     expect(Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" } }).toolSearch).toBeUndefined();
   });
 
+  test("toolSearch.deferExternals parses 'count'/'always'; absent → undefined; bad value rejected", () => {
+    const count = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, toolSearch: { deferExternals: "count" } });
+    expect(count.toolSearch).toEqual({ deferExternals: "count" });
+    const always = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, toolSearch: { enabled: true, deferThreshold: 20, deferExternals: "always" } });
+    expect(always.toolSearch).toEqual({ enabled: true, deferThreshold: 20, deferExternals: "always" });
+    expect(Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, toolSearch: {} }).toolSearch?.deferExternals).toBeUndefined();
+    expect(() => Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, toolSearch: { deferExternals: "sometimes" } })).toThrow();
+  });
+
   test("legacy migration keeps working with toolSearch field absent", () => {
     const p = tmpSettings({ webSearch: { provider: "disabled" } });
     const s = loadSettings(p);

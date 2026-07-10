@@ -258,8 +258,8 @@ export async function startDaemon(opts: {
     sharedRegistry = registry;
     registerReadTools(registry);
     registerWriteTools(registry);
-    registerBashTool(registry, { bgRegistry });
-    registerBackgroundTools(registry, { bgRegistry });
+    registerBashTool(registry, { bgRegistry }); // bash itself is NEVER deferred — only its background-poll pair below
+    registerBackgroundTools(registry, { bgRegistry }, { deferred: true });
     registerSkillTools(registry, { skills: skillStore });
     registerToolSearchTool(registry);
     questions = new QuestionBroker();
@@ -267,10 +267,10 @@ export async function startDaemon(opts: {
     registerAskUserTool(registry);
     registerTaskTools(registry, { tasks: taskStore });
     plans = new PlanBroker();
-    registerPlanTool(registry);
-    registerNotebookTool(registry);
+    registerPlanTool(registry, { deferred: true });
+    registerNotebookTool(registry, { deferred: true });
     const worktrees = new WorktreeManager({ baseRef: settings?.worktree?.baseRef });
-    registerWorktreeTools(registry);
+    registerWorktreeTools(registry, { deferred: true });
     const agents = new AgentStore({
       normaHome, trust: trustStore, baseInstructions: SYSTEM_PROMPT,
       plugins: { disabled: settings?.plugins?.disabled ?? [] },
@@ -358,6 +358,7 @@ export async function startDaemon(opts: {
       plans: plans ?? undefined,
       setPolicy: (sid, pol) => store.setApprovalPolicy(sid, pol),
       worktrees,
+      bgRegistry,
       agents,
       subagents,
       reviewer,
@@ -367,6 +368,7 @@ export async function startDaemon(opts: {
       toolSearch: {
         enabled: settings?.toolSearch?.enabled,
         deferThreshold: settings?.toolSearch?.deferThreshold ?? Number(process.env.NORMA_TOOLSEARCH_THRESHOLD ?? 12),
+        deferExternals: settings?.toolSearch?.deferExternals,
       },
     });
   }

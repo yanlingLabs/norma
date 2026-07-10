@@ -64,6 +64,9 @@ export const Settings = z.object({
   toolSearch: z.object({
     enabled: z.boolean().optional(),
     deferThreshold: z.number().int().positive().optional(),
+    // "always": externals (mcp__/plugin__) defer whenever ANY is visible, ignoring deferThreshold's
+    // count comparison entirely. Absent/"count" = today's threshold-count behavior, unchanged.
+    deferExternals: z.enum(["count", "always"]).optional(),
   }).optional(),
   worktree: z.object({
     baseRef: z.enum(["fresh", "head"]).optional(),

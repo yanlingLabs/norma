@@ -12,8 +12,10 @@ export interface ToolContext {
   signal?: AbortSignal; // aborts when the turn is interrupted; long-running tools (bash) should honor it
   markSkillLoaded?: (name: string) => void; // set by the engine; the Skill tool calls it to pin a loaded skill for the session
   markToolLoaded?: (name: string) => void; // set by the engine; the ToolSearch tool calls it to pin a deferred tool's schema as loaded for the session
-  loadedTools?: Set<string>; // mcp__/plugin__ tools whose schema has been loaded via ToolSearch this session; consulted by execute's deferral reject
-  deferThreshold?: number; // when set and cwd-visible mcp__/plugin__ tool count exceeds it, deferral is active for this session
+  loadedTools?: Set<string>; // mcp__/plugin__ tools AND deferred:true built-ins whose schema has been loaded via ToolSearch this session (or force-visible via an engine pin — see engine.ts's pinnedTools); consulted by execute's deferral reject
+  deferThreshold?: number; // when set and cwd-visible mcp__/plugin__ tool count exceeds it (or, with deferExternals:"always", whenever any is visible at all), external deferral is active for this session
+  deferExternals?: "count" | "always"; // "always": externals defer whenever ANY is visible, ignoring deferThreshold's count comparison; absent/"count" = today's threshold-count behavior
+  builtinDeferral?: boolean; // true when built-in ToolSearch deferral is active for this session (mirrors the engine's toolSearchEnabled()) — any def registered `deferred: true` rides deferral whenever this is true, independent of the external count/threshold
   ask?: (questions: Question[]) => Promise<AskOutcome>; // engine bridge: emits question_asked/question_resolved events and blocks on the QuestionBroker; the ask_user tool calls it
   taskEvent?: (task: Task) => void; // engine bridge: emits task_updated; called by the task tools (task_create/task_update/task_list)
 }
@@ -36,6 +38,12 @@ export interface ToolDefinition<S extends z.ZodTypeAny = z.ZodTypeAny> {
   rawParameters?: Record<string, unknown>;
   /** If set, the tool is only visible/callable from sessions whose cwd is within this directory (or a descendant of it). */
   scope?: string;
+  /** If true, this built-in tool rides ToolSearch deferral (hidden from specs / execute-rejected
+   *  until loaded or pinned) whenever built-in deferral is active for the session — i.e. whenever
+   *  ToolSearch itself is enabled (see engine.ts's toolSearchEnabled/pinnedTools), independent of
+   *  the external mcp__/plugin__ count-trigger. Ignored for mcp__/plugin__ names — those defer
+   *  purely off the external count (isExternalToolName), never off this flag. */
+  deferred?: boolean;
   /** May throw — the registry converts throws into isError outcomes. */
   run(args: z.infer<S>, ctx: ToolContext): Promise<string> | string;
 }
@@ -50,38 +58,67 @@ export class ToolRegistry {
     this.defs.set(def.name, def);
   }
 
-  /** Deferral is active for a (cwd, threshold) when the caller provided a threshold AND more than
-   *  that many external (mcp__/plugin__ — isExternalToolName) tools are visible. ONE definition —
-   *  specs/deferredIndex/execute all use it. */
-  private deferralActive(cwd: string | null | undefined, deferThreshold?: number): boolean {
+  /** External (mcp__/plugin__ — isExternalToolName) deferral trigger for a (cwd, threshold) pair:
+   *  active when the caller provided a threshold AND more than that many external tools are
+   *  visible ("count" mode, the default/absent case) — OR, with deferExternals "always", whenever
+   *  ANY external tool is visible at all (the count comparison is skipped). No threshold provided
+   *  → never active, same as before deferExternals existed. */
+  private externalCountActive(cwd: string | null | undefined, deferThreshold?: number, deferExternals?: "count" | "always"): boolean {
     if (deferThreshold === undefined) return false;
     let n = 0;
     for (const d of this.defs.values()) {
       if (isExternalToolName(d.name) && (!d.scope || (!!cwd && isWithin(cwd, d.scope)))) n++;
     }
-    return n > deferThreshold;
+    return deferExternals === "always" ? n > 0 : n > deferThreshold;
+  }
+
+  /** True when `d` rides deferral in the current mode: externals under the count trigger (or
+   *  deferExternals:"always"), and any def registered `deferred: true` whenever built-in deferral
+   *  (= ToolSearch enabled) is on. ONE predicate — specs/deferredIndex/execute all use it, so they
+   *  can never disagree about what's currently deferred. */
+  private isDeferred(d: ToolDefinition, countActive: boolean, builtinActive: boolean): boolean {
+    if (isExternalToolName(d.name)) return countActive;
+    return builtinActive && d.deferred === true;
   }
 
   private toSpec(d: ToolDefinition): ToolSpec {
     return { name: d.name, description: d.description, parameters: d.rawParameters ?? z.toJSONSchema(d.args) };
   }
 
-  specs(cwd?: string | null, opts?: { loaded?: Set<string>; deferThreshold?: number }): ToolSpec[] {
-    const active = this.deferralActive(cwd, opts?.deferThreshold);
+  specs(cwd?: string | null, opts?: { loaded?: Set<string>; deferThreshold?: number; deferExternals?: "count" | "always"; builtinDeferral?: boolean }): ToolSpec[] {
+    const countActive = this.externalCountActive(cwd, opts?.deferThreshold, opts?.deferExternals);
+    const builtinActive = opts?.builtinDeferral === true;
+    // ToolSearch is only useful while SOMETHING is deferred — an external tripped the count
+    // trigger, or built-in deferral is on AND at least one registered def carries deferred:true
+    // (builtin deferral on with nothing deferred has nothing for ToolSearch to load, so it stays
+    // hidden exactly like the external-only case). Reuses isDeferred with countActive forced
+    // false so externals never contribute here — only registered `deferred: true` built-ins do.
+    const anyBuiltinDeferred = builtinActive && [...this.defs.values()].some((d) => this.isDeferred(d, false, builtinActive));
+    const toolSearchVisible = countActive || anyBuiltinDeferred;
     return [...this.defs.values()]
       .filter((d) => !d.scope || (!!cwd && isWithin(cwd, d.scope)))
       .filter((d) => {
-        if (d.name === "ToolSearch") return active; // only useful while something is deferred
-        if (!active || !isExternalToolName(d.name)) return true; // built-ins/non-external always; everything when inactive
-        return opts?.loaded?.has(d.name) ?? false; // deferred: only loaded external tools ride along
+        if (d.name === "ToolSearch") return toolSearchVisible;
+        if (!this.isDeferred(d, countActive, builtinActive)) return true; // not deferred → always visible
+        return opts?.loaded?.has(d.name) ?? false; // deferred → only loaded (or pinned-then-loaded) tools ride along
       })
       .map((d) => this.toSpec(d));
   }
 
-  deferredIndex(cwd?: string | null, loaded?: Set<string>, deferThreshold?: number): Array<{ name: string; description: string }> {
-    if (!this.deferralActive(cwd, deferThreshold)) return [];
+  deferredIndex(
+    cwd?: string | null,
+    loaded?: Set<string>,
+    deferThreshold?: number,
+    builtinDeferral?: boolean,
+    deferExternals?: "count" | "always",
+  ): Array<{ name: string; description: string }> {
+    const countActive = this.externalCountActive(cwd, deferThreshold, deferExternals);
+    const builtinActive = builtinDeferral === true;
+    if (!countActive && !builtinActive) return [];
     return [...this.defs.values()]
-      .filter((d) => isExternalToolName(d.name) && (!d.scope || (!!cwd && isWithin(cwd, d.scope))) && !(loaded?.has(d.name) ?? false))
+      .filter((d) => !d.scope || (!!cwd && isWithin(cwd, d.scope)))
+      .filter((d) => this.isDeferred(d, countActive, builtinActive))
+      .filter((d) => !(loaded?.has(d.name) ?? false))
       .map((d) => ({ name: d.name, description: d.description.slice(0, 150) }));
   }
 
@@ -115,7 +152,9 @@ export class ToolRegistry {
     if (def.scope && !(ctx.cwd && isWithin(ctx.cwd, def.scope))) {
       return { output: `tool ${name} is not available in this directory`, isError: true };
     }
-    if (isExternalToolName(def.name) && this.deferralActive(ctx.cwd, ctx.deferThreshold) && !(ctx.loadedTools?.has(def.name) ?? false)) {
+    const countActive = this.externalCountActive(ctx.cwd, ctx.deferThreshold, ctx.deferExternals);
+    const builtinActive = ctx.builtinDeferral === true;
+    if (this.isDeferred(def, countActive, builtinActive) && !(ctx.loadedTools?.has(def.name) ?? false)) {
       return { output: `tool ${name} is deferred — load its schema via ToolSearch first`, isError: true };
     }
     try {

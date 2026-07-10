@@ -11,7 +11,8 @@ import { registerWriteTools } from "../../src/agent/tools/fs-write";
 import { registerSkillTools } from "../../src/agent/tools/skill";
 import { PermissionGate } from "../../src/agent/gate";
 import { ApprovalBroker } from "../../src/agent/approvals";
-import { AgentEngine } from "../../src/agent/engine";
+import { AgentEngine, type BgTaskLister } from "../../src/agent/engine";
+import type { WorktreeManager } from "../../src/agent/worktree";
 import { SessionDirectories } from "../../src/agent/dirs";
 import { GatedProvider, deferred } from "../../src/agent/test-providers";
 import type { Provider } from "../../src/providers/types";
@@ -27,13 +28,20 @@ import type { BashReviewer } from "../../src/agent/reviewer";
 // instead of duplicating it.
 export function setupEngine(provider: Provider, opts?: {
   cwd?: string; assembler?: ContextAssembler; compactor?: Compactor; skills?: SkillStore; registry?: ToolRegistry; mcp?: McpManager;
-  reviewer?: BashReviewer; reviewerEnabled?: boolean; reviewerAllow?: string[]; policy?: "ask" | "auto";
+  reviewer?: BashReviewer; reviewerEnabled?: boolean; reviewerAllow?: string[]; policy?: "ask" | "auto" | "plan";
   // undefined (default) → no deferral anywhere; every pre-existing engine test omits this and is unaffected.
-  toolSearch?: { enabled?: boolean; deferThreshold?: number };
+  toolSearch?: { enabled?: boolean; deferThreshold?: number; deferExternals?: "count" | "always" };
   // undefined (default) → EngineConfig.provider.live is absent, matching every pre-existing
   // engine test (every turn just uses the "gated-1" boot snapshot below, unchanged). Set this to
   // exercise the no-restart live model/effort resolution path (task 4e-fix2 test key 1).
   live?: () => { model: string; reasoningEffort?: string };
+  // 4g-i state pins: both undefined (default) → pinnedTools() never fires, matching every
+  // pre-existing engine test. worktrees mirrors daemon.ts's real WorktreeManager wiring;
+  // bgRegistry is any BgTaskLister-shaped object (a real BackgroundTaskRegistry or a lightweight
+  // test fake — see engine-toolsearch.test.ts's PIN tests) so tests don't need to spawn a real
+  // sandboxed background process just to exercise the bash_output/bash_kill pin.
+  worktrees?: WorktreeManager;
+  bgRegistry?: BgTaskLister;
 }) {
   const home = mkdtempSync(join(tmpdir(), "norma-engine-steer-"));
   const cwd = opts?.cwd ?? realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-steer-cwd-")));
@@ -84,6 +92,8 @@ export function setupEngine(provider: Provider, opts?: {
     reviewerEnabled: opts?.reviewerEnabled,
     reviewerAllow: opts?.reviewerAllow,
     toolSearch: opts?.toolSearch,
+    worktrees: opts?.worktrees,
+    bgRegistry: opts?.bgRegistry,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: opts?.policy ?? "auto" });
   // Collect every SessionEvent broadcast for this session (live, via a hub subscriber) so

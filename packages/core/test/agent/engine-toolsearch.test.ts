@@ -160,3 +160,80 @@ describe("engine: ToolSearch deferral wiring", () => {
     for (let i = 1; i <= 13; i++) expect(namesA).toContain(`mcp__s__t${i}`);
   });
 });
+
+// -------------------------------------------------------------------------------------------
+// Phase 4g Task 1: built-in tool deferral (registry.ts's `deferred: true`) + the engine's
+// per-round state pins (pinnedTools) that force a state-required deferred built-in visible
+// WITHOUT going through ToolSearch and WITHOUT touching the sticky loadedTools set.
+// -------------------------------------------------------------------------------------------
+describe("engine: built-in deferral + state pins (4g-i)", () => {
+  test("PIN (plan): a plan-policy session shows exit_plan_mode in round-0 specs without any ToolSearch load", async () => {
+    const registry = new ToolRegistry();
+    registerToolSearchTool(registry);
+    registry.register({ name: "exit_plan_mode", description: "present a plan", args: z.object({ plan: z.string() }), deferred: true, run: () => "stub" });
+
+    const provider = new FakeProvider([[{ type: "text_delta", delta: "ok" }, done("end_turn")]]);
+    const { engine, sessionId } = setupEngine(provider, { registry, toolSearch: { deferThreshold: 12 }, policy: "plan" });
+
+    await engine.runTurn(sessionId);
+
+    expect(provider.requests.length).toBe(1); // no ToolSearch round needed
+    const names = provider.requests[0]!.tools?.map((t) => t.name) ?? [];
+    expect(names).toContain("exit_plan_mode"); // pinned visible even though never loaded
+  });
+
+  test("PIN (bg task): a live bg task pins bash_output/bash_kill into specs; the pin releases once the task exits (sticky set untouched — they don't leak into the next turn)", async () => {
+    const registry = new ToolRegistry();
+    registerToolSearchTool(registry);
+    registry.register({ name: "bash_output", description: "read bg output", args: z.object({ taskId: z.string() }), deferred: true, run: () => "stub" });
+    registry.register({ name: "bash_kill", description: "kill a bg task", args: z.object({ taskId: z.string() }), deferred: true, run: () => "stub" });
+
+    let status: "running" | "exited" = "running";
+    const bgRegistry = { list: () => [{ status }] };
+
+    const provider = new FakeProvider([
+      [{ type: "text_delta", delta: "ok" }, done("end_turn")], // turn 1: task running
+      [{ type: "text_delta", delta: "ok2" }, done("end_turn")], // turn 2: task exited
+    ]);
+    const { engine, sessionId } = setupEngine(provider, { registry, toolSearch: { deferThreshold: 12 }, bgRegistry });
+
+    await engine.runTurn(sessionId); // turn 1
+    const turn1Names = provider.requests[0]!.tools?.map((t) => t.name) ?? [];
+    expect(turn1Names).toContain("bash_output");
+    expect(turn1Names).toContain("bash_kill");
+
+    status = "exited";
+    await engine.runTurn(sessionId); // turn 2
+    // If bash_output/bash_kill had leaked into the STICKY loadedTools set (rather than being a
+    // per-round pin), they'd still be present here even with no live task — this is the proof
+    // that pinnedTools never touched the sticky set.
+    const turn2Names = provider.requests[1]!.tools?.map((t) => t.name) ?? [];
+    expect(turn2Names).not.toContain("bash_output");
+    expect(turn2Names).not.toContain("bash_kill");
+  });
+
+  test("BYTE-IDENTICAL: toolSearch unset → specs identical whether or not built-ins carry deferred:true", async () => {
+    const cwd = tmpCwd("norma-ts-builtin-byteid-cwd-");
+
+    const flagged = new ToolRegistry();
+    flagged.register({ name: "notebook_edit", description: "edit a notebook", args: z.object({}), deferred: true, run: () => "ok" });
+    const providerA = new FakeProvider([[{ type: "text_delta", delta: "ok" }, done("end_turn")]]);
+    const { engine: engineA, sessionId: sidA } = setupEngine(providerA, { registry: flagged, cwd }); // toolSearch undefined
+
+    const plain = new ToolRegistry();
+    plain.register({ name: "notebook_edit", description: "edit a notebook", args: z.object({}), run: () => "ok" });
+    const providerB = new FakeProvider([[{ type: "text_delta", delta: "ok" }, done("end_turn")]]);
+    const { engine: engineB, sessionId: sidB } = setupEngine(providerB, { registry: plain, cwd });
+
+    await engineA.runTurn(sidA);
+    await engineB.runTurn(sidB);
+
+    const reqA = providerA.requests[0]!;
+    const reqB = providerB.requests[0]!;
+    expect(reqA.instructions).toBe(reqB.instructions);
+    const namesA = [...(reqA.tools?.map((t) => t.name) ?? [])].sort();
+    const namesB = [...(reqB.tools?.map((t) => t.name) ?? [])].sort();
+    expect(namesA).toEqual(namesB);
+    expect(namesA).toContain("notebook_edit"); // present either way — deferred:true is inert without toolSearch enabled
+  });
+});
