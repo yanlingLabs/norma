@@ -200,6 +200,10 @@ public enum SessionEvent: Codable, Equatable, Sendable {
     public struct QuestionOption: Codable, Equatable, Sendable {
         public let label: String
         public let description: String?
+        /// CC AskUserQuestion parity: per-option preview (the "visual scheme on the right"),
+        /// e.g. a diff/scheme snippet rendered alongside the option. Optional/additive — decode
+        /// only, absent in older-shaped payloads.
+        public let preview: String?
     }
 
     public struct Question: Codable, Equatable, Sendable {
@@ -233,6 +237,9 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         public let callId: String
         public let answers: [String: String]
         public let by: String
+        /// CC AskUserQuestion parity: free-text notes ("press n to add notes"), keyed by question
+        /// text like `answers`. Optional/additive — decode only, absent in older-shaped payloads.
+        public let notes: [String: String]?
     }
 
     public struct TaskUpdated: Codable, Equatable, Sendable {

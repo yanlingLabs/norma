@@ -116,6 +116,41 @@ describe("SessionEvent discriminated union", () => {
     expect(SessionEvent.parse(tuDeleted)).toEqual(tuDeleted);
   });
 
+  // CC AskUserQuestion parity: per-option `preview` and per-answer `notes` are additive/optional —
+  // both round-trip when present, and existing question_asked/question_resolved shapes without
+  // them still parse unchanged.
+  test("question_asked option preview / question_resolved notes round-trip (optional, additive)", () => {
+    const qaWithPreview = {
+      type: "question_asked" as const, sessionId: "s", threadId: "t", seq: 1, ts: 1, callId: "c1",
+      questions: [
+        { question: "Which theme?", header: "Theme", multiSelect: false, options: [
+          { label: "Falcon", description: "the bird", preview: "--- a\n+++ b\n+falcon" },
+          { label: "Osprey" },
+        ] },
+      ],
+    };
+    expect(SessionEvent.parse(qaWithPreview)).toEqual(qaWithPreview);
+
+    const qrWithNotes = {
+      type: "question_resolved" as const, sessionId: "s", threadId: "t", seq: 2, ts: 2, callId: "c1",
+      answers: { "Which theme?": "Falcon" }, notes: { "Which theme?": "prefer the bird motif" }, by: "cli",
+    };
+    expect(SessionEvent.parse(qrWithNotes)).toEqual(qrWithNotes);
+
+    // Both fields remain optional: the pre-existing shapes (no preview, no notes) still parse.
+    const qaNoPreview = {
+      type: "question_asked" as const, sessionId: "s", threadId: "t", seq: 3, ts: 3, callId: "c2",
+      questions: [{ question: "Q?", header: "H", multiSelect: false, options: [{ label: "A" }, { label: "B" }] }],
+    };
+    expect(SessionEvent.parse(qaNoPreview)).toEqual(qaNoPreview);
+
+    const qrNoNotes = {
+      type: "question_resolved" as const, sessionId: "s", threadId: "t", seq: 4, ts: 4, callId: "c2",
+      answers: { "Q?": "A" }, by: "cli",
+    };
+    expect(SessionEvent.parse(qrNoNotes)).toEqual(qrNoNotes);
+  });
+
   test("bounds: 0/5 questions, 1/5 options, 13-char header rejected", () => {
     const t = { seq: 1, sessionId: "s", ts: 1, threadId: "t" };
     const validQuestion = { question: "Q?", header: "Header", options: [{ label: "A" }, { label: "B" }], multiSelect: false };
