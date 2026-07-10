@@ -55,7 +55,14 @@ export interface EngineConfig {
   gate: PermissionGate;
   broker: ApprovalBroker;
   dirs: SessionDirectories;
-  provider: { provider: Provider; model: string };
+  // `live`, when wired (daemon.ts, from providers/manager.ts's ActiveProvider.liveModel),
+  // re-resolves the model + reasoningEffort ONCE PER TURN straight off the current settings.json
+  // — the whole point being that changing the configured model does NOT require a daemon
+  // restart. Absent (test harnesses that don't care) means every turn just uses this boot-time
+  // `model` snapshot, unchanged behavior. `model` itself is ALWAYS present as the fallback `live`
+  // resolves from when unset, and as what `contextWindow`'s default-Infinity ModelInfo lookup
+  // falls back to matching when `live` is absent.
+  provider: { provider: Provider; model: string; live?: () => { model: string; reasoningEffort?: string } };
   assembler: ContextAssembler;
   compactor: Compactor;
   mcp?: McpManager;
@@ -208,8 +215,14 @@ export class AgentEngine {
     return this.toolSearchEnabled() ? this.cfg.toolSearch!.deferThreshold : undefined;
   }
 
-  private contextWindow(): number {
-    const m = this.cfg.provider.provider.models().find((mi) => mi.id === this.cfg.provider.model);
+  /** `model` is the PER-TURN resolved model (turn()'s `sel.model` — live-resolved when
+   *  `cfg.provider.live` is wired, else the boot snapshot) — never the boot model directly, so a
+   *  live model change is reflected in the auto-compact threshold on the very next turn, not just
+   *  in the streamTurn call. Unknown model (no ModelInfo match, e.g. an openai-compatible
+   *  provider with no static `models()` list) falls back to Infinity — i.e. auto-compact never
+   *  fires rather than firing on a guessed window; this is the pre-existing behavior, unchanged. */
+  private contextWindow(model: string): number {
+    const m = this.cfg.provider.provider.models().find((mi) => mi.id === model);
     return m?.contextWindow ?? Infinity;
   }
 
@@ -217,15 +230,18 @@ export class AgentEngine {
    *  `inputTokens`) — not an estimate. Runs at the start of every turn, before `historyInput` is
    *  built, so a triggered compaction's checkpoint is what `historyInput` sees for this turn. No
    *  prior completed turn (first turn of a session) means the context is necessarily small, so
-   *  there's nothing to check. */
-  private async maybeAutoCompact(sessionId: string): Promise<void> {
+   *  there's nothing to check. `model` is this turn's resolved model (see `contextWindow`'s doc
+   *  comment) — the Compactor's OWN summarization turn still runs on the boot-time model
+   *  (Compactor is constructed once in daemon.ts and isn't live-wired); only the trigger
+   *  threshold computed here uses the per-turn resolution. */
+  private async maybeAutoCompact(sessionId: string, model: string): Promise<void> {
     const events = this.cfg.store.read(sessionId);
     const lastCompleted = [...events].reverse().find(isTurnCompleted);
     if (!lastCompleted) return;
     const used = lastCompleted.inputTokens;
     const frac = Number(process.env.NORMA_COMPACT_THRESHOLD_FRAC ?? 0.75);
     const absMax = process.env.NORMA_COMPACT_MAX_TOKENS ? Number(process.env.NORMA_COMPACT_MAX_TOKENS) : Infinity;
-    const limit = Math.min(this.contextWindow() * frac, absMax);
+    const limit = Math.min(this.contextWindow(model) * frac, absMax);
     if (used > limit) await this.cfg.compactor.compact(sessionId, this.aborters.get(sessionId)?.signal);
   }
 
@@ -303,6 +319,12 @@ export class AgentEngine {
   private async turn(sessionId: string, signal: AbortSignal): Promise<void> {
     const meta = this.cfg.store.meta(sessionId);
     const threadId = MAIN_THREAD;
+    // Resolved ONCE per turn (spec: "changing models must NOT require a daemon restart") — a
+    // settings.json edit mid-turn does not retroactively change THIS turn's model, only the
+    // NEXT one's, mirroring how `instructions`/`instructionsFull` below are also computed once
+    // per turn and not re-read mid-turn. Falls back to the boot-time `provider.model` when `live`
+    // isn't wired (most test harnesses) — unchanged behavior for them.
+    const sel = this.cfg.provider.live?.() ?? { model: this.cfg.provider.model };
     if (!meta.cwd) {
       this.emit(sessionId, { type: "turn_started", sessionId, threadId });
       this.emit(sessionId, { type: "agent_error", sessionId, threadId, message: "session has no working directory — create the session with a cwd" });
@@ -334,8 +356,9 @@ export class AgentEngine {
     const instructionsFull = this.buildInstructionsFull(instructions, cwd, loaded, meta.approvalPolicy);
     // Auto-compact BEFORE historyInput is built, so a triggered compaction's checkpoint is
     // reflected in this turn's input. A compaction failure degrades to a normal (uncompacted)
-    // turn rather than breaking it.
-    try { await this.maybeAutoCompact(sessionId); } catch (e) { console.error("auto-compact failed", e); }
+    // turn rather than breaking it. Uses THIS turn's resolved model (sel.model), not the boot
+    // snapshot — see contextWindow's doc comment.
+    try { await this.maybeAutoCompact(sessionId, sel.model); } catch (e) { console.error("auto-compact failed", e); }
     const input = this.historyInput(sessionId);
     // Appended AFTER history (nearest the model's attention), BEFORE the tool loop starts — see
     // taskListReminder's doc comment for why this is transient (assembled input only, never a
@@ -349,7 +372,8 @@ export class AgentEngine {
       instructionsFull,
       input,
       cwd,
-      model: this.cfg.provider.model,
+      model: sel.model,
+      reasoningEffort: sel.reasoningEffort,
       meta,
       depth: 0,
       signal,
@@ -369,6 +393,12 @@ export class AgentEngine {
     input: TurnInputItem[];
     cwd: string;
     model: string;
+    // Per-turn resolved reasoning-effort (turn()'s sel.reasoningEffort), threaded straight into
+    // the TurnRequest below. Subagents inherit the SAME effort as their parent thread (opts
+    // .reasoningEffort's fallback in the spawn bridge) — no per-agent-def override, matching the
+    // model-override precedence's own comment: agent defs get a model override but not an effort
+    // one (spec: "do NOT add per-agent effort").
+    reasoningEffort?: string;
     meta: ReturnType<SessionStore["meta"]>;
     depth: number;
     signal: AbortSignal;
@@ -403,6 +433,7 @@ export class AgentEngine {
           .filter((s) => !excludeTools?.has(s.name))
           .filter((s) => !allowTools || allowTools.has(s.name)),
         signal,
+        ...(opts.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
       })) {
         if (ev.type === "text_delta") {
           textBuf += ev.delta;
@@ -478,6 +509,9 @@ export class AgentEngine {
               input: [{ type: "message", role: "user", content: prompt }], // FRESH — no parent history
               cwd: opts.cwd,
               model: modelOverride ?? def.model ?? opts.model,
+              // Subagents inherit the PARENT thread's resolved reasoning effort — no per-agent-def
+              // override (agent defs only carry a model override, never an effort one).
+              reasoningEffort: opts.reasoningEffort,
               meta, // SAME object — the child inherits the parent's (possibly later-mutated) approval policy
               depth: opts.depth + 1,
               signal: childSignal,

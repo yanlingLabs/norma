@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { OpenAICompatibleProvider } from "../../src/providers/openai-compatible";
+import { OpenAICompatibleProvider, buildRequestBody } from "../../src/providers/openai-compatible";
 
 let server: ReturnType<typeof Bun.serve> | null = null;
 afterEach(() => { server?.stop(true); server = null; });
@@ -184,5 +184,38 @@ describe("OpenAICompatibleProvider", () => {
     const base503 = serveSse("simple-text.sse", { status: 503 });
     const p2 = new OpenAICompatibleProvider({ baseUrl: base503, apiKey: "sk" });
     expect((await collect(p2.streamTurn({ model: "m", input: [] })))[0]).toMatchObject({ type: "error", code: "server" });
+  });
+});
+
+describe("buildRequestBody reasoningEffort", () => {
+  const baseReq = {
+    model: "gpt-5.6-sol",
+    instructions: "be brief",
+    input: [{ type: "message", role: "user", content: "hi" } as const],
+    tools: [],
+  };
+
+  // Test-pin (task spec): when reasoningEffort is unset, the body must be BYTE-IDENTICAL to the
+  // pre-reasoning-effort shape — no `reasoning` key present at all, not even `reasoning: undefined`.
+  test("no reasoning field when reasoningEffort is unset — byte-identical to the fixture body", () => {
+    const body = buildRequestBody(baseReq);
+    expect("reasoning" in body).toBe(false);
+    const fixture = {
+      model: "gpt-5.6-sol",
+      instructions: "be brief",
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+      tools: [],
+      tool_choice: "auto",
+      parallel_tool_calls: true,
+      store: false,
+      stream: true,
+      include: [],
+    };
+    expect(JSON.stringify(body)).toBe(JSON.stringify(fixture));
+  });
+
+  test("reasoning.effort is present when reasoningEffort is set", () => {
+    const body = buildRequestBody({ ...baseReq, reasoningEffort: "high" });
+    expect(body.reasoning).toEqual({ effort: "high" });
   });
 });

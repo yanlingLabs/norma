@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FileSecretStore } from "../../src/auth/secret-store";
 import { CodexAuthStore, CodexOAuthProvider } from "../../src/providers/codex-oauth";
-import { CODEX_MODELS } from "../../src/providers/codex-config";
+import { CODEX_MODELS, DEFAULT_CODEX_MODEL } from "../../src/providers/codex-config";
 
 let server: ReturnType<typeof Bun.serve> | null = null;
 afterEach(() => { server?.stop(true); server = null; });
@@ -101,32 +101,31 @@ describe("CodexOAuthProvider", () => {
 });
 
 describe("CODEX_MODELS", () => {
-  // F4 (4e gate ledger): live-verified 2026-07-10 from /models?client_version=1.0.0 — the
-  // gpt-5.6 family (sol/terra/luna, 372K ctx) is new; gpt-5.4 was wrongly 128_000 (real: 272_000,
-  // which made auto-compaction fire ~2x early).
-  test("includes the live gpt-5.6 family at 372K context", () => {
-    for (const id of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
-      const m = CODEX_MODELS.find((mi) => mi.id === id);
-      expect(m).toBeDefined();
-      expect(m?.family).toBe("gpt-5");
-      expect(m?.contextWindow).toBe(372_000);
-      expect(m?.supportsVision).toBe(true);
+  // 2026-07-10 user decision (4e-fix Task 2): gpt-5.5 and gpt-5.4/gpt-5.4-mini are FULLY
+  // DEPRECATED — CODEX_MODELS is now EXACTLY the gpt-5.6 family (sol/terra/luna, 372K ctx).
+  // A configured settings.json model outside this list falls back at runtime to
+  // DEFAULT_CODEX_MODEL (providers/manager.ts's live model resolver), not rejected here.
+  test("is EXACTLY the gpt-5.6 family — sol/terra/luna, 372K context, nothing else", () => {
+    expect(CODEX_MODELS.map((m) => m.id)).toEqual(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
+    for (const m of CODEX_MODELS) {
+      expect(m.family).toBe("gpt-5");
+      expect(m.contextWindow).toBe(372_000);
+      expect(m.supportsVision).toBe(true);
     }
   });
 
-  test("gpt-5.4 context window is 272_000 (was wrongly 128_000)", () => {
-    const m = CODEX_MODELS.find((mi) => mi.id === "gpt-5.4");
-    expect(m?.contextWindow).toBe(272_000);
-  });
-
-  test("gpt-5.5 and gpt-5.4-mini remain at 272K", () => {
-    for (const id of ["gpt-5.5", "gpt-5.4-mini"]) {
-      const m = CODEX_MODELS.find((mi) => mi.id === id);
-      expect(m?.contextWindow).toBe(272_000);
+  test("gpt-5.5 / gpt-5.4 / gpt-5.4-mini are deprecated — no longer in CODEX_MODELS", () => {
+    for (const id of ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]) {
+      expect(CODEX_MODELS.find((mi) => mi.id === id)).toBeUndefined();
     }
   });
 
   test("codex-auto-review is excluded (hidden model)", () => {
     expect(CODEX_MODELS.find((mi) => mi.id === "codex-auto-review")).toBeUndefined();
+  });
+
+  test("DEFAULT_CODEX_MODEL is gpt-5.6-sol and is itself a member of CODEX_MODELS", () => {
+    expect(DEFAULT_CODEX_MODEL).toBe("gpt-5.6-sol");
+    expect(CODEX_MODELS.some((m) => m.id === DEFAULT_CODEX_MODEL)).toBe(true);
   });
 });

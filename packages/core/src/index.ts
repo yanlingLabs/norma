@@ -2,7 +2,11 @@ export { startDaemon, CORE_VERSION, type RunningDaemon } from "./daemon";
 export { bootstrapNormaDir, resolveNormaHome } from "./norma-dir";
 export { FileSecretStore, KeychainSecretStore } from "./auth/secret-store";
 export { TOKEN_NAMES } from "./auth/tokens";
-export { loadSettings, saveSettings, loadPermissionDirs, addLocalDir, type Settings } from "./settings";
+export {
+  loadSettings, saveSettings, loadPermissionDirs, addLocalDir,
+  REASONING_EFFORTS, setProviderModel, setReasoningEffort,
+  type Settings,
+} from "./settings";
 export {
   deriveInstallName,
   resolvePluginTarget,
@@ -18,10 +22,10 @@ export {
   type InstallPluginResult,
   type ConsentBlockPlugin,
 } from "./plugins/lifecycle";
-export { createProvider, OPENAI_API_KEY_SECRET, type ActiveProvider } from "./providers/manager";
+export { createProvider, OPENAI_API_KEY_SECRET, type ActiveProvider, type LiveModelSelection } from "./providers/manager";
 export { CodexAuthStore, CODEX_SECRET_NAMES } from "./providers/codex-oauth";
 export { runLoginFlow } from "./providers/pkce";
-export { CODEX } from "./providers/codex-config";
+export { CODEX, CODEX_MODELS, DEFAULT_CODEX_MODEL } from "./providers/codex-config";
 export { AgentEngine, type EngineConfig } from "./agent/engine";
 export { FakeProvider } from "./agent/fake-provider";
 export { ToolRegistry, type ToolDefinition, type ToolContext, type ToolOutcome } from "./agent/tools/registry";

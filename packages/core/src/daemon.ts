@@ -115,8 +115,10 @@ export async function startDaemon(opts: {
   secrets?: SecretStore;
   server?: Partial<Pick<IpcServerOptions, "helloTimeoutMs" | "maxConnections" | "preAuthMaxLine">>;
   /** undefined: try settings.json (production default). null: agent disabled (tests, Phase 0
-   *  behavior). object: use this provider directly (tests inject FakeProvider). */
-  agentProvider?: { provider: Provider; model: string } | null;
+   *  behavior). object: use this provider directly (tests inject FakeProvider). `live`, when
+   *  present, is threaded into EngineConfig.provider.live (no-restart model resolution) — tests
+   *  that inject a provider directly and don't care about live resolution just omit it. */
+  agentProvider?: { provider: Provider; model: string; live?: () => { model: string; reasoningEffort?: string } } | null;
 } = {}): Promise<RunningDaemon> {
   const startedAt = Date.now();
   const dirs = bootstrapNormaDir(opts.home ?? resolveNormaHome());
@@ -183,8 +185,16 @@ export async function startDaemon(opts: {
   if (agentProvider === undefined) {
     if (settings) {
       try {
-        const active = await createProvider(settings, secrets);
-        agentProvider = { provider: active.provider, model: active.model };
+        const active = await createProvider(settings, secrets, dirs.settingsPath);
+        // `model` here is the RESOLVED (not raw) boot selection — active.model is the raw
+        // settings.json value, which for codex-oauth may be a since-deprecated slug (e.g.
+        // "gpt-5.4"). Everything that consumes this snapshot directly rather than calling `live`
+        // per-turn (Compactor's own summarization turn, BashReviewer, SessionTitler, the
+        // daemon-status `providerInfo` below) needs a model the backend will actually accept, so
+        // resolve once here via the SAME deprecation-fallback path `live` uses on every turn.
+        // `live` itself is still wired separately below (EngineConfig.provider.live) so turns
+        // keep re-resolving on every call, not just at this boot snapshot.
+        agentProvider = { provider: active.provider, model: active.liveModel().model, live: active.liveModel };
         quota = active.quota;
       } catch (err) {
         console.error(`agent disabled: ${(err as Error).message}`);

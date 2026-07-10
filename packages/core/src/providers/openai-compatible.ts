@@ -49,6 +49,9 @@ export function mapTools(tools: ToolSpec[] | undefined): unknown[] {
  *   omitting them causes HTTP 400.
  * instructions: codex-rs skips when empty string; we always send a default so the
  *   field is never absent when the caller omits it.
+ * reasoning: omitted entirely when req.reasoningEffort is unset — the body must stay
+ *   byte-identical to the pre-reasoning-effort shape (test-pinned in openai-compatible.test.ts)
+ *   so existing callers/backends that never set it see no change at all.
  */
 export function buildRequestBody(req: TurnRequest): Record<string, unknown> {
   return {
@@ -61,6 +64,7 @@ export function buildRequestBody(req: TurnRequest): Record<string, unknown> {
     store: false,
     stream: true,
     include: [],
+    ...(req.reasoningEffort ? { reasoning: { effort: req.reasoningEffort } } : {}),
   };
 }
 

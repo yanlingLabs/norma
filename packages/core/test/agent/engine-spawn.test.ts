@@ -24,13 +24,16 @@ import { AgentStore } from "../../src/agent/agents";
 import { SubagentManager } from "../../src/agent/subagents";
 import type { Provider, ProviderEvent } from "../../src/providers/types";
 
-function setup(
+export function setup(
   script: ProviderEvent[][],
   opts: {
     approvalPolicy?: "ask" | "auto" | "plan";
     withSubagents?: boolean; // default true; false → cfg.subagents/agents both omitted
     subagentsOpts?: { maxConcurrent?: number; timeoutMs?: number };
     provider?: Provider; // override — script ignored when set (e.g. a hanging provider for timeout tests)
+    // undefined (default) → EngineConfig.provider.live absent, matching every pre-existing test
+    // here (unchanged behavior: every turn uses the "fake-1" boot snapshot below).
+    live?: () => { model: string; reasoningEffort?: string };
   } = {},
 ) {
   const withSubagents = opts.withSubagents !== false;
@@ -62,7 +65,7 @@ function setup(
   const engine = new AgentEngine({
     store, hub, registry, broker,
     gate: new PermissionGate(),
-    provider: { provider, model: "fake-1" },
+    provider: { provider, model: "fake-1", live: opts.live },
     dirs,
     approvalTimeoutMs: 500,
     assembler,

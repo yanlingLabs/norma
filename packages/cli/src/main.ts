@@ -1,6 +1,7 @@
 import { join, resolve } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { resolveNormaHome, KeychainSecretStore, startDaemon, TOKEN_NAMES } from "@norma/core";
+import type { Settings } from "@norma/core";
 import { METHODS, type ApprovalPolicy, type Task } from "@norma/protocol";
 import { NormaClient } from "./client";
 import { applyEvent, isStalled, type WatchdogState } from "./watchdog";
@@ -39,6 +40,7 @@ import {
   setPluginEnabled,
   stripPluginConsents,
 } from "./plugin-cli";
+import { parseModelArgs, validateEffort, validateModelSlug } from "./model-cli";
 import { formatElapsed, formatTokens } from "./task-display";
 import { isOtherChoice, parseQuestionAnswer } from "./questions";
 import { parsePlanResponse } from "./plan-response";
@@ -1185,6 +1187,54 @@ if (import.meta.main) {
     const s = loadSettings(join(resolveNormaHome(), "settings.json"));
     console.log(`${AQUA}${s.provider.type}${RESET} ${DIM}model ${s.provider.model}${RESET}`);
     break;
+  }
+  case "model": {
+    // Direct settings.json read/write (no daemon RPC needed) — mirrors `provider` above and
+    // `plugin enable/disable`'s direct-write pattern. The whole point of this command (spec:
+    // "changing models must NOT require a daemon restart") is that a running daemon picks the
+    // new value up on its NEXT turn via providers/manager.ts's live model resolver — no restart,
+    // no RPC round-trip needed here at all.
+    const { loadSettings, saveSettings, resolveNormaHome, setProviderModel, setReasoningEffort, CODEX_MODELS } = await import("@norma/core");
+    const settingsPath = join(resolveNormaHome(), "settings.json");
+    const settings = loadSettings(settingsPath);
+    const action = parseModelArgs(process.argv.slice(3));
+
+    if (action.kind === "usageError") {
+      console.error(action.message);
+      process.exit(1);
+    }
+
+    if (action.kind === "show") {
+      const effortSuffix = settings.provider.reasoningEffort ? `  ${DIM}effort: ${settings.provider.reasoningEffort}${RESET}` : "";
+      console.log(`${AQUA}${settings.provider.model}${RESET}${effortSuffix}`);
+      if (settings.provider.type === "codex-oauth") {
+        console.log(`${DIM}available (codex-oauth):${RESET}`);
+        for (const m of CODEX_MODELS) {
+          const active = m.id === settings.provider.model;
+          console.log(`  ${active ? `${AQUA}*${RESET}` : " "} ${m.id}`);
+        }
+      }
+      process.exit(0);
+    }
+
+    let next = settings;
+    if (action.kind === "setModel" || action.kind === "setModelAndEffort") {
+      const err = validateModelSlug(settings.provider.type, action.slug);
+      if (err) { console.error(err); process.exit(1); }
+      next = setProviderModel(next, action.slug);
+    }
+    if (action.kind === "setEffort" || action.kind === "setModelAndEffort") {
+      const err = validateEffort(action.effort);
+      if (err) { console.error(err); process.exit(1); }
+      next = setReasoningEffort(next, action.effort as NonNullable<Settings["provider"]["reasoningEffort"]>);
+    }
+    saveSettings(settingsPath, next);
+    const changed = [
+      action.kind === "setModel" || action.kind === "setModelAndEffort" ? `model ${next.provider.model}` : null,
+      action.kind === "setEffort" || action.kind === "setModelAndEffort" ? `effort ${next.provider.reasoningEffort}` : null,
+    ].filter(Boolean).join(", ");
+    console.log(`${AQUA}updated${RESET} ${DIM}(${changed}) — takes effect next turn, no daemon restart needed${RESET}`);
+    process.exit(0);
   }
   case "init": {
     await runTurnSession({ promptOverride: INIT_PROMPT, forceAuto: true, chat: false }); // force auto: writes NORMA.md without approval prompts
