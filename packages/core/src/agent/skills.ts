@@ -1,10 +1,10 @@
-import { readFileSync, readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
+import { join, dirname } from "node:path";
 import type { TrustStore } from "./trust";
 
-export interface SkillMeta { name: string; description: string; source: "project" | "user" | "self" | "plugin"; path: string }
+export interface SkillMeta { name: string; description: string; source: "project" | "user" | "self" | "plugin"; path: string; claudeFormat?: boolean }
 interface ParsedSkill { name: string; description: string; body: string }
-interface ScannedSkill extends ParsedSkill { source: SkillMeta["source"]; path: string }
+interface ScannedSkill extends ParsedSkill { source: SkillMeta["source"]; path: string; claudeFormat?: boolean }
 
 const TRUNC = "\n[…truncated]";
 
@@ -38,6 +38,27 @@ function parseSkill(path: string, fallbackName: string): ParsedSkill | null {
 function capBytes(s: string, maxBytes: number): string {
   const buf = Buffer.from(s, "utf8");
   return buf.byteLength <= maxBytes ? s : buf.subarray(0, maxBytes).toString("utf8") + TRUNC;
+}
+
+/**
+ * Spec §8 (Phase 4): skills from claude-format plugins are written for Claude Code's tool names.
+ * The mapping is CONTEXT for the agent — Norma's permission gate, not the plugin tier, contains
+ * what the skill convinces the agent to do. Prepended AFTER capBytes so it can never truncate.
+ */
+function compatPreamble(skillDir: string): string {
+  return [
+    "[compat] This skill was written for Claude Code. You are running under Norma — the equivalent tools are:",
+    "- TodoWrite / TaskCreate / TaskUpdate → `task_create` / `task_update` / `task_list`",
+    "- AskUserQuestion → `ask_user`",
+    "- Task (subagent dispatch) → `spawn_agent`",
+    "- EnterWorktree / ExitWorktree → `enter_worktree` / `exit_worktree`",
+    "- NotebookEdit → `notebook_edit`",
+    "- Skill → `Skill` (same name)",
+    "- Read / Glob / Grep / Bash → `read` / `glob` / `grep` / `bash` (same behavior)",
+    `Base directory for this skill: ${skillDir} — its scripts/ and relative references resolve against this path; run skill-internal scripts via bash as-is.`,
+    "",
+    "",
+  ].join("\n");
 }
 
 /** Scan `<root>/<dir>/SKILL.md` for every immediate subdirectory of `root`, skipping names in `exclude`. Skips anything invalid; never throws. */
@@ -96,8 +117,9 @@ export class SkillStore {
     } catch { /* no plugins dir */ }
     for (const plugin of plugins) {
       if (this.disabledPlugins.includes(plugin)) continue;
+      const claudeFormat = existsSync(join(this.normaHome, "plugins", plugin, ".claude-plugin", "plugin.json")) || undefined;
       for (const s of scanRoot(join(this.normaHome, "plugins", plugin, "skills"), "plugin")) {
-        all.push({ ...s, name: `${plugin}:${s.name}` }); // the one place plugin names get namespaced
+        all.push({ ...s, name: `${plugin}:${s.name}`, ...(claudeFormat ? { claudeFormat } : {}) }); // the one place plugin names get namespaced
       }
     }
 
@@ -111,7 +133,7 @@ export class SkillStore {
     for (const s of this.discover(input.cwd)) {
       if (seen.has(s.name)) continue;
       seen.add(s.name);
-      out.push({ name: s.name, description: s.description, source: s.source, path: s.path });
+      out.push({ name: s.name, description: s.description, source: s.source, path: s.path, ...(s.claudeFormat ? { claudeFormat: s.claudeFormat } : {}) });
     }
     return out;
   }
@@ -119,7 +141,10 @@ export class SkillStore {
   /** Loads a skill's body (frontmatter stripped, byte-capped) by name, respecting the same trust gate and precedence as `list`. */
   load(name: string, input: { cwd: string | null }): { name: string; body: string } | null {
     for (const s of this.discover(input.cwd)) {
-      if (s.name === name) return { name: s.name, body: capBytes(s.body, this.bodyBytes) };
+      if (s.name === name) {
+        const body = capBytes(s.body, this.bodyBytes);
+        return { name: s.name, body: s.claudeFormat ? compatPreamble(dirname(s.path)) + body : body };
+      }
     }
     return null;
   }

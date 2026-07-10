@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, realpathSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SkillStore } from "../../src/agent/skills";
@@ -110,5 +110,63 @@ describe("SkillStore", () => {
 
     expect(names).toContain("on:hi");
     expect(names).toContain("off:bye");
+  });
+
+  test("load() prepends the compat preamble for a claude-format plugin skill", () => {
+    const { home, trust } = setup();
+    // Fixture A: claude-format plugin with .claude-plugin/plugin.json
+    const ccPlugPath = join(home, "plugins", "cc-plug");
+    mkdirSync(join(ccPlugPath, ".claude-plugin"), { recursive: true });
+    writeFileSync(join(ccPlugPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "cc-plug" }));
+    writeSkill(join(ccPlugPath, "skills"), "greet", "greet", "d", "BODY-CC" + "x".repeat(100));
+
+    const store = new SkillStore({ normaHome: home, trust });
+    const s = store.load("cc-plug:greet", { cwd: null })!;
+    expect(s.body).toContain("written for Claude Code");           // preamble marker
+    expect(s.body).toContain("task_create");                        // mapping table present
+    expect(s.body).toContain("spawn_agent");
+    expect(s.body).toContain(join(home, "plugins", "cc-plug", "skills", "greet")); // base dir line
+    expect(s.body.indexOf("written for Claude Code")).toBeLessThan(s.body.indexOf("BODY-CC")); // preamble BEFORE body
+  });
+
+  test("load() does NOT prepend the preamble for a norma-native plugin skill", () => {
+    const { home, trust } = setup();
+    // Fixture B: norma-native plugin without .claude-plugin
+    writeSkill(join(home, "plugins", "native-plug", "skills"), "greet", "greet", "d", "BODY-NATIVE");
+
+    const store = new SkillStore({ normaHome: home, trust });
+    const s = store.load("native-plug:greet", { cwd: null })!;
+    expect(s.body).not.toContain("written for Claude Code");
+  });
+
+  test("preamble survives body capping (prepended after the cap)", () => {
+    const { home, trust } = setup();
+    // Use cc-plug with body > 64 bytes
+    const ccPlugPath = join(home, "plugins", "cc-plug");
+    mkdirSync(join(ccPlugPath, ".claude-plugin"), { recursive: true });
+    writeFileSync(join(ccPlugPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "cc-plug" }));
+    writeSkill(join(ccPlugPath, "skills"), "greet", "greet", "d", "BODY-CC" + "x".repeat(100));
+
+    const smallCapStore = new SkillStore({ normaHome: home, trust, caps: { bodyBytes: 64 } });
+    const s = smallCapStore.load("cc-plug:greet", { cwd: null })!;
+    expect(s.body).toContain("task_create"); // mapping intact despite truncated body
+    expect(s.body).toContain("[…truncated]"); // body itself was capped
+  });
+
+  test("discover() marks claudeFormat only on claude-format plugin skills", () => {
+    const { home, trust } = setup();
+    // Fixture A: claude-format plugin
+    const ccPlugPath = join(home, "plugins", "cc-plug");
+    mkdirSync(join(ccPlugPath, ".claude-plugin"), { recursive: true });
+    writeFileSync(join(ccPlugPath, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "cc-plug" }));
+    writeSkill(join(ccPlugPath, "skills"), "greet", "greet", "d", "BODY-CC" + "x".repeat(100));
+
+    // Fixture B: norma-native plugin
+    writeSkill(join(home, "plugins", "native-plug", "skills"), "greet", "greet", "d", "BODY-NATIVE");
+
+    const store = new SkillStore({ normaHome: home, trust });
+    const all = store.list({ cwd: null });
+    expect(all.find((s) => s.name === "cc-plug:greet")?.claudeFormat).toBe(true);
+    expect(all.find((s) => s.name === "native-plug:greet")?.claudeFormat).toBeUndefined();
   });
 });
