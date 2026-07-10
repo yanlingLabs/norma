@@ -17,10 +17,17 @@ function combine(root: string, p: string): string {
 export function registerReadTools(r: ToolRegistry): void {
   r.register({
     name: "read",
-    description: "Read a file's contents. Path is relative to the session directory.",
-    args: z.object({ path: z.string().min(1) }),
-    run({ path }, { roots }) {
-      return readFileSync(resolveWithinAny(roots, path), "utf8");
+    description: "Read a file's contents. Path is relative to the session directory. Optional offset (1-based start line) and limit (line count) read part of a large file — outputs over 64KB truncate, so page large files with offset/limit. Returns plain text without line numbers.",
+    args: z.object({ path: z.string().min(1), offset: z.number().int().min(1).optional(), limit: z.number().int().positive().optional() }),
+    run({ path, offset = 1, limit }, { roots }) {
+      const content = readFileSync(resolveWithinAny(roots, path), "utf8");
+      if (offset === 1 && limit === undefined) {
+        return content;
+      }
+      const lines = content.split("\n");
+      const endIdx = limit === undefined ? lines.length : offset - 1 + limit;
+      const sliced = lines.slice(offset - 1, endIdx);
+      return sliced.join("\n");
     },
   });
 

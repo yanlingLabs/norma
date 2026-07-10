@@ -55,6 +55,19 @@ describe("write tools", () => {
     expect(res.output).toMatch(/outside the allowed directories/);
   });
 
+  test("edit: replace_all replaces every occurrence; default still requires uniqueness", async () => {
+    const { r, d } = setup();
+    writeFileSync(join(d, "multi.txt"), "a b a");
+    // without replace_all, editing "a" (appears 2x) should error
+    const noReplace = await r.execute("edit", { path: "multi.txt", old_string: "a", new_string: "x" }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(noReplace.isError).toBe(true);
+    expect(noReplace.output).toMatch(/2 occurrences/);
+    // with replace_all: true, should replace both
+    const withReplace = await r.execute("edit", { path: "multi.txt", old_string: "a", new_string: "x", replace_all: true }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(withReplace.isError).toBe(false);
+    expect(readFileSync(join(d, "multi.txt"), "utf8")).toBe("x b x");
+  });
+
   test("write succeeds in a non-cwd allowed root", async () => {
     const { r, d } = setup();
     const b = realpathSync(mkdtempSync(join(tmpdir(), "norma-w2-")));
