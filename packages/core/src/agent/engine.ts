@@ -554,6 +554,21 @@ export class AgentEngine {
           const agentType = typeof parsed.agentType === "string" ? parsed.agentType : undefined;
           const modelOverride = typeof parsed.model === "string" ? parsed.model : undefined;
           const description = typeof parsed.description === "string" ? parsed.description : undefined;
+
+          // 4g-ii (CC parity): spawn_agent's `description` is now a REQUIRED arg (spawn.ts's own
+          // zod schema enforces this — but this concurrent bridge hand-parses call.argsJson and
+          // short-circuits BEFORE executeCall's registry.execute() ever runs its zod validation,
+          // same reason the model-override check below can't rely on the schema either. Must be
+          // checked BEFORE thread_started/registerThread/subagents.run, mirroring the model-
+          // override early-return just below. Message format matches registry.execute()'s own
+          // "invalid arguments for X: field" wording for a consistent typed-error shape. No
+          // `.trim()` here — matches spawn.ts's `z.string().min(1)` exactly (a whitespace-only
+          // description satisfies min(1) too), so both paths agree on what counts as "present".
+          if (!description) {
+            spawnOutcomes.set(call.callId, { output: `invalid arguments for spawn_agent: description`, isError: true });
+            return; // no thread_started, no thread registry entry, no subagents.run slot
+          }
+
           const def = this.cfg.agents!.resolve(agentType, opts.cwd);
 
           // Defect 1 (4e gate F9): validate an EXPLICIT model override — modelOverride (the
@@ -915,13 +930,18 @@ export class AgentEngine {
         };
       }
       let action: "keep" | "remove" = "keep";
-      try { const a = JSON.parse(call.argsJson || "{}"); if (a.action === "remove") action = "remove"; } catch { /* default to keep */ }
+      let discardChanges = false;
+      try {
+        const a = JSON.parse(call.argsJson || "{}");
+        if (a.action === "remove") action = "remove";
+        if (a.discard_changes === true) discardChanges = true;
+      } catch { /* default to keep, discardChanges false */ }
       // Capture the worktree dir BEFORE exit() clears the manager's active-session entry, so we
       // can drop it from SessionDirectories below — on BOTH keep and remove: once exited we're
       // back in the original repo either way, and a lingering root (especially one whose dir was
       // just deleted by {remove}) must not stick around in the allowed-roots list.
       const activeDir = worktrees.active(sessionId)?.dir;
-      const res = worktrees.exit(sessionId, action);
+      const res = worktrees.exit(sessionId, action, discardChanges);
       this.cfg.store.setCwd(sessionId, res.originalCwd);
       if (activeDir) this.cfg.dirs.remove(sessionId, activeDir);
       onCwd(res.originalCwd); // SAME-TURN revert

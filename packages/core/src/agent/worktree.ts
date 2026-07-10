@@ -58,13 +58,31 @@ export class WorktreeManager {
     return result;
   }
 
-  exit(sessionId: string, action: "keep" | "remove"): { name: string; branch: string; removed: boolean; originalCwd: string } {
+  exit(
+    sessionId: string,
+    action: "keep" | "remove",
+    discardChanges?: boolean,
+  ): { name: string; branch: string; removed: boolean; originalCwd: string } {
     const active = this.sessions.get(sessionId);
     if (!active) throw new Error("not currently in a worktree");
 
     if (action === "remove") {
-      const remove = git(["worktree", "remove", active.dir], active.originalCwd);
-      if (remove.code !== 0) throw new Error(`git worktree remove failed: ${remove.stderr.trim()}`);
+      if (discardChanges) {
+        // Force removal even with uncommitted changes — the caller has explicitly opted in to
+        // discarding them (exit_worktree's discard_changes: true).
+        const remove = git(["worktree", "remove", "--force", active.dir], active.originalCwd);
+        if (remove.code !== 0) throw new Error(`git worktree remove failed: ${remove.stderr.trim()}`);
+      } else {
+        // Pre-check with `git status --short` (rather than letting a plain `git worktree remove`
+        // fail and relaying git's own stderr) so the caller gets the actual dirty-paths listing —
+        // exit_worktree's contract promises that listing in the error.
+        const status = git(["status", "--short"], active.dir);
+        if (status.stdout.trim().length > 0) {
+          throw new Error(`refusing to remove: uncommitted changes:\n${status.stdout.trim()}\nre-run with discard_changes: true to delete them`);
+        }
+        const remove = git(["worktree", "remove", active.dir], active.originalCwd);
+        if (remove.code !== 0) throw new Error(`git worktree remove failed: ${remove.stderr.trim()}`);
+      }
     }
 
     this.sessions.delete(sessionId);

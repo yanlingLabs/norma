@@ -37,3 +37,24 @@ describe("spawn_agent tool spec: model enum", () => {
     expect(params2.properties.model.enum).toBeUndefined();
   });
 });
+
+// 4g-ii (CC parity): `description` is now a REQUIRED spawn_agent arg (registry-level zod
+// validation, distinct from the engine's own concurrent-bridge check in engine-spawn.test.ts,
+// which hand-parses argsJson and bypasses this registry.execute() path entirely).
+describe("spawn_agent tool: description is required", () => {
+  test("missing description → invalid arguments (registry-level zod validation)", async () => {
+    const r = new ToolRegistry();
+    registerSpawnAgentTool(r);
+    const out = await r.execute("spawn_agent", { prompt: "do X" }, { cwd: "/", roots: ["/"], sessionId: "s" });
+    expect(out.isError).toBe(true);
+    expect(out.output).toContain("description");
+  });
+
+  test("present → placeholder run() still fires (cfg.subagents/agents absent path — registry.execute is unaffected)", async () => {
+    const r = new ToolRegistry();
+    registerSpawnAgentTool(r);
+    const out = await r.execute("spawn_agent", { prompt: "do X", description: "explore X" }, { cwd: "/", roots: ["/"], sessionId: "s" });
+    expect(out.isError).toBe(false);
+    expect(out.output).toContain("subagents are not available in this session");
+  });
+});

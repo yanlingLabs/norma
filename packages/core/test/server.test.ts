@@ -441,9 +441,9 @@ describe("daemon IPC", () => {
     const { FakeProvider } = await import("../src/agent/fake-provider");
     const fake = new FakeProvider([
       [{ type: "tool_call", callId: "q1", name: "ask_user", argsJson: JSON.stringify({
-        questions: [{ question: "Pick one", header: "Pick", options: [{ label: "A" }, { label: "B" }], multiSelect: false }],
+        questions: [{ question: "Pick one", header: "Pick", options: [{ label: "A", description: "Option A" }, { label: "B", description: "Option B" }], multiSelect: false }],
       }) }, { type: "done", stopReason: "tool_calls" }],
-      [{ type: "tool_call", callId: "t1", name: "task_create", argsJson: JSON.stringify({ subject: "Ship it" }) }, { type: "done", stopReason: "tool_calls" }],
+      [{ type: "tool_call", callId: "t1", name: "task_create", argsJson: JSON.stringify({ subject: "Ship it", description: "Ship the release" }) }, { type: "done", stopReason: "tool_calls" }],
       [{ type: "text_delta", delta: "done" }, { type: "done", stopReason: "end_turn" }],
     ]);
     await boot({}, fake);

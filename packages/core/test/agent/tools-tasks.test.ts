@@ -20,18 +20,26 @@ describe("task tools", () => {
     const events: Task[] = [];
     const store = new TaskStore();
     const r = buildRegistry(store);
-    const out = await r.execute("task_create", { subject: "rename", activeForm: "Renaming" }, ctx({ taskEvent: (t) => events.push(t) }));
+    const out = await r.execute("task_create", { subject: "rename", description: "rename the thing", activeForm: "Renaming" }, ctx({ taskEvent: (t) => events.push(t) }));
     expect(out.isError).toBe(false);
     expect(out.output).toContain("Task #1 created");
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ id: "1", status: "pending", subject: "rename", activeForm: "Renaming" });
   });
 
+  test("task_create without description → invalid args", async () => {
+    const store = new TaskStore();
+    const r = buildRegistry(store);
+    const out = await r.execute("task_create", { subject: "rename" }, ctx());
+    expect(out.isError).toBe(true);
+    expect(out.output).toContain("description");
+  });
+
   test("task_update status flows + emits; unknown id isError", async () => {
     const events: Task[] = [];
     const store = new TaskStore();
     const r = buildRegistry(store);
-    const created = await r.execute("task_create", { subject: "work" }, ctx({ taskEvent: (t) => events.push(t) }));
+    const created = await r.execute("task_create", { subject: "work", description: "do the work" }, ctx({ taskEvent: (t) => events.push(t) }));
     expect(created.isError).toBe(false);
     const updated1 = await r.execute("task_update", { taskId: "1", status: "in_progress" }, ctx({ taskEvent: (t) => events.push(t) }));
     expect(updated1.isError).toBe(false);
@@ -62,13 +70,31 @@ describe("task tools", () => {
     const empty = await r.execute("task_list", {}, ctx());
     expect(empty.isError).toBe(false);
     expect(empty.output).toBe("no tasks");
-    await r.execute("task_create", { subject: "pending task" }, ctx());
-    await r.execute("task_create", { subject: "in-progress task" }, ctx());
+    await r.execute("task_create", { subject: "pending task", description: "do the pending thing" }, ctx());
+    await r.execute("task_create", { subject: "in-progress task", description: "do the in-progress thing" }, ctx());
     await r.execute("task_update", { taskId: "2", status: "in_progress" }, ctx());
     const listed = await r.execute("task_list", {}, ctx());
     expect(listed.isError).toBe(false);
     expect(listed.output).toContain("[1] ☐ pending task");
     expect(listed.output).toContain("[2] ◐ in-progress task");
+  });
+
+  test("task_update status 'deleted' removes the task from task_list output; unknown id isError", async () => {
+    const events: Task[] = [];
+    const store = new TaskStore();
+    const r = buildRegistry(store);
+    await r.execute("task_create", { subject: "throwaway", description: "will be deleted" }, ctx({ taskEvent: (t) => events.push(t) }));
+    const del = await r.execute("task_update", { taskId: "1", status: "deleted" }, ctx({ taskEvent: (t) => events.push(t) }));
+    expect(del.isError).toBe(false);
+    expect(del.output).toBe("Task #1 deleted");
+    // no EXTRA task_updated event was emitted for the delete itself — only the earlier create's.
+    expect(events).toHaveLength(1);
+    const listed = await r.execute("task_list", {}, ctx());
+    expect(listed.output).toBe("no tasks");
+
+    const notFound = await r.execute("task_update", { taskId: "999", status: "deleted" }, ctx());
+    expect(notFound.isError).toBe(true);
+    expect(notFound.output).toContain("no such task");
   });
 
   test("task_create/task_update descriptions steer the model to list-before-create/update (misuse guard)", () => {
@@ -77,8 +103,9 @@ describe("task tools", () => {
     const specs = r.specs();
     const create = specs.find((s) => s.name === "task_create");
     const update = specs.find((s) => s.name === "task_update");
-    expect(create?.description).toContain("First call task_list to check existing tasks and avoid creating a duplicate.");
+    expect(create?.description).toContain("Call task_list first to avoid duplicates.");
     expect(update?.description).toContain("To complete or change an EXISTING task, pass its id from task_list — do NOT create a new task.");
     expect(update?.description).toContain("Call task_list first if you don't know the id.");
+    expect(update?.description).toContain("deleted");
   });
 });

@@ -81,10 +81,31 @@ export function setup(
 
 const done = (reason: "end_turn" | "tool_calls" | "aborted"): ProviderEvent => ({ type: "done", stopReason: reason });
 const text = (t: string): ProviderEvent[] => [{ type: "text_delta", delta: t }, done("end_turn")];
+// 4g-ii (CC parity): `description` is now a REQUIRED spawn_agent arg — defaulted here so the
+// ~15 pre-existing call sites below (none of which are testing the description contract itself)
+// don't all need individual edits; `extra.description` still overrides it (see the "description
+// rides thread_started" test below). The dedicated "without description" test constructs its
+// tool_call by hand, bypassing this default, to pin the required-arg behavior itself.
 const spawnCall = (callId: string, prompt: string, extra?: { agentType?: string; model?: string; description?: string }): ProviderEvent =>
-  ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, ...extra }) });
+  ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "test task", ...extra }) });
 
 describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
+  test("spawn_agent without description → invalid args tool_result, no thread_started/completed (schema-required, bridge path)", async () => {
+    const { engine, store, sessionId } = setup([
+      [{ type: "tool_call", callId: "s1", name: "spawn_agent", argsJson: JSON.stringify({ prompt: "do X" }) }, done("tool_calls")],
+      text("parent noticed the failure and wrapped up"),
+    ]);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(events.some((e) => e.type === "thread_started")).toBe(false);
+    expect(events.some((e) => e.type === "thread_completed")).toBe(false);
+
+    const result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(result).toMatchObject({ isError: true });
+    expect((result as Extract<SessionEvent, { type: "tool_result" }>).output).toContain("description");
+  });
+
   test("single spawn: fresh child input, thread_started/completed, parent tool_result === child final text", async () => {
     const { engine, store, sessionId, provider } = setup([
       [spawnCall("s1", "do X"), done("tool_calls")],
@@ -97,7 +118,7 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     expect(started).toMatchObject({ parentThreadId: "main", agentType: "general-purpose", prompt: "do X" });
     const childId = (started as Extract<SessionEvent, { type: "thread_started" }>).threadId;
     expect(childId).toMatch(/^th_/);
-    expect((started as Extract<SessionEvent, { type: "thread_started" }>).description).toBeUndefined();
+    expect((started as Extract<SessionEvent, { type: "thread_started" }>).description).toBe("test task");
 
     const completed = events.find((e) => e.type === "thread_completed" && e.threadId === childId);
     expect(completed).toMatchObject({ stopReason: "end_turn" });
@@ -114,7 +135,7 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     expect(fp.requests[1]!.input).toEqual([{ type: "message", role: "user", content: "do X" }]);
   });
 
-  test("spawn description rides thread_started; absent stays absent", async () => {
+  test("spawn description rides thread_started (explicit override wins over the test default)", async () => {
     const { engine, store, sessionId } = setup([
       [spawnCall("s1", "go do the thing", { description: "explore auth module" }), done("tool_calls")],
       text("child final report"),

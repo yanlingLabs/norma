@@ -181,6 +181,62 @@ describe.if(isMac)("AgentEngine: worktree bridge (enter/exit_worktree)", () => {
     expect(existsSync(join(cwd, "after-remove.txt"))).toBe(true);
   });
 
+  // 4g-ii (CC parity): exit_worktree {remove} on a dirty worktree, discard_changes threaded
+  // through the engine's hand-parsed argsJson bridge (engine.ts's runWorktreeBridge) down to
+  // WorktreeManager.exit()'s own pre-check (worktree.ts). Without discard_changes: true, the
+  // manager throws BEFORE calling git worktree remove or deleting its own session entry — so the
+  // worktree stays fully active (no worktree_exited event, no cwd revert) and the SAME session
+  // can retry with discard_changes: true afterward.
+  test("exit_worktree {remove} on a DIRTY worktree WITHOUT discard_changes → isError listing the dirty paths; worktree stays active", async () => {
+    const { engine, store, sessionId } = setup([
+      [{ type: "tool_call", callId: "e1", name: "enter_worktree", argsJson: JSON.stringify({ name: "featdirty1" }) }, done("tool_calls")],
+      [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "dirty.txt", content: "uncommitted" }) }, done("tool_calls")],
+      [{ type: "tool_call", callId: "x1", name: "exit_worktree", argsJson: JSON.stringify({ action: "remove" }) }, done("tool_calls")],
+      text("done"),
+    ]);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const entered = events.find((e) => e.type === "worktree_entered");
+    const wtDir = (entered as any).path as string;
+
+    expect(events.some((e) => e.type === "worktree_exited")).toBe(false); // the bridge never got past exit()'s pre-check
+
+    const exitResult = events.find((e) => e.type === "tool_result" && e.callId === "x1");
+    expect(exitResult).toMatchObject({ isError: true });
+    const output = (exitResult as any).output as string;
+    expect(output).toContain("refusing to remove: uncommitted changes:");
+    expect(output).toContain("dirty.txt");
+    expect(output).toContain("re-run with discard_changes: true to delete them");
+
+    // the worktree is still there and still the active cwd — the refusal didn't half-apply
+    expect(existsSync(wtDir)).toBe(true);
+    expect(store.meta(sessionId).cwd).toBe(wtDir);
+  });
+
+  test("exit_worktree {remove, discard_changes: true} on a DIRTY worktree → force-removed; worktree_exited emitted; cwd reverts", async () => {
+    const { engine, store, sessionId, cwd } = setup([
+      [{ type: "tool_call", callId: "e1", name: "enter_worktree", argsJson: JSON.stringify({ name: "featdirty2" }) }, done("tool_calls")],
+      [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "dirty.txt", content: "uncommitted" }) }, done("tool_calls")],
+      [{ type: "tool_call", callId: "x1", name: "exit_worktree", argsJson: JSON.stringify({ action: "remove", discard_changes: true }) }, done("tool_calls")],
+      text("done"),
+    ]);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const entered = events.find((e) => e.type === "worktree_entered");
+    const wtDir = (entered as any).path as string;
+
+    const exited = events.find((e) => e.type === "worktree_exited");
+    expect(exited).toMatchObject({ name: "featdirty2", action: "remove", removed: true });
+    expect(existsSync(wtDir)).toBe(false); // gone from disk despite the uncommitted change
+
+    const exitResult = events.find((e) => e.type === "tool_result" && e.callId === "x1");
+    expect(exitResult).toMatchObject({ isError: false });
+
+    expect(store.meta(sessionId).cwd).toBe(cwd); // reverted to the original repo
+  });
+
   test("cfg.worktrees absent → enter_worktree returns the placeholder (no event, no cwd change)", async () => {
     const { engine, store, sessionId, cwd } = setup(
       [
