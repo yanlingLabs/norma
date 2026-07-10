@@ -74,7 +74,19 @@ export function ssrfGuard(raw: string): string | null {
 
   // IPv6 ULA (fc00::/7) + link-local (fe80::/10) — ONLY for actual IPv6 literals, else a bare
   // string-prefix match wrongly refuses public domains like fcc.gov / fdic.gov / fc-barcelona.com.
-  if (wasIpv6Literal && (h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80"))) return `refusing to fetch a private address`;
+  // fc00::/7 (top 7 bits fixed) is exactly captured by the "fc"/"fd" hex-nibble prefixes. But
+  // fe80::/10 (top 10 bits fixed) is NOT a whole-nibble prefix — the first hextet ranges over
+  // 0xfe80–0xfebf (fe80::, fe90::, fea0::, feb0::, … up to febf::), so a bare `startsWith("fe80")`
+  // string check misses fe90::/fea0::/feb0:: entirely. Range-check the first hextet numerically
+  // instead — a public domain merely starting with "fe" (fear.com) never reaches this branch at
+  // all (wasIpv6Literal gates the whole thing), so this can't over-block those.
+  if (wasIpv6Literal) {
+    if (h.startsWith("fc") || h.startsWith("fd")) return `refusing to fetch a private address`;
+    const firstHextet = parseInt(h.split(":")[0] ?? "", 16);
+    if (!Number.isNaN(firstHextet) && firstHextet >= 0xfe80 && firstHextet <= 0xfebf) {
+      return `refusing to fetch a private address`;
+    }
+  }
   return null;
 }
 
@@ -206,7 +218,7 @@ export function registerWebTools(r: ToolRegistry, deps: WebToolDeps = {}): void 
   r.register({
     name: "web_fetch",
     description:
-      "Fetch a URL (http/https) and return its readable text content. Norma's only network-capable tool — bash has no network. Large pages truncate at 64KB; fetch is read-only GET.",
+      "Fetch a URL (http/https) and return a preview of its readable text content. Norma's only network-capable tool — bash has no network. The full converted page is saved to a file (its path is in the result) — use read/grep/spawn_agent on that file for anything beyond the preview. Fetch is read-only GET.",
     // url only — no `prompt` (CC's web_fetch takes an optional page-digest prompt). Deliberate spec
     // deviation: the save-to-tmp result shape below already gives the model read/grep/spawn_agent
     // access to the FULL saved page, so a fetch-time digest prompt is redundant. Also no `max_bytes`:

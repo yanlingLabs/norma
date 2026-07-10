@@ -11,6 +11,8 @@ import { registerWriteTools } from "../../src/agent/tools/fs-write";
 import { registerAskUserTool } from "../../src/agent/tools/ask-user";
 import { registerPlanTool } from "../../src/agent/tools/plan";
 import { registerSpawnAgentTool } from "../../src/agent/tools/spawn";
+import { registerToolSearchTool } from "../../src/agent/tools/toolsearch";
+import { registerWebTools } from "../../src/agent/tools/web";
 import { PermissionGate } from "../../src/agent/gate";
 import { ApprovalBroker } from "../../src/agent/approvals";
 import { AgentEngine } from "../../src/agent/engine";
@@ -34,6 +36,14 @@ export function setup(
     // undefined (default) → EngineConfig.provider.live absent, matching every pre-existing test
     // here (unchanged behavior: every turn uses the "fake-1" boot snapshot below).
     live?: () => { model: string; reasoningEffort?: string };
+    // opts.registry lets a caller supply a registry it also registered its own tools onto
+    // (e.g. registerToolSearchTool + a deferred tool) BEFORE calling setup — mirrors
+    // engine-steer.test.ts's setupEngine `registry` opt. Default: a fresh registry, as before.
+    // The standard tool set below is always registered onto whichever registry is used.
+    registry?: ToolRegistry;
+    // undefined (default) → no deferral anywhere, matching every pre-existing test here
+    // (unchanged behavior). Mirrors engine-steer.test.ts's setupEngine `toolSearch` opt.
+    toolSearch?: { enabled?: boolean; deferThreshold?: number; deferExternals?: "count" | "always" };
   } = {},
 ) {
   const withSubagents = opts.withSubagents !== false;
@@ -41,7 +51,7 @@ export function setup(
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-spawn-cwd-")));
   const store = new SessionStore(home);
   const hub = new SessionHub(store);
-  const registry = new ToolRegistry();
+  const registry = opts.registry ?? new ToolRegistry();
   registerReadTools(registry);
   registerWriteTools(registry);
   registerAskUserTool(registry);
@@ -72,11 +82,12 @@ export function setup(
     compactor,
     agents,
     subagents,
+    toolSearch: opts.toolSearch,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: opts.approvalPolicy ?? "auto" });
   const events: SessionEvent[] = [];
   hub.attach({ clientName: "test-observer", deliver: (e) => { events.push(e); return true; } }, sessionId, 0);
-  return { engine, store, hub, broker, sessionId, cwd, provider, dirs, events };
+  return { engine, store, hub, broker, sessionId, cwd, provider, dirs, events, registry };
 }
 
 const done = (reason: "end_turn" | "tool_calls" | "aborted"): ProviderEvent => ({ type: "done", stopReason: reason });
@@ -436,5 +447,110 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     expect(childDelta).toMatchObject({ delta: "child-out" });
     const mainDeltas = events.filter((e) => e.type === "assistant_delta" && e.threadId === "main");
     expect(mainDeltas.map((d) => (d as { delta: string }).delta)).toEqual(["parent-final"]);
+  });
+});
+
+// -------------------------------------------------------------------------------------------
+// Phase 4g whole-branch final-review fix: a spawned child's own ToolSearch load must land in
+// THAT child's own `loaded` set (the one its specs()/deferred-guard actually consult), not the
+// session-scoped map only the main thread reads. Before the fix, a subagent's ToolSearch-load-
+// then-call of a deferred built-in looped (load → guard still rejects → load → ...) to the
+// MAX_TOOL_ITERATIONS cap, surfacing to the parent as "subagent … failed: tool-iteration cap
+// reached". `web_fetch` (a real deferred:true built-in, `deps.fetchFn` stubbed so no live
+// network is hit) stands in for "e.g. web_fetch" from the finding — the same class of bug would
+// hit any deferred built-in or mcp__ tool a child tries to ToolSearch-load.
+// -------------------------------------------------------------------------------------------
+describe("AgentEngine: subagent ToolSearch-load-then-call (4g final-review fix)", () => {
+  function buildWebDeferredRegistry(): { registry: ToolRegistry; fetchCalls: string[] } {
+    const registry = new ToolRegistry();
+    registerToolSearchTool(registry);
+    const fetchCalls: string[] = [];
+    const fakeFetch = (async (url: string) => {
+      fetchCalls.push(String(url));
+      return new Response("<html><body><h1>Hi from the fake page</h1></body></html>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      });
+    }) as typeof fetch;
+    registerWebTools(registry, { fetchFn: fakeFetch });
+    return { registry, fetchCalls };
+  }
+
+  test("a spawned child can ToolSearch-load a deferred built-in and call it in the SAME child turn — no iteration-cap failure", async () => {
+    const { registry, fetchCalls } = buildWebDeferredRegistry();
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "fetch the page"), done("tool_calls")], // parent round 0: spawn
+      [{ type: "tool_call", callId: "ts1", name: "ToolSearch", argsJson: JSON.stringify({ query: "select:web_fetch" }) }, done("tool_calls")], // child round 0: load
+      [{ type: "tool_call", callId: "c1", name: "web_fetch", argsJson: JSON.stringify({ url: "https://example.com/page" }) }, done("tool_calls")], // child round 1: call it
+      text("child fetched the page"), // child round 2: end turn
+      text("parent wrap-up"), // parent's continuation round, after the child's tool_result
+    ];
+    const { engine, store, sessionId } = setup(script, { registry, toolSearch: {} });
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    // The deferred tool actually ran — proof the child's OWN follow-up call was accepted, not
+    // rejected-then-looped-to-the-cap (the pre-fix bug: the load landed in the session map, which
+    // the child's own guard never consults).
+    expect(fetchCalls).toEqual(["https://example.com/page"]);
+    const callResult = events.find((e) => e.type === "tool_result" && e.callId === "c1");
+    expect(callResult).toMatchObject({ isError: false });
+    expect((callResult as Extract<SessionEvent, { type: "tool_result" }>).output).toContain("Fetched https://example.com/page");
+
+    // The child's own thread ended normally (not the iteration-cap typed error).
+    const completed = events.find((e) => e.type === "thread_completed");
+    expect(completed).toMatchObject({ stopReason: "end_turn" });
+
+    // The parent sees the child's real final text, not a "subagent … failed: tool-iteration cap
+    // reached" typed error.
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({ isError: false, output: "child fetched the page" });
+
+    // The parent's own turn completed normally.
+    const mainTurnCompleted = events.find((e) => e.type === "turn_completed" && e.threadId === "main");
+    expect(mainTurnCompleted).toMatchObject({ stopReason: "end_turn" });
+  });
+
+  test("a child's ToolSearch load does not leak into the session/main-thread loaded set: the SAME tool called unloaded from main is still rejected", async () => {
+    const { registry, fetchCalls } = buildWebDeferredRegistry();
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "fetch the page"), done("tool_calls")], // parent round 0: spawn
+      [{ type: "tool_call", callId: "ts1", name: "ToolSearch", argsJson: JSON.stringify({ query: "select:web_fetch" }) }, done("tool_calls")], // child round 0: load
+      [{ type: "tool_call", callId: "c1", name: "web_fetch", argsJson: JSON.stringify({ url: "https://example.com/page" }) }, done("tool_calls")], // child round 1: call it
+      text("child fetched the page"), // child round 2: end turn
+      // parent's continuation round: calls the SAME tool directly, unloaded on the main thread —
+      // must still be rejected if the child's earlier load didn't leak into the session set.
+      [{ type: "tool_call", callId: "p1", name: "web_fetch", argsJson: JSON.stringify({ url: "https://example.com/other" }) }, done("tool_calls")],
+      text("parent wrap-up"),
+    ];
+    const { engine, store, sessionId } = setup(script, { registry, toolSearch: {} });
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const parentCallResult = events.find((e) => e.type === "tool_result" && e.callId === "p1");
+    expect(parentCallResult).toMatchObject({ isError: true });
+    expect((parentCallResult as Extract<SessionEvent, { type: "tool_result" }>).output)
+      .toContain("deferred — load its schema via ToolSearch first");
+    // Only the CHILD's call actually reached the network stub — the parent's unloaded attempt
+    // was rejected before executeCall ever ran.
+    expect(fetchCalls).toEqual(["https://example.com/page"]);
+  });
+
+  test("main-thread ToolSearch load path is unchanged: a plain (non-subagent) load-then-call still works", async () => {
+    const { registry, fetchCalls } = buildWebDeferredRegistry();
+    const script: ProviderEvent[][] = [
+      [{ type: "tool_call", callId: "ts1", name: "ToolSearch", argsJson: JSON.stringify({ query: "select:web_fetch" }) }, done("tool_calls")],
+      [{ type: "tool_call", callId: "c1", name: "web_fetch", argsJson: JSON.stringify({ url: "https://example.com/page" }) }, done("tool_calls")],
+      text("fetched it"),
+    ];
+    const { engine, store, sessionId } = setup(script, { registry, toolSearch: {}, withSubagents: false });
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(fetchCalls).toEqual(["https://example.com/page"]);
+    const callResult = events.find((e) => e.type === "tool_result" && e.callId === "c1");
+    expect(callResult).toMatchObject({ isError: false });
+    const turnCompleted = events.find((e) => e.type === "turn_completed" && e.threadId === "main");
+    expect(turnCompleted).toMatchObject({ stopReason: "end_turn" });
   });
 });

@@ -133,6 +133,14 @@ export class AgentEngine {
   // per-round) AND for every subsequent turn of the session — so this Set is shared, mutated
   // in-place (never copied/snapshotted), across specs()/deferredIndex()/executeCall's ctx. See
   // the NOTE in turn() below.
+  // THREAD-LOCAL WRITES (4g final-review fix): this map is populated ONLY by the MAIN thread —
+  // turn() seeds `this.loadedTools.get(sessionId)` and hands that SAME Set object to runThread as
+  // opts.loaded. executeCall/markToolLoaded (below) always operate on THE CALLING THREAD's
+  // `loaded` set (threaded through as a parameter), never by re-deriving it from this map via
+  // sessionId. For the main thread that set IS this map's entry, so a load still lands here and
+  // stays sticky across turns — unchanged. A CHILD thread's `loaded` (runThread's spawn bridge:
+  // `childLoaded = new Set()`) is never stored in this map, so a subagent's ToolSearch load can
+  // no longer leak into (or be shadowed by) the session-wide set.
   private loadedTools = new Map<string, Set<string>>();
   // Thread registry (1d-iv, for thread.list): SESSION-scoped, mirrors loadedSkills/loadedTools
   // above in lifetime (never cleared per-turn). Seeded lazily (via threadList()) with the main
@@ -717,7 +725,7 @@ export class AgentEngine {
               timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
               summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
               // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
-            }, async () => this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd), pins);
+            }, loaded, async () => this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd), pins);
           } else {
             outcome = this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd);
           }
@@ -727,7 +735,7 @@ export class AgentEngine {
             timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
             summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
             // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
-          }, undefined, pins);
+          }, loaded, undefined, pins);
         } else if (call.name === "exit_plan_mode" && this.cfg.plans && meta.approvalPolicy === "plan") {
           outcome = await this.runPlanBridge(call, sessionId, threadId, meta);
         } else if (call.name === "enter_plan_mode") {
@@ -747,7 +755,7 @@ export class AgentEngine {
             justification = typeof a.justification === "string" ? a.justification : undefined;
           } catch { /* fall through to review of "" → likely unsafe */ }
           if (command && bashLooksSafe(command, this.cfg.reviewerAllow ?? [])) {
-            outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, pins);
+            outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins);
           } else {
             let v: { verdict: "safe" | "unsafe"; reason: string };
             try {
@@ -760,13 +768,13 @@ export class AgentEngine {
                 timeoutMs: Number(process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS ?? 60_000),
                 summary: `⚠ safety reviewer: ${v.reason} — ${call.name} ${command.slice(0, 120)}`,
                 denialMessage: `blocked by the safety reviewer: ${v.reason}. No approval within 60s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.`,
-              }, undefined, pins);
+              }, loaded, undefined, pins);
             } else {
-              outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, pins);
+              outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins);
             }
           }
         } else {
-          outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, pins);
+          outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins);
         }
 
         this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
@@ -803,7 +811,11 @@ export class AgentEngine {
    *  callers above), it defaults to `executeCall` — behavior-preserving for every existing caller.
    *  `pins` (4g-i) is the CALLING round's pinnedTools() result — forwarded to executeCall's
    *  default path unchanged; callers that pass their own `onApprove` (the worktree bridge) don't
-   *  need it, but still supply it for signature uniformity (defaults to an empty Set). */
+   *  need it, but still supply it for signature uniformity (defaults to an empty Set).
+   *  `loaded` (4g final-review fix) is the CALLING THREAD's live `loaded` set (runThread's
+   *  `opts.loaded` — the same object for every caller in this file, main or child) — forwarded
+   *  unchanged to executeCall's default path so an approved call's load/defense-in-depth check
+   *  lands on the thread that actually asked, not always the session-scoped map. */
   private async requestApproval(
     call: { callId: string; name: string; argsJson: string },
     cwd: string,
@@ -811,6 +823,7 @@ export class AgentEngine {
     threadId: string,
     signal: AbortSignal,
     opts: { timeoutMs: number; summary: string; denialMessage?: string },
+    loaded: Set<string>,
     onApprove?: () => Promise<{ output: string; isError: boolean }>,
     pins: Set<string> = new Set(),
   ): Promise<{ output: string; isError: boolean; deniedByHuman?: boolean }> {
@@ -828,7 +841,7 @@ export class AgentEngine {
     const res = await waiting;
     this.emit(sessionId, { type: "approval_resolved", sessionId, threadId, callId: call.callId, approved: res.approved, by: res.by });
     if (res.approved) {
-      return await (onApprove ? onApprove() : this.executeCall(call, cwd, sessionId, threadId, signal, pins));
+      return await (onApprove ? onApprove() : this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins));
     }
     // An EXPLICIT human denial (any `by` other than the broker's "timeout") ends the turn and
     // hands control back to the user (Claude Code parity) — see the caller's `deniedByHuman`
@@ -1000,9 +1013,19 @@ export class AgentEngine {
     sessionId: string,
     threadId: string,
     signal: AbortSignal,
+    // 4g final-review fix: the CALLING THREAD's live `loaded` set — runThread's own `opts.loaded`,
+    // threaded straight through by every call site in this file (main-thread branches AND the
+    // requestApproval/executeCall calls inside a spawned child's own runThread invocation). This
+    // is THE set a load must land in and THE set the defense-in-depth check below must read —
+    // for the MAIN thread it IS `this.loadedTools.get(sessionId)` (turn() hands that exact object
+    // to runThread as opts.loaded), so main-thread behavior is byte-identical to before; for a
+    // CHILD thread it's the fresh per-spawn `childLoaded` Set (runThread's spawn bridge), never
+    // `this.loadedTools` — so a subagent's ToolSearch load now lands where its OWN specs()/guard
+    // actually look, instead of a session-wide set the child never consults.
+    loaded: Set<string>,
     // 4g-i: the CALLING round's pinnedTools() result (runThread's `pins`, or requestApproval's
     // forwarded copy of it) — defaulted so any caller that doesn't care about pins compiles
-    // unchanged. Unioned below with the LIVE loadedTools set, never mutating either.
+    // unchanged. Unioned below with `loaded`, never mutating either.
     pins: Set<string> = new Set(),
   ): Promise<{ output: string; isError: boolean }> {
     let args: unknown;
@@ -1015,14 +1038,11 @@ export class AgentEngine {
       if (!set) { set = new Set(); this.loadedSkills.set(sessionId, set); }
       set.add(n);
     };
-    // Pass the LIVE loadedTools set (mutated in place by markToolLoaded) — see the NOTE in
-    // turn() above. By the time executeCall runs, turn() has already ensured this session's
-    // entry exists, so `?? new Set()` here is a defensive fallback, never the live path.
-    const markToolLoaded = (n: string) => {
-      let set = this.loadedTools.get(sessionId);
-      if (!set) { set = new Set(); this.loadedTools.set(sessionId, set); }
-      set.add(n);
-    };
+    // Mutate the CALLING THREAD's own `loaded` set in place — never `this.loadedTools.get
+    // (sessionId)` (that lookup is what caused the bug: a child thread's load used to land in the
+    // session-wide map instead of the `childLoaded` set the child's own specs()/guard consult,
+    // AND polluted the session-wide set for good measure). See `loaded`'s doc comment above.
+    const markToolLoaded = (n: string) => { loaded.add(n); };
     const askTimeoutMs = Number(process.env.NORMA_ASK_TIMEOUT_MS ?? 300_000);
     const ask = this.cfg.questions
       ? async (questions: Question[]) => {
@@ -1054,10 +1074,9 @@ export class AgentEngine {
     const taskEvent = this.cfg.tasks
       ? (task: Task) => { this.emit(sessionId, { type: "task_updated", sessionId, threadId, task }); }
       : undefined;
-    // Live loadedTools read (see the NOTE above), unioned with this round's pins into a NEW Set —
-    // `this.loadedTools.get(sessionId)` itself is NEVER copied/mutated by this union.
-    const liveLoaded = this.loadedTools.get(sessionId) ?? new Set();
-    const effectiveLoaded = pins.size ? new Set([...liveLoaded, ...pins]) : liveLoaded;
+    // The calling thread's own `loaded` set (see its doc comment above), unioned with this
+    // round's pins into a NEW Set — `loaded` itself is NEVER copied/mutated by this union.
+    const effectiveLoaded = pins.size ? new Set([...loaded, ...pins]) : loaded;
     return this.cfg.registry.execute(call.name, args, {
       cwd, roots, tmpDir, sessionId, signal, markSkillLoaded,
       markToolLoaded,

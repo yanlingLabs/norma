@@ -41,6 +41,19 @@ describe("ssrfGuard", () => {
     }
   });
 
+  // 4g final-review fix: fe80::/10 (the documented link-local range) is wider than the fe80::/16
+  // that a bare `startsWith("fe80")` prefix check covers — fe90::/fea0::/feb0:: are link-local
+  // too but were previously let through.
+  test("rejects the FULL fe80::/10 link-local range, not just fe80:: itself", () => {
+    for (const bad of ["http://[fe80::1]/", "http://[fe90::1]/", "http://[fea0::1]/", "http://[feb0::1]/", "http://[febf:ffff::1]/"]) {
+      expect(ssrfGuard(bad)).not.toBeNull();
+    }
+  });
+
+  test("still allows a public domain that merely starts with \"fear\" (past the fe80::/10 range boundary)", () => {
+    expect(ssrfGuard("https://fear.com/")).toBeNull();
+  });
+
   test("rejects IPv4-mapped IPv6 loopback/private addresses (dotted and canonical hex forms)", () => {
     for (const bad of ["http://[::ffff:127.0.0.1]/", "http://[::ffff:7f00:1]/", "http://[::ffff:10.0.0.5]/"]) {
       expect(ssrfGuard(bad)).not.toBeNull();
