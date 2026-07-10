@@ -204,13 +204,45 @@ export async function startDaemon(opts: {
   let questions: QuestionBroker | null = null;
   let taskStore: TaskStore | null = null;
   let plans: PlanBroker | null = null;
-  let pluginSupervisor: PluginSupervisor | null = null;
   // ipc/server.ts (Phase 4b Task 4) needs the SAME ToolRegistry instance the engine executes tool
   // calls against, to register/unregister `plugin__<id>__<tool>` tools — but startIpcServer() is
   // called OUTSIDE the `if (agentProvider)` block below, where the registry is constructed.
   // Mirrored into this outer binding right after construction rather than hoisting the `const`
   // itself, so every existing narrowed (non-null) use of `registry` inside the block is untouched.
   let sharedRegistry: ToolRegistry | null = null;
+
+  // Phase 4d-cleanup Task 2: PluginSupervisor construction + the boot-time orphan-PID sweep are
+  // hoisted OUT of `if (agentProvider)` below — the ctor's own deps (runDir/socketPath/mintToken/
+  // settings/logger) don't need a provider, and a daemon booted with the agent disabled (no
+  // provider configured, or a test that injects `agentProvider: null`) should still reclaim/clean
+  // up stale <runDir>/plugins/<id>.pid files left by a PREVIOUS run instead of leaving them
+  // orphaned indefinitely — until, if ever, a provider happens to become configured. `startAll(...)`
+  // — the part that actually spawns spawn-eligible plugins as live agent tools — STAYS inside the
+  // gate below (a plugin process spawned with no engine/registry to bridge its tools into would be
+  // pointless). `onCircuitOpen` closes over the OUTER `sharedRegistry` binding (not the gate-local
+  // `registry` const, which isn't in scope here) so it keeps behaving correctly either way — a safe
+  // no-op via optional chaining while `sharedRegistry` is still null (no provider).
+  const allPlugins = pluginStore.list();
+  const pluginSupervisor = new PluginSupervisor({
+    runDir: dirs.runDir,
+    socketPath: dirs.socketPath,
+    mintToken: (id) => store.mintPluginToken(id),
+    settings: settings?.plugins?.supervisor,
+    onLog: (m) => console.error(m),
+    onCircuitOpen: (id) => sharedRegistry?.unregisterByPrefix(`plugin__${id}__`),
+  });
+  const spawnablePlugins = allPlugins
+    .filter(pluginSpawnEligible)
+    .map((p) => ({ id: p.name, dir: join(normaHome, "plugins", p.name), entry: p.entry! }));
+  // Phase 4d-i Task 4: boot-time orphan-PID sweep, BEFORE startAll spawns the current set — a
+  // plugin disabled or removed since the last run may have left its process running under a
+  // stale <runDir>/plugins/<id>.pid; startAll/reclaimOrphans would never find it (they only look
+  // at PID files for plugins in `spawnablePlugins`), so this sweeps the FULL PID-file directory
+  // and cleans up anything not in the currently spawn-eligible set (verified via the same
+  // ps-lstart identity check, fail-safe no-kill on any mismatch — see sweepOrphans's doc comment).
+  // Runs regardless of agentProvider (see this block's own doc comment above).
+  pluginSupervisor.sweepOrphans(spawnablePlugins.map((p) => p.id));
+
   if (agentProvider) {
     const registry = new ToolRegistry();
     sharedRegistry = registry;
@@ -248,7 +280,6 @@ export async function startDaemon(opts: {
     // why-log drift out of sync with what actually gates MCP start; the left-hand guard just
     // narrows the log to the "would be eligible if not for consent" case so we don't log for
     // plugins that were never enabled or never carried MCP content in the first place.
-    const allPlugins = pluginStore.list();
     for (const p of allPlugins) {
       if (p.mcpEnabled && !p.disabled && (p.hasMcp || p.hasManifestMcp) && !pluginMcpEligible(p)) {
         const missing = p.requiredConsents.filter((c) => !p.consented.includes(c));
@@ -270,33 +301,18 @@ export async function startDaemon(opts: {
     // Tier-2 platform plugins (Phase 4b Task 3, spec §3): PluginSupervisor owns process lifecycle
     // (spawn/registration timeout/crash backoff/circuit breaker/PID-file orphan reclaim) for every
     // spawn-eligible plugin (pluginSpawnEligible — tier "platform" + entry present + enabled +
-    // consented, the same enabled/disabled/consent shape as pluginMcpEligible above). Built right
-    // after mcp.startPlugins, unconditionally for the eligible set — startAll() is non-blocking
-    // (orphan reclaim/registration waits are timer-driven, never awaited here). Task 4 wires the
-    // actual tool.register/plugin_tool_invoke bridge into `registry` and the ipc handlers that
-    // call notifyRegistered/notifyDisconnected/resolveToolResult. `onCircuitOpen` is Task 4's other
-    // half of that wiring: when the breaker trips, this plugin's process is done until a manual
-    // restart — its `plugin__<id>__*` tools must stop being offered to the agent, so we unregister
-    // them straight out of the SAME registry `registerReadTools` etc. above populated (safe to
-    // reference here — `registry` is in scope, non-null, for the rest of this block).
-    pluginSupervisor = new PluginSupervisor({
-      runDir: dirs.runDir,
-      socketPath: dirs.socketPath,
-      mintToken: (id) => store.mintPluginToken(id),
-      settings: settings?.plugins?.supervisor,
-      onLog: (m) => console.error(m),
-      onCircuitOpen: (id) => registry.unregisterByPrefix(`plugin__${id}__`),
-    });
-    const spawnablePlugins = allPlugins
-      .filter(pluginSpawnEligible)
-      .map((p) => ({ id: p.name, dir: join(normaHome, "plugins", p.name), entry: p.entry! }));
-    // Phase 4d-i Task 4: boot-time orphan-PID sweep, BEFORE startAll spawns the current set — a
-    // plugin disabled or removed since the last run may have left its process running under a
-    // stale <runDir>/plugins/<id>.pid; startAll/reclaimOrphans would never find it (they only look
-    // at PID files for plugins in `spawnablePlugins`), so this sweeps the FULL PID-file directory
-    // and cleans up anything not in the currently spawn-eligible set (verified via the same
-    // ps-lstart identity check, fail-safe no-kill on any mismatch — see sweepOrphans's doc comment).
-    pluginSupervisor.sweepOrphans(spawnablePlugins.map((p) => p.id));
+    // consented, the same enabled/disabled/consent shape as pluginMcpEligible above). `pluginSupervisor`/
+    // `spawnablePlugins` are constructed above, OUTSIDE this gate (Phase 4d-cleanup Task 2 — the
+    // orphan sweep runs regardless of agentProvider); only the actual spawn — `startAll()` — is
+    // gated here, since a spawned plugin process needs `registry` (just below) to bridge its tools
+    // into. startAll() is non-blocking (orphan reclaim/registration waits are timer-driven, never
+    // awaited here). Task 4 wires the actual tool.register/plugin_tool_invoke bridge into `registry`
+    // and the ipc handlers that call notifyRegistered/notifyDisconnected/resolveToolResult.
+    // `onCircuitOpen` (wired at construction, above) is Task 4's other half of that wiring: when the
+    // breaker trips, this plugin's process is done until a manual restart — its `plugin__<id>__*`
+    // tools must stop being offered to the agent, so it unregisters them straight out of the SAME
+    // registry `registerReadTools` etc. above populated (via the `sharedRegistry` mirror, since
+    // `onCircuitOpen` was wired before `registry` existed).
     pluginSupervisor.startAll(spawnablePlugins);
 
     registerRequestDirTool(registry, {
@@ -392,11 +408,14 @@ export async function startDaemon(opts: {
     // above's boot-time snapshot.
     normaHome,
     mcp: mcp ?? undefined,
-    // Phase 4b Task 4: the plugin tool bridge. `registry`/`supervisor` are undefined together
-    // whenever agentProvider is null (see `sharedRegistry`'s doc comment above); `contrib` is
-    // always available.
+    // Phase 4b Task 4: the plugin tool bridge. `registry` is undefined whenever agentProvider is
+    // null (see `sharedRegistry`'s doc comment above). `supervisor`, unlike `registry`, is now
+    // ALWAYS defined (Phase 4d-cleanup Task 2 hoisted its construction out of the agentProvider
+    // gate — its orphan-sweep duties don't need a provider) — ipc/server.ts's handlers that need
+    // BOTH together (e.g. `tool.register`) still gate correctly since they check `opts.registry`
+    // explicitly, not `opts.supervisor`'s presence as a proxy for it. `contrib` is always available.
     registry: sharedRegistry ?? undefined,
-    supervisor: pluginSupervisor ?? undefined,
+    supervisor: pluginSupervisor,
     contrib: pluginContrib,
     questions: questions ?? undefined,
     tasks: taskStore ?? undefined,
@@ -414,7 +433,7 @@ export async function startDaemon(opts: {
   return {
     socketPath: dirs.socketPath,
     tokens,
-    stop() { server.stop(); mcp?.stopAll(); pluginSupervisor?.stopAll(); bgRegistry.killAll(); store.close(); lock.release(); },
+    stop() { server.stop(); mcp?.stopAll(); pluginSupervisor.stopAll(); bgRegistry.killAll(); store.close(); lock.release(); },
   };
 }
 

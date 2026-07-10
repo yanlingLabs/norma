@@ -161,10 +161,20 @@ enum PluginInstallError: Error, Equatable {
 /// zip containing both the real plugin folder AND a `__MACOSX` metadata folder, which would
 /// otherwise look like two top-level subdirectories and wrongly fail the single-subdirectory
 /// check below.
+///
+/// A manifest that is itself a SYMLINK is rejected (checked via `URLResourceValues.isSymbolicLink`,
+/// which reports on the path itself rather than following it) — a zip/folder can otherwise smuggle
+/// a symlinked `norma-plugin.json` pointing anywhere on disk, which `fileExists`/`Data(contentsOf:)`
+/// would happily follow.
 func locatePluginRoot(in directory: URL, fileManager: FileManager = .default) -> URL? {
+    func isManifest(_ url: URL) -> Bool {
+        guard fileManager.fileExists(atPath: url.path) else { return false }
+        let isSymlink = (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink ?? false
+        return !isSymlink
+    }
     func hasManifest(_ url: URL) -> Bool {
-        fileManager.fileExists(atPath: url.appendingPathComponent("norma-plugin.json").path)
-            || fileManager.fileExists(atPath: url.appendingPathComponent("plugin.json").path)
+        isManifest(url.appendingPathComponent("norma-plugin.json"))
+            || isManifest(url.appendingPathComponent("plugin.json"))
     }
     func isIgnoredCandidate(_ url: URL) -> Bool {
         let name = url.lastPathComponent
@@ -183,16 +193,40 @@ func locatePluginRoot(in directory: URL, fileManager: FileManager = .default) ->
 /// Extracts a `.zip` at `zipURL` into a fresh temp directory via `/usr/bin/unzip -q ... -d ...`
 /// and returns that directory — the CALLER resolves the actual plugin root inside it via
 /// `locatePluginRoot` (the zip may or may not wrap its contents in one top-level folder).
-func extractPluginZip(at zipURL: URL, fileManager: FileManager = .default) throws -> URL {
+///
+/// `async` (Fix wave, Task 2 review): `installFrom` below calls this from `PluginManagerView`,
+/// whose methods are MainActor-isolated (SwiftUI infers `@MainActor` across a `View`'s own
+/// methods) — a plain `process.waitUntilExit()` synchronously blocks that thread for the whole
+/// unzip, freezing the UI on a large archive. Setting `terminationHandler` BEFORE `run()` and
+/// resuming a continuation from it (rather than blocking on `waitUntilExit()`) means no thread —
+/// MainActor's or otherwise — sits blocked while `/usr/bin/unzip` runs; the caller just suspends.
+///
+/// On failure (either `run()` throwing, or a non-zero exit) `tempDir` is removed here before
+/// rethrowing — the caller never gets a URL to it in that case, so it couldn't clean it up
+/// itself. `installFrom`'s own `defer`-based cleanup only ever has to handle the URL this
+/// function actually returns (extraction succeeded).
+func extractPluginZip(at zipURL: URL, fileManager: FileManager = .default) async throws -> URL {
     let tempDir = fileManager.temporaryDirectory
         .appendingPathComponent("norma-plugin-install-\(UUID().uuidString)", isDirectory: true)
     try fileManager.createDirectory(at: tempDir, withIntermediateDirectories: true)
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-    process.arguments = ["-q", zipURL.path, "-d", tempDir.path]
-    try process.run()
-    process.waitUntilExit()
-    guard process.terminationStatus == 0 else { throw PluginInstallError.unzipFailed }
+    do {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        process.arguments = ["-q", zipURL.path, "-d", tempDir.path]
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            process.terminationHandler = { _ in continuation.resume() }
+            do {
+                try process.run()
+            } catch {
+                process.terminationHandler = nil
+                continuation.resume(throwing: error)
+            }
+        }
+        guard process.terminationStatus == 0 else { throw PluginInstallError.unzipFailed }
+    } catch {
+        try? fileManager.removeItem(at: tempDir)
+        throw error
+    }
     return tempDir
 }
 
@@ -224,27 +258,14 @@ func settleShouldContinue(status: String?, elapsedSeconds: Double) -> Bool {
 
 @MainActor
 final class PluginManagerModel: ObservableObject {
-    /// A `plugin.enable` call that came back `.needsConsent` (Task 2's original surfacing point).
-    /// Task 3 drives the actual GUI consent sheet off `consentSheet` below instead — this field is
-    /// kept alongside it, written on the same transitions, purely so Task 2's existing shape/tests
-    /// (`PluginManagerModelTests.swift`'s `XCTAssertNil(model.pendingConsent)` coverage) stay
-    /// untouched; nothing in the view reads it anymore.
-    struct PendingConsent: Equatable {
-        let name: String
-        let requiredConsents: [String]
-        let consentBlock: [String]
-    }
-
     private let client: NormaClient
 
     @Published private(set) var rows: [PluginRowDisplay] = []
     @Published var errorText: String?
-    @Published var pendingConsent: PendingConsent?
     /// Task 3 (4d-iii): the live consent sheet, seeded from EITHER trigger — an `enable(_:)` that
-    /// came back `.needsConsent` (mirrors `pendingConsent` above; kept alongside it rather than
-    /// replacing it, so `pendingConsent`'s existing shape/tests are untouched) or a successful
-    /// `install(source:)`. `PluginManagerView` presents this via `.sheet(item:)`; setting it to
-    /// `nil` (confirm/cancel, or a swipe-to-dismiss) closes the sheet.
+    /// came back `.needsConsent`, or a successful `install(source:)`. `PluginManagerView` presents
+    /// this via `.sheet(item:)`; setting it to `nil` (confirm/cancel, or a swipe-to-dismiss) closes
+    /// the sheet.
     @Published var consentSheet: ConsentSheetState?
     /// The plugin name an in-flight action is currently running against — lets the view disable
     /// that row's buttons mid-action, same `revokingPath`-style single-flight posture as
@@ -253,6 +274,11 @@ final class PluginManagerModel: ObservableObject {
     /// Task 3: true while `install(source:)` is in flight — lets the view disable the "Install
     /// Plugin…" button so a second pick can't race the first.
     @Published private(set) var installing = false
+    /// Fix wave (Task 2 review, consent double-submit guard): true while `confirmConsent()` is
+    /// running — makes re-entry (a second call landing before the first's RPC resolves) a no-op,
+    /// on top of `busyName`-driven `.disabled(...)` on the sheet's own buttons (belt-and-suspenders
+    /// against a click racing ahead of that state update).
+    private var isConfirmingConsent = false
     /// 4d gate-fix loop 1: raw `plugins.list` status strings, keyed by name — kept alongside `rows`
     /// (which only stores the user-facing `statusText`/`statusColorKind`) so `startSettling`'s poll
     /// loop can compare against the wire's own vocabulary (`"starting"`, ...) via
@@ -333,7 +359,7 @@ final class PluginManagerModel: ObservableObject {
     // the action itself failed — sets `errorText` to the captured message, so it's the LAST write
     // and survives the refresh. On an action success, `actionError` stays nil and refresh's own
     // clear stands untouched. `.needsConsent` is deliberately NOT routed through `actionError` — it
-    // is a pending state, not a failure (see `pendingConsent`, left untouched by this fix).
+    // is a pending state, not a failure (see `consentSheet`, below).
     func enable(_ name: String) async {
         busyName = name
         defer { busyName = nil }
@@ -341,13 +367,11 @@ final class PluginManagerModel: ObservableObject {
         do {
             switch try await client.pluginEnable(name: name) {
             case .ok:
-                pendingConsent = nil
                 consentSheet = nil
             case .needsConsent(let requiredConsents, let consentBlock):
                 // Task 3: replaces Task 2's dead orange-banner-only surfacing — clicking Enable on
                 // a needs-consent plugin now opens the GUI consent sheet, seeded verbatim from the
                 // server's disclosure.
-                pendingConsent = PendingConsent(name: name, requiredConsents: requiredConsents, consentBlock: consentBlock)
                 consentSheet = ConsentSheetState(pluginName: name, consentBlock: consentBlock, requiredConsents: requiredConsents)
             case .unknownPlugin:
                 actionError = "unknown plugin: \(name)"
@@ -441,8 +465,16 @@ final class PluginManagerModel: ObservableObject {
     /// retry, or the first-ever enable right after an `install`). Dismisses the sheet on `.ok`;
     /// stays open (re-seeded) if the server somehow still reports `.needsConsent` — mirrors
     /// `enable(_:)`'s own handling of that outcome.
+    ///
+    /// Fix wave (Task 2 review, consent double-submit guard): `isConfirmingConsent` makes a second
+    /// call a no-op while the first is still in flight — e.g. a click landing before the view's
+    /// own `busy`-driven `.disabled(...)` has had a chance to take effect — so at most one
+    /// `pluginEnable(consent:true)` RPC is ever sent per grant.
     func confirmConsent() async {
+        guard !isConfirmingConsent else { return }
         guard var sheet = consentSheet else { return }
+        isConfirmingConsent = true
+        defer { isConfirmingConsent = false }
         sheet.confirm()
         consentSheet = sheet
         let name = sheet.pluginName
@@ -453,7 +485,6 @@ final class PluginManagerModel: ObservableObject {
             switch try await client.pluginEnable(name: name, consent: true) {
             case .ok:
                 consentSheet = nil
-                pendingConsent = nil
             case .needsConsent(let requiredConsents, let consentBlock):
                 consentSheet = ConsentSheetState(pluginName: name, consentBlock: consentBlock, requiredConsents: requiredConsents)
             case .unknownPlugin:
@@ -474,7 +505,6 @@ final class PluginManagerModel: ObservableObject {
     func cancelConsent() {
         consentSheet?.cancel()
         consentSheet = nil
-        pendingConsent = nil
     }
 }
 
@@ -541,8 +571,12 @@ struct PluginManagerView: View {
         // machinery — same end state as `cancelConsent()`, just without that method's explicit
         // `.cancel()` record on the (by-then-discarded) state value.
         .sheet(item: $model.consentSheet) { sheet in
+            // Fix wave (Task 2 review, consent double-submit guard): `busy` mirrors this same
+            // `busyName == name` posture the row buttons already use (`pluginRow(_:)` below) —
+            // `confirmConsent()` sets `busyName` to the sheet's plugin name for the RPC's duration.
             ConsentSheet(
                 state: sheet,
+                busy: model.busyName == sheet.pluginName,
                 onConfirm: { Task { await model.confirmConsent() } },
                 onCancel: { model.cancelConsent() }
             )
@@ -598,11 +632,25 @@ struct PluginManagerView: View {
     /// If `url` is a `.zip`, extract it to a temp dir first and resolve the actual plugin root
     /// within it (`extractPluginZip`/`locatePluginRoot`) before calling `pluginsInstall` — the RPC
     /// itself is folder-source-only. A folder is used directly.
+    ///
+    /// Fix wave (Task 2 review): the extraction temp dir was never removed. `zipTempDir`, cleaned
+    /// in `defer`, tracks it ONLY when `url` was actually a zip we extracted — a picked FOLDER
+    /// (`sourceDir = url` below) must never be deleted. The `defer` fires on every exit path
+    /// (locatePluginRoot-nil, `model.install` failure, and success alike), but only AFTER
+    /// `await model.install(source:)` resolves — the daemon needs the directory to still exist
+    /// while it copies the plugin in.
     private func installFrom(url: URL) async {
+        var zipTempDir: URL?
+        defer {
+            if let zipTempDir {
+                try? FileManager.default.removeItem(at: zipTempDir)
+            }
+        }
         let sourceDir: URL
         if url.pathExtension.lowercased() == "zip" {
             do {
-                let tempDir = try extractPluginZip(at: url)
+                let tempDir = try await extractPluginZip(at: url)
+                zipTempDir = tempDir
                 guard let root = locatePluginRoot(in: tempDir) else {
                     model.errorText = "zip has no norma-plugin.json/plugin.json — not a plugin"
                     return

@@ -239,6 +239,96 @@ final class ShortcutBindingEditorModelCaptureTests: XCTestCase {
     }
 }
 
+// -----------------------------------------------------------------------------------------------
+// Phase 4d-cleanup Task 3 fix 2: hotkey-arm failure surfaced. `ShortcutRegistry` itself can't be
+// unit-tested (real Carbon calls — see `ShortcutRegistryTests.swift`'s own doc comment), so these
+// exercise `ShortcutBindingEditorModel.capture(...)`'s handling of `reload(_:)`'s return value
+// through the `ShortcutHotkeyReloading` seam (`ShortcutRegistry.swift`), injecting a fake that
+// scripts which bindings "failed to arm" without ever touching a real hotkey.
+// -----------------------------------------------------------------------------------------------
+
+/// Scripts `reload(_:)`'s return value — `failedBindings` is echoed back verbatim on every call,
+/// same "script the response" posture as this target's `FeedScriptedTransport` double.
+@MainActor
+private final class FakeHotkeyReloader: ShortcutHotkeyReloading {
+    var failedBindings: [ShortcutBinding] = []
+    private(set) var lastReloadedBindings: [ShortcutBinding] = []
+
+    func reload(_ bindings: [ShortcutBinding]) -> [ShortcutBinding] {
+        lastReloadedBindings = bindings
+        return failedBindings
+    }
+}
+
+@MainActor
+final class ShortcutBindingEditorModelArmFailureTests: XCTestCase {
+    private func freshDefaults(_ name: String) -> (defaults: UserDefaults, cleanup: () -> Void) {
+        let suiteName = "ShortcutBindingEditorModelArmFailureTests.\(name).\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        return (defaults, { defaults.removePersistentDomain(forName: suiteName) })
+    }
+
+    /// The just-captured binding is in `reload`'s failed set → `conflictMessage` surfaces the
+    /// arm-failure text (not the generic "already bound" message), and the binding is STILL
+    /// persisted (a later retry — app restart, the other app quitting — should be able to pick it
+    /// back up without the user having to re-capture it).
+    func testCaptureSurfacesArmFailureWhenTheJustCapturedBindingFailsToRegister() {
+        let (defaults, cleanup) = freshDefaults("failed")
+        defer { cleanup() }
+        let candidate = ShortcutBinding(pluginId: "com.example.a", shortcutId: "toggle", keyCode: UInt32(kVK_ANSI_K), modifiers: UInt32(controlKey))
+        let fake = FakeHotkeyReloader()
+        fake.failedBindings = [candidate]
+        let m = ShortcutBindingEditorModel(client: NormaClientTestFactory.make(), shortcutRegistry: fake, defaults: defaults)
+
+        m.capture(pluginId: "com.example.a", shortcutId: "toggle", keyCode: UInt32(kVK_ANSI_K), modifiers: UInt32(controlKey))
+
+        XCTAssertEqual(ShortcutSettingsStore.load(from: defaults), [candidate], "the binding is persisted even though it failed to arm live")
+        XCTAssertEqual(m.conflictMessage, "Couldn't register \u{2303}K \u{2014} the key may be in use by another app.")
+        XCTAssertEqual(fake.lastReloadedBindings, [candidate], "reload must be called with the full updated bindings list")
+    }
+
+    /// An empty failed-set (the common case) clears `conflictMessage` — same as before this fix.
+    func testCaptureClearsConflictMessageWhenReloadReportsNoFailures() {
+        let (defaults, cleanup) = freshDefaults("ok")
+        defer { cleanup() }
+        let fake = FakeHotkeyReloader()
+        fake.failedBindings = []
+        let m = ShortcutBindingEditorModel(client: NormaClientTestFactory.make(), shortcutRegistry: fake, defaults: defaults)
+
+        m.capture(pluginId: "com.example.a", shortcutId: "toggle", keyCode: UInt32(kVK_ANSI_K), modifiers: UInt32(controlKey))
+
+        XCTAssertNil(m.conflictMessage)
+    }
+
+    /// `reload`'s failed set names a DIFFERENT binding (not the one just captured) — irrelevant to
+    /// this capture, so `conflictMessage` stays clear.
+    func testCaptureIgnoresAFailureReportedForADifferentBinding() {
+        let (defaults, cleanup) = freshDefaults("otherfailed")
+        defer { cleanup() }
+        let other = ShortcutBinding(pluginId: "com.example.b", shortcutId: "open", keyCode: UInt32(kVK_ANSI_L), modifiers: UInt32(optionKey))
+        let fake = FakeHotkeyReloader()
+        fake.failedBindings = [other]
+        let m = ShortcutBindingEditorModel(client: NormaClientTestFactory.make(), shortcutRegistry: fake, defaults: defaults)
+
+        m.capture(pluginId: "com.example.a", shortcutId: "toggle", keyCode: UInt32(kVK_ANSI_K), modifiers: UInt32(controlKey))
+
+        XCTAssertNil(m.conflictMessage)
+    }
+
+    /// A `nil` registry (the unit-test-boot posture — `AppDelegate.boot()` never constructs a real
+    /// one under `isRunningUnitTests`) must not crash and must clear `conflictMessage`, same as
+    /// before this fix.
+    func testCaptureWithNilRegistryDoesNotCrashAndClearsConflictMessage() {
+        let (defaults, cleanup) = freshDefaults("nilregistry")
+        defer { cleanup() }
+        let m = ShortcutBindingEditorModel(client: NormaClientTestFactory.make(), shortcutRegistry: nil, defaults: defaults)
+
+        m.capture(pluginId: "com.example.a", shortcutId: "toggle", keyCode: UInt32(kVK_ANSI_K), modifiers: UInt32(controlKey))
+
+        XCTAssertNil(m.conflictMessage)
+    }
+}
+
 /// `KeyCaptureNSView.keyDown`'s Escape-cancel rule — exercised directly (no window/responder chain
 /// needed: `mouseDown`/`keyDown` are just method calls, and `window?.makeFirstResponder(self)`
 /// no-ops safely with `window` nil).

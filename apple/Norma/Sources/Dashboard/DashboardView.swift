@@ -47,6 +47,26 @@ func dashboardPaneSystemImage(_ pane: DashboardPane) -> String {
 /// The fixed left-sidebar width (spec §B: "left pane sidebar (fixed 180pt)").
 let dashboardSidebarWidth: CGFloat = 180
 
+/// Phase 4d-cleanup Task 3 fix 1: owns the Dashboard's currently-selected pane. Previously this
+/// lived as `DashboardView`'s own `@State private var selection` — a `@State` only ever seeds
+/// ONCE, at the view's construction, so nothing outside the view could ever retarget it after the
+/// fact. That was the bug: the menu bar's "Manage Plugins…" entry, fired while the Dashboard was
+/// already open, refocused the window (`DashboardWindowController.show()`) but never switched
+/// panes, because `AppDelegate.openDashboard(initialPane:)`'s refocus branch had no way to reach
+/// into the already-constructed `DashboardView`'s state. `DashboardSelectionModel` is OWNED by
+/// `DashboardWindowController` (constructed once per window, alongside `pluginManager`/
+/// `tilesModel`/`shortcutsModel` — see that controller's `init`) and handed to `DashboardView` as
+/// an `@ObservedObject`, so `DashboardWindowController.selectPane(_:)` can retarget the SAME
+/// instance the already-rendered view is observing.
+@MainActor
+final class DashboardSelectionModel: ObservableObject {
+    @Published var selection: DashboardPane
+
+    init(initialPane: DashboardPane = defaultDashboardPane) {
+        self.selection = initialPane
+    }
+}
+
 // MARK: - Mountable-pane contract (spec §B)
 
 /// The injected bundle every pane is built from — DATA or a CLOSURE, never a `NormaClient`
@@ -82,15 +102,15 @@ struct DashboardWiring {
 /// used anywhere else in this target.
 struct DashboardView: View {
     let wiring: DashboardWiring
-    @State private var selection: DashboardPane
+    /// Phase 4d-cleanup Task 3 fix 1: `@ObservedObject`, not `@State` — see
+    /// `DashboardSelectionModel`'s own doc comment for why. Owned + constructed by
+    /// `DashboardWindowController`, which seeds it with `initialPane` at window-open and can
+    /// retarget it later via `DashboardWindowController.selectPane(_:)` (the refocus path).
+    @ObservedObject var selectionModel: DashboardSelectionModel
 
-    /// Phase 4d-iii Task 2: `initialPane` lets a caller (the "Manage Plugins…" menu item, via
-    /// `DashboardWindowController`) land the window on a specific pane on first open — defaults to
-    /// `defaultDashboardPane` so every pre-existing call site (`DashboardView(wiring:)`) keeps its
-    /// original behavior unchanged.
-    init(wiring: DashboardWiring, initialPane: DashboardPane = defaultDashboardPane) {
+    init(wiring: DashboardWiring, selectionModel: DashboardSelectionModel) {
         self.wiring = wiring
-        self._selection = State(initialValue: initialPane)
+        self.selectionModel = selectionModel
     }
 
     var body: some View {
@@ -116,7 +136,7 @@ struct DashboardView: View {
     }
 
     private func paneRow(_ pane: DashboardPane) -> some View {
-        let isCurrent = pane == selection
+        let isCurrent = pane == selectionModel.selection
         return HStack(spacing: 6) {
             Image(systemName: dashboardPaneSystemImage(pane))
                 .font(.system(size: 12))
@@ -135,12 +155,12 @@ struct DashboardView: View {
             }
         }
         .contentShape(Rectangle())
-        .onTapGesture { selection = pane }
+        .onTapGesture { selectionModel.selection = pane }
     }
 
     @ViewBuilder
     private var detailView: some View {
-        switch selection {
+        switch selectionModel.selection {
         case .sessions:
             SessionsPane(directory: wiring.directory, onOpenSessionDetached: wiring.onOpenSessionDetached)
         case .daemonStatus:

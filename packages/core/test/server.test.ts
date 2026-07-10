@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, realpathSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1333,6 +1333,82 @@ describe("daemon IPC", () => {
   });
 
   // -----------------------------------------------------------------------------------------
+  // Phase 4d-cleanup Task 2: PluginSupervisor construction + the boot-time orphan-PID sweep are
+  // hoisted OUT of `if (agentProvider)` in daemon.ts — a daemon booted with the agent DISABLED
+  // (no provider configured, or a test injecting `agentProvider: null`, as here) must still reclaim
+  // stale <runDir>/plugins/<id>.pid files left by a previous run, not just a daemon with an active
+  // provider. Exercises the REAL `startDaemon` wiring end to end (no injected fakes for
+  // isAlivePid/spawn — daemon.ts's own PluginSupervisor construction doesn't expose that seam), so
+  // the PID file uses a definitely-dead pid: the sweep's "not alive" branch removes it without ever
+  // needing the `ps -o lstart=` identity check, so this doesn't depend on any real process at all.
+  // -----------------------------------------------------------------------------------------
+  test("Phase 4d-cleanup Task 2: a daemon booted with NO agent provider still sweeps a stale orphaned plugin PID file at boot", async () => {
+    const home = mkdtempSync(join(tmpdir(), "norma-daemon-no-provider-sweep-"));
+    const pidDir = join(home, "run", "plugins");
+    mkdirSync(pidDir, { recursive: true });
+    const pidFile = join(pidDir, "ghost-plugin.pid");
+    // A definitely-dead pid (no plugin named "ghost-plugin" is installed at all, so it's not in
+    // the spawn-eligible set regardless — this is exactly the "plugin disabled/removed since last
+    // run" case sweepOrphans exists for).
+    writeFileSync(pidFile, JSON.stringify({ pid: 999999, pluginId: "ghost-plugin", startedAt: "Thu Jan  1 00:00:00 1970" }));
+    expect(existsSync(pidFile)).toBe(true);
+
+    const secrets = new FileSecretStore(join(home, "test-secrets"));
+    daemon = await startDaemon({ home, secrets, agentProvider: null }); // no provider — the case under test
+
+    // The sweep ran synchronously, before startDaemon's returned promise resolves (it's hoisted
+    // ahead of every `await` gated on agentProvider) — no polling/waitFor needed.
+    expect(existsSync(pidFile)).toBe(false);
+  });
+
+  // -----------------------------------------------------------------------------------------
+  // Review-caught regression (post Phase 4d-cleanup Task 2): hoisting `PluginSupervisor`
+  // construction out of `if (agentProvider)` (above) made `opts.supervisor` ALWAYS defined, which
+  // silently widened `hotApplyStart` (ipc/server.ts) — its old guard was `!opts.supervisor ||
+  // !opts.normaHome`, so a no-provider daemon fell through to a REAL `opts.supervisor.restart()`
+  // spawn on `plugin.enable {consent:true}`, where before this task it always returned "stopped"
+  // with no spawn. Fixed by also gating on `opts.registry` (only ever wired for a
+  // provider-configured daemon — same signal `tool.register` already uses). This proves the FIX:
+  // a spawn-eligible plugin's `plugin.enable{consent:true}` on a no-provider daemon still records
+  // settings but genuinely never spawns. Exercises the REAL `startDaemon` wiring end to end (same
+  // no-injectable-spawn-seam constraint as the sweep test above), with a real, harmless entry
+  // (`bun --version`) — if the bug regressed, this WOULD spawn a real OS process.
+  // -----------------------------------------------------------------------------------------
+  test("Phase 4d-cleanup Task 2 fix: a daemon booted with NO agent provider does NOT hot-spawn on plugin.enable — settings recorded, status stays \"stopped\", no process spawned", async () => {
+    const home = mkdtempSync(join(tmpdir(), "norma-daemon-no-provider-enable-"));
+    writeFileSync(join(home, "settings.json"), JSON.stringify({
+      schemaVersion: 2,
+      provider: { type: "codex-oauth", model: "gpt-5.4" }, // unused — agentProvider: null below forces no-provider
+    }));
+    // A Tier-2 (platform) plugin with an `entry` — spawn-eligible once enabled+consented, exactly
+    // the shape `plugin.enable{consent:true}` would hot-spawn on a provider-configured daemon.
+    mkdirSync(join(home, "plugins", "runner"), { recursive: true });
+    writeFileSync(join(home, "plugins", "runner", "norma-plugin.json"), JSON.stringify({
+      id: "runner", tier: "platform", entry: { command: "bun", args: ["--version"] },
+    }));
+
+    const secrets = new FileSecretStore(join(home, "test-secrets"));
+    daemon = await startDaemon({ home, secrets, agentProvider: null }); // no provider — the case under test
+    harnessToken = daemon.tokens.harness;
+
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "no-provider-enabler");
+    const res = await c.request(METHODS.pluginEnable, { name: "runner", consent: true });
+    expect(res.result).toEqual({ ok: true, status: "stopped" }); // recorded, never hot-spawned
+
+    // The strongest available proof of "never spawned": PluginSupervisor.writePidFile runs
+    // SYNCHRONOUSLY inside spawnFresh, before restart() returns — so if hotApplyStart had reached
+    // supervisor.restart() at all, this file would already exist by the time the RPC responded.
+    expect(existsSync(join(home, "run", "plugins", "runner.pid"))).toBe(false);
+
+    const list = await c.request(METHODS.pluginsList, {});
+    const runner = list.result.plugins.find((p: any) => p.name === "runner");
+    expect(runner).toMatchObject({ disabled: false, mcpEnabled: true, status: "stopped" }); // enabled, never running
+
+    c.close();
+  });
+
+  // -----------------------------------------------------------------------------------------
   // Peripheral lease v1 (Phase 2f). `boot()` wires the REAL PeripheralBroker/AuditLog/
   // ProviderLink daemon.ts builds — these tests exercise the production wiring, not fakes.
   // -----------------------------------------------------------------------------------------
@@ -2385,8 +2461,15 @@ describe("daemon IPC", () => {
         isAlivePid: () => false,
         signalPid: () => {},
       });
+      // A ToolRegistry represents "this daemon has an agent runtime configured" (daemon.ts only
+      // builds one inside `if (agentProvider)`) — hotApplyStart (ipc/server.ts) now gates the real
+      // hot-spawn on `opts.registry`, not just `opts.supervisor` (which Phase 4d-cleanup Task 2
+      // made always-present for the orphan sweep). This suite's tests (b)/(c)/(e) exercise a
+      // provider-configured daemon's hot-start/hot-stop lifecycle, so a registry is wired here to
+      // match — the dedicated no-provider case (registry omitted) is covered separately above.
+      const registry = new ToolRegistry();
       const server = startIpcServer({
-        socketPath, serverVersion: "test", tokens: authority, store, plugins, supervisor, normaHome: home,
+        socketPath, serverVersion: "test", tokens: authority, store, plugins, supervisor, registry, normaHome: home,
       });
       return {
         home, settingsPath: join(home, "settings.json"), pluginsRoot: join(home, "plugins"),
@@ -2581,6 +2664,39 @@ describe("daemon IPC", () => {
       await c.hello(srv.harnessToken, "cli-setconsent-unknown");
       const res = await c.request(METHODS.pluginSetConsent, { name: "ghost", classes: ["exec"] });
       expect(res.result).toEqual({ code: "unknown_plugin" });
+      c.close(); srv.stop();
+    });
+
+    // -----------------------------------------------------------------------------------------
+    // Phase 4d-cleanup Task 1: livePlugins() now caches the derived PluginInfo[] keyed on
+    // settings.json's + the plugins dir's mtime, instead of re-deriving a fresh PluginStore().list()
+    // (readdirSync + per-plugin loadManifest) on EVERY call — a hot path for `hardware.request`.
+    // This proves the cache-HIT path: two `plugins.list` calls with no settings/plugin-dir write in
+    // between only derive once. Not tautological — it spies on `node:fs`'s `readdirSync`, the REAL
+    // I/O `PluginStore.list()` performs (agent/plugins.ts:79), and counts calls against the
+    // PLUGINS ROOT specifically (list() also readdirSync's each plugin's own skills/ subdir, so a
+    // raw total call count would over-count per plugin fixture) — if the cache were a no-op (always
+    // re-deriving), this would see 2 root-dir listings, not 1.
+    // -----------------------------------------------------------------------------------------
+    test("livePlugins() cache-hit: two plugins.list calls with no settings/plugin-dir write between them only derive (readdirSync the plugins root) ONCE", async () => {
+      const srv = await bootLifecycleServer();
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "cache-hit-check");
+
+      const fs = await import("node:fs");
+      const spy = spyOn(fs, "readdirSync");
+      try {
+        const first = await c.request(METHODS.pluginsList, {});
+        expect(first.result.plugins).toHaveLength(1); // the "runner" fixture bootLifecycleServer seeds
+        const second = await c.request(METHODS.pluginsList, {});
+        expect(second.result).toEqual(first.result); // same settings-current view either way
+
+        const rootListings = spy.mock.calls.filter((args) => args[0] === srv.pluginsRoot);
+        expect(rootListings).toHaveLength(1); // the second call was served from cache — no re-derive
+      } finally {
+        spy.mockRestore();
+      }
+
       c.close(); srv.stop();
     });
 

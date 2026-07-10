@@ -44,6 +44,14 @@ func centeredDashboardFrame(visibleFrame: CGRect) -> CGRect {
 final class DashboardWindowController: NSObject, NSWindowDelegate {
     private let window: NSWindow
     private var didClose = false
+    /// Phase 4d-cleanup Task 3 fix 1: owns the pane the `DashboardView` this controller hosts is
+    /// currently showing — see `DashboardSelectionModel`'s own doc comment. Constructed alongside
+    /// `pluginManager`/`tilesModel`/`shortcutsModel` below, before `super.init()` since it's a
+    /// non-optional stored property.
+    private let selectionModel: DashboardSelectionModel
+
+    /// Test-only read-through, same convention as `windowForTesting`.
+    var selectionForTesting: DashboardPane { selectionModel.selection }
 
     /// Registry-removal hook (`AppDelegate.openDashboard`'s wiring) — fires exactly once, same
     /// one-shot-latch posture as `DetachedWindowController.onClosed`.
@@ -78,6 +86,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
         window.toolbar = toolbar
         window.toolbarStyle = .unified
         self.window = window
+        self.selectionModel = DashboardSelectionModel(initialPane: initialPane)
 
         super.init()
 
@@ -106,7 +115,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
             tilesModel: tilesModel,
             shortcutsModel: shortcutsModel
         )
-        window.contentView = NSHostingView(rootView: DashboardView(wiring: wiring, initialPane: initialPane))
+        window.contentView = NSHostingView(rootView: DashboardView(wiring: wiring, selectionModel: selectionModel))
         window.setFrame(frame, display: true)
     }
 
@@ -116,6 +125,16 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
     func show() {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Phase 4d-cleanup Task 3 fix 1: retargets the ALREADY-OPEN window's pane — the refocus half
+    /// of the pane-refocus fix. `AppDelegate.openDashboard(initialPane:)`'s refocus branch calls
+    /// this BEFORE `show()` (when a pane was explicitly requested — fix wave 1 made that call
+    /// conditional on `initialPane != nil`, since a PLAIN refocus must preserve the current pane
+    /// instead) so the pane switch is visible the instant the window comes to front, rather than
+    /// showing the old pane for one frame.
+    func selectPane(_ pane: DashboardPane) {
+        selectionModel.selection = pane
     }
 
     /// Programmatic close (`AppDelegate.applicationWillTerminate`) — goes through the SAME AppKit

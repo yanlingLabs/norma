@@ -96,16 +96,21 @@ final class ShortcutBindingEditorModel: ObservableObject {
     private let client: NormaClient
     /// `nil` under unit tests (`AppDelegate.boot()` only constructs a real `ShortcutRegistry`
     /// outside `!isRunningUnitTests`) — `capture(...)` still persists the binding either way; only
-    /// the live Carbon re-registration is skipped when this is `nil`.
-    private let shortcutRegistry: ShortcutRegistry?
+    /// the live Carbon re-registration is skipped when this is `nil`. Typed as the
+    /// `ShortcutHotkeyReloading` seam (not the concrete `ShortcutRegistry`) so
+    /// `testCaptureSurfacesArmFailure...` (`ShortcutBindingEditorTests.swift`) can inject a fake
+    /// that scripts a failed-arm result without touching real Carbon.
+    private let shortcutRegistry: (any ShortcutHotkeyReloading)?
     private let defaults: UserDefaults
 
     @Published private(set) var rows: [Row] = []
-    /// Set by `capture(...)` when the candidate binding collides with a DIFFERENT shortcut's combo
-    /// — cleared on the next successful capture. The view surfaces this as an inline message.
+    /// Set by `capture(...)` when the candidate binding collides with a DIFFERENT shortcut's combo,
+    /// fails the modifier/reserved-combo gates, OR (Phase 4d-cleanup Task 3 fix 2) the live
+    /// `ShortcutRegistry` reports the just-captured binding failed to arm — cleared on the next
+    /// successful-and-armed capture. The view surfaces this as an inline message.
     @Published var conflictMessage: String?
 
-    init(client: NormaClient, shortcutRegistry: ShortcutRegistry?, defaults: UserDefaults = .standard) {
+    init(client: NormaClient, shortcutRegistry: (any ShortcutHotkeyReloading)?, defaults: UserDefaults = .standard) {
         self.client = client
         self.shortcutRegistry = shortcutRegistry
         self.defaults = defaults
@@ -137,6 +142,13 @@ final class ShortcutBindingEditorModel: ObservableObject {
     /// pair's prior binding (if any) in the persisted list, saves, reloads the live
     /// `ShortcutRegistry`, and updates `rows` in place so the display string refreshes without a
     /// full `refresh()` round-trip.
+    ///
+    /// Phase 4d-cleanup Task 3 fix 2: the persisted save always happens (a plugin author or the
+    /// user may still want the intended binding remembered for a later retry — e.g. the app
+    /// restarts, or the other app holding the combo quits), but if the live `reload(_:)` reports
+    /// THIS pair's binding specifically failed to arm, `conflictMessage` is set to say so instead
+    /// of being cleared — same inline-message surface as every other rejection above, just after
+    /// persistence rather than instead of it.
     func capture(pluginId: String, shortcutId: String, keyCode: UInt32, modifiers: UInt32) {
         guard hasRequiredModifier(modifiers) else {
             conflictMessage = "Use a modifier combo like \u{2303}\u{2325}K."
@@ -152,11 +164,15 @@ final class ShortcutBindingEditorModel: ObservableObject {
             conflictMessage = "That key combo is already bound to another shortcut."
             return
         }
-        conflictMessage = nil
         bindings.removeAll { $0.pluginId == pluginId && $0.shortcutId == shortcutId }
         bindings.append(candidate)
         ShortcutSettingsStore.save(bindings, to: defaults)
-        shortcutRegistry?.reload(bindings)
+        let failed = shortcutRegistry?.reload(bindings) ?? []
+        if failed.contains(candidate) {
+            conflictMessage = "Couldn't register \(shortcutDisplayString(keyCode: keyCode, modifiers: modifiers)) \u{2014} the key may be in use by another app."
+        } else {
+            conflictMessage = nil
+        }
         if let idx = rows.firstIndex(where: { $0.pluginId == pluginId && $0.shortcutId == shortcutId }) {
             rows[idx].binding = candidate
         }

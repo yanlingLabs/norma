@@ -149,11 +149,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// resolves to a log + no-op, never a crash or a half-wired window.
     /// Phase 4d-iii Task 2: `initialPane` lets `openPluginManager()` below reuse this exact body
     /// (same "shared spawn body" posture as `openSessionInNewDetachedWindow`'s own `frame`
-    /// override) instead of duplicating the guard/construction. Only matters for a FRESH window —
-    /// a second invocation while one is already open just refocuses it via `show()` (singleton
-    /// behavior, unchanged), it does NOT re-select the pane on the already-open window.
-    func openDashboard(initialPane: DashboardPane = defaultDashboardPane) {
+    /// override) instead of duplicating the guard/construction.
+    /// Phase 4d-cleanup Task 3 fix 1: a second invocation while one is already open retargets the
+    /// pane (`DashboardWindowController.selectPane(_:)`, below) before refocusing via `show()` —
+    /// previously this only refocused the window without ever switching panes, so "Manage
+    /// Plugins…" fired against an already-open Dashboard silently did nothing pane-wise.
+    /// Phase 4d-cleanup Task 3 fix wave 1: that fix over-corrected — retargeting UNCONDITIONALLY
+    /// on refocus meant the plain "Dashboard…" entry (`initialPane` omitted, `AppDelegate.swift`'s
+    /// `openDashboard: { ... }` wiring below) snapped an already-open window back to the default
+    /// pane too, discarding whatever pane the user had navigated to. `initialPane` is now
+    /// `DashboardPane?`: `nil` means "no pane requested" — a plain refocus that preserves whatever
+    /// is currently showing (the selection model already starts at `defaultDashboardPane` on first
+    /// open, so a fresh window still lands correctly). Non-`nil` means "targeted" — callers like
+    /// `openPluginManager()` below that must land on a specific pane whether the window is opening
+    /// fresh or already open.
+    func openDashboard(initialPane: DashboardPane? = nil) {
         if let dashboardWindow {
+            // Only a TARGETED open (non-nil `initialPane`) retargets the pane before refocusing —
+            // a plain refocus (`initialPane == nil`) leaves the current pane untouched.
+            if let initialPane {
+                dashboardWindow.selectPane(initialPane)
+            }
             dashboardWindow.show()
             return
         }
@@ -170,7 +186,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             shortcutRegistry: shortcutRegistry,
             onOpenSessionDetached: { [weak self] sid in self?.openSessionInNewDetachedWindow(sid) },
             frame: centeredDashboardFrame(visibleFrame: visible),
-            initialPane: initialPane
+            initialPane: initialPane ?? defaultDashboardPane
         )
         controller.onClosed = { [weak self] _ in self?.dashboardWindow = nil }
         dashboardWindow = controller
@@ -178,8 +194,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Phase 4d-iii Task 2: the menu bar's "Manage Plugins…" entry — opens the SAME singleton
-    /// Dashboard window `openDashboard()` owns, landed on `.pluginManager` when a fresh window is
-    /// spawned (mirrors that method's own doc comment on the refocus-vs-fresh-window distinction).
+    /// Dashboard window `openDashboard()` owns, landed on `.pluginManager` whether the window is
+    /// spawned fresh or already open (a targeted `initialPane` retargets an open window; only the
+    /// plain nil-pane "Dashboard…" path preserves the user's current pane — 4d-cleanup T3).
     func openPluginManager() {
         openDashboard(initialPane: .pluginManager)
     }
@@ -375,7 +392,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
             }
-            shortcuts.reload(ShortcutSettingsStore.load())
+            // Phase 4d-cleanup Task 3 fix 2: boot time has no editor UI to surface a per-binding
+            // arm failure against (unlike `ShortcutBindingEditorModel.capture`'s `conflictMessage`)
+            // — just log how many failed, same posture as this file's other silent-failure paths.
+            let failedAtBoot = shortcuts.reload(ShortcutSettingsStore.load())
+            if !failedAtBoot.isEmpty {
+                OrbDebug.log("boot: \(failedAtBoot.count) plugin shortcut hotkey(s) failed to arm (key may be in use by another app)")
+            }
             shortcutRegistry = shortcuts
 
             // Task 4 (2f): the panic hotkey/screen-lock observer and the TCC-change poll are

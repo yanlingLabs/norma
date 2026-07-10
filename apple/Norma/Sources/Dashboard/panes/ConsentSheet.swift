@@ -78,6 +78,11 @@ struct ConsentSheetState: Equatable, Identifiable {
 
 struct ConsentSheet: View {
     let state: ConsentSheetState
+    /// Fix wave (Task 2 review, consent double-submit guard): true while `confirmConsent()` is
+    /// in flight (`model.busyName == state.pluginName`, threaded in by `PluginManagerView`) —
+    /// disables BOTH buttons (Cancel too, so the sheet can't be torn down mid-RPC) and shows a
+    /// small progress indicator on the grant button, so a second click can't fire a second RPC.
+    let busy: Bool
     let onConfirm: () -> Void
     let onCancel: () -> Void
 
@@ -108,12 +113,24 @@ struct ConsentSheet: View {
                 Spacer()
                 Button("Cancel") { onCancel() }
                     .keyboardShortcut(.cancelAction)
+                    .disabled(busy)
                 // Deliberately NO `.keyboardShortcut(.defaultAction)` here — mirrors the CLI's
                 // typed-"yes" gravity (`packages/cli/src/main.ts`'s `plugin enable`: a bare Enter
                 // at the prompt does NOT consent, only literally typing "yes" does). Granting
                 // exec/tcc/hardware access must be a deliberate click, never a reflexive Enter.
-                Button("Grant consent & enable") { onConfirm() }
-                    .foregroundStyle(.red)
+                Button {
+                    onConfirm()
+                } label: {
+                    HStack(spacing: 6) {
+                        if busy {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Text("Grant consent & enable")
+                    }
+                }
+                .foregroundStyle(.red)
+                .disabled(busy)
             }
         }
         .padding(20)

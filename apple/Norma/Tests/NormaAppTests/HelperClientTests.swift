@@ -5,7 +5,7 @@ import XCTest
 /// Task 4 (4c): the two pure mappings in `HelperClient.swift` — `SMAppService.Status` →
 /// `HelperApprovalStatus` (the bridge init) and `HelperApprovalStatus` → `HelperStatusDisplay`
 /// (the dashboard row's state text + button visibility). `HelperClient`'s real `SMAppService`/XPC
-/// surface (`register`/`unregister`/`setChargeLimit`/`getChargeLimit`) drives a real privileged
+/// surface (`register`/`setChargeLimit`/`getChargeLimit`) drives a real privileged
 /// daemon — a LIVE-GATE item (Task 6), not exercised here, same posture as `SMCController` in
 /// `HelperSources/SMCController.swift` relative to `chargeLimitPlan`.
 final class HelperClientTests: XCTestCase {
