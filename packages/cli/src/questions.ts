@@ -1,3 +1,26 @@
+import { DIM, RESET } from "./task-block";
+
+/** Task 3 (ask_user CC parity): formats one numbered option line plus, when the option carries a
+ *  `preview` (the "visual scheme on the right" alongside the option), one additional indented
+ *  line PER LINE of the — possibly multi-line — preview text, rendered on a "┆" rail 5 columns
+ *  in (options are capped at 4 by QuestionOptionSchema, so "  N) " is always exactly 5 columns
+ *  wide — the preview rail lines up under the label regardless of which option it belongs to).
+ *  Pure and TTY-only: main.ts's question_asked handler calls this ONLY inside its existing
+ *  `if (process.stdin.isTTY)` gate and emit()s every returned line verbatim, so the pinned
+ *  block's erase/reprint bookkeeping (every emit() call already re-derives it) stays correct
+ *  without any separate line-count tracking here — and headless (`-p`) never calls this function
+ *  at all, so the preview text can never leak into non-TTY output. Extracted as a pure function
+ *  (rather than inlined into the emit() loop) so this formatting is unit-testable without
+ *  readline. The option line's own bytes are IDENTICAL to before this feature when no preview is
+ *  present — a preview only ever appends extra lines, never changes the option line itself. */
+export function formatOptionLines(index: number, option: { label: string; description?: string; preview?: string }): string[] {
+  const lines = [`  ${index}) ${option.label}${option.description ? ` ${DIM}${option.description}${RESET}` : ""}\n`];
+  if (option.preview) {
+    for (const previewLine of option.preview.split("\n")) lines.push(`     ┆ ${previewLine}\n`);
+  }
+  return lines;
+}
+
 /** True when the raw input is exactly the menu number for "Other" (options.length + 1) — the
  *  digit itself is never a real answer, so the caller should re-prompt for actual free text
  *  instead of handing the model the literal number (M1: "Other" chosen BY NUMBER used to pass

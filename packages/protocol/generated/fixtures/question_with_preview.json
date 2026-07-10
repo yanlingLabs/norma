@@ -1,0 +1,25 @@
+{
+  "type": "question_asked",
+  "sessionId": "s_1",
+  "threadId": "t_1",
+  "seq": 28,
+  "ts": 1700000000018,
+  "callId": "call_2",
+  "questions": [
+    {
+      "question": "Which layout?",
+      "header": "Layout",
+      "multiSelect": false,
+      "options": [
+        {
+          "label": "Sidebar",
+          "description": "nav on the left",
+          "preview": "┌──┬────┐\n│▮ │    │\n└──┴────┘"
+        },
+        {
+          "label": "Topbar"
+        }
+      ]
+    }
+  ]
+}

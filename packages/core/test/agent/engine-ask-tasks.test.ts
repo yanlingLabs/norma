@@ -92,6 +92,34 @@ describe("AgentEngine: ask_user / task bridges", () => {
     expect((toolResult as any).output).toContain("Pick: B");
   });
 
+  // CC AskUserQuestion parity (Task 2): a note attached to the respond call must (a) ride the
+  // persisted/broadcast question_resolved event and (b) be folded verbatim into the tool_result
+  // the model sees, via the engine's ask bridge + QuestionBroker + ask-user.ts's run().
+  test("ask_user: respond with a note → question_resolved carries it AND the model-visible tool result includes it", async () => {
+    const { engine, store, hub, questions, sessionId } = setup([
+      [{ type: "tool_call", callId: "c1", name: "ask_user", argsJson: JSON.stringify(askArgs) }, done("tool_calls")],
+      text("thanks"),
+    ]);
+    const watcher: HubClient = {
+      clientName: "answerer",
+      deliver(e) {
+        if (e.type === "question_asked") {
+          questions!.respond(sessionId, e.callId, { "Pick one": "B" }, "test", { "Pick one": "prefer B for perf" });
+        }
+        return true;
+      },
+    };
+    hub.attach(watcher, sessionId, 0);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+    const resolved = events.find((e) => e.type === "question_resolved");
+    expect(resolved).toMatchObject({ callId: "c1", answers: { "Pick one": "B" }, by: "test", notes: { "Pick one": "prefer B for perf" } });
+    const toolResult = events.find((e) => e.type === "tool_result");
+    expect(toolResult).toMatchObject({ isError: false });
+    expect((toolResult as any).output).toContain("Pick: B");
+    expect((toolResult as any).output).toContain('[user note on "Pick one": prefer B for perf]');
+  });
+
   test("ask_user timeout → proceed message (short NORMA_ASK_TIMEOUT_MS)", async () => {
     const prev = process.env.NORMA_ASK_TIMEOUT_MS;
     process.env.NORMA_ASK_TIMEOUT_MS = "50";

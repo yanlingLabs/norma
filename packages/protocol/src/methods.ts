@@ -161,6 +161,10 @@ export const PluginsListResult = z.object({ ok: z.literal(true), plugins: z.arra
 
 export const AskUserRespondParams = z.object({
   sessionId: z.string().min(1), callId: z.string().min(1), answers: z.record(z.string(), z.string()),
+  // CC AskUserQuestion parity: optional per-question notes (mirrors QuestionResolvedEvent.notes,
+  // events.ts), keyed by question text like `answers`. Additive — older callers omitting it
+  // still parse.
+  notes: z.record(z.string(), z.string()).optional(),
 });
 export const AskUserRespondResult = z.object({ ok: z.literal(true), alreadyResolved: z.boolean() });
 

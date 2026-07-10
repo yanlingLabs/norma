@@ -556,7 +556,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       }
       case METHODS.askUserRespond: {
         const p = parseParams(AskUserRespondParams, params);
-        return opts.questions?.respond(p.sessionId, p.callId, p.answers, socket.data.clientName) ?? { ok: true, alreadyResolved: true };
+        return opts.questions?.respond(p.sessionId, p.callId, p.answers, socket.data.clientName, p.notes) ?? { ok: true, alreadyResolved: true };
       }
       case METHODS.taskList: {
         const p = parseParams(TaskListParams, params);

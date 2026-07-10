@@ -1,0 +1,15 @@
+{
+  "type": "question_resolved",
+  "sessionId": "s_1",
+  "threadId": "t_1",
+  "seq": 29,
+  "ts": 1700000000019,
+  "callId": "call_2",
+  "answers": {
+    "Which layout?": "Sidebar"
+  },
+  "notes": {
+    "Which layout?": "prefer the nav on the left"
+  },
+  "by": "cli"
+}

@@ -128,7 +128,7 @@ final class OrbWindowController: ObservableObject {
     /// `onSubmit` chain (`FieldStateAdapter.onXRespond` → `GlassRootView.wireCallbacks()` → these
     /// closures → `AppDelegate` → `AppModel`) so this controller stays model-free.
     var onApprovalRespond: ((String, Bool) async -> Bool)?
-    var onQuestionRespond: ((String, [String: String]) async -> Bool)?
+    var onQuestionRespond: ((String, [String: String], [String: String]) async -> Bool)?
     var onPlanRespond: ((String, Bool, Bool, String?) async -> Bool)?
 
     /// Task 4 (2d-iii): the ⋯ menu's approval-mode picker — SAME seam as `onApprovalRespond` et al
@@ -487,7 +487,8 @@ final class OrbWindowController: ObservableObject {
                         keyCode: event.keyCode,
                         chars: event.charactersIgnoringModifiers,
                         topmost: topmost,
-                        composerDraft: self.fieldAdapter.composerDraft
+                        composerDraft: self.fieldAdapter.composerDraft,
+                        textFieldFocused: isTextEditingFocused(in: panel)
                     ) {
                         self.dispatchCardKeyAction(action, topmost: topmost)
                         return nil
@@ -588,7 +589,7 @@ final class OrbWindowController: ObservableObject {
             fieldAdapter.onApprovalRespond(callId, false)
         case .selectOption(let callId, let index):
             guard case .question(_, let questions) = topmost else { return }
-            fieldAdapter.onQuestionRespond(callId, questionAnswers(for: questions, selections: [0: [index]], otherTexts: [:]))
+            fieldAdapter.onQuestionRespond(callId, questionAnswers(for: questions, selections: [0: [index]], otherTexts: [:]), [:])
         }
     }
 
@@ -1508,6 +1509,16 @@ func windowEscAction(keyCode: UInt16, escConsumed: () -> Bool) -> WindowEscActio
 /// — so the whole "typing 'yes' into the composer must never trigger a card" guard is itself
 /// unit-testable without a live `NSEvent` monitor. Checked FIRST, before even looking at
 /// `topmost`: cards capture a keystroke ONLY while the composer draft is empty, full stop.
+///
+/// T4-review fix: `textFieldFocused` is the SAME idea extended to a card's OWN text fields (the
+/// always-visible per-question notes field, and the pre-existing "Other" field) — both call sites'
+/// key monitor runs BEFORE the SwiftUI field editor ever sees the event (a local
+/// `NSEvent.addLocalMonitorForEvents` monitor fires ahead of first-responder dispatch), so without
+/// this guard a digit-leading note ("3 retries") got eaten as `.selectOption` before a single
+/// character reached the field. `composerDraft.isEmpty` does NOT cover this case — the card's notes/
+/// Other state is local `@State` on the card view, never written through `composerDraft` at all.
+/// Defaults `false` so every pre-existing call site (and the tests above) is byte-identical; only
+/// the two live monitors below pass a real value, computed from AppKit's `firstResponder`.
 enum CardKeyAction: Equatable {
     case approve(String)
     case deny(String)
@@ -1515,8 +1526,10 @@ enum CardKeyAction: Equatable {
 }
 
 func cardKeyAction(
-    keyCode: UInt16, chars: String?, topmost: PendingInteraction?, composerDraft: String
+    keyCode: UInt16, chars: String?, topmost: PendingInteraction?, composerDraft: String,
+    textFieldFocused: Bool = false
 ) -> CardKeyAction? {
+    guard !textFieldFocused else { return nil }
     guard composerDraft.isEmpty else { return nil }
     guard let topmost, let chars, let ch = chars.lowercased().first else { return nil }
     switch topmost {
@@ -1540,4 +1553,29 @@ func cardKeyAction(
     case .plan:
         return nil // approve/deny/feedback all need more than one bare keystroke — mouse only.
     }
+}
+
+/// T4-review fix: the `cardKeyAction(textFieldFocused:)` guard's live input — is `window`'s current
+/// `firstResponder` an ACTIVE text-editing view a keystroke would otherwise land in?
+///
+/// AppKit-correct form for "is a SwiftUI `TextField` currently being edited": when one takes focus,
+/// the window's `firstResponder` becomes its FIELD EDITOR, which is always an `NSTextView` (the
+/// concrete class backing the `NSText` protocol) — never the `NSTextField`/SwiftUI view itself. So
+/// `firstResponder is NSText` is true for exactly "some text view is editing right now" — both the
+/// card's notes/Other `TextField`s (the T4 bug) AND, ordinarily, nothing else in this app.
+///
+/// EXCEPT: this window's own message composer (`ComposerTextView`'s `CommandTextView`, a real
+/// `NSTextView` subclass, not a field-editor-backed `NSTextField`) aggressively claims and holds
+/// `firstResponder` at rest — `makeNSView`/`updateNSView` (`ComposerTextView.swift:98-104,121-126`)
+/// both re-claim it via `makeFirstResponder` whenever it isn't already the first responder. That
+/// means `firstResponder is NSText` is ALREADY true the instant a card appears with an empty,
+/// unfocused composer — the composer itself is an `NSText`. Without excluding it by concrete type,
+/// this guard would suppress digit-select on the primary, already-shipped, already-tested path
+/// (`CardWiringTests.testCardKeyActionDigitsSelectOption`) — a regression strictly worse than the
+/// bug it fixes. `!(firstResponder is CommandTextView)` narrows the guard to "some OTHER text view
+/// — i.e., a card's own field — is being edited," leaving the composer's resting/typing behavior
+/// completely unchanged (still governed solely by `composerDraft.isEmpty`, as before this fix).
+func isTextEditingFocused(in window: NSWindow) -> Bool {
+    guard let responder = window.firstResponder else { return false }
+    return responder is NSText && !(responder is CommandTextView)
 }

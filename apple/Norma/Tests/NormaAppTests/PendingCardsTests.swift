@@ -84,6 +84,69 @@ final class PendingCardsTests: XCTestCase {
         XCTAssertTrue(questionCardComplete(questions: qs, selections: [0: [0]], otherTexts: [:]))
     }
 
+    // MARK: - questionNotes (Task 4: CC AskUserQuestion parity — per-question notes)
+
+    func testQuestionNotesOmitsEmptyAndWhitespaceOnly() {
+        let qs = questions(#"[{"question":"Which db?","header":"DB","options":[{"label":"Postgres","description":null}],"multiSelect":false},{"question":"Which port?","header":"Port","options":[{"label":"80","description":null}],"multiSelect":false}]"#)
+        let notes = questionNotes(for: qs, notes: [0: "prefer the managed one", 1: "   "])
+        XCTAssertEqual(notes, ["Which db?": "prefer the managed one"])
+    }
+
+    func testQuestionNotesKeyedByQuestionTextLikeAnswers() {
+        let qs = questions(#"[{"question":"Which db?","header":"DB","options":[{"label":"Postgres","description":null}],"multiSelect":false}]"#)
+        let notes = questionNotes(for: qs, notes: [0: "  a note  "])
+        XCTAssertEqual(notes, ["Which db?": "a note"])
+    }
+
+    func testQuestionNotesEmptyWhenNoNotesGiven() {
+        let qs = questions(#"[{"question":"Which db?","header":"DB","options":[{"label":"Postgres","description":null}],"multiSelect":false}]"#)
+        XCTAssertEqual(questionNotes(for: qs, notes: [:]), [:])
+    }
+
+    func testQuestionNotesNeverGateSubmit() {
+        // A note alone (no answer) does NOT satisfy questionCardComplete — notes ride alongside
+        // an answer, they never substitute for one.
+        let qs = questions(#"[{"question":"Which db?","header":"DB","options":[{"label":"Postgres","description":null}],"multiSelect":false}]"#)
+        XCTAssertFalse(questionCardComplete(questions: qs, selections: [:], otherTexts: [:]))
+        // (the note itself isn't threaded through questionCardComplete at all — it takes no notes
+        // param — which is the point: there is no way for a note to affect the gate.)
+    }
+
+    // MARK: - questionShowsPreviewPane / questionFocusedPreview (Task 4: side-by-side preview)
+
+    func testSingleSelectWithPreviewsShowsPreviewPane() {
+        let qs = questions(#"[{"question":"Which scheme?","header":"Scheme","options":[{"label":"Light","description":null,"preview":"bg: #fff"},{"label":"Dark","description":null,"preview":"bg: #000"}],"multiSelect":false}]"#)
+        XCTAssertTrue(questionShowsPreviewPane(qs[0]))
+    }
+
+    func testFocusedPreviewUsesSelectedOption() {
+        let qs = questions(#"[{"question":"Which scheme?","header":"Scheme","options":[{"label":"Light","description":null,"preview":"bg: #fff"},{"label":"Dark","description":null,"preview":"bg: #000"}],"multiSelect":false}]"#)
+        XCTAssertEqual(questionFocusedPreview(qs[0], selected: [1]), "bg: #000")
+    }
+
+    func testFocusedPreviewFallsBackToFirstOptionWhenNoneSelected() {
+        let qs = questions(#"[{"question":"Which scheme?","header":"Scheme","options":[{"label":"Light","description":null,"preview":"bg: #fff"},{"label":"Dark","description":null,"preview":"bg: #000"}],"multiSelect":false}]"#)
+        XCTAssertEqual(questionFocusedPreview(qs[0], selected: []), "bg: #fff")
+    }
+
+    func testQuestionWithNoPreviewsDoesNotShowPreviewPane() {
+        let qs = questions(#"[{"question":"Which db?","header":"DB","options":[{"label":"Postgres","description":null},{"label":"MySQL","description":null}],"multiSelect":false}]"#)
+        XCTAssertFalse(questionShowsPreviewPane(qs[0]))
+        XCTAssertNil(questionFocusedPreview(qs[0], selected: [0]))
+    }
+
+    func testMultiSelectQuestionIgnoresPreviewsEvenWhenPresent() {
+        let qs = questions(#"[{"question":"Which ports?","header":"Ports","options":[{"label":"80","description":null,"preview":"http"},{"label":"443","description":null,"preview":"https"}],"multiSelect":true}]"#)
+        XCTAssertFalse(questionShowsPreviewPane(qs[0]))
+        XCTAssertNil(questionFocusedPreview(qs[0], selected: [0, 1]))
+    }
+
+    func testFocusedPreviewIgnoresOutOfRangeSelection() {
+        let qs = questions(#"[{"question":"Which scheme?","header":"Scheme","options":[{"label":"Light","description":null,"preview":"bg: #fff"}],"multiSelect":false}]"#)
+        // A stale/out-of-range selection index falls back to the first option rather than crashing.
+        XCTAssertEqual(questionFocusedPreview(qs[0], selected: [5]), "bg: #fff")
+    }
+
     func testCardTitles() {
         let approval = PendingInteraction.approval(callId: "a1", toolName: "bash", summary: "rm x")
         XCTAssertEqual(cardTitle(approval), "Approval needed — bash")

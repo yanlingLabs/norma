@@ -79,7 +79,13 @@ export const CheckpointEvent = ThreadBase.extend({
   type: z.literal("checkpoint"), summary: z.string(), uptoSeq: z.number().int().nonnegative(),
 });
 
-export const QuestionOptionSchema = z.object({ label: z.string().min(1), description: z.string().optional() });
+export const QuestionOptionSchema = z.object({
+  label: z.string().min(1), description: z.string().optional(),
+  // CC AskUserQuestion parity: a per-option preview (e.g. a diff/scheme snippet rendered
+  // alongside the option) shown in the "visual scheme on the right" panel. Optional/additive —
+  // older-shaped questions without a preview still parse.
+  preview: z.string().optional(),
+});
 export const QuestionSchema = z.object({
   question: z.string().min(1), header: z.string().min(1).max(12),
   options: z.array(QuestionOptionSchema).min(2).max(4), multiSelect: z.boolean(),
@@ -102,6 +108,9 @@ export const QuestionAskedEvent = ThreadBase.extend({
 });
 export const QuestionResolvedEvent = ThreadBase.extend({
   type: z.literal("question_resolved"), callId: z.string().min(1), answers: z.record(z.string(), z.string()), by: z.string().min(1),
+  // CC AskUserQuestion parity: free-text notes ("press n to add notes"), keyed by question text
+  // like `answers`. Optional/additive — older-shaped resolutions without notes still parse.
+  notes: z.record(z.string(), z.string()).optional(),
 });
 export const TaskUpdatedEvent = ThreadBase.extend({ type: z.literal("task_updated"), task: TaskSchema });
 

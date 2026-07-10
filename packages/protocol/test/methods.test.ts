@@ -290,6 +290,17 @@ describe("ask_user.respond / task.list schemas", () => {
     expect(METHODS.askUserRespond).toBe("ask_user.respond");
   });
 
+  // CC AskUserQuestion parity: optional per-question `notes`, additive to `answers`.
+  test("ask_user.respond params accept optional notes, keyed like answers", () => {
+    const withNotes = AskUserRespondParams.parse({
+      sessionId: "s1", callId: "c1", answers: { "Which codename?": "Falcon" }, notes: { "Which codename?": "prefer the bird" },
+    });
+    expect(withNotes.notes?.["Which codename?"]).toBe("prefer the bird");
+
+    const withoutNotes = AskUserRespondParams.parse({ sessionId: "s1", callId: "c1", answers: { "Which codename?": "Falcon" } });
+    expect(withoutNotes.notes).toBeUndefined();
+  });
+
   test("task.list params/result + method string", () => {
     expect(TaskListParams.parse({ sessionId: "s1" }).sessionId).toBe("s1");
     const r = TaskListResult.parse({ ok: true, tasks: [{ id: "1", subject: "rename", status: "pending" }] });

@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 import NormaProtocol
 import NormaKit
@@ -77,6 +78,80 @@ final class CardWiringTests: XCTestCase {
 
         // empty draft: unaffected, falls through to the ordinary routing.
         XCTAssertEqual(cardKeyAction(keyCode: 16, chars: "y", topmost: approval, composerDraft: ""), .approve("a1"))
+    }
+
+    /// T4-review fix: a card's OWN text fields (notes, Other) are local `@State`, never routed
+    /// through `composerDraft` — so this is a SEPARATE guard, independently threaded and tested,
+    /// same convention as `testCardKeyActionGuardedByComposerDraft` above. Covers exactly the
+    /// brief's three cases: digit + text-field-focused → suppressed, digit + no-text-focus →
+    /// unaffected (the pre-existing shortcut), non-digit (y/n) + text-field-focused → also
+    /// suppressed (typing "yes"/"no" into a note must not fire an approval either).
+    func testCardKeyActionGuardedByTextFieldFocus() {
+        let qs = questions(#"[{"question":"How many retries?","header":"Retries","options":[{"label":"1","description":null},{"label":"2","description":null},{"label":"3","description":null}],"multiSelect":false}]"#)
+        let question = PendingInteraction.question(callId: "q1", questions: qs)
+
+        // The bug: typing "3 retries" into the notes field — the leading digit must NOT select/
+        // submit the card while a text field (the notes field) holds focus.
+        XCTAssertNil(
+            cardKeyAction(keyCode: 20, chars: "3", topmost: question, composerDraft: "", textFieldFocused: true),
+            "a digit-leading note must not be swallowed as a card shortcut while a text field is focused"
+        )
+
+        // No text field focused: unaffected — the pre-existing digit-select contract still works
+        // (default `textFieldFocused: false`, matching every call site above).
+        XCTAssertEqual(
+            cardKeyAction(keyCode: 20, chars: "3", topmost: question, composerDraft: ""),
+            .selectOption("q1", 2)
+        )
+        XCTAssertEqual(
+            cardKeyAction(keyCode: 20, chars: "3", topmost: question, composerDraft: "", textFieldFocused: false),
+            .selectOption("q1", 2)
+        )
+
+        // y/n (approval cards) while a text field is focused: also suppressed — same guard, not
+        // digit-specific.
+        let approval = PendingInteraction.approval(callId: "a1", toolName: "bash", summary: "rm x")
+        XCTAssertNil(cardKeyAction(keyCode: 16, chars: "y", topmost: approval, composerDraft: "", textFieldFocused: true))
+        XCTAssertNil(cardKeyAction(keyCode: 45, chars: "n", topmost: approval, composerDraft: "", textFieldFocused: true))
+    }
+
+    // MARK: - isTextEditingFocused (live firstResponder guard)
+
+    /// T4-review fix: the guard's own AppKit input. `isTextEditingFocused(in:)` must recognize a
+    /// generic `NSTextView` (what a SwiftUI `TextField`'s shared field editor actually is — the
+    /// card's notes/Other fields) as "a text field is focused," while excluding this app's own
+    /// message composer (`CommandTextView`, a real `NSTextView` subclass that legitimately holds
+    /// `firstResponder` at rest — see `isTextEditingFocused`'s doc for why the exclusion is
+    /// required, not optional polish).
+    @MainActor
+    func testIsTextEditingFocusedExcludesComposerButCatchesFieldEditor() {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
+                               styleMask: [.titled], backing: .buffered, defer: false)
+        // A test-constructed NSWindow is held ONLY by this local `let` — AppKit's default
+        // `isReleasedWhenClosed == true` means `close()` below performs an ADDITIONAL release on
+        // top of ARC's own, over-releasing the window (crashed this suite with EXC_BAD_ACCESS in
+        // `objc_release` during XCTest's post-test dealloc-scope check until this was added). Same
+        // fix `DetachedWindowController.swift:119` applies for the identical reason ("this
+        // controller owns the window's lifetime").
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+
+        // Nothing focused yet (or a non-text responder): not text-editing.
+        XCTAssertFalse(isTextEditingFocused(in: window))
+
+        // A generic NSTextView (stand-in for a SwiftUI TextField's field editor) IS text-editing.
+        let plainTextView = NSTextView()
+        window.contentView = NSView()
+        window.contentView?.addSubview(plainTextView)
+        _ = window.makeFirstResponder(plainTextView)
+        XCTAssertTrue(isTextEditingFocused(in: window), "a focused generic NSTextView must count as text-editing")
+
+        // This app's own composer view (CommandTextView) must be excluded — it holds firstResponder
+        // at rest and must never suppress the digit-select shortcut.
+        let composer = CommandTextView()
+        window.contentView?.addSubview(composer)
+        _ = window.makeFirstResponder(composer)
+        XCTAssertFalse(isTextEditingFocused(in: window), "the composer itself must never count as a card's text field")
     }
 
     // MARK: - Adapter in-flight/error discipline

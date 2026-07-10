@@ -298,8 +298,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         orb.onApprovalRespond = { [weak self] callId, approved in
             await self?.appModel?.respondApproval(callId: callId, approved: approved) ?? false
         }
-        orb.onQuestionRespond = { [weak self] callId, answers in
-            await self?.appModel?.respondQuestion(callId: callId, answers: answers) ?? false
+        orb.onQuestionRespond = { [weak self] callId, answers, notes in
+            await self?.appModel?.respondQuestion(callId: callId, answers: answers, notes: notes) ?? false
         }
         orb.onPlanRespond = { [weak self] callId, approved, autoAccept, feedback in
             await self?.appModel?.respondPlan(callId: callId, approved: approved, autoAccept: autoAccept, feedback: feedback) ?? false

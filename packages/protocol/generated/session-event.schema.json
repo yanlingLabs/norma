@@ -847,6 +847,9 @@
                     },
                     "description": {
                       "type": "string"
+                    },
+                    "preview": {
+                      "type": "string"
                     }
                   },
                   "required": [
@@ -921,6 +924,15 @@
         "by": {
           "type": "string",
           "minLength": 1
+        },
+        "notes": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
         }
       },
       "required": [

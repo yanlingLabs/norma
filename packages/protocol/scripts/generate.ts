@@ -36,6 +36,17 @@ const fixtures: Record<string, unknown> = {
     questions: [{ question: "Which codename?", header: "Codename", options: [{ label: "Falcon" }, { label: "Osprey", description: "the bird" }], multiSelect: false },
                 { question: "Which features?", header: "Features", options: [{ label: "A", description: "first" }, { label: "B" }, { label: "C" }], multiSelect: true }] },
   question_resolved: { type: "question_resolved", sessionId: "s_1", threadId: "t_1", seq: 11, ts: 1700000000001, callId: "call_1", answers: { "Which codename?": "Osprey", "Which features?": "A, C" }, by: "cli" },
+  // CC AskUserQuestion parity: per-option `preview` (the "visual scheme on the right") is
+  // optional/additive — a dedicated fixture so Swift round-trips a question_asked option that
+  // carries one.
+  question_with_preview: { type: "question_asked", sessionId: "s_1", threadId: "t_1", seq: 28, ts: 1700000000018, callId: "call_2",
+    questions: [{ question: "Which layout?", header: "Layout", multiSelect: false,
+      options: [{ label: "Sidebar", description: "nav on the left", preview: "┌──┬────┐\n│▮ │    │\n└──┴────┘" }, { label: "Topbar" }] }] },
+  // CC AskUserQuestion parity: per-answer `notes` ("press n to add notes") is optional/additive —
+  // a dedicated fixture (distinct from question_resolved above) so Swift round-trips a
+  // question_resolved carrying notes.
+  question_resolved_with_notes: { type: "question_resolved", sessionId: "s_1", threadId: "t_1", seq: 29, ts: 1700000000019, callId: "call_2",
+    answers: { "Which layout?": "Sidebar" }, notes: { "Which layout?": "prefer the nav on the left" }, by: "cli" },
   task_updated: { type: "task_updated", sessionId: "s_1", threadId: "t_1", seq: 12, ts: 1700000000002, task: { id: "1", subject: "rename the project", status: "in_progress", activeForm: "Renaming the project" } },
   // T3 review fix wave 1: task_update{status:"deleted"} now emits a task_updated event carrying
   // this status (see events.ts's TaskSchema doc comment) — a separate fixture (distinct file from

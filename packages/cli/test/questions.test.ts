@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { isOtherChoice, parseQuestionAnswer } from "../src/questions";
+import { formatOptionLines, isOtherChoice, parseQuestionAnswer } from "../src/questions";
+
+const DIM = "\x1b[2m";
+const RESET = "\x1b[0m";
 
 describe("parseQuestionAnswer", () => {
   test("number → label; comma numbers → joined; free text passthrough; whitespace trimmed", () => {
@@ -26,6 +29,46 @@ describe("parseQuestionAnswer", () => {
   test("the 'Other' index (options.length + 1) is out-of-range → free text (raw fallback, pre-isOtherChoice check)", () => {
     const opts = ["Falcon", "Osprey", "Heron"];
     expect(parseQuestionAnswer("4", opts, false)).toBe("4");
+  });
+});
+
+describe("formatOptionLines — Task 3 (ask_user CC parity: option preview)", () => {
+  test("no preview → exactly the pre-existing single option line (byte-identical to before this feature)", () => {
+    expect(formatOptionLines(1, { label: "Falcon" })).toEqual(["  1) Falcon\n"]);
+  });
+
+  test("description (no preview) → same dim-wrapped description formatting as before this feature", () => {
+    expect(formatOptionLines(2, { label: "Osprey", description: "a diving raptor" })).toEqual([
+      `  2) Osprey ${DIM}a diving raptor${RESET}\n`,
+    ]);
+  });
+
+  test("single-line preview → option line unchanged, plus one indented '┆'-rail line", () => {
+    expect(formatOptionLines(1, { label: "Falcon", preview: "diff: +12 -3" })).toEqual([
+      "  1) Falcon\n",
+      "     ┆ diff: +12 -3\n",
+    ]);
+  });
+
+  test("multi-line preview → one '┆'-rail line PER preview line, in order", () => {
+    expect(formatOptionLines(3, { label: "Heron", preview: "line one\nline two\nline three" })).toEqual([
+      "  3) Heron\n",
+      "     ┆ line one\n",
+      "     ┆ line two\n",
+      "     ┆ line three\n",
+    ]);
+  });
+
+  test("description AND preview together — description stays on the option line, preview follows on its own rail lines", () => {
+    expect(formatOptionLines(4, { label: "Osprey", description: "a diving raptor", preview: "scheme: light\nscheme: dark" })).toEqual([
+      `  4) Osprey ${DIM}a diving raptor${RESET}\n`,
+      "     ┆ scheme: light\n",
+      "     ┆ scheme: dark\n",
+    ]);
+  });
+
+  test("empty-string preview is falsy → treated as no preview (no rail lines appended)", () => {
+    expect(formatOptionLines(1, { label: "Falcon", preview: "" })).toEqual(["  1) Falcon\n"]);
   });
 });
 

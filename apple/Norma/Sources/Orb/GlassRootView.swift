@@ -64,11 +64,11 @@ struct GlassRootView: View {
                 if !ok { adapter.interactionErrors[callId] = "couldn't send — try again" }
             }
         }
-        adapter.onQuestionRespond = { [adapter, controller] callId, answers in
+        adapter.onQuestionRespond = { [adapter, controller] callId, answers, notes in
             adapter.interactionInFlight.insert(callId)
             adapter.interactionErrors[callId] = nil
             Task { @MainActor in
-                let ok = await controller.onQuestionRespond?(callId, answers) ?? false
+                let ok = await controller.onQuestionRespond?(callId, answers, notes) ?? false
                 adapter.interactionInFlight.remove(callId)
                 if !ok { adapter.interactionErrors[callId] = "couldn't send — try again" }
             }
