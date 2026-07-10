@@ -15,7 +15,7 @@ struct PendingCardsView: View {
     let inFlight: Set<String>                       // callIds with an RPC awaiting
     let errorLines: [String: String]                // callId → inline error text
     let onApproval: (String, Bool) -> Void          // callId, approved
-    let onQuestion: (String, [String: String]) -> Void  // callId, answers (keyed by question text)
+    let onQuestion: (String, [String: String], [String: String]) -> Void  // callId, answers, notes (both keyed by question text)
     let onPlan: (String, Bool, Bool, String?) -> Void   // callId, approved, autoAccept, feedback
 
     var body: some View {
@@ -75,6 +75,51 @@ func questionCardComplete(
     questionAnswers(for: questions, selections: selections, otherTexts: otherTexts).count == questions.count
 }
 
+/// Maps the card's local per-question notes state (`notes[index]` — one free-text
+/// `TextField("Add a note (optional)", ...)` per question, see `QuestionBlock`) to the notes dict
+/// `onQuestion` sends — keyed the SAME way `questionAnswers` keys `answers` (by each question's own
+/// `question` text, per `NormaProtocol.SessionEvent.QuestionResolved.notes`/
+/// `packages/protocol/src/methods.ts`'s `AskUserRespondParams.notes`). Notes are OPTIONAL and never
+/// gate `questionCardComplete` — a question with no note (or a whitespace-only one) is simply
+/// omitted, matching `packages/core/src/agent/questions.ts`'s "omitted entirely when no notes were
+/// given" convention (so a fully-omitted dict, not a dict of empty strings, rides an all-notes-blank
+/// submit).
+func questionNotes(
+    for questions: [SessionEvent.Question],
+    notes: [Int: String]
+) -> [String: String] {
+    var result: [String: String] = [:]
+    for (index, question) in questions.enumerated() {
+        guard let note = notes[index]?.trimmingCharacters(in: .whitespacesAndNewlines), !note.isEmpty else { continue }
+        result[question.question] = note
+    }
+    return result
+}
+
+/// CC AskUserQuestion parity: whether a question's side-by-side preview layout should render at
+/// all — single-select only (a multiSelect question's "one focused option" concept doesn't exist,
+/// since any number of options can be on at once) AND at least one option actually carries a
+/// preview (an all-nil-preview question keeps the plain stacked list, same as before this
+/// feature).
+func questionShowsPreviewPane(_ question: SessionEvent.Question) -> Bool {
+    !question.multiSelect && question.options.contains { $0.preview != nil }
+}
+
+/// The side-by-side layout's right-pane content for one question: the currently-selected option's
+/// preview, or (nothing selected yet) the FIRST option's — so the pane is never blank before a
+/// pick (brief: "the selected option's preview, or the first option's if none selected yet").
+/// `nil` whenever `questionShowsPreviewPane` would be `false` for this question (a multiSelect
+/// question, or one with no previews at all) — callers that already gate on that helper never hit
+/// this fallback, but a caller that doesn't still gets the CC-parity "ignore previews" behavior for
+/// multiSelect for free.
+func questionFocusedPreview(_ question: SessionEvent.Question, selected: Set<Int>) -> String? {
+    guard questionShowsPreviewPane(question) else { return nil }
+    if let selectedIndex = selected.first, question.options.indices.contains(selectedIndex) {
+        return question.options[selectedIndex].preview
+    }
+    return question.options.first?.preview
+}
+
 /// Per-kind card header text. Approval names the tool; a question card titles itself after its
 /// FIRST question's `header` (a batch ask's later questions render their own `question` text
 /// inline in the body — see `PendingQuestionBody`); a plan card's title is fixed (the plan text
@@ -109,7 +154,7 @@ private struct PendingCard: View {
     let isInFlight: Bool
     let errorLine: String?
     let onApproval: (String, Bool) -> Void
-    let onQuestion: (String, [String: String]) -> Void
+    let onQuestion: (String, [String: String], [String: String]) -> Void
     let onPlan: (String, Bool, Bool, String?) -> Void
 
     var body: some View {
@@ -209,11 +254,16 @@ private struct PendingQuestionBody: View {
     let callId: String
     let questions: [SessionEvent.Question]
     let isInFlight: Bool
-    let onQuestion: (String, [String: String]) -> Void
+    let onQuestion: (String, [String: String], [String: String]) -> Void
 
     @State private var selections: [Int: Set<Int>] = [:]
     @State private var otherTexts: [Int: String] = [:]
     @State private var otherExpanded: Set<Int> = []
+    /// CC AskUserQuestion parity: per-question free-text note, index-keyed like `selections`/
+    /// `otherTexts` above — independent of both (a note rides ALONGSIDE whatever answer the
+    /// question already has; it never substitutes for one, so it plays no part in
+    /// `questionCardComplete`'s gate).
+    @State private var notes: [Int: String] = [:]
 
     private var isComplete: Bool {
         questionCardComplete(questions: questions, selections: selections, otherTexts: otherTexts)
@@ -229,6 +279,7 @@ private struct PendingQuestionBody: View {
                     selected: selections[index] ?? [],
                     otherText: otherTexts[index] ?? "",
                     isOtherExpanded: otherExpanded.contains(index),
+                    noteText: notes[index] ?? "",
                     isInFlight: isInFlight,
                     onSelectSingle: { optionIndex in
                         selections[index] = [optionIndex]
@@ -244,7 +295,8 @@ private struct PendingQuestionBody: View {
                     onOtherTextChange: { text in
                         otherTexts[index] = text
                         selections[index] = []
-                    }
+                    },
+                    onNoteTextChange: { text in notes[index] = text }
                 )
             }
 
@@ -256,15 +308,19 @@ private struct PendingQuestionBody: View {
     }
 
     private func submit() {
-        onQuestion(callId, questionAnswers(for: questions, selections: selections, otherTexts: otherTexts))
+        onQuestion(
+            callId,
+            questionAnswers(for: questions, selections: selections, otherTexts: otherTexts),
+            questionNotes(for: questions, notes: notes)
+        )
     }
 }
 
-/// One question's options + Other row. Selecting a listed option (single or multi) clears that
-/// question's Other text, and typing into Other clears that question's selection — the two
-/// affordances are mutually exclusive per question so a stale Other string can never silently
-/// outrank (or be outranked by) a fresh selection in `questionAnswers`. No affordance here submits
-/// the card — see `PendingQuestionBody`'s single whole-card Submit button.
+/// One question's options + Other row + optional note field. Selecting a listed option (single or
+/// multi) clears that question's Other text, and typing into Other clears that question's
+/// selection — the two affordances are mutually exclusive per question so a stale Other string can
+/// never silently outrank (or be outranked by) a fresh selection in `questionAnswers`. No
+/// affordance here submits the card — see `PendingQuestionBody`'s single whole-card Submit button.
 private struct QuestionBlock: View {
     let index: Int
     let question: SessionEvent.Question
@@ -272,11 +328,19 @@ private struct QuestionBlock: View {
     let selected: Set<Int>
     let otherText: String
     let isOtherExpanded: Bool
+    let noteText: String
     let isInFlight: Bool
     let onSelectSingle: (Int) -> Void
     let onToggleMulti: (Int) -> Void
     let onExpandOther: () -> Void
     let onOtherTextChange: (String) -> Void
+    let onNoteTextChange: (String) -> Void
+
+    /// Thin view-local reads onto the pure, unit-tested helpers above (`PendingCardsTests`) — kept
+    /// here only so the `body` below doesn't have to spell out `question`/`selected` at every call
+    /// site.
+    private var showsPreviewPane: Bool { questionShowsPreviewPane(question) }
+    private var focusedPreview: String? { questionFocusedPreview(question, selected: selected) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -289,11 +353,45 @@ private struct QuestionBlock: View {
                 .font(.system(size: 13))
                 .foregroundStyle(.primary)
 
-            ForEach(Array(question.options.enumerated()), id: \.offset) { optionIndex, option in
-                optionRow(optionIndex, option)
+            if showsPreviewPane {
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        optionsList
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    previewPane
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } else {
+                optionsList
             }
 
             otherRow
+            noteRow
+        }
+    }
+
+    @ViewBuilder
+    private var optionsList: some View {
+        ForEach(Array(question.options.enumerated()), id: \.offset) { optionIndex, option in
+            optionRow(optionIndex, option)
+        }
+    }
+
+    @ViewBuilder
+    private var previewPane: some View {
+        if let text = focusedPreview {
+            ScrollView {
+                Text(text)
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(.primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding(8)
+            }
+            .frame(maxHeight: 180)
+            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
     }
 
@@ -351,6 +449,21 @@ private struct QuestionBlock: View {
                 .foregroundStyle(.secondary)
                 .disabled(isInFlight)
         }
+    }
+
+    /// CC AskUserQuestion parity: a per-question free-text note — always visible (unlike Other,
+    /// which is a discoverable toggle), never gates Submit, and rides into `questionNotes`'s dict
+    /// only when non-empty (see that helper's doc). Always below the options/Other row, for both
+    /// the plain-list and side-by-side-preview layouts.
+    private var noteRow: some View {
+        // No `.foregroundStyle` override, matching `otherRow`'s TextField above — SwiftUI's
+        // `TextField` prompt (the "Add a note (optional)" placeholder) already renders dimmed on
+        // its own; overriding the whole field to `.secondary` would ALSO dim actually-typed text,
+        // which is a `.primary`-weight answer, not a hint.
+        TextField("Add a note (optional)", text: Binding(get: { noteText }, set: onNoteTextChange))
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 12))
+            .disabled(isInFlight)
     }
 }
 

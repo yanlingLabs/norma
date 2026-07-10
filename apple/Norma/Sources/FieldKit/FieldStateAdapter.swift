@@ -440,8 +440,9 @@ final class FieldStateAdapter: ObservableObject {
     /// Wired by whichever surface owns this adapter (see `interactionInFlight`'s doc) to reach
     /// the daemon's `approval.respond` — callId, approved.
     var onApprovalRespond: (String, Bool) -> Void = { _, _ in }
-    /// callId, answers (keyed by question text — see `PendingCards.swift`'s `questionAnswers`).
-    var onQuestionRespond: (String, [String: String]) -> Void = { _, _ in }
+    /// callId, answers, notes (both keyed by question text — see `PendingCards.swift`'s
+    /// `questionAnswers`/`questionNotes`).
+    var onQuestionRespond: (String, [String: String], [String: String]) -> Void = { _, _, _ in }
     /// callId, approved, autoAccept, feedback.
     var onPlanRespond: (String, Bool, Bool, String?) -> Void = { _, _, _, _ in }
 

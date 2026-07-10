@@ -128,7 +128,7 @@ final class OrbWindowController: ObservableObject {
     /// `onSubmit` chain (`FieldStateAdapter.onXRespond` → `GlassRootView.wireCallbacks()` → these
     /// closures → `AppDelegate` → `AppModel`) so this controller stays model-free.
     var onApprovalRespond: ((String, Bool) async -> Bool)?
-    var onQuestionRespond: ((String, [String: String]) async -> Bool)?
+    var onQuestionRespond: ((String, [String: String], [String: String]) async -> Bool)?
     var onPlanRespond: ((String, Bool, Bool, String?) async -> Bool)?
 
     /// Task 4 (2d-iii): the ⋯ menu's approval-mode picker — SAME seam as `onApprovalRespond` et al
@@ -588,7 +588,7 @@ final class OrbWindowController: ObservableObject {
             fieldAdapter.onApprovalRespond(callId, false)
         case .selectOption(let callId, let index):
             guard case .question(_, let questions) = topmost else { return }
-            fieldAdapter.onQuestionRespond(callId, questionAnswers(for: questions, selections: [0: [index]], otherTexts: [:]))
+            fieldAdapter.onQuestionRespond(callId, questionAnswers(for: questions, selections: [0: [index]], otherTexts: [:]), [:])
         }
     }
 

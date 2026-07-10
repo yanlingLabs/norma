@@ -262,9 +262,9 @@ final class AppModel: ObservableObject {
         return (try? await client.approvalRespond(sessionId: sid, callId: callId, approved: approved)) != nil
     }
 
-    func respondQuestion(callId: String, answers: [String: String]) async -> Bool {
+    func respondQuestion(callId: String, answers: [String: String], notes: [String: String] = [:]) async -> Bool {
         guard let sid = focusedSessionId, pendingCallIdIsCurrent(callId) else { return false }
-        return (try? await client.askUserRespond(sessionId: sid, callId: callId, answers: answers)) != nil
+        return (try? await client.askUserRespond(sessionId: sid, callId: callId, answers: answers, notes: notes.isEmpty ? nil : notes)) != nil
     }
 
     func respondPlan(callId: String, approved: Bool, autoAccept: Bool, feedback: String?) async -> Bool {

@@ -283,10 +283,16 @@ extension NormaClient {
         ]))["alreadyResolved"]?.boolValue ?? false
     }
 
-    public func askUserRespond(sessionId: String, callId: String, answers: [String: String]) async throws -> Bool {
+    /// `notes` — CC AskUserQuestion parity, free-text notes keyed by question text like `answers`
+    /// (`packages/protocol/src/methods.ts`'s `AskUserRespondParams.notes`). Optional/defaulted so
+    /// existing no-notes call sites keep compiling unchanged; `obj(...)`'s `compactMapValues`
+    /// (above) omits the `"notes"` key entirely when `nil`, matching `planRespond`'s own
+    /// `feedback.map { .string($0) }` convention for an optional param.
+    public func askUserRespond(sessionId: String, callId: String, answers: [String: String], notes: [String: String]? = nil) async throws -> Bool {
         try await request("ask_user.respond", params: obj([
             "sessionId": .string(sessionId), "callId": .string(callId),
             "answers": .object(answers.mapValues { .string($0) }),
+            "notes": notes.map { .object($0.mapValues { .string($0) }) },
         ]))["alreadyResolved"]?.boolValue ?? false
     }
 

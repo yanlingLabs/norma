@@ -174,13 +174,13 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
                 if !ok { adapter?.interactionErrors[callId] = "couldn't send — try again" }
             }
         }
-        adapter.onQuestionRespond = { [weak self, weak adapter] callId, answers in
+        adapter.onQuestionRespond = { [weak self, weak adapter] callId, answers, notes in
             guard let adapter else { return }
             adapter.interactionInFlight.insert(callId)
             adapter.interactionErrors[callId] = nil
             Task { @MainActor [weak self, weak adapter] in
                 guard let self else { return }
-                let ok = (try? await client.askUserRespond(sessionId: self.sessionId, callId: callId, answers: answers)) != nil
+                let ok = (try? await client.askUserRespond(sessionId: self.sessionId, callId: callId, answers: answers, notes: notes.isEmpty ? nil : notes)) != nil
                 adapter?.interactionInFlight.remove(callId)
                 if !ok { adapter?.interactionErrors[callId] = "couldn't send — try again" }
             }
@@ -305,7 +305,7 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
             adapter.onApprovalRespond(callId, false)
         case .selectOption(let callId, let index):
             guard case .question(_, let questions) = topmost else { return }
-            adapter.onQuestionRespond(callId, questionAnswers(for: questions, selections: [0: [index]], otherTexts: [:]))
+            adapter.onQuestionRespond(callId, questionAnswers(for: questions, selections: [0: [index]], otherTexts: [:]), [:])
         }
     }
 
