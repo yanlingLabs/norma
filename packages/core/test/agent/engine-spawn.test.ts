@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SessionEvent } from "@norma/protocol";
@@ -24,6 +24,7 @@ import { SkillStore } from "../../src/agent/skills";
 import { Compactor } from "../../src/agent/compactor";
 import { AgentStore } from "../../src/agent/agents";
 import { SubagentManager } from "../../src/agent/subagents";
+import { WorktreeManager } from "../../src/agent/worktree";
 import type { ModelInfo, Provider, ProviderEvent, TurnRequest } from "../../src/providers/types";
 
 export function setup(
@@ -102,7 +103,7 @@ const text = (t: string): ProviderEvent[] => [{ type: "text_delta", delta: t }, 
 // don't all need individual edits; `extra.description` still overrides it (see the "description
 // rides thread_started" test below). The dedicated "without description" test constructs its
 // tool_call by hand, bypassing this default, to pin the required-arg behavior itself.
-const spawnCall = (callId: string, prompt: string, extra?: { agentType?: string; model?: string; description?: string; max_turns?: number; mode?: string }): ProviderEvent =>
+const spawnCall = (callId: string, prompt: string, extra?: { agentType?: string; model?: string; description?: string; max_turns?: number; mode?: string; isolation?: string }): ProviderEvent =>
   ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "test task", ...extra }) });
 
 describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
@@ -1078,5 +1079,222 @@ describe("AgentEngine: configurable subagent nesting depth (4h-i Task 3)", () =>
     // the parent's own turn still completes normally afterward — no stall propagates upward
     const s1Result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
     expect(s1Result).toMatchObject({ isError: false, output: "child noticed the saturation error and wrapped up" });
+  });
+});
+
+// -------------------------------------------------------------------------------------------
+// Phase 4h-i Task 4: spawn_agent `isolation: "worktree"` (CC parity with Agent.isolation) — a
+// spawned child runs in a FRESH git worktree instead of the parent's own cwd. Mac-gated (real
+// git repos, mirroring engine-worktree.test.ts's isMac/repo() convention) since WorktreeManager
+// shells out to the real `git` binary.
+// -------------------------------------------------------------------------------------------
+const isMac = process.platform === "darwin";
+
+function git(args: string[], cwd: string): { code: number; stdout: string; stderr: string } {
+  const p = Bun.spawnSync(["git", "-C", cwd, ...args]);
+  return { code: p.exitCode ?? 0, stdout: p.stdout.toString(), stderr: p.stderr.toString() };
+}
+
+/** mkdtemp + git init + an initial commit so HEAD exists. Mirrors engine-worktree.test.ts's helper. */
+function repo(): string {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-spawn-wt-")));
+  git(["init"], dir);
+  git(["config", "user.email", "test@norma.dev"], dir);
+  git(["config", "user.name", "Norma Test"], dir);
+  writeFileSync(join(dir, "README.md"), "hello\n");
+  git(["add", "-A"], dir);
+  git(["commit", "-m", "init"], dir);
+  return dir;
+}
+
+function setupIsolation(
+  script: ProviderEvent[][],
+  opts: { cwd?: string; withWorktrees?: boolean } = {},
+) {
+  const home = mkdtempSync(join(tmpdir(), "norma-engine-spawn-wt-home-"));
+  const cwd = opts.cwd ?? repo();
+  const store = new SessionStore(home);
+  const hub = new SessionHub(store);
+  const registry = new ToolRegistry();
+  registerReadTools(registry);
+  registerWriteTools(registry);
+  registerSpawnAgentTool(registry);
+  const broker = new ApprovalBroker();
+  const provider = new FakeProvider(script);
+  // Mirrors engine-worktree.test.ts's setup: roots are derived LIVE from store.meta(sid).cwd —
+  // irrelevant to the isolated CHILD (its roots come from rootsOverride, not this), but this is
+  // what the PARENT thread's own tool calls (before/after the spawn) still resolve against.
+  const dirs = new SessionDirectories((sid) => {
+    const m = store.meta(sid);
+    return m.cwd ? [m.cwd] : [];
+  });
+  const worktrees = opts.withWorktrees !== false ? new WorktreeManager({ baseRef: "head" }) : undefined;
+  const assemblerHome = mkdtempSync(join(tmpdir(), "norma-engine-spawn-wt-actx-"));
+  const assemblerTrust = new TrustStore(join(assemblerHome, "trust.json"));
+  const assembler = new ContextAssembler({
+    normaHome: assemblerHome,
+    trust: assemblerTrust,
+    skills: new SkillStore({ normaHome: assemblerHome, trust: assemblerTrust }),
+  });
+  const compactor = new Compactor({ provider: { provider, model: "fake-1" }, store, hub });
+  const agentsHome = mkdtempSync(join(tmpdir(), "norma-engine-spawn-wt-agents-"));
+  const agentsTrust = new TrustStore(join(agentsHome, "trust.json"));
+  const agents = new AgentStore({ normaHome: agentsHome, trust: agentsTrust });
+  const subagents = new SubagentManager({});
+  const engine = new AgentEngine({
+    store, hub, registry, broker,
+    gate: new PermissionGate(),
+    provider: { provider, model: "fake-1" },
+    dirs,
+    approvalTimeoutMs: 500,
+    assembler,
+    compactor,
+    agents,
+    subagents,
+    worktrees,
+  });
+  const sessionId = store.createSession("global", { cwd, approvalPolicy: "auto" });
+  return { engine, store, hub, broker, sessionId, cwd, provider, dirs };
+}
+
+describe.if(isMac)("AgentEngine: spawn_agent isolation:\"worktree\" (4h-i Task 4)", () => {
+  test("child writes a file under isolation:\"worktree\" → the file lands in the worktree dir, NOT the parent repo; the (dirty) worktree is left on disk (no auto-remove, no auto-merge)", async () => {
+    const { engine, store, sessionId, cwd } = setupIsolation([
+      [spawnCall("s1", "write a note", { isolation: "worktree" }), done("tool_calls")], // parent round 0: spawn, isolated
+      [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "note.txt", content: "isolated" }) }, done("tool_calls")], // child round 0
+      text("wrote the note"), // child round 1: end turn
+      text("parent wrap-up"), // parent's continuation round
+    ]);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const started = events.find((e) => e.type === "thread_started");
+    expect(started).toBeDefined();
+    const completed = events.find((e) => e.type === "thread_completed");
+    expect(completed).toMatchObject({ stopReason: "end_turn" });
+
+    const writeResult = events.find((e) => e.type === "tool_result" && e.callId === "w1");
+    expect(writeResult).toMatchObject({ isError: false });
+
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({ isError: false, output: "wrote the note" });
+
+    // the parent repo itself was never touched
+    expect(existsSync(join(cwd, "note.txt"))).toBe(false);
+
+    // the file DID land in a freshly created worktree under .norma/worktrees — discovered via
+    // the filesystem since isolation doesn't emit a worktree_entered event (that's the
+    // session-scoped enter_worktree/exit_worktree bridge, a different, unrelated mechanism)
+    const wtParent = join(cwd, ".norma", "worktrees");
+    const names = readdirSync(wtParent);
+    expect(names.length).toBe(1);
+    const wtDir = join(wtParent, names[0]!);
+    expect(existsSync(join(wtDir, "note.txt"))).toBe(true);
+
+    // dirty (uncommitted note.txt) → clean-only teardown refused to remove it; left on disk
+    const status = git(["status", "--short"], wtDir);
+    expect(status.stdout).toContain("note.txt");
+
+    // sanity: still a real git worktree, on its own norma/ branch
+    const branchList = git(["branch", "--list", `norma/${names[0]}`], cwd);
+    expect(branchList.stdout.trim().length).toBeGreaterThan(0);
+  });
+
+  test("a CLEAN isolated child (no changes) → the worktree is auto-removed after it returns — `git worktree list` shows only the original repo", async () => {
+    const { engine, store, sessionId, cwd } = setupIsolation([
+      [spawnCall("s1", "just look around", { isolation: "worktree" }), done("tool_calls")],
+      text("nothing to change"), // child makes no tool calls at all — worktree stays pristine
+      text("parent wrap-up"),
+    ]);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const completed = events.find((e) => e.type === "thread_completed");
+    expect(completed).toMatchObject({ stopReason: "end_turn" });
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({ isError: false, output: "nothing to change" });
+
+    // clean → auto-removed: `git worktree list` shows ONLY the main repo, no leftover worktree
+    const list = git(["worktree", "list"], cwd);
+    const lines = list.stdout.trim().split("\n").filter((l) => l.length > 0);
+    expect(lines.length).toBe(1);
+  });
+
+  test("no isolation arg → child runs in the parent's own cwd, unchanged from before this feature (no .norma/worktrees created)", async () => {
+    const { engine, store, sessionId, cwd } = setupIsolation([
+      [spawnCall("s1", "write a note"), done("tool_calls")], // no isolation
+      [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "plain.txt", content: "x" }) }, done("tool_calls")],
+      text("wrote it"),
+      text("parent wrap-up"),
+    ]);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const writeResult = events.find((e) => e.type === "tool_result" && e.callId === "w1");
+    expect(writeResult).toMatchObject({ isError: false });
+    // the file lands directly in the parent repo — no worktree involved
+    expect(existsSync(join(cwd, "plain.txt"))).toBe(true);
+    expect(existsSync(join(cwd, ".norma", "worktrees"))).toBe(false);
+  });
+
+  test("cwd is NOT a git repository → isolation:\"worktree\" fails as a typed isError tool_result, no thread_started (no ghost thread)", async () => {
+    const plainDir = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-spawn-wt-notgit-")));
+    const { engine, store, sessionId } = setupIsolation(
+      [
+        [spawnCall("s1", "do X", { isolation: "worktree" }), done("tool_calls")],
+        text("parent noticed the failure and wrapped up"),
+      ],
+      { cwd: plainDir },
+    );
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(events.some((e) => e.type === "thread_started")).toBe(false);
+    expect(events.some((e) => e.type === "thread_completed")).toBe(false);
+
+    const result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(result).toMatchObject({ isError: true });
+    const output = (result as Extract<SessionEvent, { type: "tool_result" }>).output;
+    expect(output).toContain("requires a git repository");
+  });
+
+  test("cfg.worktrees not wired (WorktreeManager unavailable) → isolation:\"worktree\" fails as a typed isError tool_result, no thread_started", async () => {
+    const { engine, store, sessionId } = setupIsolation(
+      [
+        [spawnCall("s1", "do X", { isolation: "worktree" }), done("tool_calls")],
+        text("parent noticed the failure and wrapped up"),
+      ],
+      { withWorktrees: false },
+    );
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(events.some((e) => e.type === "thread_started")).toBe(false);
+    expect(events.some((e) => e.type === "thread_completed")).toBe(false);
+
+    const result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(result).toMatchObject({ isError: true });
+    const output = (result as Extract<SessionEvent, { type: "tool_result" }>).output;
+    expect(output).toContain("isolation:\"worktree\" is not available in this session");
+  });
+
+  test("PARENT cwd/roots are unaffected by a sibling isolated spawn: the parent's own post-spawn write still lands in the original repo", async () => {
+    const { engine, store, sessionId, cwd } = setupIsolation([
+      [spawnCall("s1", "write a note", { isolation: "worktree" }), done("tool_calls")], // parent round 0: spawn, isolated
+      [{ type: "tool_call", callId: "cw1", name: "write", argsJson: JSON.stringify({ path: "child.txt", content: "y" }) }, done("tool_calls")], // child round 0
+      text("child done"), // child round 1
+      // parent's OWN continuation round: writes its own file — must land in the ORIGINAL repo,
+      // proving the isolated child's cwd/roots override never leaked into the parent's own state
+      [{ type: "tool_call", callId: "p1", name: "write", argsJson: JSON.stringify({ path: "parent.txt", content: "z" }) }, done("tool_calls")],
+      text("parent wrap-up"),
+    ]);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const p1Result = events.find((e) => e.type === "tool_result" && e.callId === "p1");
+    expect(p1Result).toMatchObject({ isError: false });
+    expect(existsSync(join(cwd, "parent.txt"))).toBe(true);
+    // the child's own file did NOT land in the parent repo
+    expect(existsSync(join(cwd, "child.txt"))).toBe(false);
   });
 });

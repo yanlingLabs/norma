@@ -124,3 +124,88 @@ describe.if(isMac)("WorktreeManager", () => {
     expect(() => m.exit("no-such-session", "keep")).toThrow(/not currently in a worktree/);
   });
 });
+
+// 4h-i Task 4 (CC parity: spawn_agent isolation:"worktree"): createDetached/removeDetached are
+// STATELESS — they must never touch `this.sessions`, the per-session active-worktree map
+// enter()/exit() use. That's the whole point: a spawned child's ephemeral isolation worktree
+// must be able to coexist with (and be torn down completely independently of) a user's own
+// concurrent enter_worktree/exit_worktree session state.
+describe.if(isMac)("WorktreeManager: createDetached/removeDetached (stateless, 4h-i Task 4)", () => {
+  test("createDetached creates the worktree dir + branch, same layout as enter(), WITHOUT touching sessions state", () => {
+    const dir = repo();
+    const m = new WorktreeManager({ baseRef: "head" });
+    const wt = m.createDetached(dir, "spawn-feat");
+    expect(wt.branch).toBe("norma/spawn-feat");
+    expect(existsSync(wt.dir)).toBe(true);
+    const listed = git(["branch", "--list", "norma/spawn-feat"], dir);
+    expect(listed.stdout.trim().length).toBeGreaterThan(0);
+    // no per-session bookkeeping — active() sees nothing
+    expect(m.active("any-session")).toBeUndefined();
+  });
+
+  test("createDetached default name uses a random 8-char id when omitted", () => {
+    const dir = repo();
+    const m = new WorktreeManager({ baseRef: "head" });
+    const wt = m.createDetached(dir);
+    expect(wt.branch).toMatch(/^norma\/[0-9a-f]{8}$/);
+    expect(existsSync(wt.dir)).toBe(true);
+  });
+
+  test("createDetached does NOT collide with an active session worktree (enter() + createDetached() coexist)", () => {
+    const dir = repo();
+    const m = new WorktreeManager({ baseRef: "head" });
+    const sessionWt = m.enter("s1", dir, "session-feat"); // occupies the session's ONE slot
+    const childWt = m.createDetached(dir, "spawn-child"); // must NOT throw "already in worktree"
+    expect(existsSync(sessionWt.dir)).toBe(true);
+    expect(existsSync(childWt.dir)).toBe(true);
+    expect(childWt.dir).not.toBe(sessionWt.dir);
+    // the session's active-worktree state is completely unaffected by the detached create
+    expect(m.active("s1")).toEqual(sessionWt);
+  });
+
+  test("createDetached in a non-git dir → error", () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "norma-wt-notgit-")));
+    const m = new WorktreeManager({ baseRef: "head" });
+    expect(() => m.createDetached(dir, "x")).toThrow(/not a git repository/);
+  });
+
+  test("removeDetached (clean, cleanOnly:true) removes the worktree dir, returns true, does NOT touch sessions", () => {
+    const dir = repo();
+    const m = new WorktreeManager({ baseRef: "head" });
+    const wt = m.createDetached(dir, "spawn-clean");
+    const removed = m.removeDetached(wt.dir, dir, true);
+    expect(removed).toBe(true);
+    expect(existsSync(wt.dir)).toBe(false);
+  });
+
+  test("removeDetached (dirty, cleanOnly:true) leaves the worktree on disk, returns false, does NOT throw", () => {
+    const dir = repo();
+    const m = new WorktreeManager({ baseRef: "head" });
+    const wt = m.createDetached(dir, "spawn-dirty");
+    writeFileSync(join(wt.dir, "dirty.txt"), "uncommitted\n");
+    const removed = m.removeDetached(wt.dir, dir, true);
+    expect(removed).toBe(false);
+    expect(existsSync(wt.dir)).toBe(true); // left in place — no data loss
+  });
+
+  test("removeDetached (dirty, cleanOnly:false) force-removes despite uncommitted changes", () => {
+    const dir = repo();
+    const m = new WorktreeManager({ baseRef: "head" });
+    const wt = m.createDetached(dir, "spawn-force");
+    writeFileSync(join(wt.dir, "dirty.txt"), "uncommitted\n");
+    const removed = m.removeDetached(wt.dir, dir, false);
+    expect(removed).toBe(true);
+    expect(existsSync(wt.dir)).toBe(false);
+  });
+
+  test("createDetached + removeDetached never mutate an unrelated active session worktree", () => {
+    const dir = repo();
+    const m = new WorktreeManager({ baseRef: "head" });
+    const sessionWt = m.enter("s1", dir, "session-feat2");
+    const childWt = m.createDetached(dir, "spawn-child2");
+    m.removeDetached(childWt.dir, dir, true);
+    expect(existsSync(childWt.dir)).toBe(false); // child's worktree gone
+    expect(existsSync(sessionWt.dir)).toBe(true); // session's own worktree untouched
+    expect(m.active("s1")).toEqual(sessionWt); // session state untouched
+  });
+});

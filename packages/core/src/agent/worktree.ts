@@ -93,6 +93,60 @@ export class WorktreeManager {
     return this.sessions.get(sessionId);
   }
 
+  /** Creates an EPHEMERAL worktree for a spawned child (spawn_agent `isolation:"worktree"`,
+   *  4h-i Task 4) — does NOT read or write `this.sessions`. Mirrors enter()'s git sequence
+   *  exactly (same `.norma/worktrees/<name>` layout, same `norma/<name>` branch naming, same
+   *  base-ref resolution) but is a pure create with no per-session bookkeeping: a child's
+   *  isolation worktree is per-child and torn down by the SPAWN BRIDGE itself (via
+   *  removeDetached below), never by exit_worktree — sharing `sessions` here would let a
+   *  child's isolation worktree collide with (or get silently torn down/orphaned by) the
+   *  session's own concurrent enter_worktree/exit_worktree state, since both would fight over
+   *  the SAME one-slot-per-session map. Throws on any git failure (not a repo, dir/branch
+   *  collision, `git worktree add` failure) — same throw-on-failure contract as enter(), so
+   *  callers can `try/catch` it identically. */
+  createDetached(baseCwd: string, name?: string): { dir: string; branch: string } {
+    const isRepo = git(["rev-parse", "--git-dir"], baseCwd);
+    if (isRepo.code !== 0) throw new Error("not a git repository");
+
+    const toplevel = git(["rev-parse", "--show-toplevel"], baseCwd);
+    if (toplevel.code !== 0) throw new Error("not a git repository");
+    const root = toplevel.stdout.trim();
+
+    const wtName = name ?? randomUUID().slice(0, 8);
+    const dir = join(root, ".norma", "worktrees", wtName);
+    const branch = `norma/${wtName}`;
+
+    if (existsSync(dir)) throw new Error(`worktree dir already exists: ${dir}`);
+    const branchList = git(["branch", "--list", branch], root);
+    if (branchList.stdout.trim().length > 0) throw new Error(`branch already exists: ${branch}`);
+
+    const base = this.resolveBaseRef(root);
+    const add = git(["worktree", "add", dir, "-b", branch, base], root);
+    if (add.code !== 0) throw new Error(`git worktree add failed: ${add.stderr.trim()}`);
+
+    return { dir, branch };
+  }
+
+  /** Tears down an EPHEMERAL worktree created by createDetached — does NOT touch
+   *  `this.sessions`. `cleanOnly: true` (the spawn bridge's only use) mirrors exit_worktree's
+   *  default clean-only guard: if `git status --short` inside `dir` shows uncommitted changes,
+   *  the worktree is left on disk for the user to review and this returns `false` (no git
+   *  removal attempted, no throw — a dirty worktree is an expected, non-exceptional outcome).
+   *  `cleanOnly: false` force-removes regardless (mirrors exit()'s discardChanges:true path;
+   *  unused by the spawn bridge today — NO auto-merge/auto-discard of a child's work — but kept
+   *  symmetric with exit()'s own two removal modes). Returns `true` iff the worktree was
+   *  actually removed. Throws only on an unexpected `git worktree remove` failure. */
+  removeDetached(dir: string, baseCwd: string, cleanOnly: boolean): boolean {
+    if (cleanOnly) {
+      const status = git(["status", "--short"], dir);
+      if (status.stdout.trim().length > 0) return false; // dirty — leave it, caller logs
+    }
+    const args = cleanOnly ? ["worktree", "remove", dir] : ["worktree", "remove", "--force", dir];
+    const remove = git(args, baseCwd);
+    if (remove.code !== 0) throw new Error(`git worktree remove failed: ${remove.stderr.trim()}`);
+    return true;
+  }
+
   private resolveBaseRef(root: string): string {
     if (this.baseRef === "head") return "HEAD";
     const symref = git(["symbolic-ref", "refs/remotes/origin/HEAD"], root);

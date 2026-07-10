@@ -512,8 +512,18 @@ export class AgentEngine {
     // 50) gets a LARGER cap than the main thread's default, not just a smaller one. Additive/sync
     // only: no new async surface, just a different bound for that one child thread's own loop.
     maxTurns?: number;
+    // 4h-i Task 4 (CC parity: Agent.isolation "worktree"): a per-thread override of the allowed
+    // fs-tool roots. Only the spawn bridge (below) ever passes this, and only for a child
+    // spawned with `isolation:"worktree"` — set to EXACTLY `[worktreeDir]`, not an addition to
+    // the session's own roots (this.cfg.dirs.roots(sessionId) is SESSION-scoped, keyed by
+    // sessionId not threadId — widening it here would leak the worktree into the PARENT's own
+    // roots too, and persist past the child's lifetime). Undefined (every other caller) means
+    // executeCall falls back to the session's normal live roots, unchanged behavior. roots[0]
+    // MUST be the primary cwd (registry.ts's own contract) — the spawn bridge sets this to
+    // exactly `[childCwd]` where childCwd is also what's passed as this same call's `cwd`.
+    rootsOverride?: string[];
   }): Promise<{ finalText: string; stopReason: "end_turn" | "aborted" | "error"; errorMessage?: string }> {
-    const { sessionId, threadId, instructionsFull, input, meta, signal, loaded, excludeTools, allowTools } = opts;
+    const { sessionId, threadId, instructionsFull, input, meta, signal, loaded, excludeTools, allowTools, rootsOverride } = opts;
     let cwd = opts.cwd;
     const tsEnabled = this.toolSearchEnabled();
     const deferThreshold = this.toolSearchThreshold();
@@ -619,7 +629,7 @@ export class AgentEngine {
         : [];
       if (spawnCalls.length > 0) {
         await Promise.all(spawnCalls.map(async (call) => {
-          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown; max_turns?: unknown; mode?: unknown } = {};
+          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown; max_turns?: unknown; mode?: unknown; isolation?: unknown } = {};
           try { parsed = JSON.parse(call.argsJson || "{}"); } catch { /* defensive: empty prompt below */ }
           const prompt = typeof parsed.prompt === "string" ? parsed.prompt : "";
           const agentType = typeof parsed.agentType === "string" ? parsed.agentType : undefined;
@@ -650,6 +660,12 @@ export class AgentEngine {
           // and the parent's policy wins; only a NARROWING request actually changes childPolicy.
           const requestedPolicy = mapSpawnMode(modeRaw);
           const childPolicy = requestedPolicy !== undefined ? restrictPolicy(meta.approvalPolicy, requestedPolicy) : meta.approvalPolicy;
+          // 4h-i Task 4 (CC parity: Agent.isolation "worktree") — same hand-parse-before-zod
+          // reasoning as mode/max_turns/model/description above: only the literal "worktree" is
+          // recognized; anything else (wrong type, typo, provider hallucination) → false, same as
+          // omitting the arg entirely (no isolation, child runs in the parent's own cwd — today's
+          // unchanged behavior).
+          const wantsWorktreeIsolation = parsed.isolation === "worktree";
           // Child-scoped meta: a shallow copy ONLY when childPolicy actually narrows (differs from
           // the parent's) — never mutate the shared `meta` object itself (that object is the SAME
           // one `turn()`'s dispatch loop uses for the REST of the parent's turn; mutating
@@ -700,6 +716,42 @@ export class AgentEngine {
             }
           }
 
+          // 4h-i Task 4 (CC parity: Agent.isolation "worktree") — create the child's isolation
+          // worktree BEFORE thread_started/registerThread/subagents.run, same as the
+          // description/model checks above: a create failure (no git repo, or
+          // WorktreeManager not wired into this session) must fail the spawn as a typed
+          // isError tool_result with NO ghost thread, never a half-spawned child.
+          // `createDetached` is a STATELESS WorktreeManager method (worktree.ts) — it does NOT
+          // touch the per-session `sessions` map that enter_worktree/exit_worktree use, so a
+          // child's ephemeral isolation worktree can never collide with (or be silently torn
+          // down by) this session's own concurrent enter_worktree/exit_worktree state. Base off
+          // opts.cwd (THIS spawning thread's own cwd — for a depth>0 spawner that is itself an
+          // isolated child, that's already its own worktree dir, so a grandchild's isolation
+          // worktree nests off the child's, not the top-level session repo).
+          let isolatedWorktree: { dir: string; branch: string } | undefined;
+          if (wantsWorktreeIsolation) {
+            if (!this.cfg.worktrees) {
+              spawnOutcomes.set(call.callId, {
+                output: `isolation:"worktree" is not available in this session`,
+                isError: true,
+              });
+              return; // no thread_started, no thread registry entry, no subagents.run slot
+            }
+            try {
+              isolatedWorktree = this.cfg.worktrees.createDetached(opts.cwd, `spawn-${randomUUID().slice(0, 8)}`);
+            } catch (err) {
+              spawnOutcomes.set(call.callId, {
+                output: `isolation:"worktree" requires a git repository (${err instanceof Error ? err.message : String(err)})`,
+                isError: true,
+              });
+              return; // no thread_started, no thread registry entry, no subagents.run slot
+            }
+          }
+          // The child's own cwd: the fresh worktree dir when isolated, otherwise unchanged
+          // (opts.cwd, today's behavior). This is what the child's runThread actually runs at
+          // AND what buildInstructionsFull below resolves project context relative to.
+          const childCwd = isolatedWorktree?.dir ?? opts.cwd;
+
           const childId = "th_" + randomUUID().slice(0, 8);
           this.emit(sessionId, {
             type: "thread_started", sessionId, threadId: childId, parentThreadId: threadId,
@@ -724,58 +776,82 @@ export class AgentEngine {
           // fails fast with a typed error instead of stalling for the full per-run timeoutMs
           // (300s) — see SubagentManager.acquire's doc comment. A depth-0 (top-level) spawn is
           // never reentrant and keeps its existing unbounded queueing behind busy siblings.
-          const result = await this.cfg.subagents!.run(async (childSignal) => {
-            const childLoaded = new Set<string>();
-            const instructionsFull = this.buildInstructionsFull(def.instructions, opts.cwd, childLoaded, childPolicy, sessionId);
-            return this.runThread({
-              sessionId,
-              threadId: childId,
-              instructionsFull,
-              input: [{ type: "message", role: "user", content: prompt }], // FRESH — no parent history
-              cwd: opts.cwd,
-              model: effectiveOverride ?? opts.model,
-              // Subagents inherit the PARENT thread's resolved reasoning effort — no per-agent-def
-              // override (agent defs only carry a model override, never an effort one).
-              reasoningEffort: opts.reasoningEffort,
-              // childMeta: the SAME object as `meta` (byte-identical, no copy) when there's no
-              // narrowing `mode` override — the child inherits the parent's (possibly
-              // later-mutated) approval policy, exactly as before 4h-i. Only a NARROWING `mode`
-              // (restrictPolicy above) produces a child-scoped shallow copy, so the parent's own
-              // `meta.approvalPolicy` is NEVER mutated by a spawn's mode override — see
-              // `childMeta`'s own doc comment above for why (concurrent spawns, same-turn parent
-              // policy corruption).
-              meta: childMeta,
-              depth: childDepth,
-              signal: childSignal,
-              loaded: childLoaded,
-              // enter_plan_mode excluded alongside exit_plan_mode (4g Task 4): the child inherits
-              // the parent's (or, with a narrowing `mode` override, its OWN child-scoped) `meta`
-              // object BY REFERENCE (just above) — an unexcluded child calling enter_plan_mode
-              // would mutate that object's `approvalPolicy` AND persist it via `cfg.setPolicy`
-              // (when it's the SAME object as the parent's, that would silently put the WHOLE
-              // session into plan mode once the spawn returns). Plan-mode entry/exit stays a
-              // main-thread-only decision regardless of which meta object the child got.
-              // spawn_agent's presence/absence here is depth-conditional — see childExcludeTools
-              // above (4h-i Task 3).
-              excludeTools: childExcludeTools,
-              allowTools: def.allowTools,
-              maxTurns,
-            });
-          }, { reentrant: opts.depth > 0 });
-          const stopReason = result.ok ? result.value.stopReason : "error";
-          this.emit(sessionId, { type: "thread_completed", sessionId, threadId: childId, stopReason });
-          this.completeThread(sessionId, childId, stopReason);
-          // Defect 2 (4e gate F10): a child that ran to completion (result.ok) but whose OWN
-          // final round hit a provider error (runThread's error branch, stopReason "error") must
-          // be reported to the parent as a FAILURE, not as a quiet "finished without a final
-          // message" success — the parent's tool_result is the only channel a child has back to
-          // its caller (unlike the main thread, whose agent_error event the user sees directly).
-          // The `!result.ok` branch (SubagentManager timeout / thrown error) is unchanged.
-          spawnOutcomes.set(call.callId, !result.ok
-            ? { output: `subagent (${agentType ?? "general-purpose"}) ${result.error}`, isError: true }
-            : result.value.stopReason === "error"
-              ? { output: `subagent (${agentType ?? "general-purpose"}) failed: ${result.value.errorMessage ?? "provider error"}`, isError: true }
-              : { output: result.value.finalText || "the subagent finished without a final message", isError: false });
+          try {
+            const result = await this.cfg.subagents!.run(async (childSignal) => {
+              const childLoaded = new Set<string>();
+              const instructionsFull = this.buildInstructionsFull(def.instructions, childCwd, childLoaded, childPolicy, sessionId);
+              return this.runThread({
+                sessionId,
+                threadId: childId,
+                instructionsFull,
+                input: [{ type: "message", role: "user", content: prompt }], // FRESH — no parent history
+                cwd: childCwd,
+                model: effectiveOverride ?? opts.model,
+                // Subagents inherit the PARENT thread's resolved reasoning effort — no per-agent-def
+                // override (agent defs only carry a model override, never an effort one).
+                reasoningEffort: opts.reasoningEffort,
+                // childMeta: the SAME object as `meta` (byte-identical, no copy) when there's no
+                // narrowing `mode` override — the child inherits the parent's (possibly
+                // later-mutated) approval policy, exactly as before 4h-i. Only a NARROWING `mode`
+                // (restrictPolicy above) produces a child-scoped shallow copy, so the parent's own
+                // `meta.approvalPolicy` is NEVER mutated by a spawn's mode override — see
+                // `childMeta`'s own doc comment above for why (concurrent spawns, same-turn parent
+                // policy corruption).
+                meta: childMeta,
+                depth: childDepth,
+                signal: childSignal,
+                loaded: childLoaded,
+                // enter_plan_mode excluded alongside exit_plan_mode (4g Task 4): the child inherits
+                // the parent's (or, with a narrowing `mode` override, its OWN child-scoped) `meta`
+                // object BY REFERENCE (just above) — an unexcluded child calling enter_plan_mode
+                // would mutate that object's `approvalPolicy` AND persist it via `cfg.setPolicy`
+                // (when it's the SAME object as the parent's, that would silently put the WHOLE
+                // session into plan mode once the spawn returns). Plan-mode entry/exit stays a
+                // main-thread-only decision regardless of which meta object the child got.
+                // spawn_agent's presence/absence here is depth-conditional — see childExcludeTools
+                // above (4h-i Task 3).
+                excludeTools: childExcludeTools,
+                allowTools: def.allowTools,
+                maxTurns,
+                // 4h-i Task 4: isolated child's fs tools are fenced to EXACTLY the worktree dir
+                // (not additive to the session's own roots — see rootsOverride's own doc comment
+                // on RunThreadOpts). Undefined (no isolation) → executeCall falls back to the
+                // session's normal live roots, unchanged behavior.
+                rootsOverride: isolatedWorktree ? [isolatedWorktree.dir] : undefined,
+              });
+            }, { reentrant: opts.depth > 0 });
+            const stopReason = result.ok ? result.value.stopReason : "error";
+            this.emit(sessionId, { type: "thread_completed", sessionId, threadId: childId, stopReason });
+            this.completeThread(sessionId, childId, stopReason);
+            // Defect 2 (4e gate F10): a child that ran to completion (result.ok) but whose OWN
+            // final round hit a provider error (runThread's error branch, stopReason "error") must
+            // be reported to the parent as a FAILURE, not as a quiet "finished without a final
+            // message" success — the parent's tool_result is the only channel a child has back to
+            // its caller (unlike the main thread, whose agent_error event the user sees directly).
+            // The `!result.ok` branch (SubagentManager timeout / thrown error) is unchanged.
+            spawnOutcomes.set(call.callId, !result.ok
+              ? { output: `subagent (${agentType ?? "general-purpose"}) ${result.error}`, isError: true }
+              : result.value.stopReason === "error"
+                ? { output: `subagent (${agentType ?? "general-purpose"}) failed: ${result.value.errorMessage ?? "provider error"}`, isError: true }
+                : { output: result.value.finalText || "the subagent finished without a final message", isError: false });
+          } finally {
+            // 4h-i Task 4: teardown runs whether the child succeeded, errored, or timed out —
+            // clean-only (mirrors exit_worktree's default guard AND CC's own isolation
+            // teardown): a CLEAN worktree (no uncommitted changes) is removed; a DIRTY one is
+            // left on disk for the user to review (logged) — NO auto-merge, NO force-remove
+            // (no data loss). `this.cfg.worktrees` is guaranteed set here (isolatedWorktree is
+            // only ever assigned after that same guard above).
+            if (isolatedWorktree) {
+              try {
+                const removed = this.cfg.worktrees!.removeDetached(isolatedWorktree.dir, opts.cwd, true);
+                if (!removed) {
+                  console.error(`spawn_agent isolation:"worktree": left dirty worktree at ${isolatedWorktree.dir} (uncommitted changes) — not auto-removed`);
+                }
+              } catch (err) {
+                console.error(`spawn_agent isolation:"worktree": teardown failed for ${isolatedWorktree.dir}: ${err instanceof Error ? err.message : String(err)}`);
+              }
+            }
+          }
         }));
       }
 
@@ -853,7 +929,7 @@ export class AgentEngine {
               timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
               summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
               // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
-            }, loaded, async () => this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd), pins);
+            }, loaded, async () => this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd), pins, rootsOverride);
           } else {
             outcome = this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd);
           }
@@ -863,7 +939,7 @@ export class AgentEngine {
             timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
             summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
             // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
-          }, loaded, undefined, pins);
+          }, loaded, undefined, pins, rootsOverride);
         } else if (call.name === "exit_plan_mode" && this.cfg.plans && meta.approvalPolicy === "plan") {
           outcome = await this.runPlanBridge(call, sessionId, threadId, meta);
         } else if (call.name === "enter_plan_mode") {
@@ -883,7 +959,7 @@ export class AgentEngine {
             justification = typeof a.justification === "string" ? a.justification : undefined;
           } catch { /* fall through to review of "" → likely unsafe */ }
           if (command && bashLooksSafe(command, this.cfg.reviewerAllow ?? [])) {
-            outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins);
+            outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride);
           } else {
             let v: { verdict: "safe" | "unsafe"; reason: string };
             try {
@@ -896,13 +972,13 @@ export class AgentEngine {
                 timeoutMs: Number(process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS ?? 60_000),
                 summary: `⚠ safety reviewer: ${v.reason} — ${call.name} ${command.slice(0, 120)}`,
                 denialMessage: `blocked by the safety reviewer: ${v.reason}. No approval within 60s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.`,
-              }, loaded, undefined, pins);
+              }, loaded, undefined, pins, rootsOverride);
             } else {
-              outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins);
+              outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride);
             }
           }
         } else {
-          outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins);
+          outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride);
         }
 
         this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
@@ -943,7 +1019,9 @@ export class AgentEngine {
    *  `loaded` (4g final-review fix) is the CALLING THREAD's live `loaded` set (runThread's
    *  `opts.loaded` — the same object for every caller in this file, main or child) — forwarded
    *  unchanged to executeCall's default path so an approved call's load/defense-in-depth check
-   *  lands on the thread that actually asked, not always the session-scoped map. */
+   *  lands on the thread that actually asked, not always the session-scoped map.
+   *  `rootsOverride` (4h-i Task 4) — forwarded unchanged to executeCall's default path; callers
+   *  that pass their own `onApprove` (the worktree bridge) don't need it. */
   private async requestApproval(
     call: { callId: string; name: string; argsJson: string },
     cwd: string,
@@ -954,6 +1032,7 @@ export class AgentEngine {
     loaded: Set<string>,
     onApprove?: () => Promise<{ output: string; isError: boolean }>,
     pins: Set<string> = new Set(),
+    rootsOverride?: string[],
   ): Promise<{ output: string; isError: boolean; deniedByHuman?: boolean }> {
     const waiting = this.cfg.broker.wait(sessionId, call.callId, opts.timeoutMs);
     try {
@@ -969,7 +1048,7 @@ export class AgentEngine {
     const res = await waiting;
     this.emit(sessionId, { type: "approval_resolved", sessionId, threadId, callId: call.callId, approved: res.approved, by: res.by });
     if (res.approved) {
-      return await (onApprove ? onApprove() : this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins));
+      return await (onApprove ? onApprove() : this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride));
     }
     // An EXPLICIT human denial (any `by` other than the broker's "timeout") ends the turn and
     // hands control back to the user (Claude Code parity) — see the caller's `deniedByHuman`
@@ -1155,11 +1234,16 @@ export class AgentEngine {
     // forwarded copy of it) — defaulted so any caller that doesn't care about pins compiles
     // unchanged. Unioned below with `loaded`, never mutating either.
     pins: Set<string> = new Set(),
+    // 4h-i Task 4: forwarded straight from runThread's own `opts.rootsOverride` (see its doc
+    // comment) — undefined for every caller except a worktree-isolated child, in which case it's
+    // EXACTLY that child's `[worktreeDir]`, replacing (not extending) the session-wide roots
+    // this.cfg.dirs.roots(sessionId) would otherwise return.
+    rootsOverride?: string[],
   ): Promise<{ output: string; isError: boolean }> {
     let args: unknown;
     try { args = call.argsJson.length ? JSON.parse(call.argsJson) : {}; }
     catch { return Promise.resolve({ output: `tool arguments were not valid JSON`, isError: true }); }
-    const roots = this.cfg.dirs.roots(sessionId);
+    const roots = rootsOverride ?? this.cfg.dirs.roots(sessionId);
     const tmpDir = sessionTmpDir(sessionId);
     const markSkillLoaded = (n: string) => {
       let set = this.loadedSkills.get(sessionId);
