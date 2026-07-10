@@ -146,6 +146,26 @@ describe("loadSettings", () => {
     expect(() => Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, subagents: { maxConcurrent: -1 } })).toThrow();
   });
 
+  // 4h-i Task 3: subagents.maxDepth — CC parity (CC allows nesting depth up to 5; Norma's engine
+  // defaults to 2 when this is unset — see engine.ts's `subagentMaxDepth ?? 2`).
+  test("subagents.maxDepth parses (1-5 inclusive); absent → undefined; out-of-range/non-integer rejected", () => {
+    const s = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, subagents: { maxDepth: 3 } });
+    expect(s.subagents).toEqual({ maxDepth: 3 });
+    expect(Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" } }).subagents).toBeUndefined();
+
+    // boundaries: 1 and 5 both accepted
+    expect(Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, subagents: { maxDepth: 1 } }).subagents).toEqual({ maxDepth: 1 });
+    expect(Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, subagents: { maxDepth: 5 } }).subagents).toEqual({ maxDepth: 5 });
+
+    expect(() => Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, subagents: { maxDepth: 0 } })).toThrow();
+    expect(() => Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, subagents: { maxDepth: 6 } })).toThrow();
+    expect(() => Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, subagents: { maxDepth: 2.5 } })).toThrow();
+
+    // maxConcurrent and maxDepth coexist independently within the same subagents block
+    const both = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, subagents: { maxConcurrent: 2, maxDepth: 4 } });
+    expect(both.subagents).toEqual({ maxConcurrent: 2, maxDepth: 4 });
+  });
+
   test("legacy migration keeps working with subagents field absent", () => {
     const p = tmpSettings({ legacyCustom: { provider: "disabled" } });
     const s = loadSettings(p);

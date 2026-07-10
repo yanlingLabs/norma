@@ -376,6 +376,10 @@ export async function startDaemon(opts: {
       bgRegistry,
       agents,
       subagents,
+      // 4h-i Task 3: undefined (settings.subagents.maxDepth unset) → engine.ts's runThread
+      // defaults it to 2 itself (`subagentMaxDepth ?? 2`) — mirrors the maxConcurrent line above,
+      // which leans on SubagentManager's own internal default the same way.
+      subagentMaxDepth: settings?.subagents?.maxDepth,
       reviewer,
       reviewerEnabled: reviewerCfg?.enabled,
       reviewerAllow: reviewerCfg?.allow ?? [],

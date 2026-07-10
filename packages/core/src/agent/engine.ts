@@ -145,6 +145,16 @@ export interface EngineConfig {
   // the bridge to activate — see the `spawnCalls` filter in runThread's dispatch loop.
   subagents?: SubagentManager;
   agents?: AgentStore;
+  // 4h-i Task 3 (CC parity: configurable nesting depth, settings.subagents.maxDepth): how many
+  // levels of spawn_agent nesting are allowed, orthogonal to SubagentManager's maxConcurrent
+  // (fan-out width) and the 1000-total-agent backstop (AgentStore.resolve) — this is depth, not
+  // count or concurrency. Undefined → defaults to 2 (runThread reads `subagentMaxDepth ?? 2`),
+  // one level deeper than the old hardcoded depth-1 cap: a depth-0 main thread could always spawn
+  // a depth-1 child; that child could never spawn further. `maxDepth: 1` reproduces that old
+  // behavior explicitly. A thread at `depth < maxDepth` may spawn (spawn_agent stays in its specs,
+  // the bridge runs its calls); a thread AT `depth >= maxDepth` has spawn_agent excluded from its
+  // specs and, belt-and-braces, rejects any spawn_agent call it receives anyway.
+  subagentMaxDepth?: number;
   // SessionTitler (Phase 2e-iii Task 3): optional — absent means no session gets an
   // auto-generated title. Fired fire-and-forget, only at the main thread's (depth 0) turn
   // completion, never on the error paths (an errored first turn has nothing worth titling).
@@ -513,6 +523,10 @@ export class AgentEngine {
     // shared default. Computed once so the loop condition and the cap message below always agree
     // on the exact number.
     const effectiveMaxIterations = opts.maxTurns ?? MAX_TOOL_ITERATIONS;
+    // 4h-i Task 3: the nesting-depth cap for THIS thread's own spawn attempts — see
+    // EngineConfig.subagentMaxDepth's doc comment. Computed once so the spawn-gather filter below
+    // and the belt-and-braces reject agree on the exact same number.
+    const maxDepth = this.cfg.subagentMaxDepth ?? 2;
 
     this.emit(sessionId, { type: "turn_started", sessionId, threadId });
 
@@ -594,9 +608,13 @@ export class AgentEngine {
       // order of Promise.all). Only active when both cfg.subagents and cfg.agents are wired
       // (daemon.ts) AND this is a depth-0 thread — a depth>0 (child) thread trying to spawn is
       // denied in the loop below instead (belt-and-braces: its own specs already exclude
-      // spawn_agent via excludeTools, so this only matters if a provider ignores that).
+      // spawn_agent via excludeTools, so this only matters if a provider ignores that). 4h-i Task
+      // 3: "depth-0 thread" generalizes to "depth < maxDepth" — any thread below the configured
+      // nesting cap (not just the main thread) gathers its own spawn_agent calls through this SAME
+      // bridge, recursively, so a depth-1 child can itself spawn a depth-2 grandchild when
+      // maxDepth allows it.
       const spawnOutcomes = new Map<string, { output: string; isError: boolean }>();
-      const spawnCalls = this.cfg.subagents && this.cfg.agents && opts.depth === 0
+      const spawnCalls = this.cfg.subagents && this.cfg.agents && opts.depth < maxDepth
         ? calls.filter((c) => c.name === "spawn_agent")
         : [];
       if (spawnCalls.length > 0) {
@@ -690,6 +708,15 @@ export class AgentEngine {
           this.registerThread(sessionId, {
             threadId: childId, parentThreadId: threadId, agentType: agentType ?? "general-purpose", status: "running",
           });
+          // 4h-i Task 3: spawn_agent is excluded from the child's own specs ONLY when the child
+          // itself sits AT (or past) the nesting cap — i.e. it has no room left to spawn a
+          // grandchild. `childDepth < maxDepth` keeps spawn_agent visible so the child can spawn
+          // one more level (recursing into this SAME bridge, via its own runThread call, with the
+          // gate-1 spawnCalls filter above reading ITS OWN opts.depth). ask_user/exit_plan_mode/
+          // enter_plan_mode stay excluded from every child regardless of depth (unchanged).
+          const childDepth = opts.depth + 1;
+          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode"]);
+          if (childDepth >= maxDepth) childExcludeTools.add("spawn_agent");
           const result = await this.cfg.subagents!.run(async (childSignal) => {
             const childLoaded = new Set<string>();
             const instructionsFull = this.buildInstructionsFull(def.instructions, opts.cwd, childLoaded, childPolicy, sessionId);
@@ -711,7 +738,7 @@ export class AgentEngine {
               // `childMeta`'s own doc comment above for why (concurrent spawns, same-turn parent
               // policy corruption).
               meta: childMeta,
-              depth: opts.depth + 1,
+              depth: childDepth,
               signal: childSignal,
               loaded: childLoaded,
               // enter_plan_mode excluded alongside exit_plan_mode (4g Task 4): the child inherits
@@ -721,7 +748,9 @@ export class AgentEngine {
               // (when it's the SAME object as the parent's, that would silently put the WHOLE
               // session into plan mode once the spawn returns). Plan-mode entry/exit stays a
               // main-thread-only decision regardless of which meta object the child got.
-              excludeTools: new Set(["spawn_agent", "ask_user", "exit_plan_mode", "enter_plan_mode"]),
+              // spawn_agent's presence/absence here is depth-conditional — see childExcludeTools
+              // above (4h-i Task 3).
+              excludeTools: childExcludeTools,
               allowTools: def.allowTools,
               maxTurns,
             });
@@ -755,9 +784,12 @@ export class AgentEngine {
           input.push({ type: "tool_result", callId: call.callId, output: outcome.output, isError: outcome.isError });
           continue;
         }
-        if (call.name === "spawn_agent" && opts.depth > 0) {
-          // Belt-and-braces: a child thread's specs already exclude spawn_agent (excludeTools
-          // above), so this only fires if a provider ignores the tool list and calls it anyway.
+        if (call.name === "spawn_agent" && opts.depth >= maxDepth) {
+          // Belt-and-braces: a thread AT the nesting cap already had spawn_agent excluded from its
+          // specs (childExcludeTools above), so this only fires if a provider ignores the tool
+          // list and calls it anyway. A thread BELOW the cap (opts.depth < maxDepth) never reaches
+          // here for spawn_agent — its calls were already siphoned off into spawnOutcomes by the
+          // spawn-gather filter earlier in this same round (4h-i Task 3).
           outcome = { output: "subagents cannot spawn further subagents", isError: true };
           this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
           input.push({ type: "tool_result", callId: call.callId, output: outcome.output, isError: outcome.isError });

@@ -44,6 +44,10 @@ export function setup(
     // undefined (default) → no deferral anywhere, matching every pre-existing test here
     // (unchanged behavior). Mirrors engine-steer.test.ts's setupEngine `toolSearch` opt.
     toolSearch?: { enabled?: boolean; deferThreshold?: number; deferExternals?: "count" | "always" };
+    // 4h-i Task 3: undefined (default) → EngineConfig.subagentMaxDepth absent → engine.ts defaults
+    // it to 2 itself (one level deeper than the old hardcoded depth-1 cap). Pass 1 explicitly to
+    // pin the OLD default behavior (a depth-1 child could never spawn further) as a regression.
+    maxDepth?: number;
   } = {},
 ) {
   const withSubagents = opts.withSubagents !== false;
@@ -82,6 +86,7 @@ export function setup(
     compactor,
     agents,
     subagents,
+    subagentMaxDepth: opts.maxDepth,
     toolSearch: opts.toolSearch,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: opts.approvalPolicy ?? "auto" });
@@ -180,12 +185,15 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     expect(r2).toMatchObject({ isError: false, output: "child result" });
   });
 
-  test("depth>0 spawn (a child trying to spawn) is denied without running the bridge", async () => {
-    const { engine, store, sessionId } = setup([
-      [spawnCall("s1", "do X"), done("tool_calls")], // parent spawns a child
-      [spawnCall("s2", "grandchild"), done("tool_calls")], // the child tries to spawn again (depth 1)
-      text("child gave up on spawning further"), // the child's final round after the denial
-    ]);
+  test("maxDepth:1 (regression pin, today's old default): depth>0 spawn (a child trying to spawn) is denied without running the bridge", async () => {
+    const { engine, store, sessionId } = setup(
+      [
+        [spawnCall("s1", "do X"), done("tool_calls")], // parent spawns a child
+        [spawnCall("s2", "grandchild"), done("tool_calls")], // the child tries to spawn again (depth 1, at the cap)
+        text("child gave up on spawning further"), // the child's final round after the denial
+      ],
+      { maxDepth: 1 },
+    );
     await engine.runTurn(sessionId);
     const events = store.read(sessionId);
 
@@ -197,11 +205,14 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     expect(denied).toMatchObject({ isError: true, output: "subagents cannot spawn further subagents" });
   });
 
-  test("child specs exclude spawn_agent, ask_user, exit_plan_mode", async () => {
-    const { provider, engine, sessionId } = setup([
-      [spawnCall("s1", "do X"), done("tool_calls")],
-      text("done"),
-    ]);
+  test("maxDepth:1 (regression pin, today's old default): child specs exclude spawn_agent, ask_user, exit_plan_mode", async () => {
+    const { provider, engine, sessionId } = setup(
+      [
+        [spawnCall("s1", "do X"), done("tool_calls")],
+        text("done"),
+      ],
+      { maxDepth: 1 },
+    );
     await engine.runTurn(sessionId);
     const fp = provider as FakeProvider;
     const childTools = fp.requests[1]!.tools ?? [];
@@ -900,5 +911,121 @@ describe("AgentEngine: spawn_agent mode (restrict-only, 4h-i Task 2)", () => {
 
     // the session's persisted policy is untouched (only enter/exit_plan_mode ever calls setPolicy)
     expect(store.meta(sessionId).approvalPolicy).toBe("auto");
+  });
+});
+
+describe("AgentEngine: configurable subagent nesting depth (4h-i Task 3)", () => {
+  test("default maxDepth (2, no explicit setting): a depth-1 child's specs DO include spawn_agent — nesting one level deeper than the old hardcoded cap", async () => {
+    const { provider, engine, sessionId } = setup([
+      [spawnCall("s1", "do X"), done("tool_calls")],
+      text("done"),
+    ]);
+    await engine.runTurn(sessionId);
+    const fp = provider as FakeProvider;
+    const childTools = fp.requests[1]!.tools ?? [];
+    const names = childTools.map((t) => t.name);
+    expect(names).toContain("spawn_agent");
+    // the depth-agnostic exclusions still apply regardless of maxDepth
+    expect(names).not.toContain("ask_user");
+    expect(names).not.toContain("exit_plan_mode");
+    expect(names).not.toContain("enter_plan_mode");
+  });
+
+  test("default maxDepth (2): a depth-1 child spawns a depth-2 grandchild end-to-end — thread_started/completed nest correctly, results bubble up two levels, grandchild's specs exclude spawn_agent (at the cap)", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "do X"), done("tool_calls")], // parent (depth 0) round 0: spawns the child
+      [spawnCall("s2", "grandchild task"), done("tool_calls")], // child (depth 1) round 0: spawns the grandchild
+      text("grandchild final report"), // grandchild (depth 2) round 0: no further spawn — ends its turn
+      text("child wrapped up after grandchild"), // child's own continuation round, after the grandchild bridge returns
+      text("parent final report"), // parent's own continuation round, after the child bridge returns
+    ];
+    const { engine, store, sessionId, provider } = setup(script);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const starts = events.filter((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>[];
+    expect(starts.length).toBe(2); // child + grandchild
+
+    const childStart = starts.find((e) => e.parentThreadId === "main")!;
+    expect(childStart).toBeDefined();
+    const grandchildStart = starts.find((e) => e.parentThreadId === childStart.threadId)!;
+    expect(grandchildStart).toBeDefined(); // proves the grandchild nests UNDER the child, not under main
+
+    const completions = events.filter((e) => e.type === "thread_completed");
+    expect(completions.length).toBe(2);
+    expect(completions.every((e) => (e as Extract<SessionEvent, { type: "thread_completed" }>).stopReason === "end_turn")).toBe(true);
+
+    // the grandchild's own result bubbles up as the CHILD's tool_result for s2
+    const s2Result = events.find((e) => e.type === "tool_result" && e.callId === "s2");
+    expect(s2Result).toMatchObject({ isError: false, output: "grandchild final report" });
+    // and the child's own final text (after the grandchild returns) bubbles up as the PARENT's
+    // tool_result for s1 — proves the child kept running its OWN loop after the nested spawn
+    const s1Result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(s1Result).toMatchObject({ isError: false, output: "child wrapped up after grandchild" });
+
+    const fp = provider as FakeProvider;
+    // request[1] = child's round 0 (depth 1) — spawn_agent still visible, one level of room left
+    expect((fp.requests[1]!.tools ?? []).map((t) => t.name)).toContain("spawn_agent");
+    // request[2] = grandchild's round 0 (depth 2, AT the cap) — spawn_agent excluded
+    expect((fp.requests[2]!.tools ?? []).map((t) => t.name)).not.toContain("spawn_agent");
+  });
+
+  test("default maxDepth (2): a depth-2 grandchild that calls spawn_agent anyway (provider ignoring the excluded specs) is rejected via belt-and-braces — no great-grandchild thread runs", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "do X"), done("tool_calls")], // parent (depth 0): spawns the child
+      [spawnCall("s2", "grandchild task"), done("tool_calls")], // child (depth 1): spawns the grandchild
+      [spawnCall("s3", "great-grandchild attempt"), done("tool_calls")], // grandchild (depth 2, AT the cap) tries anyway
+      text("grandchild gave up on spawning further"), // grandchild's continuation round after the denial
+      text("child wrapped up"), // child's continuation round after the grandchild bridge returns
+      text("parent final report"), // parent's continuation round after the child bridge returns
+    ];
+    const { engine, store, sessionId } = setup(script);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    // only TWO thread_started/completed pairs (child + grandchild) — the great-grandchild attempt
+    // never ran the bridge
+    expect(events.filter((e) => e.type === "thread_started").length).toBe(2);
+    expect(events.filter((e) => e.type === "thread_completed").length).toBe(2);
+
+    const denied = events.find((e) => e.type === "tool_result" && e.callId === "s3");
+    expect(denied).toMatchObject({ isError: true, output: "subagents cannot spawn further subagents" });
+
+    const s2Result = events.find((e) => e.type === "tool_result" && e.callId === "s2");
+    expect(s2Result).toMatchObject({ isError: false, output: "grandchild gave up on spawning further" });
+  });
+
+  test("maxDepth: 1 explicit — a depth-1 child cannot spawn (regression pin, identical to today's hardcoded default)", async () => {
+    const { engine, store, sessionId } = setup(
+      [
+        [spawnCall("s1", "do X"), done("tool_calls")],
+        [spawnCall("s2", "grandchild"), done("tool_calls")],
+        text("child gave up on spawning further"),
+      ],
+      { maxDepth: 1 },
+    );
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(events.filter((e) => e.type === "thread_started").length).toBe(1);
+    const denied = events.find((e) => e.type === "tool_result" && e.callId === "s2");
+    expect(denied).toMatchObject({ isError: true, output: "subagents cannot spawn further subagents" });
+  });
+
+  test("maxDepth: 5 — a depth-4 great-great-grandchild's specs still include spawn_agent (below the cap), same excludeTools logic applies at any depth", async () => {
+    // Not a full 5-level e2e (heavy) — pins the depth-parameterized excludeTools construction
+    // itself by checking BOTH boundary depths in one setup: the main thread's own child (depth 1)
+    // keeps spawn_agent (1 < 5), same as any other below-cap depth would.
+    const { provider, engine, sessionId } = setup(
+      [
+        [spawnCall("s1", "do X"), done("tool_calls")],
+        text("done"),
+      ],
+      { maxDepth: 5 },
+    );
+    await engine.runTurn(sessionId);
+    const fp = provider as FakeProvider;
+    const names = (fp.requests[1]!.tools ?? []).map((t) => t.name);
+    expect(names).toContain("spawn_agent");
   });
 });
