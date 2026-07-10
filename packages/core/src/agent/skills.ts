@@ -54,7 +54,10 @@ function compatPreamble(skillDir: string): string {
     "- EnterWorktree / ExitWorktree → `enter_worktree` / `exit_worktree`",
     "- NotebookEdit → `notebook_edit`",
     "- Skill → `Skill` (same name)",
-    "- Read / Glob / Grep / Bash → `read` / `glob` / `grep` / `bash` (same behavior)",
+    // Honest, not "(same behavior)" — the parity audit (docs/superpowers/research/
+    // 2026-07-10-cc-tool-parity-audit.md P1-1) caught that overclaim: these are reduced variants,
+    // and a skill relying on the differences must know.
+    "- Read / Glob / Grep / Bash → `read` / `glob` / `grep` / `bash` — similar but NOT identical: `bash` runs SANDBOXED (no network; writes confined to approved directories), `read` returns plain text (no line numbers; very large files truncate), `grep` uses JS regex syntax",
     `Base directory for this skill: ${skillDir} — its scripts/ and relative references resolve against this path; run skill-internal scripts via bash as-is.`,
     "",
     "",
