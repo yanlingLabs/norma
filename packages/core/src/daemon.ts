@@ -82,6 +82,14 @@ function buildLeasePolicy(deps: {
   return async (sessionId: string, cls: PeripheralClass): Promise<"granted" | "denied"> => {
     let approvalPolicy: "ask" | "auto" | "plan";
     try {
+      // COUPLING (4h-i): this reads the PERSISTED session policy as a proxy for "the current
+      // caller's policy". That's safe TODAY only because peripheral.lease is IPC/app-initiated
+      // (ipc/server.ts) and never reachable from a subagent's tool loop — so the caller is always
+      // the session itself. A spawn_agent `mode`-narrowed CHILD now runs at a policy that diverges
+      // from the persisted session policy (its narrowed childMeta is never written back to the
+      // store), so if a lease path ever becomes reachable from a child (or from an async/4h-ii
+      // child that outlives the turn), this proxy would grant against the SESSION policy, not the
+      // child's narrower one. Make the lease policy thread-aware before that lands.
       approvalPolicy = deps.store.meta(sessionId).approvalPolicy;
     } catch {
       return "denied"; // unknown session — fail closed (ipc/server.ts already validates first)
