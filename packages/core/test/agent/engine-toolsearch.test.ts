@@ -403,7 +403,12 @@ describe("engine: deferred-tool guard runs before the enter_plan_mode bridge (4g
     expect(toolResult.isError).toBe(true);
     expect(toolResult.output).toContain("deferred");
     expect(toolResult.output).toContain("ToolSearch");
-    // The bridge did NOT run: the session's approval policy was never touched.
+    // The rejection message above IS the proof the bridge never ran (it fires BEFORE the
+    // dispatch-loop bridge branches — see the isDeferredBuiltin guard's doc comment in engine.ts).
+    // This policy check is NOT independent evidence of that on its own: setupEngine doesn't wire
+    // `cfg.setPolicy`, so store.meta() would read "auto" here even if the bridge HAD run (its
+    // `cfg.setPolicy?.(...)` call would just no-op) — kept only as a sanity check that nothing
+    // else in the turn incidentally touched the persisted policy.
     expect(store.meta(sessionId).approvalPolicy).toBe("auto"); // setupEngine's default policy
   });
 
