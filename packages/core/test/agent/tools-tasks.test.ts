@@ -87,14 +87,39 @@ describe("task tools", () => {
     const del = await r.execute("task_update", { taskId: "1", status: "deleted" }, ctx({ taskEvent: (t) => events.push(t) }));
     expect(del.isError).toBe(false);
     expect(del.output).toBe("Task #1 deleted");
-    // no EXTRA task_updated event was emitted for the delete itself — only the earlier create's.
-    expect(events).toHaveLength(1);
     const listed = await r.execute("task_list", {}, ctx());
     expect(listed.output).toBe("no tasks");
 
     const notFound = await r.execute("task_update", { taskId: "999", status: "deleted" }, ctx());
     expect(notFound.isError).toBe(true);
     expect(notFound.output).toContain("no such task");
+  });
+
+  // T3 review fix wave 1: task_update{status:"deleted"} now emits ONE task_updated event carrying
+  // the deleted task's full shape with status:"deleted" — BEFORE the store removal — so live task
+  // views (CLI pinned block, app SessionModel) can react by removing the task instead of
+  // phantoming it forever.
+  test("task_update status 'deleted' emits a task_updated event with status 'deleted' before the store removal", async () => {
+    const events: Task[] = [];
+    const store = new TaskStore();
+    const r = buildRegistry(store);
+    await r.execute("task_create", { subject: "throwaway", description: "will be deleted", activeForm: "Deleting it" }, ctx({ taskEvent: (t) => events.push(t) }));
+    const del = await r.execute("task_update", { taskId: "1", status: "deleted" }, ctx({ taskEvent: (t) => events.push(t) }));
+    expect(del.isError).toBe(false);
+    expect(events).toHaveLength(2); // task_create's event, then the deletion's
+    expect(events[0]!.status).toBe("pending");
+    expect(events[1]).toMatchObject({ id: "1", subject: "throwaway", status: "deleted", activeForm: "Deleting it" });
+    // The store itself no longer has the task — the event fired for a task that is now gone.
+    expect(store.list("s")).toHaveLength(0);
+  });
+
+  test("task_update status 'deleted' on an unknown id emits no event", async () => {
+    const events: Task[] = [];
+    const store = new TaskStore();
+    const r = buildRegistry(store);
+    const notFound = await r.execute("task_update", { taskId: "999", status: "deleted" }, ctx({ taskEvent: (t) => events.push(t) }));
+    expect(notFound.isError).toBe(true);
+    expect(events).toHaveLength(0);
   });
 
   test("task_create/task_update descriptions steer the model to list-before-create/update (misuse guard)", () => {

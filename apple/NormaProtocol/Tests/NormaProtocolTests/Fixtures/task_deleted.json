@@ -1,0 +1,12 @@
+{
+  "type": "task_updated",
+  "sessionId": "s_1",
+  "threadId": "t_1",
+  "seq": 27,
+  "ts": 1700000000017,
+  "task": {
+    "id": "3",
+    "subject": "throwaway task",
+    "status": "deleted"
+  }
+}

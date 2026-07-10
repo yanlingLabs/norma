@@ -7,8 +7,13 @@ import { anySubagentAlive, subagentElapsedMs, subagentTokens } from "./subagent-
  *  the TTY pinned block switched to task-display's shared `taskGlyph`/sort/collapse so it stays in
  *  lockstep with the Swift window twin). Keyed loosely (Record<string, string>, not
  *  Record<Task["status"], string>) to match how call sites index it with an event payload's
- *  `.status` field (typed `any` at the wire boundary) without fighting TS7053. */
-export const TASK_ICONS: Record<string, string> = { pending: "☐", in_progress: "◐", completed: "☑" };
+ *  `.status` field (typed `any` at the wire boundary) without fighting TS7053.
+ *
+ *  `deleted` (T3 review fix wave 1): a task_updated carrying `status: "deleted"` now reaches this
+ *  non-TTY line too (upsertTask below removes it from the TTY block instead, but the non-TTY path
+ *  is a flat append-only event log, not a live list — it still prints ONE line per event). Without
+ *  this entry the line would render the literal string "undefined" for the glyph. */
+export const TASK_ICONS: Record<string, string> = { pending: "☐", in_progress: "◐", completed: "☑", deleted: "✗" };
 
 /** Non-TTY (piped/`-p`) one-line-per-update literals (2e-iii-b Task 6). Headless consumers parse
  *  these, so they are byte-frozen: `nontty-bytes.test.ts` pins each output exactly, and main.ts's
@@ -43,8 +48,17 @@ export const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", 
  *  task_update) emit one task_updated per task, each carrying that task's full current state —
  *  there is no batch/full-list "reset" event (unlike e.g. Claude Code's TodoWrite) — so tracking
  *  the list is just: replace-by-id, or append if this id hasn't been seen yet. Insertion order is
- *  preserved (first-created task stays first) so the block doesn't reshuffle as tasks update. */
+ *  preserved (first-created task stays first) so the block doesn't reshuffle as tasks update.
+ *
+ *  `status: "deleted"` (T3 review fix wave 1) is the one exception to "upsert": task_update's
+ *  deleted branch (packages/core/src/agent/tools/tasks.ts) now emits a task_updated carrying this
+ *  status right before the daemon's TaskStore actually removes the task, so the pinned block must
+ *  REMOVE the entry instead of upserting a phantom row that would otherwise live forever (the
+ *  daemon never sends a follow-up event once a task is gone). `renderTaskBlock`'s count header
+ *  (`taskCountsLine`) is computed over whatever this function returns, so removing here is
+ *  sufficient for the header to recount correctly too — no separate accounting needed. */
 export function upsertTask(tasks: Task[], task: Task): Task[] {
+  if (task.status === "deleted") return tasks.filter((t) => t.id !== task.id);
   const idx = tasks.findIndex((t) => t.id === task.id);
   if (idx === -1) return [...tasks, task];
   const next = tasks.slice();

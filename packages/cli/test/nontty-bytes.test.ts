@@ -19,6 +19,13 @@ describe("NONTTY_TASK_LINE — task_updated non-TTY line", () => {
   test("exact raw bytes (no interpolation) for the common in_progress case", () => {
     expect(NONTTY_TASK_LINE("in_progress", "Building the parser")).toBe("\x1b[2m◐ Building the parser\x1b[0m\n");
   });
+
+  // T3 review fix wave 1: task_update{status:"deleted"} now emits a task_updated event, so this
+  // non-TTY (append-only) line renders it too — pinned so it never regresses to the literal
+  // string "undefined" for the glyph.
+  test("deleted glyph, dim-wrapped, trailing newline", () => {
+    expect(NONTTY_TASK_LINE("deleted", "Throwaway task")).toBe(`${DIM}✗ Throwaway task${RESET}\n`);
+  });
 });
 
 describe("NONTTY_SPAWN_LINE — thread_started non-TTY line", () => {

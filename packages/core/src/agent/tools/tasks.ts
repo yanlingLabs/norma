@@ -3,7 +3,7 @@ import type { Task } from "@norma/protocol";
 import type { ToolRegistry } from "./registry";
 import type { TaskStore } from "../task-store";
 
-const ICONS = { pending: "☐", in_progress: "◐", completed: "☑" } as const;
+const ICONS = { pending: "☐", in_progress: "◐", completed: "☑", deleted: "✗" } as const;
 
 const TaskCreateArgsSchema = z.object({ subject: z.string().min(1), description: z.string().min(1), activeForm: z.string().optional() });
 const TaskUpdateArgsSchema = z.object({
@@ -31,12 +31,17 @@ export function registerTaskTools(r: ToolRegistry, deps: { tasks: TaskStore }): 
     args: TaskUpdateArgsSchema,
     run({ taskId, status, subject, activeForm }: z.infer<typeof TaskUpdateArgsSchema>, ctx) {
       if (status === "deleted") {
-        const existed = deps.tasks.delete(ctx.sessionId, taskId);
-        if (!existed) throw new Error(`no such task: ${taskId}`);
-        // Terminal removal, not a status transition — @norma/protocol's Task.status enum has no
-        // "deleted" value, so there is no task_updated event that could represent this without
-        // either widening the protocol (out of scope, zero-drift constraint) or lying on the wire
-        // with an existing status. The task simply stops appearing in task_list.
+        // T3 review fix wave 1: @norma/protocol's Task.status enum now HAS a "deleted" value
+        // (events.ts's TaskSchema) — emit a task_updated event carrying it BEFORE the terminal
+        // TaskStore.delete() removal, mirroring the update branch below (`build the task, emit,
+        // then mutate`). Live task views (CLI pinned block, app SessionModel) key off this event
+        // to REMOVE the task instead of upserting a phantom entry that outlives the delete.
+        // `update()` both builds the full Task object (id/subject/status/activeForm) with the
+        // new status AND doubles as the existence check — undefined means the id is unknown.
+        const deleted = deps.tasks.update(ctx.sessionId, taskId, { status: "deleted" });
+        if (!deleted) throw new Error(`no such task: ${taskId}`);
+        ctx.taskEvent?.(deleted);
+        deps.tasks.delete(ctx.sessionId, taskId);
         return `Task #${taskId} deleted`;
       }
       const patch: { status?: Task["status"]; subject?: typeof subject; activeForm?: typeof activeForm } = {};

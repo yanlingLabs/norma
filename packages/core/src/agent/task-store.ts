@@ -44,11 +44,12 @@ export class TaskStore {
     return next;
   }
 
-  /** Terminal removal — @norma/protocol's Task.status enum has no "deleted" value, so (per the
-   *  task_create/task_update tool's design) deletion is modeled as OUTRIGHT REMOVAL from the
-   *  store rather than an update to a "deleted" status: emitting a task_updated event with a
-   *  fabricated status the wire schema doesn't declare would misrepresent the protocol. Returns
-   *  false (no-op) if the id doesn't exist. */
+  /** Terminal removal from the store's live map (the tool caller — tasks.ts's task_update
+   *  "deleted" branch — emits a task_updated event with `status: "deleted"` via `update()` BEFORE
+   *  calling this, so live task views see the removal on the wire; T3 review fix wave 1,
+   *  @norma/protocol's Task.status enum now has a "deleted" value). This method itself still just
+   *  drops the id from the map/description store — no event, no return value beyond the
+   *  existed/didn't-exist boolean. Returns false (no-op) if the id doesn't exist. */
   delete(sessionId: string, id: string): boolean {
     const existed = this.forSession(sessionId).delete(id);
     this.descFor(sessionId).delete(id);

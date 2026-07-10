@@ -86,7 +86,12 @@ export const QuestionSchema = z.object({
 });
 export const TaskSchema = z.object({
   id: z.string().min(1), subject: z.string().min(1),
-  status: z.enum(["pending", "in_progress", "completed"]), activeForm: z.string().optional(),
+  // "deleted" (T3 review fix wave 1): task_update{status:"deleted"} emits a task_updated event
+  // carrying this status BEFORE the task is removed from the session's TaskStore, so live task
+  // views (CLI pinned block, app SessionModel) can react by REMOVING the task instead of
+  // upserting a phantom entry that outlives the delete. Terminal — no event ever transitions a
+  // task OUT of "deleted".
+  status: z.enum(["pending", "in_progress", "completed", "deleted"]), activeForm: z.string().optional(),
 });
 export type QuestionOption = z.infer<typeof QuestionOptionSchema>;
 export type Question = z.infer<typeof QuestionSchema>;
