@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ToolRegistry } from "../../../src/agent/tools/registry";
@@ -17,6 +17,32 @@ describe("ssrfGuard", () => {
       expect(ssrfGuard(bad)).not.toBeNull();
     }
     expect(ssrfGuard("https://example.com/page")).toBeNull();
+  });
+
+  test("rejects trailing-dot FQDN bypass of localhost/.local/IPv4 checks", () => {
+    for (const bad of ["http://localhost./x", "http://foo.local./x", "http://10.0.0.1./x"]) {
+      expect(ssrfGuard(bad)).not.toBeNull();
+    }
+  });
+
+  test("still allows a trailing dot on a genuinely public hostname", () => {
+    expect(ssrfGuard("https://example.com.")).toBeNull();
+  });
+
+  test("rejects bracketed IPv6 link-local/unique-local literals (brackets previously made these structurally dead)", () => {
+    for (const bad of ["http://[fe80::1]/", "http://[fc00::1]/", "http://[fd12:3456::1]/"]) {
+      expect(ssrfGuard(bad)).not.toBeNull();
+    }
+  });
+
+  test("rejects IPv4-mapped IPv6 loopback/private addresses (dotted and canonical hex forms)", () => {
+    for (const bad of ["http://[::ffff:127.0.0.1]/", "http://[::ffff:7f00:1]/", "http://[::ffff:10.0.0.5]/"]) {
+      expect(ssrfGuard(bad)).not.toBeNull();
+    }
+  });
+
+  test("rejects the IPv6 unspecified address", () => {
+    expect(ssrfGuard("http://[::]/")).not.toBeNull();
   });
 });
 
@@ -102,6 +128,18 @@ describe("followRedirects", () => {
     if (!res.ok) expect(res.kind).toBe("redirects");
   });
 
+  test("public first hop redirecting into an IPv4-mapped IPv6 loopback is refused mid-chain", async () => {
+    const fetchFn = fakeFetch([{ status: 302, location: "http://[::ffff:127.0.0.1]/" }]);
+    const res = await followRedirects("https://example.com", { fetchFn });
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.kind).toBe("ssrf");
+      const expected = ssrfGuard("http://[::ffff:127.0.0.1]/");
+      expect(expected).not.toBeNull();
+      expect(res.error).toBe(expected as string);
+    }
+  });
+
   test("non-2xx after redirects resolve is 'fetch failed: <status>'", async () => {
     const fetchFn = fakeFetch([{ status: 404, body: "not found" }]);
     const res = await followRedirects("https://example.com/missing", { fetchFn });
@@ -176,6 +214,37 @@ describe("web_fetch tool", () => {
     expect(out.isError).toBe(true);
     expect(out.output).toBe("fetch failed: 500");
     expect(audited[0]).toMatchObject({ outcome: "http_error" });
+  });
+
+  test("audit includes finalUrl (distinct from requested url) when a redirect chain resolves elsewhere", async () => {
+    const r = new ToolRegistry();
+    const audited: Record<string, unknown>[] = [];
+    registerWebTools(r, {
+      audit: (l) => audited.push(l),
+      fetchFn: fakeFetch([
+        { status: 302, location: "https://example.com/final" },
+        { status: 200, body: "final body", contentType: "text/plain" },
+      ]),
+    });
+    const dir = tmp();
+    const out = await r.execute("web_fetch", { url: "https://example.com/start" }, { cwd: dir, roots: [dir], sessionId: "s1", tmpDir: dir });
+    expect(out.isError).toBe(false);
+    expect(audited[0]).toMatchObject({ url: "https://example.com/start", finalUrl: "https://example.com/final", outcome: "ok" });
+  });
+
+  test("a successful fetch followed by a file-write failure is audited as write_error, not network_error", async () => {
+    const r = new ToolRegistry();
+    const audited: Record<string, unknown>[] = [];
+    registerWebTools(r, { audit: (l) => audited.push(l), fetchFn: fakeFetch([{ status: 200, body: "x", contentType: "text/plain" }]) });
+    const dir = tmp();
+    // ctx.tmpDir points INTO a regular file — mkdirSync(recursive) throws ENOTDIR, simulating a
+    // write-time failure that happens strictly after the fetch already succeeded.
+    const blockerFile = join(dir, "not-a-dir");
+    writeFileSync(blockerFile, "x");
+    const badTmpDir = join(blockerFile, "sub");
+    const out = await r.execute("web_fetch", { url: "https://example.com/" }, { cwd: dir, roots: [dir], sessionId: "s1", tmpDir: badTmpDir });
+    expect(out.isError).toBe(true);
+    expect(audited[0]).toMatchObject({ outcome: "write_error" });
   });
 
   test("missing ctx.tmpDir is a typed error (audited too)", async () => {

@@ -11,17 +11,56 @@ const MAX_REDIRECT_HOPS = 3;
 // module-level, per-process — names saved files webfetch-<n>-<host>.md (USER DESIGN, task-5-brief.md)
 let fetchCounter = 0;
 
+/** First-two-octets private/loopback/link-local IPv4 check — shared by literal IPv4 hosts
+ *  (`10.0.0.1`) AND IPv4-mapped IPv6 addresses (`::ffff:10.0.0.1` / its canonical hex form
+ *  `::ffff:a00:1`), which resolve to the exact same 32-bit address and must not evade the guard
+ *  just because they're spelled as IPv6. */
+function ipv4Refusal(a: number, b: number): string | null {
+  if (a === 127 || a === 10 || a === 0 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254)) {
+    return `refusing to fetch a private address`;
+  }
+  return null;
+}
+
 /** Norma's ONLY sanctioned network egress (spec 4g §4.3) — bash stays sandboxed (network denied).
  *  v1 SSRF posture: literal private/loopback/link-local hosts rejected; DNS-rebinding is out of
  *  scope (documented). Response bytes are DATA, never instructions. */
 export function ssrfGuard(raw: string): string | null {
   let u: URL; try { u = new URL(raw); } catch { return `invalid url: ${raw}`; }
   if (u.protocol !== "http:" && u.protocol !== "https:") return `only http(s) urls are allowed`;
-  const h = u.hostname.toLowerCase();
-  if (h === "localhost" || h.endsWith(".local") || h === "0.0.0.0" || h === "::1" || h === "[::1]") return `refusing to fetch a local address`;
+
+  let h = u.hostname.toLowerCase();
+  // Trailing-dot FQDN normalization: "localhost." / "10.0.0.1." are the SAME address as their
+  // dot-less forms (a trailing dot is just the DNS root label) but defeat `h === "localhost"` /
+  // the IPv4 regex if left as-is. Strip ONE trailing dot before every check below.
+  if (h.endsWith(".")) h = h.slice(0, -1);
+  // IPv6 literals arrive bracketed from URL.hostname ("[fe80::1]") — unwrap BEFORE any check,
+  // else every prefix/equality check below is structurally dead (nothing starts with "fc" once
+  // bracketed).
+  if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, -1);
+
+  if (h === "localhost" || h.endsWith(".local") || h === "0.0.0.0") return `refusing to fetch a local address`;
+
   const ip4 = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
-  if (ip4) { const [a, b] = [Number(ip4[1]), Number(ip4[2])];
-    if (a === 127 || a === 10 || a === 0 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254)) return `refusing to fetch a private address`; }
+  if (ip4) { const refusal = ipv4Refusal(Number(ip4[1]), Number(ip4[2])); if (refusal) return refusal; }
+
+  // IPv6 loopback / unspecified.
+  if (h === "::1" || h === "::" || (h.includes(":") && h.split(":").every((g) => g === "" || /^0+$/.test(g)))) {
+    return `refusing to fetch a local address`;
+  }
+
+  // IPv4-mapped IPv6 (`::ffff:a.b.c.d`, or its canonical hex form `::ffff:XXXX:YYYY` — the form
+  // URL.hostname actually normalizes to) resolves to a real IPv4 address and must be checked
+  // against the SAME private-range table as literal IPv4 hosts (the textbook v4-blocklist bypass).
+  const mappedDotted = h.match(/^::ffff:(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (mappedDotted) { const refusal = ipv4Refusal(Number(mappedDotted[1]), Number(mappedDotted[2])); if (refusal) return refusal; }
+  const mappedHex = h.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (mappedHex) {
+    const g1 = parseInt(mappedHex[1]!, 16);
+    const refusal = ipv4Refusal((g1 >> 8) & 0xff, g1 & 0xff);
+    if (refusal) return refusal;
+  }
+
   if (h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80")) return `refusing to fetch a private address`;
   return null;
 }
@@ -91,7 +130,9 @@ export interface FollowRedirectsOptions {
   maxHops?: number;
 }
 export interface FetchSuccess { ok: true; url: string; status: number; contentType: string; body: string; bytesRead: number }
-export interface FetchFailure { ok: false; error: string; kind: "ssrf" | "redirects" | "http" | "timeout" | "network" }
+// `url` is the current/last-attempted hop — needed so callers can audit the FINAL resolved
+// address on a failure that happens mid-redirect-chain, not just the originally-requested one.
+export interface FetchFailure { ok: false; error: string; kind: "ssrf" | "redirects" | "http" | "timeout" | "network"; url: string }
 export type FollowResult = FetchSuccess | FetchFailure;
 
 /** SSRF-guarded manual-redirect loop: guards EVERY hop (including the first) — a compliant first
@@ -103,7 +144,7 @@ export async function followRedirects(startUrl: string, opts: FollowRedirectsOpt
   let current = startUrl;
   for (let redirects = 0; ; redirects++) {
     const guardErr = ssrfGuard(current);
-    if (guardErr) return { ok: false, error: guardErr, kind: "ssrf" };
+    if (guardErr) return { ok: false, error: guardErr, kind: "ssrf", url: current };
 
     let res: Response;
     try {
@@ -111,19 +152,19 @@ export async function followRedirects(startUrl: string, opts: FollowRedirectsOpt
     } catch (e) {
       const name = e instanceof Error ? e.name : "";
       if (name === "AbortError" || name === "TimeoutError") {
-        return { ok: false, error: `request timed out fetching ${current}`, kind: "timeout" };
+        return { ok: false, error: `request timed out fetching ${current}`, kind: "timeout", url: current };
       }
-      return { ok: false, error: `fetch failed: ${e instanceof Error ? e.message : String(e)}`, kind: "network" };
+      return { ok: false, error: `fetch failed: ${e instanceof Error ? e.message : String(e)}`, kind: "network", url: current };
     }
 
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get("location");
-      if (!loc) return { ok: false, error: `redirect (${res.status}) with no Location header`, kind: "http" };
-      if (redirects >= maxHops) return { ok: false, error: `too many redirects (>${maxHops} hops)`, kind: "redirects" };
+      if (!loc) return { ok: false, error: `redirect (${res.status}) with no Location header`, kind: "http", url: current };
+      if (redirects >= maxHops) return { ok: false, error: `too many redirects (>${maxHops} hops)`, kind: "redirects", url: current };
       current = new URL(loc, current).toString();
       continue;
     }
-    if (res.status < 200 || res.status >= 300) return { ok: false, error: `fetch failed: ${res.status}`, kind: "http" };
+    if (res.status < 200 || res.status >= 300) return { ok: false, error: `fetch failed: ${res.status}`, kind: "http", url: current };
 
     const contentType = res.headers.get("content-type") ?? "";
     const { text, bytesRead } = await readCapped(res, MAX_FETCH_BYTES);
@@ -156,6 +197,10 @@ export function registerWebTools(r: ToolRegistry, deps: WebToolDeps = {}): void 
     deferred: true, // T1 machinery, per-def flag — same pattern as task_get
     async run({ url }, ctx) {
       let outcome = "network_error";
+      // Last hop's resolved URL (from followRedirects — set on BOTH success and failure, since a
+      // failure can happen mid-redirect-chain too). Audited alongside the originally-requested
+      // `url` when it differs, so a redirect chain's actual source is never silently dropped.
+      let finalUrl: string | undefined;
       try {
         if (!ctx.tmpDir) {
           outcome = "no_tmp_dir";
@@ -165,6 +210,7 @@ export function registerWebTools(r: ToolRegistry, deps: WebToolDeps = {}): void 
         const signal = AbortSignal.any([ctx.signal, timeoutSignal].filter((s): s is AbortSignal => Boolean(s)));
 
         const res = await followRedirects(url, { fetchFn: deps.fetchFn, signal });
+        finalUrl = res.url;
         if (!res.ok) {
           outcome = res.kind === "ssrf" ? "ssrf_refused"
             : res.kind === "timeout" ? "timeout"
@@ -173,6 +219,9 @@ export function registerWebTools(r: ToolRegistry, deps: WebToolDeps = {}): void 
             : "network_error";
           throw new Error(res.error);
         }
+        // Fetch succeeded — anything that throws past this point (e.g. the file write below) is a
+        // local/write failure, not a network one, so it must not be mislabeled "network_error".
+        outcome = "fetched";
 
         const isHtml = res.contentType.toLowerCase().includes("text/html");
         const finalText = isHtml ? htmlToText(res.body) : res.body;
@@ -180,9 +229,15 @@ export function registerWebTools(r: ToolRegistry, deps: WebToolDeps = {}): void 
 
         const host = new URL(res.url).hostname.toLowerCase().replace(/[^a-z0-9.-]/g, "_");
         const filename = `webfetch-${++fetchCounter}-${host}.md`;
-        mkdirSync(ctx.tmpDir, { recursive: true });
-        const savedPath = join(ctx.tmpDir, filename);
-        writeFileSync(savedPath, finalText);
+        let savedPath: string;
+        try {
+          mkdirSync(ctx.tmpDir, { recursive: true });
+          savedPath = join(ctx.tmpDir, filename);
+          writeFileSync(savedPath, finalText);
+        } catch (e) {
+          outcome = "write_error";
+          throw e;
+        }
 
         const savedBytes = Buffer.byteLength(finalText, "utf8");
         const preview = Buffer.from(finalText, "utf8").subarray(0, PREVIEW_BYTES).toString("utf8");
@@ -198,7 +253,11 @@ export function registerWebTools(r: ToolRegistry, deps: WebToolDeps = {}): void 
           `Full page saved. Use read with offset/limit to page through it, grep to search it, or spawn_agent to digest it.`,
         ].join("\n");
       } finally {
-        deps.audit?.({ kind: "network", tool: "web_fetch", url, outcome });
+        deps.audit?.({
+          kind: "network", tool: "web_fetch", url,
+          ...(finalUrl !== undefined && finalUrl !== url ? { finalUrl } : {}),
+          outcome,
+        });
       }
     },
   });
