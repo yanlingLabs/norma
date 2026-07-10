@@ -405,7 +405,7 @@ export class AgentEngine {
     loaded: Set<string>;
     excludeTools?: Set<string>;
     allowTools?: Set<string>;
-  }): Promise<{ finalText: string; stopReason: "end_turn" | "aborted" | "error" }> {
+  }): Promise<{ finalText: string; stopReason: "end_turn" | "aborted" | "error"; errorMessage?: string }> {
     const { sessionId, threadId, instructionsFull, input, meta, signal, loaded, excludeTools, allowTools } = opts;
     let cwd = opts.cwd;
     const tsEnabled = this.toolSearchEnabled();
@@ -446,7 +446,12 @@ export class AgentEngine {
         else if (ev.type === "error") {
           this.emit(sessionId, { type: "agent_error", sessionId, threadId, message: ev.message });
           this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "error", ...usage });
-          return { finalText: lastText, stopReason: "error" };
+          // `errorMessage` is consumed ONLY by the spawn bridge below (a CHILD thread's failure
+          // must surface through the parent's tool_result — the agent_error/turn_completed events
+          // just emitted are invisible to the parent model, which only sees the child's return
+          // value). Main-thread callers (turn(), which just `await`s runThread without touching
+          // the return value) are unaffected — see the grep note in the 4e-fix3 report.
+          return { finalText: lastText, stopReason: "error", errorMessage: ev.message };
         }
       }
 
@@ -490,8 +495,33 @@ export class AgentEngine {
           const agentType = typeof parsed.agentType === "string" ? parsed.agentType : undefined;
           const modelOverride = typeof parsed.model === "string" ? parsed.model : undefined;
           const description = typeof parsed.description === "string" ? parsed.description : undefined;
-          const childId = "th_" + randomUUID().slice(0, 8);
           const def = this.cfg.agents!.resolve(agentType, opts.cwd);
+
+          // Defect 1 (4e gate F9): validate an EXPLICIT model override — modelOverride (the
+          // calling model's own tool arg) or def.model (an agent-def's configured override), NOT
+          // opts.model, which is the inherited parent-thread model and is already
+          // resolver-validated (turn()'s sel.model / manager.ts's liveModel) — BEFORE emitting
+          // thread_started or registering the thread. A provider whose models() enumerates a
+          // known set (codex-oauth: the gpt-5.6 trio) rejects an override outside that set as a
+          // typed error tool_result, so a hallucinated model id (e.g. "gpt-5-mini") fails fast
+          // instead of spawning a child whose provider call 404s. A provider with an EMPTY
+          // models() (openai-compatible with no static `models` configured, i.e. an arbitrary
+          // endpoint the provider can't enumerate) can't validate anything, so the override
+          // passes through unchanged — same as before this fix.
+          const effectiveOverride = modelOverride ?? def.model;
+          if (effectiveOverride !== undefined) {
+            const known = this.cfg.provider.provider.models();
+            if (known.length > 0 && !known.some((m) => m.id === effectiveOverride)) {
+              const ids = known.map((m) => m.id).join(", ");
+              spawnOutcomes.set(call.callId, {
+                output: `unknown model '${effectiveOverride}' — available models: ${ids}; omit \`model\` to inherit the session's model`,
+                isError: true,
+              });
+              return; // no thread_started, no thread registry entry, no subagents.run slot
+            }
+          }
+
+          const childId = "th_" + randomUUID().slice(0, 8);
           this.emit(sessionId, {
             type: "thread_started", sessionId, threadId: childId, parentThreadId: threadId,
             agentType: agentType ?? "general-purpose", prompt, description,
@@ -508,7 +538,7 @@ export class AgentEngine {
               instructionsFull,
               input: [{ type: "message", role: "user", content: prompt }], // FRESH — no parent history
               cwd: opts.cwd,
-              model: modelOverride ?? def.model ?? opts.model,
+              model: effectiveOverride ?? opts.model,
               // Subagents inherit the PARENT thread's resolved reasoning effort — no per-agent-def
               // override (agent defs only carry a model override, never an effort one).
               reasoningEffort: opts.reasoningEffort,
@@ -523,9 +553,17 @@ export class AgentEngine {
           const stopReason = result.ok ? result.value.stopReason : "error";
           this.emit(sessionId, { type: "thread_completed", sessionId, threadId: childId, stopReason });
           this.completeThread(sessionId, childId, stopReason);
-          spawnOutcomes.set(call.callId, result.ok
-            ? { output: result.value.finalText || "the subagent finished without a final message", isError: false }
-            : { output: `subagent (${agentType ?? "general-purpose"}) ${result.error}`, isError: true });
+          // Defect 2 (4e gate F10): a child that ran to completion (result.ok) but whose OWN
+          // final round hit a provider error (runThread's error branch, stopReason "error") must
+          // be reported to the parent as a FAILURE, not as a quiet "finished without a final
+          // message" success — the parent's tool_result is the only channel a child has back to
+          // its caller (unlike the main thread, whose agent_error event the user sees directly).
+          // The `!result.ok` branch (SubagentManager timeout / thrown error) is unchanged.
+          spawnOutcomes.set(call.callId, !result.ok
+            ? { output: `subagent (${agentType ?? "general-purpose"}) ${result.error}`, isError: true }
+            : result.value.stopReason === "error"
+              ? { output: `subagent (${agentType ?? "general-purpose"}) failed: ${result.value.errorMessage ?? "provider error"}`, isError: true }
+              : { output: result.value.finalText || "the subagent finished without a final message", isError: false });
         }));
       }
 
@@ -644,9 +682,10 @@ export class AgentEngine {
       }
     }
 
-    this.emit(sessionId, { type: "agent_error", sessionId, threadId, message: `tool-iteration cap (${MAX_TOOL_ITERATIONS}) reached` });
+    const capMessage = `tool-iteration cap (${MAX_TOOL_ITERATIONS}) reached`;
+    this.emit(sessionId, { type: "agent_error", sessionId, threadId, message: capMessage });
     this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "error", ...usage });
-    return { finalText: lastText, stopReason: "error" };
+    return { finalText: lastText, stopReason: "error", errorMessage: capMessage };
   }
 
   /** Shared approval-request flow for the `ask`-policy path, the reviewer's escalation path, and

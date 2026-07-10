@@ -294,6 +294,116 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     expect(asText).toContain("second question");
   });
 
+  // 4e gate fix loop 2 — Defect 1: spawn_agent model override validated against the calling
+  // provider's own models() BEFORE thread_started/registerThread/subagents.run (a hallucinated
+  // override must fail fast as a typed tool_result, not spawn a child that 404s).
+  const TRIO_MODELS = [
+    { id: "gpt-5.6-sol", family: "gpt-5", contextWindow: 100_000, supportsVision: false },
+    { id: "gpt-5.6-terra", family: "gpt-5", contextWindow: 100_000, supportsVision: false },
+    { id: "gpt-5.6-luna", family: "gpt-5", contextWindow: 100_000, supportsVision: false },
+  ];
+
+  test("spawn with unknown model override vs a provider whose models() = the 5.6 trio → typed error tool_result, no thread_started, child never runs", async () => {
+    const script = [
+      [spawnCall("s1", "do X", { model: "gpt-5-mini" }), done("tool_calls")],
+      text("parent noticed the failure and wrapped up"),
+    ];
+    const provider = new FakeProvider(script, TRIO_MODELS);
+    const { engine, store, sessionId } = setup(script, { provider });
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(events.some((e) => e.type === "thread_started")).toBe(false);
+    expect(events.some((e) => e.type === "thread_completed")).toBe(false);
+
+    const result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(result).toMatchObject({ isError: true });
+    const output = (result as Extract<SessionEvent, { type: "tool_result" }>).output;
+    expect(output).toContain("gpt-5-mini");
+    expect(output).toContain("gpt-5.6-sol");
+    expect(output).toContain("gpt-5.6-terra");
+    expect(output).toContain("gpt-5.6-luna");
+
+    // No child dispatch at all — only the parent's own two rounds (spawn, then continuation
+    // after the typed-error tool_result) hit the provider.
+    expect(provider.requests.length).toBe(2);
+  });
+
+  test("spawn with a valid model override (in the provider's models()) passes through to the child's TurnRequest.model", async () => {
+    const script = [
+      [spawnCall("s1", "do X", { model: "gpt-5.6-terra" }), done("tool_calls")],
+      text("child final report"),
+      text("parent wrap-up"),
+    ];
+    const provider = new FakeProvider(script, TRIO_MODELS);
+    const { engine, store, sessionId } = setup(script, { provider });
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(events.some((e) => e.type === "thread_started")).toBe(true);
+    const toolResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(toolResult).toMatchObject({ isError: false, output: "child final report" });
+
+    expect(provider.requests[1]!.model).toBe("gpt-5.6-terra");
+  });
+
+  test("provider with EMPTY models() → an arbitrary spawn model override passes through unchecked", async () => {
+    const script = [
+      [spawnCall("s1", "do X", { model: "totally-made-up-model" }), done("tool_calls")],
+      text("child final report"),
+      text("parent wrap-up"),
+    ];
+    const provider = new FakeProvider(script, []); // e.g. openai-compatible with no static `models` configured
+    const { engine, store, sessionId } = setup(script, { provider });
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(events.some((e) => e.type === "thread_started")).toBe(true);
+    const toolResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(toolResult).toMatchObject({ isError: false, output: "child final report" });
+
+    expect(provider.requests[1]!.model).toBe("totally-made-up-model");
+  });
+
+  // 4e gate fix loop 2 — Defect 2: a child whose OWN final round hits a provider error must
+  // surface to the parent as an isError tool_result (not the silent "finished without a final
+  // message" success), and thread_completed must still carry stopReason "error".
+  test("child provider stream error → parent tool_result isError:true with the error message, thread_completed stopReason error", async () => {
+    class ErrorOnChildCall implements Provider {
+      readonly id = "fake";
+      private call = 0;
+      models() { return [{ id: "fake-1", family: "fake", contextWindow: 100_000, supportsVision: false }]; }
+      async *streamTurn(): AsyncIterable<ProviderEvent> {
+        const n = this.call++;
+        if (n === 0) {
+          // parent round 0: spawns the child
+          yield spawnCall("s1", "do X");
+          yield done("tool_calls");
+          return;
+        }
+        if (n === 1) {
+          // the child's only round: the provider itself errors (e.g. a 404 on an unknown model)
+          yield { type: "error", code: "server", message: "upstream 404: model not found" };
+          return;
+        }
+        // n >= 2: the parent's own continuation round, after the child's isError tool_result
+        // comes back — lets the parent's turn actually finish.
+        yield { type: "text_delta", delta: "parent wrapped up despite the child's failure" };
+        yield done("end_turn");
+      }
+    }
+    const { engine, store, sessionId } = setup([], { provider: new ErrorOnChildCall() });
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const completed = events.find((e) => e.type === "thread_completed");
+    expect(completed).toMatchObject({ stopReason: "error" });
+
+    const result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(result).toMatchObject({ isError: true });
+    expect((result as Extract<SessionEvent, { type: "tool_result" }>).output).toContain("upstream 404: model not found");
+  });
+
   test("child-thread deltas carry the child threadId, not main", async () => {
     const { engine, sessionId, events } = setup([
       [spawnCall("c1", "do a thing"), done("tool_calls")],
