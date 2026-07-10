@@ -95,4 +95,50 @@ describe("ask_user tool", () => {
     expect(out.isError).toBe(false);
     expect(out.output).toContain("Proceed with your best judgment");
   });
+
+  // CC AskUserQuestion parity (Task 2): option preview, single-select only.
+  test("option preview accepted on a single-select question", async () => {
+    const r = buildRegistry();
+    const out = await r.execute(
+      "ask_user",
+      { questions: [Q({ options: [{ label: "A", description: "Option A", preview: "diff A" }, { label: "B", description: "Option B" }] })] },
+      ctx({ ask: async () => ({ answers: { "Pick one": "A" }, by: "cli" }) }),
+    );
+    expect(out.isError).toBe(false);
+    expect(out.output).toContain("Pick: A");
+  });
+
+  test("option preview + multiSelect:true → invalid args", async () => {
+    const r = buildRegistry();
+    const out = await r.execute(
+      "ask_user",
+      { questions: [Q({ multiSelect: true, options: [{ label: "A", description: "Option A", preview: "diff A" }, { label: "B", description: "Option B" }] })] },
+      ctx(),
+    );
+    expect(out.isError).toBe(true);
+  });
+
+  test("ask outcome with notes → tool result includes the note text verbatim", async () => {
+    const r = buildRegistry();
+    const out = await r.execute(
+      "ask_user",
+      { questions: [Q()] },
+      ctx({ ask: async () => ({ answers: { "Pick one": "B" }, notes: { "Pick one": "prefer B for perf" }, by: "cli" }) }),
+    );
+    expect(out.isError).toBe(false);
+    expect(out.output).toContain("Pick: B");
+    expect(out.output).toContain('[user note on "Pick one": prefer B for perf]');
+  });
+
+  // (d) no-preview/no-notes path unchanged — locks the exact byte shape of the pre-existing
+  // "formats answers by header" output so the notes-folding addition never perturbs it.
+  test("no-notes path is byte-identical to the pre-notes output", async () => {
+    const r = buildRegistry();
+    const out = await r.execute(
+      "ask_user",
+      { questions: [Q()] },
+      ctx({ ask: async () => ({ answers: { "Pick one": "B" }, by: "cli" }) }),
+    );
+    expect(out.output).toBe("User answered:\n- Pick: B");
+  });
 });

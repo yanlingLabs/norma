@@ -35,4 +35,21 @@ describe("QuestionBroker", () => {
     const b = new QuestionBroker();
     expect(b.respond("s", "nope", { Q: "A" }, "cli")).toEqual({ ok: true, alreadyResolved: true });
   });
+
+  // CC AskUserQuestion parity (Task 2): notes flow through wait/respond alongside answers.
+  test("respond with notes → resolved outcome carries notes", async () => {
+    const b = new QuestionBroker();
+    const p = b.wait("s", "c", 5000);
+    expect(b.respond("s", "c", { Q: "A" }, "cli", { Q: "please double-check" })).toEqual({ ok: true, alreadyResolved: false });
+    expect(await p).toEqual({ answers: { Q: "A" }, notes: { Q: "please double-check" }, by: "cli" });
+  });
+
+  test("respond without notes → resolved outcome has no notes key (unchanged shape)", async () => {
+    const b = new QuestionBroker();
+    const p = b.wait("s", "c", 5000);
+    b.respond("s", "c", { Q: "A" }, "cli");
+    const res = await p;
+    expect(res).toEqual({ answers: { Q: "A" }, by: "cli" });
+    expect("notes" in res).toBe(false);
+  });
 });

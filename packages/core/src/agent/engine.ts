@@ -1062,6 +1062,10 @@ export class AgentEngine {
             type: "question_resolved", sessionId, threadId, callId: call.callId,
             answers: "answers" in res ? res.answers : {},
             by: "by" in res ? res.by : "timeout",
+            // CC AskUserQuestion parity: mirror the broker's notes onto the persisted/broadcast
+            // event too (schema-optional, additive) so replay/other clients can see them — the
+            // model-visible copy is folded into the tool's own return string in ask-user.ts.
+            ...("notes" in res && res.notes ? { notes: res.notes } : {}),
           });
           return res;
         }

@@ -1,4 +1,8 @@
-export type AskOutcome = { answers: Record<string, string>; by: string } | { timedOut: true };
+// CC AskUserQuestion parity: `notes` carries optional free-text notes keyed by question text
+// (mirrors QuestionResolvedEvent.notes / AskUserRespondParams.notes, protocol/src/{events,methods}.ts).
+// Optional/additive — omitted entirely (not just undefined) when no notes were given, so existing
+// callers/tests comparing the resolved outcome by equality are unaffected.
+export type AskOutcome = { answers: Record<string, string>; notes?: Record<string, string>; by: string } | { timedOut: true };
 
 /** In-flight ask_user questions, keyed by sessionId+callId. First response wins (mirrors ApprovalBroker). */
 export class QuestionBroker {
@@ -13,13 +17,13 @@ export class QuestionBroker {
     });
   }
 
-  respond(sessionId: string, callId: string, answers: Record<string, string>, by: string): { ok: true; alreadyResolved: boolean } {
+  respond(sessionId: string, callId: string, answers: Record<string, string>, by: string, notes?: Record<string, string>): { ok: true; alreadyResolved: boolean } {
     const k = this.key(sessionId, callId);
     const entry = this.pending.get(k);
     if (!entry) return { ok: true, alreadyResolved: true };
     this.pending.delete(k);
     clearTimeout(entry.timer);
-    entry.resolve({ answers, by });
+    entry.resolve(notes ? { answers, notes, by } : { answers, by });
     return { ok: true, alreadyResolved: false };
   }
 }

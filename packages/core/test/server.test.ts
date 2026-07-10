@@ -466,6 +466,40 @@ describe("daemon IPC", () => {
     c.close();
   });
 
+  // CC AskUserQuestion parity (Task 2): ask_user.respond's optional `notes` param must reach the
+  // QuestionBroker (server.ts's handler passes p.notes through) and end up both on the persisted
+  // question_resolved event and folded into the model-visible tool_result.
+  test("ask_user.respond with notes → question_resolved carries notes + tool result includes the note", async () => {
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const fake = new FakeProvider([
+      [{ type: "tool_call", callId: "q1", name: "ask_user", argsJson: JSON.stringify({
+        questions: [{ question: "Pick one", header: "Pick", options: [{ label: "A", description: "Option A" }, { label: "B", description: "Option B" }], multiSelect: false }],
+      }) }, { type: "done", stopReason: "tool_calls" }],
+      [{ type: "text_delta", delta: "done" }, { type: "done", stopReason: "end_turn" }],
+    ]);
+    await boot({}, fake);
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "ask-noter");
+    const cwd = mkdtempSync(join(tmpdir(), "norma-askuser-notes-"));
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", cwd, approvalPolicy: "auto" });
+    await c.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
+    await c.request(METHODS.sessionSend, { sessionId: created.sessionId, text: "ask, then note" });
+
+    const asked = await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "question_asked");
+    const res1 = await c.request(METHODS.askUserRespond, {
+      sessionId: created.sessionId, callId: asked.params.callId,
+      answers: { "Pick one": "B" }, notes: { "Pick one": "prefer B for perf" },
+    });
+    expect(res1.result).toEqual({ ok: true, alreadyResolved: false });
+
+    const resolved = await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "question_resolved");
+    expect(resolved.params).toMatchObject({ answers: { "Pick one": "B" }, notes: { "Pick one": "prefer B for perf" } });
+
+    const toolResult = await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "tool_result" && n.params.callId === "q1");
+    expect(toolResult.params.output).toContain('[user note on "Pick one": prefer B for perf]');
+    c.close();
+  });
+
   test("plan.respond round-trip + alreadyResolved", async () => {
     const { FakeProvider } = await import("../src/agent/fake-provider");
     const fake = new FakeProvider([
