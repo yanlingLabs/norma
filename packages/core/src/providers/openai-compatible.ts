@@ -4,7 +4,9 @@ import { ResponsesSseParser } from "./responses-sse";
 export interface OpenAICompatibleConfig {
   baseUrl: string;            // e.g. https://api.openai.com/v1
   apiKey: string;
-  models?: ModelInfo[];       // optional static list for UI; not validated
+  models?: ModelInfo[];       // optional static list — when NON-EMPTY it is also an ALLOW-LIST: the
+                              // engine's spawn bridge rejects spawn_agent model overrides not in it
+                              // (4e F9). Leave unset/empty for arbitrary-endpoint passthrough.
   extraHeaders?: Record<string, string>;
 }
 

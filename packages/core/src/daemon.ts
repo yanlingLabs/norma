@@ -276,7 +276,12 @@ export async function startDaemon(opts: {
       plugins: { disabled: settings?.plugins?.disabled ?? [] },
     });
     const subagents = new SubagentManager({ maxConcurrent: settings?.subagents?.maxConcurrent });
-    registerSpawnAgentTool(registry);
+    // `agentProvider` is already narrowed non-null here (we're inside `if (agentProvider)`), and
+    // its `.provider` is the SAME provider instance the engine's spawn bridge calls .models() on
+    // to validate a spawn_agent model override (4e gate F9) — so this list is exactly what the
+    // bridge will accept. Empty (an openai-compatible provider with no static `models` configured)
+    // → registerSpawnAgentTool falls back to its generic "model: optional model override" wording.
+    registerSpawnAgentTool(registry, { models: agentProvider.provider.models().map((m) => m.id) });
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
     await mcp.startAll(settings?.mcpServers ?? {});
     // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled &&
