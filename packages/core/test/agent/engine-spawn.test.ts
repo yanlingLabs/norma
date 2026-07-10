@@ -24,7 +24,7 @@ import { SkillStore } from "../../src/agent/skills";
 import { Compactor } from "../../src/agent/compactor";
 import { AgentStore } from "../../src/agent/agents";
 import { SubagentManager } from "../../src/agent/subagents";
-import type { Provider, ProviderEvent } from "../../src/providers/types";
+import type { ModelInfo, Provider, ProviderEvent, TurnRequest } from "../../src/providers/types";
 
 export function setup(
   script: ProviderEvent[][],
@@ -785,5 +785,120 @@ describe("AgentEngine: spawn_agent mode (restrict-only, 4h-i Task 2)", () => {
 
     const writeResult = events.find((e) => e.type === "tool_result" && e.callId === "w1");
     expect(writeResult).toMatchObject({ isError: false });
+  });
+
+  // T2 security review: the invariant above ("no mode → the spawn NEVER mutates the shared parent
+  // meta") is pinned for the single-spawn case, but nothing yet proved it for the two CRITICAL
+  // scenarios a copy-vs-mutate regression would actually break: (a) TWO concurrent spawns in one
+  // assistant message, one narrowing + one not — a regression that did
+  // `meta.approvalPolicy = childPolicy; childMeta = meta` (mutating the shared object instead of
+  // copying) would make the FIRST (narrowing) spawn's mutation visible to the SECOND spawn's read
+  // of `meta.approvalPolicy`, since the bridge's per-call setup runs synchronously up to its first
+  // `await` (Promise.all(calls.map(...)) invokes each callback in order; the narrowing spawn's
+  // sync prefix — including the mutation, under the regression — completes before the next spawn's
+  // callback starts); (b) after a narrowing spawn returns, the PARENT's own same-turn continuation
+  // tool call must still see the ORIGINAL policy, not the mutated one. Both pass on the current
+  // (copy-on-narrow) code and both would fail under the regression — see the doc comment on
+  // `childMeta` at engine.ts ~643.
+  test("concurrent spawns, one narrowing + one not: the un-narrowed sibling's write still runs at the parent's ORIGINAL 'auto' policy (narrowing spawn A does not leak into spawn B via shared meta)", async () => {
+    // A custom provider (not the shared script-array harness) because the two children must
+    // behave DIFFERENTLY (child A's write is plan-denied, child B's write is auto-allowed) while
+    // running CONCURRENTLY via Promise.all inside the engine's spawn bridge — dispatch here is
+    // keyed off each request's OWN input content (each child's fresh thread input is exactly
+    // `[{message,user,<prompt>}]` — see the spawn bridge's `input: [{type:"message",...}]`), not
+    // provider-call order, so the test is robust regardless of which child's synchronous setup the
+    // engine happens to run first.
+    class ConcurrentModeProvider implements Provider {
+      readonly id = "fake";
+      readonly requests: TurnRequest[] = [];
+      private parentRound = 0;
+      models(): ModelInfo[] { return [{ id: "fake-1", family: "fake", contextWindow: 100_000, supportsVision: false }]; }
+      async *streamTurn(req: TurnRequest): AsyncIterable<ProviderEvent> {
+        this.requests.push(req);
+        const first = req.input[0] as { type?: string; content?: unknown } | undefined;
+        const isChildA = first?.type === "message" && first.content === "task A";
+        const isChildB = first?.type === "message" && first.content === "task B";
+        if (isChildA || isChildB) {
+          const callId = isChildA ? "wA" : "wB";
+          const path = isChildA ? "a.txt" : "b.txt";
+          if (req.input.length === 1) {
+            // this child's first round: attempt a write
+            yield { type: "tool_call", callId, name: "write", argsJson: JSON.stringify({ path, content: "y" }) };
+            yield done("tool_calls");
+          } else {
+            // this child's second round, after the write's tool_result comes back: wrap up
+            yield { type: "text_delta", delta: `${isChildA ? "child A" : "child B"} wrap-up` };
+            yield done("end_turn");
+          }
+          return;
+        }
+        // the PARENT thread's own rounds — its own input never has input[0].content === "task A"/
+        // "task B" (its history holds the spawn_agent function_calls, not the children's fresh
+        // per-thread user messages), so it always falls through to here.
+        const n = this.parentRound++;
+        if (n === 0) {
+          yield spawnCall("s1", "task A", { mode: "plan" }); // narrowing
+          yield spawnCall("s2", "task B"); // no mode
+          yield done("tool_calls");
+          return;
+        }
+        yield { type: "text_delta", delta: "parent wrap-up" };
+        yield done("end_turn");
+      }
+    }
+    const { engine, store, sessionId } = setup([], { provider: new ConcurrentModeProvider(), approvalPolicy: "auto" });
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    // both children ran to completion
+    expect(events.filter((e) => e.type === "thread_started").length).toBe(2);
+    expect(events.filter((e) => e.type === "thread_completed").length).toBe(2);
+
+    // child A (mode: "plan") — its write was plan-denied
+    const wA = events.find((e) => e.type === "tool_result" && e.callId === "wA");
+    expect(wA).toMatchObject({ isError: true });
+    expect((wA as Extract<SessionEvent, { type: "tool_result" }>).output).toContain("Blocked in plan mode");
+
+    // child B (no mode) — its write was NOT plan-denied; it ran under the parent's original "auto"
+    // policy, proving A's narrowing never leaked into B via the shared `meta` object
+    const wB = events.find((e) => e.type === "tool_result" && e.callId === "wB");
+    expect(wB).toMatchObject({ isError: false });
+
+    // sanity: the parent's own session policy is untouched
+    expect(store.meta(sessionId).approvalPolicy).toBe("auto");
+  });
+
+  test("after a narrowing (mode: 'plan') spawn returns, the PARENT's own same-turn write is still gated at the parent's ORIGINAL 'auto' policy, not the child's narrowed 'plan'", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "do X", { mode: "plan" }), done("tool_calls")], // parent round 0: spawn, narrowing mode
+      text("child final report"), // the child's only round, running under the narrowed "plan" policy
+      // the parent's OWN continuation round makes its OWN write call — must still be gated under
+      // the session's ORIGINAL "auto" policy, NOT the child's narrowed "plan". If the spawn bridge
+      // had mutated the shared `meta` object in place (regression: `meta.approvalPolicy =
+      // childPolicy; childMeta = meta`) instead of copying, this call would see "plan" and be
+      // denied ("Blocked in plan mode") even though the PARENT itself was never narrowed.
+      [{ type: "tool_call", callId: "p1", name: "write", argsJson: JSON.stringify({ path: "after.txt", content: "z" }) }, done("tool_calls")],
+      text("parent wrap-up"),
+    ];
+    const { engine, store, sessionId } = setup(script, { approvalPolicy: "auto" });
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const completed = events.find((e) => e.type === "thread_completed");
+    expect(completed).toMatchObject({ stopReason: "end_turn" });
+
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({ isError: false, output: "child final report" });
+
+    // the parent's post-spawn write was NOT plan-denied — proof the narrowing spawn didn't corrupt
+    // the parent's own `meta.approvalPolicy` for the rest of the turn
+    const p1Result = events.find((e) => e.type === "tool_result" && e.callId === "p1");
+    expect(p1Result).toMatchObject({ isError: false });
+
+    const mainTurnCompleted = events.find((e) => e.type === "turn_completed" && e.threadId === "main");
+    expect(mainTurnCompleted).toMatchObject({ stopReason: "end_turn" });
+
+    // the session's persisted policy is untouched (only enter/exit_plan_mode ever calls setPolicy)
+    expect(store.meta(sessionId).approvalPolicy).toBe("auto");
   });
 });
