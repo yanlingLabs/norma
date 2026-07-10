@@ -97,7 +97,7 @@ const text = (t: string): ProviderEvent[] => [{ type: "text_delta", delta: t }, 
 // don't all need individual edits; `extra.description` still overrides it (see the "description
 // rides thread_started" test below). The dedicated "without description" test constructs its
 // tool_call by hand, bypassing this default, to pin the required-arg behavior itself.
-const spawnCall = (callId: string, prompt: string, extra?: { agentType?: string; model?: string; description?: string }): ProviderEvent =>
+const spawnCall = (callId: string, prompt: string, extra?: { agentType?: string; model?: string; description?: string; max_turns?: number }): ProviderEvent =>
   ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "test task", ...extra }) });
 
 describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
@@ -552,5 +552,121 @@ describe("AgentEngine: subagent ToolSearch-load-then-call (4g final-review fix)"
     expect(callResult).toMatchObject({ isError: false });
     const turnCompleted = events.find((e) => e.type === "turn_completed" && e.threadId === "main");
     expect(turnCompleted).toMatchObject({ stopReason: "end_turn" });
+  });
+});
+
+// -------------------------------------------------------------------------------------------
+// Phase 4h-i: spawn_agent's `max_turns` — a per-child cap on the tool-iteration loop (CC parity
+// with Agent.max_turns). Only the spawn bridge ever passes this; main-thread turns are unaffected.
+// -------------------------------------------------------------------------------------------
+describe("AgentEngine: spawn_agent max_turns (4h-i)", () => {
+  const loopingToolCall = (callId: string): ProviderEvent =>
+    ({ type: "tool_call", callId, name: "glob", argsJson: '{"pattern":"*"}' });
+
+  test("max_turns: 2 caps the child at exactly 2 iterations — parent sees the cap message as an isError tool_result", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "loop forever", { max_turns: 2 }), done("tool_calls")], // parent round 0: spawn
+      [loopingToolCall("loop0"), done("tool_calls")], // child iteration 0
+      [loopingToolCall("loop1"), done("tool_calls")], // child iteration 1 — bound reached, cap fires
+      text("parent wrap-up"), // parent's continuation round, after the child's isError tool_result
+    ];
+    const { engine, store, sessionId, provider } = setup(script);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const started = events.find((e) => e.type === "thread_started");
+    const childId = (started as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+
+    const childCapError = events.find((e) => e.type === "agent_error" && e.threadId === childId);
+    expect(childCapError).toMatchObject({ message: "tool-iteration cap (2) reached" });
+
+    const completed = events.find((e) => e.type === "thread_completed" && e.threadId === childId);
+    expect(completed).toMatchObject({ stopReason: "error" });
+
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({
+      isError: true,
+      output: "subagent (general-purpose) failed: tool-iteration cap (2) reached",
+    });
+
+    // The parent's own turn still completes normally — an isError tool_result doesn't itself end
+    // the turn (only a human denial does); the parent just sees it and continues.
+    const mainTurnCompleted = events.find((e) => e.type === "turn_completed" && e.threadId === "main");
+    expect(mainTurnCompleted).toMatchObject({ stopReason: "end_turn" });
+
+    // 4 provider calls: parent round 0 (spawn), the child's 2 capped iterations, then the
+    // parent's own continuation round.
+    const fp = provider as FakeProvider;
+    expect(fp.requests.length).toBe(4);
+  });
+
+  test("no max_turns → child still uses the default cap (24), unchanged from before this feature", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "loop forever"), done("tool_calls")], // parent round 0: spawn, no max_turns
+      ...Array.from({ length: 24 }, (_, i): ProviderEvent[] => [loopingToolCall(`loop${i}`), done("tool_calls")]),
+      text("parent wrap-up"), // parent's continuation round, after the child's isError tool_result
+    ];
+    const { engine, store, sessionId, provider } = setup(script);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const started = events.find((e) => e.type === "thread_started");
+    const childId = (started as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+
+    const childCapError = events.find((e) => e.type === "agent_error" && e.threadId === childId);
+    expect(childCapError).toMatchObject({ message: "tool-iteration cap (24) reached" });
+
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({
+      isError: true,
+      output: "subagent (general-purpose) failed: tool-iteration cap (24) reached",
+    });
+
+    // 26 provider calls: parent round 0 (spawn), the child's 24 capped iterations, then the
+    // parent's own continuation round.
+    const fp = provider as FakeProvider;
+    expect(fp.requests.length).toBe(26);
+  });
+
+  test("max_turns: 1 — the tight boundary caps after exactly 1 iteration", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "loop forever", { max_turns: 1 }), done("tool_calls")], // parent round 0: spawn
+      [loopingToolCall("loop0"), done("tool_calls")], // child iteration 0 — bound reached, cap fires
+      text("parent wrap-up"), // parent's continuation round
+    ];
+    const { engine, store, sessionId, provider } = setup(script);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const started = events.find((e) => e.type === "thread_started");
+    const childId = (started as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+    const childCapError = events.find((e) => e.type === "agent_error" && e.threadId === childId);
+    expect(childCapError).toMatchObject({ message: "tool-iteration cap (1) reached" });
+
+    // 3 provider calls: parent round 0 (spawn), the child's single capped iteration, then the
+    // parent's own continuation round.
+    const fp = provider as FakeProvider;
+    expect(fp.requests.length).toBe(3);
+  });
+
+  // The bridge hand-parses raw argsJson BEFORE spawn.ts's own zod validation would ever run (a
+  // provider could send an out-of-schema value even though the declared arg is
+  // `.int().positive().max(50)`) — the guard must IGNORE an invalid value, not pass it through
+  // as-is. A bug here (e.g. clamping a negative number up to 1 instead of ignoring it, or worse,
+  // leaving it negative/zero) would make the loop bound `iteration < 0` — the child would hit the
+  // cap message WITHOUT ever calling the provider. This pins that it's ignored (falls back to the
+  // default 24), not misapplied.
+  test("invalid max_turns (non-positive) is ignored — not passed through as a 0/negative bound", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "do X", { max_turns: -5 }), done("tool_calls")], // parent round 0: spawn, invalid max_turns
+      text("child final report"), // child round 0: completes normally — proves the bound wasn't clamped to <= 0
+      text("parent wrap-up"), // parent's continuation round
+    ];
+    const { engine, store, sessionId } = setup(script);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({ isError: false, output: "child final report" });
   });
 });

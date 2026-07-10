@@ -461,6 +461,14 @@ export class AgentEngine {
     loaded: Set<string>;
     excludeTools?: Set<string>;
     allowTools?: Set<string>;
+    // 4h-i (CC parity: Agent.max_turns): a per-thread override of MAX_TOOL_ITERATIONS. Only the
+    // spawn bridge (below) ever passes this — main-thread callers (turn()) never set it, so the
+    // main thread's bound is unchanged (MAX_TOOL_ITERATIONS, 24). A child's effective bound is
+    // 1-50 (spawn.ts's zod range / the bridge's own clamp); omitted → the default 24. Note this
+    // can go EITHER direction relative to the default — a child asking for max_turns > 24 (up to
+    // 50) gets a LARGER cap than the main thread's default, not just a smaller one. Additive/sync
+    // only: no new async surface, just a different bound for that one child thread's own loop.
+    maxTurns?: number;
   }): Promise<{ finalText: string; stopReason: "end_turn" | "aborted" | "error"; errorMessage?: string }> {
     const { sessionId, threadId, instructionsFull, input, meta, signal, loaded, excludeTools, allowTools } = opts;
     let cwd = opts.cwd;
@@ -468,10 +476,14 @@ export class AgentEngine {
     const deferThreshold = this.toolSearchThreshold();
     const usage = { inputTokens: 0, outputTokens: 0 };
     let lastText = "";
+    // The effective iteration bound for THIS thread — opts.maxTurns (spawn bridge only) or the
+    // shared default. Computed once so the loop condition and the cap message below always agree
+    // on the exact number.
+    const effectiveMaxIterations = opts.maxTurns ?? MAX_TOOL_ITERATIONS;
 
     this.emit(sessionId, { type: "turn_started", sessionId, threadId });
 
-    for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
+    for (let iteration = 0; iteration < effectiveMaxIterations; iteration++) {
       if (threadId === MAIN_THREAD) {
         const steers = this.steerQueue.get(sessionId);
         if (steers && steers.length) { for (const t of steers) input.push({ type: "message", role: "user", content: t }); steers.length = 0; }
@@ -556,12 +568,21 @@ export class AgentEngine {
         : [];
       if (spawnCalls.length > 0) {
         await Promise.all(spawnCalls.map(async (call) => {
-          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown } = {};
+          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown; max_turns?: unknown } = {};
           try { parsed = JSON.parse(call.argsJson || "{}"); } catch { /* defensive: empty prompt below */ }
           const prompt = typeof parsed.prompt === "string" ? parsed.prompt : "";
           const agentType = typeof parsed.agentType === "string" ? parsed.agentType : undefined;
           const modelOverride = typeof parsed.model === "string" ? parsed.model : undefined;
           const description = typeof parsed.description === "string" ? parsed.description : undefined;
+          // 4h-i (CC parity: Agent.max_turns): this bridge hand-parses raw argsJson BEFORE
+          // spawn.ts's own zod validation would ever run (same reason model/description are
+          // hand-checked above), so a provider that ignores the declared `.int().positive().max(50)`
+          // schema could still send an out-of-range or non-integer value through — clamp
+          // defensively here rather than trusting the schema. Non-finite/non-integer/non-positive
+          // → ignored (undefined), same as omitting the arg (falls back to MAX_TOOL_ITERATIONS).
+          const maxTurns = typeof parsed.max_turns === "number" && Number.isInteger(parsed.max_turns) && parsed.max_turns > 0
+            ? Math.min(parsed.max_turns, 50)
+            : undefined;
 
           // 4g-ii (CC parity): spawn_agent's `description` is now a REQUIRED arg (spawn.ts's own
           // zod schema enforces this — but this concurrent bridge hand-parses call.argsJson and
@@ -635,6 +656,7 @@ export class AgentEngine {
               // returns. Plan-mode entry/exit stays a main-thread-only decision.
               excludeTools: new Set(["spawn_agent", "ask_user", "exit_plan_mode", "enter_plan_mode"]),
               allowTools: def.allowTools,
+              maxTurns,
             });
           });
           const stopReason = result.ok ? result.value.stopReason : "error";
@@ -793,7 +815,7 @@ export class AgentEngine {
       }
     }
 
-    const capMessage = `tool-iteration cap (${MAX_TOOL_ITERATIONS}) reached`;
+    const capMessage = `tool-iteration cap (${effectiveMaxIterations}) reached`;
     this.emit(sessionId, { type: "agent_error", sessionId, threadId, message: capMessage });
     this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "error", ...usage });
     return { finalText: lastText, stopReason: "error", errorMessage: capMessage };

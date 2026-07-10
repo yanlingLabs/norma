@@ -41,6 +41,7 @@ export function registerSpawnAgentTool(r: ToolRegistry, opts: { models?: string[
     agentType: z.string().optional(),
     model: modelField,
     description: z.string().min(1),
+    max_turns: z.number().int().positive().max(50).optional(),
   });
   r.register({
     name: "spawn_agent",
@@ -48,7 +49,8 @@ export function registerSpawnAgentTool(r: ToolRegistry, opts: { models?: string[
       "Launch a child agent to handle a task autonomously with its own fresh context. It runs its own tool loop and returns its final report. " +
       "Delegate multi-step work; run several in parallel by emitting multiple spawn_agent calls in one message. " +
       "The child does NOT see this conversation — put everything it needs in `prompt`. " +
-      `agentType: optional subagent type; ${modelClause}; description: a short (3-5 word) summary of the task (required).`,
+      `agentType: optional subagent type; ${modelClause}; description: a short (3-5 word) summary of the task (required); ` +
+      "max_turns: optional cap (1-50) on the child's own tool-use iterations, after which it stops with an error (omit to inherit the default cap).",
     args: SpawnArgs,
     run(_args: z.infer<typeof SpawnArgs>) {
       return "subagents are not available in this session";
