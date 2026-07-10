@@ -17,7 +17,7 @@ export function registerAskUserTool(r: ToolRegistry): void {
   r.register({
     name: "ask_user",
     description:
-      "Ask the user 1-4 questions when you are blocked on a decision only they can make — one you cannot resolve from the request, the code, or sensible defaults. " +
+      "Ask the user 1-4 questions whenever you need them to choose between options or clarify something you cannot resolve from the request, the code, or sensible defaults. ALWAYS ask through this tool — never pose the question as prose and stop; a prose question stalls the session and can't be answered from other surfaces. " +
       "Each question has 2-4 distinct option choices; each option needs a label AND a description explaining what it means; do NOT add an 'Other' option (the interface adds a free-text 'Other' automatically). " +
       "If you recommend an option, put it first and append ' (Recommended)' to its label. Use multiSelect: true when choices are not mutually exclusive. " +
       "The user's answers are returned; if no one answers in time you'll be told to proceed with your best judgment.",
