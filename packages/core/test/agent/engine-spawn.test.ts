@@ -97,7 +97,7 @@ const text = (t: string): ProviderEvent[] => [{ type: "text_delta", delta: t }, 
 // don't all need individual edits; `extra.description` still overrides it (see the "description
 // rides thread_started" test below). The dedicated "without description" test constructs its
 // tool_call by hand, bypassing this default, to pin the required-arg behavior itself.
-const spawnCall = (callId: string, prompt: string, extra?: { agentType?: string; model?: string; description?: string; max_turns?: number }): ProviderEvent =>
+const spawnCall = (callId: string, prompt: string, extra?: { agentType?: string; model?: string; description?: string; max_turns?: number; mode?: string }): ProviderEvent =>
   ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "test task", ...extra }) });
 
 describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
@@ -668,5 +668,122 @@ describe("AgentEngine: spawn_agent max_turns (4h-i)", () => {
 
     const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
     expect(spawnResult).toMatchObject({ isError: false, output: "child final report" });
+  });
+});
+
+// -------------------------------------------------------------------------------------------
+// Phase 4h-i Task 2: spawn_agent's `mode` — a RESTRICT-ONLY child permission-mode override (CC
+// parity with Agent's permission-mode arg). A child may run NARROWER than its parent, NEVER
+// wider — see restrictPolicy/mapSpawnMode's own unit tests (spawn-mode-policy.test.ts) for the
+// pure min-permissiveness logic itself. These engine tests pin the end-to-end wiring: the bridge
+// actually applies the narrowed policy to the CHILD's own runThread, and never mutates the
+// parent's shared `meta` object.
+// -------------------------------------------------------------------------------------------
+describe("AgentEngine: spawn_agent mode (restrict-only, 4h-i Task 2)", () => {
+  test("mode: 'plan' narrows a parent-'auto' child to plan policy — the child's write tool_call is gate-denied (Blocked in plan mode)", async () => {
+    const { engine, store, sessionId } = setup(
+      [
+        [spawnCall("s1", "do X", { mode: "plan" }), done("tool_calls")], // parent policy "auto"; mode narrows the child to "plan"
+        [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "x.txt", content: "y" }) }, done("tool_calls")],
+        text("child acknowledged the block"),
+      ],
+      { approvalPolicy: "auto" },
+    );
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({ isError: false }); // spawning itself is never blocked (read-only/orchestration)
+
+    const writeResult = events.find((e) => e.type === "tool_result" && e.callId === "w1");
+    expect(writeResult).toMatchObject({ isError: true });
+    expect((writeResult as Extract<SessionEvent, { type: "tool_result" }>).output).toContain("Blocked in plan mode");
+
+    // sanity: the PARENT's own session policy is untouched by the child's narrowed mode
+    expect(store.meta(sessionId).approvalPolicy).toBe("auto");
+  });
+
+  test("mode: 'bypassPermissions' from a parent-'ask' session is an ESCALATION — denied; the child's write still requires human approval, is not auto-allowed", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "do X", { mode: "bypassPermissions" }), done("tool_calls")], // parent policy "ask"
+      [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "x.txt", content: "y" }) }, done("tool_calls")],
+      text("child acknowledged the denial"),
+      text("parent wrap-up"),
+    ];
+    const { engine, store, sessionId, hub, broker } = setup(script, { approvalPolicy: "ask" });
+    const watcher = {
+      clientName: "auto-denier",
+      deliver: (e: SessionEvent) => { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, false, "auto-denier"); return true; },
+    };
+    hub.attach(watcher, sessionId, 0);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({ isError: false }); // spawn_agent itself is read-only, always allowed
+
+    // The child's write call REQUIRED approval — proof the "bypassPermissions" (→ Norma "auto")
+    // escalation was denied and the child stayed at the parent's "ask" policy. If the escalation
+    // had gone through, this would have been an auto-allow with NO approval_requested at all.
+    const approvalReq = events.find((e) => e.type === "approval_requested" && e.callId === "w1");
+    expect(approvalReq).toBeDefined();
+    expect(events.find((e) => e.type === "approval_resolved" && e.callId === "w1")).toMatchObject({ approved: false, by: "auto-denier" });
+
+    const writeResult = events.find((e) => e.type === "tool_result" && e.callId === "w1");
+    expect(writeResult).toMatchObject({ isError: true });
+
+    // sanity: the PARENT's own session policy is untouched by the denied escalation attempt
+    expect(store.meta(sessionId).approvalPolicy).toBe("ask");
+  });
+
+  test("no mode → child inherits the parent's policy exactly, and the spawn NEVER mutates the shared parent meta (a same-turn parent write still follows the original 'ask' policy)", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "do X"), done("tool_calls")], // parent round 0: spawn, no mode at all
+      text("child final report"), // the child's only round
+      // the parent's OWN continuation round makes its OWN write call — must still be gated under
+      // the session's ORIGINAL "ask" policy; if the spawn bridge had mutated the shared `meta`
+      // object (e.g. widened it while building childMeta), this call would see the corruption.
+      [{ type: "tool_call", callId: "p1", name: "write", argsJson: JSON.stringify({ path: "after.txt", content: "z" }) }, done("tool_calls")],
+      text("parent wrap-up"),
+    ];
+    const { engine, store, sessionId, hub, broker } = setup(script, { approvalPolicy: "ask" });
+    const watcher = {
+      clientName: "auto-approver",
+      deliver: (e: SessionEvent) => { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, true, "auto-approver"); return true; },
+    };
+    hub.attach(watcher, sessionId, 0);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const completed = events.find((e) => e.type === "thread_completed");
+    expect(completed).toMatchObject({ stopReason: "end_turn" });
+
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({ isError: false, output: "child final report" });
+
+    // the parent's post-spawn write still went through the normal "ask" approval flow
+    const approvalReq = events.find((e) => e.type === "approval_requested" && e.callId === "p1");
+    expect(approvalReq).toBeDefined();
+    const p1Result = events.find((e) => e.type === "tool_result" && e.callId === "p1");
+    expect(p1Result).toMatchObject({ isError: false }); // approved
+
+    // the session's persisted policy is untouched (only enter/exit_plan_mode ever calls setPolicy)
+    expect(store.meta(sessionId).approvalPolicy).toBe("ask");
+  });
+
+  test("mode: 'default' behaves exactly like an absent mode — no override, child inherits the parent's 'auto' policy (a child write is NOT blocked)", async () => {
+    const { engine, store, sessionId } = setup(
+      [
+        [spawnCall("s1", "do X", { mode: "default" }), done("tool_calls")],
+        [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "x.txt", content: "y" }) }, done("tool_calls")],
+        text("child wrote the file"),
+      ],
+      { approvalPolicy: "auto" },
+    );
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const writeResult = events.find((e) => e.type === "tool_result" && e.callId === "w1");
+    expect(writeResult).toMatchObject({ isError: false });
   });
 });

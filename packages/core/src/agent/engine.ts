@@ -4,7 +4,7 @@ import type { SessionStore } from "../sessions/store";
 import type { SessionHub } from "../sessions/hub";
 import type { Provider, ProviderEvent, TurnInputItem } from "../providers/types";
 import type { ToolRegistry } from "./tools/registry";
-import type { PermissionGate } from "./gate";
+import type { PermissionGate, SessionApprovalPolicy } from "./gate";
 import type { ApprovalBroker } from "./approvals";
 import type { QuestionBroker } from "./questions";
 import type { TaskStore } from "./task-store";
@@ -29,6 +29,39 @@ export interface BgTaskLister {
 
 const MAIN_THREAD = "main";
 const MAX_TOOL_ITERATIONS = 24; // runaway guard until 1b-ii budgets land
+
+// 4h-i (CC parity: spawn_agent `mode`) — permissiveness order, LEAST to MOST permissive: "plan"
+// is read-only (most restrictive), "ask" is human-gated (middle), "auto" auto-allows non-
+// destructive tools (least restrictive). Mirrors gate.ts's own PermissionGate.evaluate() ordering
+// (plan denies everything mutating outright; ask/auto both gate mutating tools, auto auto-allows).
+const POLICY_RESTRICTIVENESS: Record<SessionApprovalPolicy, number> = { plan: 0, ask: 1, auto: 2 };
+
+/** RESTRICT-ONLY: returns the MORE RESTRICTIVE of {parent, requested} — a spawn_agent `mode`
+ *  override can only NARROW a child's effective approval policy relative to its parent thread's,
+ *  never WIDEN it. A request that would widen (e.g. parent "ask" + requested "auto", or parent
+ *  "plan" + requested "auto") is silently ignored — the parent's policy wins. Pure and exported
+ *  for direct unit testing: this is the security-critical piece of the `mode` feature (a bug here
+ *  is a privilege-escalation bug, not a UX one). */
+export function restrictPolicy(parent: SessionApprovalPolicy, requested: SessionApprovalPolicy): SessionApprovalPolicy {
+  return POLICY_RESTRICTIVENESS[requested] < POLICY_RESTRICTIVENESS[parent] ? requested : parent;
+}
+
+/** Maps a CC-parity spawn `mode` arg to Norma's `approvalPolicy`. Only `plan` maps to Norma's
+ *  "plan" (read-only); `acceptEdits`/`dontAsk`/`bypassPermissions` all collapse to "auto" — Norma
+ *  has no finer-grained distinction between them (CC parity here is at the arg-surface level, not
+ *  full behavioral parity with CC's own distinct modes). `default`, absent, or any unrecognized
+ *  string maps to `undefined` — "no override", i.e. the child inherits the parent's policy
+ *  unchanged (this is what lets the spawn bridge skip building a child-scoped meta entirely when
+ *  there's nothing to narrow — see the bridge's `childMeta` computation). */
+export function mapSpawnMode(mode: string | undefined): SessionApprovalPolicy | undefined {
+  switch (mode) {
+    case "plan": return "plan";
+    case "acceptEdits":
+    case "dontAsk":
+    case "bypassPermissions": return "auto";
+    default: return undefined; // "default", absent, or an unrecognized string
+  }
+}
 
 /** Mirrors protocol's ThreadInfoSchema (methods.ts) — kept as a plain local type rather than a
  *  zod import here since engine.ts only needs the shape, not a schema/validator of its own. */
@@ -568,7 +601,7 @@ export class AgentEngine {
         : [];
       if (spawnCalls.length > 0) {
         await Promise.all(spawnCalls.map(async (call) => {
-          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown; max_turns?: unknown } = {};
+          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown; max_turns?: unknown; mode?: unknown } = {};
           try { parsed = JSON.parse(call.argsJson || "{}"); } catch { /* defensive: empty prompt below */ }
           const prompt = typeof parsed.prompt === "string" ? parsed.prompt : "";
           const agentType = typeof parsed.agentType === "string" ? parsed.agentType : undefined;
@@ -583,6 +616,31 @@ export class AgentEngine {
           const maxTurns = typeof parsed.max_turns === "number" && Number.isInteger(parsed.max_turns) && parsed.max_turns > 0
             ? Math.min(parsed.max_turns, 50)
             : undefined;
+          // 4h-i (CC parity: spawn_agent `mode`) — same hand-parse-before-zod reasoning as
+          // max_turns/model/description above: only accept one of the 5 known mode strings;
+          // anything else (wrong type, typo, provider hallucination) → undefined, same as omitting
+          // the arg entirely (no override, child inherits the parent's policy). mapSpawnMode below
+          // further narrows "default"/unrecognized to "no override" too.
+          const modeRaw = typeof parsed.mode === "string" ? parsed.mode : undefined;
+          // RESTRICT-ONLY (the security-critical bit — see restrictPolicy's own doc comment):
+          // requestedPolicy is undefined when there's nothing to apply (mode absent/"default"/
+          // unrecognized) — in that case childPolicy is EXACTLY meta.approvalPolicy (the parent's),
+          // so childMeta below stays the SAME object as `meta`, byte-identical to pre-4h-i
+          // behavior. When a mode DOES map to a policy, restrictPolicy takes the more restrictive
+          // of {parent, requested} — a request that would WIDEN the child's permissions relative to
+          // the parent (e.g. parent "ask" + requested "auto"/bypassPermissions) is silently denied
+          // and the parent's policy wins; only a NARROWING request actually changes childPolicy.
+          const requestedPolicy = mapSpawnMode(modeRaw);
+          const childPolicy = requestedPolicy !== undefined ? restrictPolicy(meta.approvalPolicy, requestedPolicy) : meta.approvalPolicy;
+          // Child-scoped meta: a shallow copy ONLY when childPolicy actually narrows (differs from
+          // the parent's) — never mutate the shared `meta` object itself (that object is the SAME
+          // one `turn()`'s dispatch loop uses for the REST of the parent's turn; mutating
+          // `meta.approvalPolicy` here would corrupt the parent's own policy for later tool calls
+          // in this same turn, and this bridge runs N spawns concurrently via Promise.all — a
+          // second spawn's read of `meta.approvalPolicy` must never see a first spawn's override).
+          // When childPolicy === meta.approvalPolicy (no mode, or an escalation request that was
+          // denied), childMeta IS `meta` — the identical object, not just an equal-valued copy.
+          const childMeta = childPolicy !== meta.approvalPolicy ? { ...meta, approvalPolicy: childPolicy } : meta;
 
           // 4g-ii (CC parity): spawn_agent's `description` is now a REQUIRED arg (spawn.ts's own
           // zod schema enforces this — but this concurrent bridge hand-parses call.argsJson and
@@ -634,7 +692,7 @@ export class AgentEngine {
           });
           const result = await this.cfg.subagents!.run(async (childSignal) => {
             const childLoaded = new Set<string>();
-            const instructionsFull = this.buildInstructionsFull(def.instructions, opts.cwd, childLoaded, meta.approvalPolicy, sessionId);
+            const instructionsFull = this.buildInstructionsFull(def.instructions, opts.cwd, childLoaded, childPolicy, sessionId);
             return this.runThread({
               sessionId,
               threadId: childId,
@@ -645,15 +703,24 @@ export class AgentEngine {
               // Subagents inherit the PARENT thread's resolved reasoning effort — no per-agent-def
               // override (agent defs only carry a model override, never an effort one).
               reasoningEffort: opts.reasoningEffort,
-              meta, // SAME object — the child inherits the parent's (possibly later-mutated) approval policy
+              // childMeta: the SAME object as `meta` (byte-identical, no copy) when there's no
+              // narrowing `mode` override — the child inherits the parent's (possibly
+              // later-mutated) approval policy, exactly as before 4h-i. Only a NARROWING `mode`
+              // (restrictPolicy above) produces a child-scoped shallow copy, so the parent's own
+              // `meta.approvalPolicy` is NEVER mutated by a spawn's mode override — see
+              // `childMeta`'s own doc comment above for why (concurrent spawns, same-turn parent
+              // policy corruption).
+              meta: childMeta,
               depth: opts.depth + 1,
               signal: childSignal,
               loaded: childLoaded,
               // enter_plan_mode excluded alongside exit_plan_mode (4g Task 4): the child inherits
-              // the PARENT's `meta` object BY REFERENCE (just above) — an unexcluded child calling
-              // enter_plan_mode would mutate the shared `meta.approvalPolicy` AND persist it via
-              // `cfg.setPolicy`, silently putting the WHOLE session into plan mode once the spawn
-              // returns. Plan-mode entry/exit stays a main-thread-only decision.
+              // the parent's (or, with a narrowing `mode` override, its OWN child-scoped) `meta`
+              // object BY REFERENCE (just above) — an unexcluded child calling enter_plan_mode
+              // would mutate that object's `approvalPolicy` AND persist it via `cfg.setPolicy`
+              // (when it's the SAME object as the parent's, that would silently put the WHOLE
+              // session into plan mode once the spawn returns). Plan-mode entry/exit stays a
+              // main-thread-only decision regardless of which meta object the child got.
               excludeTools: new Set(["spawn_agent", "ask_user", "exit_plan_mode", "enter_plan_mode"]),
               allowTools: def.allowTools,
               maxTurns,
