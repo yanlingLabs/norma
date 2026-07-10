@@ -1235,6 +1235,7 @@ if (import.meta.main) {
     ].filter(Boolean).join(", ");
     console.log(`${AQUA}updated${RESET} ${DIM}(${changed}) — takes effect next turn, no daemon restart needed${RESET}`);
     process.exit(0);
+    break; // unreachable (every branch exits) — guards against silent fallthrough if exit behavior ever changes
   }
   case "init": {
     await runTurnSession({ promptOverride: INIT_PROMPT, forceAuto: true, chat: false }); // force auto: writes NORMA.md without approval prompts

@@ -32,11 +32,13 @@ describe("ContextAssembler", () => {
     expect(trusted).toContain("USER_RULE_SENTINEL");
   });
 
-  test("F2 (4e gate ledger): assembled output states today's date (YYYY-MM-DD, locale-stable)", () => {
+  test("F2 (4e gate ledger): assembled output states today's date (YYYY-MM-DD, LOCAL timezone)", () => {
     const { home, trust } = setup();
     const a = new ContextAssembler({ normaHome: home, trust, skills: new SkillStore({ normaHome: home, trust }) });
     const out = a.assemble({ cwd: null });
-    const today = new Date().toISOString().slice(0, 10);
+    // Mirror the assembler: LOCAL date parts, not toISOString (UTC) — review-caught F2 fix.
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
     expect(out).toContain(`Today's date is ${today}.`);
   });
 
