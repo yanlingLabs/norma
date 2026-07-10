@@ -13,6 +13,7 @@ const TaskUpdateArgsSchema = z.object({
   activeForm: z.string().optional(),
 }).refine((a) => a.status !== undefined || a.subject !== undefined || a.activeForm !== undefined, { message: "provide at least one of status/subject/activeForm" });
 const TaskListArgsSchema = z.object({});
+const TaskGetArgsSchema = z.object({ taskId: z.string().min(1) });
 
 export function registerTaskTools(r: ToolRegistry, deps: { tasks: TaskStore }): void {
   r.register({
@@ -61,6 +62,28 @@ export function registerTaskTools(r: ToolRegistry, deps: { tasks: TaskStore }): 
     run(_a: z.infer<typeof TaskListArgsSchema>, ctx) {
       const tasks = deps.tasks.list(ctx.sessionId);
       return tasks.length ? tasks.map((t) => `[${t.id}] ${ICONS[t.status]} ${t.subject}`).join("\n") : "no tasks";
+    },
+  });
+  r.register({
+    name: "task_get",
+    description: "Get a task's full details (subject, description, status, activeForm) by id from task_list.",
+    args: TaskGetArgsSchema,
+    // New in 4g Task 4 (CC parity: task_create/task_update/task_list already existed — this
+    // rounds out the CRUD set with a single-task read). Registered deferred: true on just this
+    // def — the trio above stays always-loaded (unchanged pre-4g behavior); only this NEW tool
+    // rides ToolSearch deferral.
+    deferred: true,
+    run({ taskId }: z.infer<typeof TaskGetArgsSchema>, ctx) {
+      const t = deps.tasks.get(ctx.sessionId, taskId);
+      if (!t) throw new Error(`no task ${taskId}`);
+      const description = deps.tasks.descriptionOf(ctx.sessionId, taskId);
+      const lines = [
+        `#${t.id} ${ICONS[t.status]} ${t.subject}`,
+        `status: ${t.status}`,
+        `description: ${description ?? "(none)"}`,
+      ];
+      if (t.activeForm) lines.push(`activeForm: ${t.activeForm}`);
+      return lines.join("\n");
     },
   });
 }

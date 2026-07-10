@@ -620,7 +620,12 @@ export class AgentEngine {
               depth: opts.depth + 1,
               signal: childSignal,
               loaded: childLoaded,
-              excludeTools: new Set(["spawn_agent", "ask_user", "exit_plan_mode"]),
+              // enter_plan_mode excluded alongside exit_plan_mode (4g Task 4): the child inherits
+              // the PARENT's `meta` object BY REFERENCE (just above) — an unexcluded child calling
+              // enter_plan_mode would mutate the shared `meta.approvalPolicy` AND persist it via
+              // `cfg.setPolicy`, silently putting the WHOLE session into plan mode once the spawn
+              // returns. Plan-mode entry/exit stays a main-thread-only decision.
+              excludeTools: new Set(["spawn_agent", "ask_user", "exit_plan_mode", "enter_plan_mode"]),
               allowTools: def.allowTools,
             });
           });
@@ -725,6 +730,11 @@ export class AgentEngine {
           }, undefined, pins);
         } else if (call.name === "exit_plan_mode" && this.cfg.plans && meta.approvalPolicy === "plan") {
           outcome = await this.runPlanBridge(call, sessionId, threadId, meta);
+        } else if (call.name === "enter_plan_mode") {
+          // Unconditional — no PlanBroker/manager dependency to gate on (see runEnterPlanBridge's
+          // doc comment). decision is always "allow" here (enter_plan_mode is in gate.ts's
+          // READ_ONLY set under every policy), so this branch is reached for every call.
+          outcome = await this.runEnterPlanBridge(sessionId, meta);
         } else if (
           decision === "allow" && call.name === "bash" && this.cfg.reviewer &&
           this.cfg.reviewerEnabled !== false && meta.approvalPolicy === "auto"
@@ -890,6 +900,33 @@ export class AgentEngine {
           : "the user rejected the plan without specific feedback");
     return {
       output: `Plan rejected: ${reason}. Stay in plan mode and revise your plan, then call exit_plan_mode again.`,
+      isError: false,
+    };
+  }
+
+  /** enter_plan_mode's bridge (4g Task 4, CC parity) — mirrors runPlanBridge's `meta` mutation +
+   *  `cfg.setPolicy` persistence mechanics, but is wired UNCONDITIONALLY at the call site (no
+   *  `cfg.plans`-style optional dependency to gate on): entering plan mode needs no human
+   *  approval — it's strictly restrictive, so there's no broker wait, no `plan_presented`/
+   *  `plan_resolved` event pair, just an immediate switch. Guard: calling this while ALREADY in
+   *  plan mode is a typed error (not a gate denial — gate.ts's READ_ONLY membership allows the
+   *  call through under every policy, including "plan", precisely so this guard can produce a
+   *  clear message instead of the generic "Blocked in plan mode" text). On success,
+   *  `meta.approvalPolicy` is mutated IN PLACE on the SAME object the dispatch loop's gate check
+   *  reads every iteration — a follow-up tool call LATER IN THIS SAME TURN sees the new mode
+   *  immediately; `cfg.setPolicy` persists the switch to the SessionStore so it also survives into
+   *  the next turn (same as the exit bridge — see runPlanBridge's doc comment). */
+  private async runEnterPlanBridge(
+    sessionId: string,
+    meta: { approvalPolicy: "ask" | "auto" | "plan" },
+  ): Promise<{ output: string; isError: boolean }> {
+    if (meta.approvalPolicy === "plan") {
+      return { output: "already in plan mode", isError: true };
+    }
+    await this.cfg.setPolicy?.(sessionId, "plan");
+    meta.approvalPolicy = "plan"; // SAME-TURN: follow-up calls in this turn use the new mode
+    return {
+      output: "Plan mode ON — read-only tools only; present your plan with exit_plan_mode when ready.",
       isError: false,
     };
   }

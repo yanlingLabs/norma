@@ -133,4 +133,45 @@ describe("task tools", () => {
     expect(update?.description).toContain("Call task_list first if you don't know the id.");
     expect(update?.description).toContain("deleted");
   });
+
+  // task_get (4g Task 4, CC parity): full-record lookup composed from TaskStore.get() (wire shape:
+  // id/subject/status/activeForm) + T3's core-side-only descriptionOf().
+  describe("task_get", () => {
+    test("returns the full record incl. description, status, and activeForm", async () => {
+      const store = new TaskStore();
+      const r = buildRegistry(store);
+      await r.execute("task_create", { subject: "rename", description: "rename the thing", activeForm: "Renaming" }, ctx());
+      const out = await r.execute("task_get", { taskId: "1" }, ctx());
+      expect(out.isError).toBe(false);
+      expect(out.output).toContain("rename");
+      expect(out.output).toContain("rename the thing");
+      expect(out.output).toContain("pending");
+      expect(out.output).toContain("Renaming");
+    });
+
+    test("reflects a status update", async () => {
+      const store = new TaskStore();
+      const r = buildRegistry(store);
+      await r.execute("task_create", { subject: "work", description: "do the work" }, ctx());
+      await r.execute("task_update", { taskId: "1", status: "in_progress" }, ctx());
+      const out = await r.execute("task_get", { taskId: "1" }, ctx());
+      expect(out.isError).toBe(false);
+      expect(out.output).toContain("in_progress");
+    });
+
+    test("unknown id → isError 'no task <id>'", async () => {
+      const store = new TaskStore();
+      const r = buildRegistry(store);
+      const out = await r.execute("task_get", { taskId: "3" }, ctx());
+      expect(out.isError).toBe(true);
+      expect(out.output).toContain("no task 3");
+    });
+
+    test("missing taskId → invalid arguments", async () => {
+      const store = new TaskStore();
+      const r = buildRegistry(store);
+      const out = await r.execute("task_get", {}, ctx());
+      expect(out.isError).toBe(true);
+    });
+  });
 });

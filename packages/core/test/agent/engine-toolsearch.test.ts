@@ -7,6 +7,7 @@ import { ToolRegistry } from "../../src/agent/tools/registry";
 import { registerToolSearchTool } from "../../src/agent/tools/toolsearch";
 import { registerWorktreeTools } from "../../src/agent/tools/worktree";
 import { WorktreeManager } from "../../src/agent/worktree";
+import { registerPlanTool } from "../../src/agent/tools/plan";
 import { FakeProvider } from "../../src/agent/fake-provider";
 import { setupEngine } from "./engine-steer.test";
 
@@ -374,5 +375,53 @@ describe.if(isMac)("engine: deferred-tool guard runs before the worktree bridge 
     expect(worktrees.active(sessionId)).toBeDefined();
     const enterResult = events.find((e) => e.type === "tool_result" && e.callId === "e1");
     expect(enterResult).toMatchObject({ isError: false });
+  });
+});
+
+// enter_plan_mode (4g Task 4): the engine's dispatch loop intercepts it unconditionally (no
+// broker/manager dependency to gate the bridge on, unlike worktree/exit_plan_mode) — but it's
+// still registered `deferred: true` (daemon.ts), so the SAME guard that runs "BEFORE any of the
+// bridge intercepts" (engine.ts's isDeferredBuiltin check, just above the dispatch loop's
+// bridge branches) must reject an unloaded call before the bridge ever gets a chance to flip the
+// session into plan mode. This is the ONE toolSearch-on test for the bridge (the policy-switch/
+// already-in-plan bridge-behavior tests live in engine-plan.test.ts, run toolSearch-off).
+describe("engine: deferred-tool guard runs before the enter_plan_mode bridge (4g Task 4)", () => {
+  test("REJECT: enter_plan_mode called unloaded is rejected before the bridge runs — policy unchanged", async () => {
+    const registry = new ToolRegistry();
+    registerToolSearchTool(registry);
+    registerPlanTool(registry, { deferred: true });
+    const provider = new FakeProvider([
+      [{ type: "tool_call", callId: "p1", name: "enter_plan_mode", argsJson: "{}" }, done("tool_calls")],
+      [{ type: "text_delta", delta: "ok" }, done("end_turn")],
+    ]);
+    const { engine, sessionId, store, events } = setupEngine(provider, { registry, toolSearch: {} });
+
+    await engine.runTurn(sessionId);
+
+    const toolResult = events.find((e) => e.type === "tool_result" && e.callId === "p1");
+    if (!toolResult || toolResult.type !== "tool_result") throw new Error("expected a tool_result for p1");
+    expect(toolResult.isError).toBe(true);
+    expect(toolResult.output).toContain("deferred");
+    expect(toolResult.output).toContain("ToolSearch");
+    // The bridge did NOT run: the session's approval policy was never touched.
+    expect(store.meta(sessionId).approvalPolicy).toBe("auto"); // setupEngine's default policy
+  });
+
+  test("LOAD THEN CALL: ToolSearch-loading enter_plan_mode lets the SAME tool reach the bridge", async () => {
+    const registry = new ToolRegistry();
+    registerToolSearchTool(registry);
+    registerPlanTool(registry, { deferred: true });
+    const provider = new FakeProvider([
+      [{ type: "tool_call", callId: "s1", name: "ToolSearch", argsJson: JSON.stringify({ query: "select:enter_plan_mode" }) }, done("tool_calls")],
+      [{ type: "tool_call", callId: "p1", name: "enter_plan_mode", argsJson: "{}" }, done("tool_calls")],
+      [{ type: "text_delta", delta: "ok" }, done("end_turn")],
+    ]);
+    const { engine, sessionId, events } = setupEngine(provider, { registry, toolSearch: {} });
+
+    await engine.runTurn(sessionId);
+
+    const enterResult = events.find((e) => e.type === "tool_result" && e.callId === "p1");
+    expect(enterResult).toMatchObject({ isError: false });
+    expect((enterResult as any).output).toContain("Plan mode ON");
   });
 });

@@ -9,8 +9,8 @@ import type { Task } from "@norma/protocol";
  *  in a SEPARATE per-session map here, core-side only — never merged into the `Task` objects
  *  returned by list()/create() or handed to `ctx.taskEvent`, which stay byte-identical to the
  *  wire `Task` shape (task.list's RPC response and the task_updated event's `task` field are
- *  UNCHANGED). A future task_get tool (Phase 4g Task 4) is expected to read `descriptionOf()`
- *  to surface it back to the model. */
+ *  UNCHANGED). The task_get tool (tools/tasks.ts, Phase 4g Task 4) composes `get()` +
+ *  `descriptionOf()` to surface the description back to the model. */
 export class TaskStore {
   private sessions = new Map<string, Map<string, Task>>();
   private descriptions = new Map<string, Map<string, string>>();
@@ -57,6 +57,13 @@ export class TaskStore {
   }
 
   list(sessionId: string): Task[] { return [...this.forSession(sessionId).values()]; }
+
+  /** Single-task lookup backing the task_get tool (4g Task 4) — same wire shape as list()/
+   *  create() (id/subject/status/activeForm, no description). undefined for an unknown id or
+   *  session. */
+  get(sessionId: string, id: string): Task | undefined {
+    return this.forSession(sessionId).get(id);
+  }
 
   /** Core-side-only description lookup — see the class doc comment. undefined if the task was
    *  never created with one (shouldn't happen post-4g-ii: task_create requires it) or has since

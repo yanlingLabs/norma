@@ -58,4 +58,23 @@ describe("TaskStore", () => {
     expect(store.descriptionOf("s1", t1.id)).toBeUndefined();
     expect(store.delete("s1", "999")).toBe(false);
   });
+
+  // get() (4g Task 4): single-task lookup backing the task_get tool. Returns the same Task shape
+  // as list()/create() — id/subject/status/activeForm, no description (that's descriptionOf()'s job).
+  test("get() returns the task record by id; unknown id → undefined", () => {
+    const store = new TaskStore();
+    const t1 = store.create("s1", "Task 1", "desc 1", "Doing task 1");
+    expect(store.get("s1", t1.id)).toMatchObject({ id: "1", subject: "Task 1", status: "pending", activeForm: "Doing task 1" });
+    expect(store.get("s1", "999")).toBeUndefined();
+    expect(store.get("s2", t1.id)).toBeUndefined(); // wrong session
+  });
+
+  test("get() reflects update() patches and returns undefined after delete()", () => {
+    const store = new TaskStore();
+    const t1 = store.create("s1", "Task 1", "desc 1");
+    store.update("s1", t1.id, { status: "in_progress" });
+    expect(store.get("s1", t1.id)).toMatchObject({ status: "in_progress" });
+    store.delete("s1", t1.id);
+    expect(store.get("s1", t1.id)).toBeUndefined();
+  });
 });

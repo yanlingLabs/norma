@@ -257,3 +257,62 @@ describe("AgentEngine: plan mode (deny + exit_plan_mode bridge)", () => {
     }
   });
 });
+
+// enter_plan_mode (4g Task 4): plan-mode symmetry — unlike exit_plan_mode, entering needs no
+// PlanBroker wait (no human approval — entering is strictly restrictive), so the engine bridge
+// fires unconditionally: guard on the CURRENT policy (already "plan" → typed isError), else
+// `cfg.setPolicy` persists + a SAME-TURN local `meta.approvalPolicy` mutation, mirroring the exit
+// bridge's mechanics exactly (see runPlanBridge's doc comment above).
+describe("AgentEngine: enter_plan_mode bridge", () => {
+  test("under ask policy → setPolicy('plan') + same-turn meta.approvalPolicy flips, so a follow-up write in the SAME turn is denied", async () => {
+    const { engine, store, sessionId, cwd, setPolicyCalls } = setup(
+      [
+        [{ type: "tool_call", callId: "p1", name: "enter_plan_mode", argsJson: "{}" }, done("tool_calls")],
+        [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "f.txt", content: "x" }) }, done("tool_calls")],
+        text("ok"),
+      ],
+      { approvalPolicy: "ask" },
+    );
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const enterResult = events.find((e) => e.type === "tool_result" && e.callId === "p1");
+    expect(enterResult).toMatchObject({ isError: false });
+    expect((enterResult as any).output).toBe("Plan mode ON — read-only tools only; present your plan with exit_plan_mode when ready.");
+
+    expect(setPolicyCalls).toEqual([{ sessionId, policy: "plan" }]);
+    // Persisted to the store too (not just the in-memory `meta` mutation).
+    expect(store.meta(sessionId).approvalPolicy).toBe("plan");
+
+    // Same-turn follow-up write must be DENIED — the local `meta.approvalPolicy` mutation took
+    // effect immediately, without waiting for the next turn's store.meta() re-read.
+    const writeResult = events.find((e) => e.type === "tool_result" && e.callId === "w1");
+    expect(writeResult).toMatchObject({ isError: true });
+    expect((writeResult as any).output).toContain("Blocked in plan mode");
+    expect(existsSync(join(cwd, "f.txt"))).toBe(false);
+  });
+
+  test("under auto policy → also switches to plan (entering is allowed from any non-plan policy)", async () => {
+    const { engine, store, sessionId, setPolicyCalls } = setup(
+      [[{ type: "tool_call", callId: "p1", name: "enter_plan_mode", argsJson: "{}" }, done("tool_calls")], text("ok")],
+      { approvalPolicy: "auto" },
+    );
+    await engine.runTurn(sessionId);
+    expect(setPolicyCalls).toEqual([{ sessionId, policy: "plan" }]);
+    expect(store.meta(sessionId).approvalPolicy).toBe("plan");
+  });
+
+  test("already in plan mode → typed isError 'already in plan mode', policy unchanged, no setPolicy call", async () => {
+    const { engine, store, sessionId, setPolicyCalls } = setup(
+      [[{ type: "tool_call", callId: "p1", name: "enter_plan_mode", argsJson: "{}" }, done("tool_calls")], text("ok")],
+      { approvalPolicy: "plan" },
+    );
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+    const enterResult = events.find((e) => e.type === "tool_result" && e.callId === "p1");
+    expect(enterResult).toMatchObject({ isError: true });
+    expect((enterResult as any).output).toContain("already in plan mode");
+    expect(setPolicyCalls).toEqual([]);
+    expect(store.meta(sessionId).approvalPolicy).toBe("plan");
+  });
+});

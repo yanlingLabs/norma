@@ -22,7 +22,12 @@ export type SessionApprovalPolicy = "ask" | "auto" | "plan";
 // a child agent), not a mutation itself. The child inherits the parent's approval policy (engine.ts's
 // bridge passes the SAME `meta` object down), so the child's own mutating tool calls still get gated
 // by that policy — spawning doesn't bypass anything, it just delegates.
-const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "exit_plan_mode", "spawn_agent"]);
+// task_get is read-only too (4g Task 4): a pure TaskStore lookup, same class as task_list.
+// enter_plan_mode is read-only too (4g Task 4): it only flips the session's approval policy to
+// "plan" (no fs/process mutation) — it must be allowed under EVERY policy, including "plan" itself
+// (calling it while already in plan mode is a no-op the engine bridge turns into a typed error,
+// not a gate denial), so the model can always request the restrictive mode.
+const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent"]);
 const MUTATING = new Set(["write", "edit", "bash", "bash_kill", "notebook_edit", "enter_worktree", "exit_worktree"]);
 const SELF_GATING = new Set(["request_directory"]);
 
