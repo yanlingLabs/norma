@@ -107,6 +107,13 @@ describe("SessionEvent discriminated union", () => {
       task: { id: "1", subject: "rename", status: "pending" },
     } as const;
     expect(SessionEvent.parse(tu)).toEqual(tu);
+
+    // T3 review fix wave 1: task_update{status:"deleted"} now round-trips a "deleted" status too.
+    const tuDeleted = {
+      type: "task_updated", sessionId: "s", threadId: "t", seq: 4, ts: 4,
+      task: { id: "1", subject: "rename", status: "deleted" },
+    } as const;
+    expect(SessionEvent.parse(tuDeleted)).toEqual(tuDeleted);
   });
 
   test("bounds: 0/5 questions, 1/5 options, 13-char header rejected", () => {

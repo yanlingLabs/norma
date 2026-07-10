@@ -976,7 +976,8 @@
               "enum": [
                 "pending",
                 "in_progress",
-                "completed"
+                "completed",
+                "deleted"
               ]
             },
             "activeForm": {

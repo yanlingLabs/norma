@@ -95,14 +95,28 @@ describe.if(isMac)("WorktreeManager", () => {
     expect(m.active("s")).toBeUndefined();
   });
 
-  test("exit remove (dirty) refuses — git's dirty-worktree guard", () => {
+  test("exit remove (dirty) refuses without discardChanges — error lists the git status --short output", () => {
     const dir = repo();
     const m = new WorktreeManager({ baseRef: "head" });
     const wt = m.enter("s", dir, "feat");
     writeFileSync(join(wt.dir, "dirty.txt"), "uncommitted\n");
-    expect(() => m.exit("s", "remove")).toThrow();
+    expect(() => m.exit("s", "remove")).toThrow(/refusing to remove: uncommitted changes:/);
+    expect(() => m.exit("s", "remove")).toThrow(/dirty\.txt/);
+    expect(() => m.exit("s", "remove")).toThrow(/re-run with discard_changes: true to delete them/);
     // the worktree must still be there — the guard refused the removal.
     expect(existsSync(wt.dir)).toBe(true);
+    expect(m.active("s")).toBeDefined(); // still active — exit() never got past the pre-check
+  });
+
+  test("exit remove (dirty) with discardChanges:true force-removes despite uncommitted changes", () => {
+    const dir = repo();
+    const m = new WorktreeManager({ baseRef: "head" });
+    const wt = m.enter("s", dir, "feat");
+    writeFileSync(join(wt.dir, "dirty.txt"), "uncommitted\n");
+    const result = m.exit("s", "remove", true);
+    expect(result).toEqual({ name: "feat", branch: "norma/feat", removed: true, originalCwd: dir });
+    expect(existsSync(wt.dir)).toBe(false);
+    expect(m.active("s")).toBeUndefined();
   });
 
   test("exit when not in a worktree → error", () => {

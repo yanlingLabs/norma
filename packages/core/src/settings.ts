@@ -64,6 +64,9 @@ export const Settings = z.object({
   toolSearch: z.object({
     enabled: z.boolean().optional(),
     deferThreshold: z.number().int().positive().optional(),
+    // "always": externals (mcp__/plugin__) defer whenever ANY is visible, ignoring deferThreshold's
+    // count comparison entirely. Absent/"count" = today's threshold-count behavior, unchanged.
+    deferExternals: z.enum(["count", "always"]).optional(),
   }).optional(),
   worktree: z.object({
     baseRef: z.enum(["fresh", "head"]).optional(),
@@ -77,6 +80,12 @@ export const Settings = z.object({
   peripheral: z.object({
     heartbeatMs: z.number().int().positive().optional(),
     expiryMs: z.number().int().positive().optional(),
+  }).optional(),
+  /** web_search backend (4g Task 6). `provider` defaults to "brave" when the block/field is
+   *  absent — the literal union is forward-room for other search backends later; today "brave"
+   *  is the only accepted value. */
+  webSearch: z.object({
+    provider: z.literal("brave").optional(),
   }).optional(),
 });
 export type Settings = z.infer<typeof Settings>;

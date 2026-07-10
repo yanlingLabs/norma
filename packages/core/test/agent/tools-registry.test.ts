@@ -154,6 +154,59 @@ describe("deferral", () => {
 });
 
 // -------------------------------------------------------------------------------------------
+// Phase 4g Task 1: built-in tools can ALSO ride ToolSearch deferral via `deferred: true` on the
+// ToolDefinition — riding the SAME isDeferred/specs/deferredIndex/execute machinery as mcp__/
+// plugin__ tools above, gated on `builtinDeferral` (== ToolSearch enabled) instead of the
+// external count/threshold.
+// -------------------------------------------------------------------------------------------
+describe("built-in deferred tools (4g-i)", () => {
+  test("a built-in def with deferred:true is hidden from specs, listed in deferredIndex, and execute-rejected until loaded (ToolSearch enabled, external count below threshold)", () => {
+    const r = new ToolRegistry();
+    r.register({ name: "notebook_edit", description: "d", args: z.object({}), deferred: true, run: () => "ran" });
+    r.register({ name: "read", description: "d", args: z.object({}), run: () => "ran" });
+    r.register({ name: "ToolSearch", description: "d", args: z.object({}), run: () => "" });
+    const opts = { loaded: new Set<string>(), deferThreshold: 12, builtinDeferral: true };
+    expect(r.specs(null, opts).map(s => s.name)).not.toContain("notebook_edit");
+    expect(r.specs(null, opts).map(s => s.name)).toContain("read");
+    expect(r.specs(null, opts).map(s => s.name)).toContain("ToolSearch"); // visible: something IS deferred
+    expect(r.deferredIndex(null, new Set(), 12, true).map(d => d.name)).toContain("notebook_edit");
+    // loaded → rides along
+    expect(r.specs(null, { ...opts, loaded: new Set(["notebook_edit"]) }).map(s => s.name)).toContain("notebook_edit");
+  });
+  test("deferred:true built-in is inert when builtinDeferral is off (toolSearch disabled) — byte-identical specs", () => {
+    const flagged = new ToolRegistry(); const plain = new ToolRegistry();
+    flagged.register({ name: "notebook_edit", description: "d", args: z.object({}), deferred: true, run: () => "" });
+    plain.register({ name: "notebook_edit", description: "d", args: z.object({}), run: () => "" });
+    expect(JSON.stringify(flagged.specs(null))).toBe(JSON.stringify(plain.specs(null))); // no opts = deferral off
+  });
+  test("execute rejects an unloaded deferred built-in with the load-via-ToolSearch message and runs it once loaded", async () => {
+    const r = new ToolRegistry();
+    r.register({ name: "notebook_edit", description: "d", args: z.object({}), deferred: true, run: () => "ran" });
+    const base = { cwd: "/", roots: ["/"], sessionId: "s", deferThreshold: 12, builtinDeferral: true };
+    const rej = await r.execute("notebook_edit", {}, { ...base, loadedTools: new Set() });
+    expect(rej.isError).toBe(true); expect(rej.output).toContain("ToolSearch");
+    const ok = await r.execute("notebook_edit", {}, { ...base, loadedTools: new Set(["notebook_edit"]) });
+    expect(ok).toEqual({ output: "ran", isError: false });
+  });
+
+  test("deferExternals:'always' defers externals whenever ANY is visible, ignoring deferThreshold's count", () => {
+    const r = new ToolRegistry();
+    r.register({ name: "mcp__s__t1", description: "d", args: z.object({}), run: () => "ok" });
+    r.register({ name: "read", description: "d", args: z.object({}), run: () => "ok" });
+    r.register({ name: "ToolSearch", description: "d", args: z.object({}), run: () => "" });
+    // A single external tool, threshold 12 (well above count 1) — "count" mode leaves it visible.
+    const countMode = r.specs(null, { deferThreshold: 12 }).map((s) => s.name);
+    expect(countMode).toContain("mcp__s__t1");
+    expect(countMode).not.toContain("ToolSearch");
+    // Same threshold, "always" mode — the lone external now defers.
+    const alwaysMode = r.specs(null, { deferThreshold: 12, deferExternals: "always" }).map((s) => s.name);
+    expect(alwaysMode).not.toContain("mcp__s__t1");
+    expect(alwaysMode).toContain("ToolSearch");
+    expect(alwaysMode).toContain("read");
+  });
+});
+
+// -------------------------------------------------------------------------------------------
 // Phase 4b Task 4 (spec §3): `plugin__<pluginId>__<tool>` tools ride the SAME deferral machinery
 // as `mcp__` tools (isExternalToolName, registry.ts) — every test below mirrors a "deferral"
 // describe-block test above 1:1, substituting plugin__ names, plus a mixed-namespace test proving

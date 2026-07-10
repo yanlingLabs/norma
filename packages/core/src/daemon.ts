@@ -25,6 +25,7 @@ import { registerPlanTool } from "./agent/tools/plan";
 import { registerNotebookTool } from "./agent/tools/notebook";
 import { registerWorktreeTools } from "./agent/tools/worktree";
 import { registerSpawnAgentTool } from "./agent/tools/spawn";
+import { registerWebTools } from "./agent/tools/web";
 import { McpManager } from "./agent/mcp/manager";
 import { PermissionGate } from "./agent/gate";
 import { ApprovalBroker } from "./agent/approvals";
@@ -253,13 +254,19 @@ export async function startDaemon(opts: {
   // Runs regardless of agentProvider (see this block's own doc comment above).
   pluginSupervisor.sweepOrphans(spawnablePlugins.map((p) => p.id));
 
+  // Hoisted above the `if (agentProvider)` gate (4g Task 5) — registerWebTools below needs it, and
+  // tool registration happens inside that gate. Built unconditionally regardless (same precedent as
+  // `peripheral`/`hardware` further down, which share this SAME instance): normaHome is ready at
+  // line 135, and AuditLog's own constructor is cheap (mkdir is lazy, on first write — see audit.ts).
+  const audit = new AuditLog(join(normaHome, "audit.jsonl"));
+
   if (agentProvider) {
     const registry = new ToolRegistry();
     sharedRegistry = registry;
     registerReadTools(registry);
     registerWriteTools(registry);
-    registerBashTool(registry, { bgRegistry });
-    registerBackgroundTools(registry, { bgRegistry });
+    registerBashTool(registry, { bgRegistry }); // bash itself is NEVER deferred — only its background-poll pair below
+    registerBackgroundTools(registry, { bgRegistry }, { deferred: true });
     registerSkillTools(registry, { skills: skillStore });
     registerToolSearchTool(registry);
     questions = new QuestionBroker();
@@ -267,10 +274,18 @@ export async function startDaemon(opts: {
     registerAskUserTool(registry);
     registerTaskTools(registry, { tasks: taskStore });
     plans = new PlanBroker();
-    registerPlanTool(registry);
-    registerNotebookTool(registry);
+    registerPlanTool(registry, { deferred: true });
+    registerNotebookTool(registry, { deferred: true });
     const worktrees = new WorktreeManager({ baseRef: settings?.worktree?.baseRef });
-    registerWorktreeTools(registry);
+    registerWorktreeTools(registry, { deferred: true });
+    // 4g Task 5: web_fetch — Norma's ONLY sanctioned network egress (bash's sandbox denies network
+    // by design). Shares the SAME `audit` appender instance as peripheral/hardware below (hoisted
+    // above this gate for exactly this reason) — every call (success, ssrf-refusal, http error,
+    // timeout) gets one `{kind:"network", tool:"web_fetch", url, outcome}` line on audit.jsonl.
+    // 4g Task 6: web_search's Brave API key rides the SAME `secrets` store (KeychainSecretStore,
+    // built at the top of startDaemon) `norma login --web-search-key` writes into — one
+    // SecretStore instance, one Keychain, no separate store to keep in sync.
+    registerWebTools(registry, { audit: (line) => audit.append(line), secret: (name) => secrets.get(name) });
     const agents = new AgentStore({
       normaHome, trust: trustStore, baseInstructions: SYSTEM_PROMPT,
       plugins: { disabled: settings?.plugins?.disabled ?? [] },
@@ -358,6 +373,7 @@ export async function startDaemon(opts: {
       plans: plans ?? undefined,
       setPolicy: (sid, pol) => store.setApprovalPolicy(sid, pol),
       worktrees,
+      bgRegistry,
       agents,
       subagents,
       reviewer,
@@ -367,13 +383,15 @@ export async function startDaemon(opts: {
       toolSearch: {
         enabled: settings?.toolSearch?.enabled,
         deferThreshold: settings?.toolSearch?.deferThreshold ?? Number(process.env.NORMA_TOOLSEARCH_THRESHOLD ?? 12),
+        deferExternals: settings?.toolSearch?.deferExternals,
       },
     });
   }
 
   // Peripheral lease v1 (Phase 2f). Built unconditionally (like approvalBroker/quota above) —
-  // leasing has nothing to do with whether an LLM provider is configured.
-  const audit = new AuditLog(join(normaHome, "audit.jsonl"));
+  // leasing has nothing to do with whether an LLM provider is configured. `audit` itself is now
+  // constructed further up (before the `if (agentProvider)` gate — see that comment) so
+  // registerWebTools can share this SAME instance; this block just reuses it.
   const providerLink = new ProviderLink();
   const peripheral = new PeripheralBroker({
     audit,

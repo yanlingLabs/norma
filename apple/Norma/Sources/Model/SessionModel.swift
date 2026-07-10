@@ -271,6 +271,25 @@ enum SessionReducer {
             }
             s.subagents = [] // defensive prune — an errored main turn must not strand a live block
         case .taskUpdated(let v): // any thread — tasks are session-wide
+            // T3 review fix wave 1: `status: "deleted"` is a TERMINAL removal, not an upsert —
+            // packages/protocol's TaskSchema now has this value (events.ts), and
+            // packages/core/src/agent/tools/tasks.ts's task_update deleted branch emits this
+            // event right before the daemon's TaskStore actually drops the task. Handled FIRST,
+            // before the pre-upsert/upsert/append logic below, so a deleted task can never
+            // re-enter `s.tasks` via that path. Without this, the pinned task list (and this
+            // orb pill) would phantom the deleted task forever — the daemon never sends a
+            // follow-up event once a task is actually gone.
+            if v.task.status == "deleted" {
+                // `wasPresent` mirrors the upsert path's `previousStatus`-gated activity append
+                // below (only append on an actual change) — a delete for an id already absent
+                // (e.g. a duplicated/replayed event) removes nothing, so it logs nothing either.
+                let wasPresent = s.tasks.contains(where: { $0.id == v.task.id })
+                s.tasks.removeAll(where: { $0.id == v.task.id })
+                if v.threadId == mainThread, wasPresent {
+                    appendActivity(.task(subject: v.task.subject, status: v.task.status), to: &s)
+                }
+                break
+            }
             // 2d-ii-a task 1: remember the PRE-upsert status so activity capture below can
             // append only when this event actually transitioned the task (nil = brand-new
             // task, which counts as a change). The helper's adjacent-dupe collapse is a
@@ -295,20 +314,20 @@ enum SessionReducer {
                 // `packages/core/src/agent/tools/tasks.ts`: only `task_create` can mint a new
                 // id; `task_update` 404s on an unknown one — `TaskStore.create`'s ids are a
                 // monotonic session-wide counter, `String(m.size + 1)`, so they're never reused
-                // either). The daemon's `TaskStore` never removes tasks (no delete op exists —
-                // see its doc) and the wire protocol has no "deleted" status
-                // (`TaskSchema.status` is pending/in_progress/completed only,
-                // packages/protocol/src/events.ts) — by design, session task HISTORY is kept
-                // forever for CLI/replay purposes. That's correct for the CLI, but this orb pill
-                // is a CURRENT-RUN indicator, not a session history view: upserting forever into
-                // one flat array made `taskCounts` (done/total) accumulate across every task
-                // list the session ever had, so completing one 3-task run and starting a new one
-                // showed "☑ 4/6 working…" instead of "☑ 1/3 working…" — the old, finished batch
-                // visually never went away.
+                // either). An EXPLICIT deletion now removes its task on arrival (the `status ==
+                // "deleted"` branch above, T3 review fix wave 1) — but a task that's simply never
+                // been touched again still lingers in `s.tasks` by design, so session task
+                // HISTORY is kept for CLI/replay purposes. That's correct for the CLI, but this
+                // orb pill is a CURRENT-RUN indicator, not a session history view: upserting
+                // forever into one flat array made `taskCounts` (done/total) accumulate across
+                // every task list the session ever had, so completing one 3-task run and
+                // starting a new one showed "☑ 4/6 working…" instead of "☑ 1/3 working…" — the
+                // old, finished batch visually never went away.
                 //
-                // Fix, scoped entirely to this reducer (no daemon change — see wave-4 report for
-                // why a daemon-side "deleted" status is out of scope this wave): a brand-new
-                // task id arriving while the CURRENT list has nothing in_progress and every
+                // Fix, scoped entirely to this reducer (no daemon change needed — this predates
+                // the "deleted" status and is orthogonal to it: an explicit delete removes ONE
+                // task by id, this handles an entire finished BATCH aging out implicitly): a
+                // brand-new task id arriving while the CURRENT list has nothing in_progress and every
                 // existing task is already completed is exactly "the start of a new batch" —
                 // there is no in-flight work the old entries could still be tracking. Clear the
                 // finished batch before appending the new task, so the pill's counts reset to

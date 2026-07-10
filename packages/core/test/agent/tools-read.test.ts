@@ -126,6 +126,21 @@ describe("read tools", () => {
     expect((await r.execute("read", { path: join(outside, "secret.txt") }, ctx)).isError).toBe(true);
   });
 
+  test("read: offset/limit select a line window, cat-n style guidance honored", async () => {
+    const d = proj();
+    writeFileSync(join(d, "lines.txt"), "l1\nl2\nl3\nl4\nl5");
+    const r = makeRegistry(d);
+    // offset is 1-based line number
+    const res1 = await r.execute("read", { path: "lines.txt", offset: 2, limit: 2 }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res1).toEqual({ output: "l2\nl3", isError: false });
+    // default offset is 1
+    const res2 = await r.execute("read", { path: "lines.txt", limit: 2 }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res2).toEqual({ output: "l1\nl2", isError: false });
+    // no offset/limit returns all
+    const res3 = await r.execute("read", { path: "lines.txt" }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res3).toEqual({ output: "l1\nl2\nl3\nl4\nl5", isError: false });
+  });
+
   test("glob does not leak OS paths from an absolute recursive pattern outside roots", async () => {
     const d = proj();
     const r = makeRegistry(d);

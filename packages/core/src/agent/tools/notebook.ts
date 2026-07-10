@@ -22,12 +22,13 @@ function toLines(s: string): string[] {
   return parts.map((p, i) => (i < parts.length - 1 ? p + "\n" : p)).filter((_, i) => !(i === parts.length - 1 && parts[i] === ""));
 }
 
-export function registerNotebookTool(r: ToolRegistry): void {
+export function registerNotebookTool(r: ToolRegistry, opts?: { deferred?: boolean }): void {
   r.register({
     name: "notebook_edit",
     description:
       "Edit a Jupyter notebook (.ipynb) at the cell level. edit_mode 'replace' (default) overwrites the cell's source (and cell_type if given); 'insert' adds a new cell after cell_id (or at the top if cell_id is omitted); 'delete' removes the cell. cell_id is required for replace and delete.",
     args: NotebookEditArgs,
+    deferred: opts?.deferred,
     run({ notebook_path, new_source, cell_id, cell_type, edit_mode }: z.infer<typeof NotebookEditArgs>, { roots }) {
       const mode = edit_mode ?? "replace";
       const target = resolveWithinAny(roots, notebook_path);

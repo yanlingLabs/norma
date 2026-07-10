@@ -37,6 +37,10 @@ const fixtures: Record<string, unknown> = {
                 { question: "Which features?", header: "Features", options: [{ label: "A", description: "first" }, { label: "B" }, { label: "C" }], multiSelect: true }] },
   question_resolved: { type: "question_resolved", sessionId: "s_1", threadId: "t_1", seq: 11, ts: 1700000000001, callId: "call_1", answers: { "Which codename?": "Osprey", "Which features?": "A, C" }, by: "cli" },
   task_updated: { type: "task_updated", sessionId: "s_1", threadId: "t_1", seq: 12, ts: 1700000000002, task: { id: "1", subject: "rename the project", status: "in_progress", activeForm: "Renaming the project" } },
+  // T3 review fix wave 1: task_update{status:"deleted"} now emits a task_updated event carrying
+  // this status (see events.ts's TaskSchema doc comment) — a separate fixture (distinct file from
+  // task_updated.json above) so Swift round-trips a "deleted" Task.status too.
+  task_deleted: { type: "task_updated", sessionId: "s_1", threadId: "t_1", seq: 27, ts: 1700000000017, task: { id: "3", subject: "throwaway task", status: "deleted" } },
   plan_presented: { type: "plan_presented", sessionId: "s_1", threadId: "t_1", seq: 13, ts: 1700000000003, callId: "call_1", plan: "# Plan\n\n1. Add the flag\n2. Wire it up\n3. Test" },
   plan_resolved: { type: "plan_resolved", sessionId: "s_1", threadId: "t_1", seq: 14, ts: 1700000000004, callId: "call_1", approved: true, feedback: "looks good", autoAccept: true, by: "cli" },
   worktree_entered: { type: "worktree_entered", sessionId: "s_1", threadId: "t_1", seq: 15, ts: 1700000000005, name: "fix-auth", path: "/repo/.norma/worktrees/fix-auth", branch: "norma/fix-auth" },

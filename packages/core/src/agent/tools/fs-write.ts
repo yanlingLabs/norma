@@ -24,9 +24,9 @@ export function registerWriteTools(r: ToolRegistry): void {
 
   r.register({
     name: "edit",
-    description: "Replace an exact unique string in a file with a new string.",
-    args: z.object({ path: z.string().min(1), old_string: z.string().min(1), new_string: z.string() }),
-    run({ path, old_string, new_string }, { roots }) {
+    description: "Replace an exact string in a file. old_string must match exactly (including whitespace) and, unless replace_all is true, be UNIQUE in the file — the edit fails otherwise. replace_all: true replaces every occurrence.",
+    args: z.object({ path: z.string().min(1), old_string: z.string().min(1), new_string: z.string(), replace_all: z.boolean().optional() }),
+    run({ path, old_string, new_string, replace_all }, { roots }) {
       let target: string;
       try {
         target = resolveWithinAny(roots, path);
@@ -36,8 +36,9 @@ export function registerWriteTools(r: ToolRegistry): void {
       const text = readFileSync(target, "utf8");
       const count = text.split(old_string).length - 1;
       if (count === 0) throw new Error(`old_string not found in ${path}`);
-      if (count > 1) throw new Error(`old_string matches ${count} occurrences in ${path} — provide a longer unique string`);
-      writeFileSync(target, text.replace(old_string, new_string));
+      if (!replace_all && count > 1) throw new Error(`old_string matches ${count} occurrences in ${path} — provide a longer unique string`);
+      const newText = replace_all ? text.split(old_string).join(new_string) : text.replace(old_string, new_string);
+      writeFileSync(target, newText);
       return `edited ${path}`;
     },
   });

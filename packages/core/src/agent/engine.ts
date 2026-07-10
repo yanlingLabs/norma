@@ -19,6 +19,14 @@ import type { WorktreeManager } from "./worktree";
 import type { SubagentManager } from "./subagents";
 import type { AgentStore } from "./agents";
 
+/** Structural narrowing of BackgroundTaskRegistry (bg-registry.ts) to just what pinnedTools
+ *  (below) needs — lets the engine (and tests) work with anything shaped like a per-session task
+ *  lister, without requiring the full class (whose other members — start/read/kill — pinnedTools
+ *  never touches). A real BackgroundTaskRegistry instance satisfies this structurally. */
+export interface BgTaskLister {
+  list(sessionId: string): Array<{ status: string }>;
+}
+
 const MAIN_THREAD = "main";
 const MAX_TOOL_ITERATIONS = 24; // runaway guard until 1b-ii budgets land
 
@@ -77,7 +85,9 @@ export interface EngineConfig {
   reviewerAllow?: string[]; // extra commands/argv0s bashLooksSafe treats as obviously-safe (bypass review)
   // deferral wired ONLY when this is set AND enabled !== false — undefined (the setupEngine/
   // daemon default before this config existed) leaves specs()/instructions/execute untouched.
-  toolSearch?: { enabled?: boolean; deferThreshold?: number };
+  // deferExternals mirrors registry.ts's opt of the same name ("always": externals defer whenever
+  // ANY is visible, ignoring deferThreshold's count comparison; absent/"count" = unchanged).
+  toolSearch?: { enabled?: boolean; deferThreshold?: number; deferExternals?: "count" | "always" };
   // Plan mode (1d-ii): both optional, and both absent leaves existing behavior untouched. Without
   // `plans`, exit_plan_mode falls to the else executeCall branch → the tool's own placeholder
   // run() (tools/plan.ts) rather than the approval bridge below. `setPolicy` persists an approved
@@ -92,6 +102,11 @@ export interface EngineConfig {
   // call later in this same turn resolves into (or back out of) the worktree immediately — it
   // also persists via store.setCwd/dirs.add so the NEXT turn sees it too.
   worktrees?: WorktreeManager;
+  // State pin (4g-i): per-session live background-task listing, consulted ONLY by pinnedTools
+  // (below) to force bash_output/bash_kill visible while a task is running, without touching the
+  // sticky loadedTools set. Absent → that pin never fires (bash_output/bash_kill, if registered
+  // deferred:true, stay hidden until ToolSearch-loaded like any other deferred built-in).
+  bgRegistry?: BgTaskLister;
   // Subagents (1d-iv): both optional, and both absent leaves spawn_agent at its own placeholder
   // run() (tools/spawn.ts) rather than the parallel bridge below. Both must be set together for
   // the bridge to activate — see the `spawnCalls` filter in runThread's dispatch loop.
@@ -118,6 +133,14 @@ export class AgentEngine {
   // per-round) AND for every subsequent turn of the session — so this Set is shared, mutated
   // in-place (never copied/snapshotted), across specs()/deferredIndex()/executeCall's ctx. See
   // the NOTE in turn() below.
+  // THREAD-LOCAL WRITES (4g final-review fix): this map is populated ONLY by the MAIN thread —
+  // turn() seeds `this.loadedTools.get(sessionId)` and hands that SAME Set object to runThread as
+  // opts.loaded. executeCall/markToolLoaded (below) always operate on THE CALLING THREAD's
+  // `loaded` set (threaded through as a parameter), never by re-deriving it from this map via
+  // sessionId. For the main thread that set IS this map's entry, so a load still lands here and
+  // stays sticky across turns — unchanged. A CHILD thread's `loaded` (runThread's spawn bridge:
+  // `childLoaded = new Set()`) is never stored in this map, so a subagent's ToolSearch load can
+  // no longer leak into (or be shadowed by) the session-wide set.
   private loadedTools = new Map<string, Set<string>>();
   // Thread registry (1d-iv, for thread.list): SESSION-scoped, mirrors loadedSkills/loadedTools
   // above in lifetime (never cleared per-turn). Seeded lazily (via threadList()) with the main
@@ -215,6 +238,31 @@ export class AgentEngine {
     return this.toolSearchEnabled() ? this.cfg.toolSearch!.deferThreshold : undefined;
   }
 
+  private toolSearchDeferExternals(): "count" | "always" | undefined {
+    return this.toolSearchEnabled() ? this.cfg.toolSearch!.deferExternals : undefined;
+  }
+
+  /** Per-turn/round pins (4g-i): state-required deferred built-ins forced visible WITHOUT
+   *  touching the sticky `loadedTools` set (that Set is mutated ONLY by markToolLoaded — see the
+   *  NOTE above `loadedTools`'s declaration). Callers union the result into a NEW Set
+   *  (`effectiveLoaded`) at each of the three deferral seams (buildInstructionsFull, the
+   *  per-round specs() call, and executeCall) — `loaded` itself is never copied or mutated here.
+   *  Recomputed fresh at each seam (not cached) so a mid-turn state change — a plan approved, a
+   *  worktree entered/exited via the same-turn bridges, a bg task started/exited — is reflected
+   *  without waiting for the next turn. A no-op when the corresponding tool isn't registered
+   *  deferred:true (or isn't registered at all) — specs()/execute don't care about pins for a
+   *  tool that was never hidden in the first place. `_cwd` is unused today (no current pin is
+   *  scope-aware) — kept in the signature for parity with the other deferral seams, which all
+   *  thread cwd, in case a future pin needs it. */
+  private pinnedTools(sessionId: string, meta: { approvalPolicy: "ask" | "auto" | "plan" }, _cwd: string | null): Set<string> {
+    const pins = new Set<string>();
+    if (meta.approvalPolicy === "plan") pins.add("exit_plan_mode");
+    if (this.cfg.worktrees?.active(sessionId)) pins.add("exit_worktree");
+    const bgTasks = this.cfg.bgRegistry?.list(sessionId) ?? [];
+    if (bgTasks.some((t) => t.status === "running")) { pins.add("bash_output"); pins.add("bash_kill"); }
+    return pins;
+  }
+
   /** `model` is the PER-TURN resolved model (turn()'s `sel.model` — live-resolved when
    *  `cfg.provider.live` is wired, else the boot snapshot) — never the boot model directly, so a
    *  live model change is reflected in the auto-compact threshold on the very next turn, not just
@@ -303,10 +351,18 @@ export class AgentEngine {
   // plan-mode reminder is appended off the policy at turn start, not re-checked per round, so an
   // in-turn exit_plan_mode approval (which mutates `meta.approvalPolicy` for the REST of this
   // turn) does not retroactively add/remove this reminder mid-turn.
-  private buildInstructionsFull(base: string, cwd: string, loaded: Set<string>, policy: "ask" | "auto" | "plan"): string {
+  private buildInstructionsFull(base: string, cwd: string, loaded: Set<string>, policy: "ask" | "auto" | "plan", sessionId: string): string {
     const tsEnabled = this.toolSearchEnabled();
     const deferThreshold = this.toolSearchThreshold();
-    const deferred = tsEnabled ? this.cfg.registry.deferredIndex(cwd, loaded, deferThreshold) : [];
+    // Pins computed HERE, at instructionsFull's own once-per-turn/thread cadence (see this
+    // method's callers — turn() and the spawn bridge each call it exactly once), NOT the
+    // per-round cadence used at the specs()/executeCall seams below. `loaded` itself is never
+    // mutated — pins are unioned into a NEW Set.
+    const pins = tsEnabled ? this.pinnedTools(sessionId, { approvalPolicy: policy }, cwd) : new Set<string>();
+    const effectiveLoaded = pins.size ? new Set([...loaded, ...pins]) : loaded;
+    const deferred = tsEnabled
+      ? this.cfg.registry.deferredIndex(cwd, effectiveLoaded, deferThreshold, tsEnabled, this.toolSearchDeferExternals())
+      : [];
     let instructionsFull = deferred.length
       ? base + "\n\n# Deferred tools\nThe following tools exist but their schemas are NOT loaded — calling them directly fails. Load schemas first with the ToolSearch tool (query \"select:<name>\" or keywords), then call them normally.\n" + deferred.map((d) => `- ${d.name} — ${d.description}`).join("\n")
       : base;
@@ -353,7 +409,7 @@ export class AgentEngine {
     // to execute's defense-in-depth check, all within this one turn, without re-reading anything.
     if (!this.loadedTools.has(sessionId)) this.loadedTools.set(sessionId, new Set());
     const loaded = this.loadedTools.get(sessionId)!;
-    const instructionsFull = this.buildInstructionsFull(instructions, cwd, loaded, meta.approvalPolicy);
+    const instructionsFull = this.buildInstructionsFull(instructions, cwd, loaded, meta.approvalPolicy, sessionId);
     // Auto-compact BEFORE historyInput is built, so a triggered compaction's checkpoint is
     // reflected in this turn's input. A compaction failure degrades to a normal (uncompacted)
     // turn rather than breaking it. Uses THIS turn's resolved model (sel.model), not the boot
@@ -425,11 +481,22 @@ export class AgentEngine {
       const calls: Extract<ProviderEvent, { type: "tool_call" }>[] = [];
       let stop: "end_turn" | "tool_calls" | "aborted" | null = null;
 
+      // Pins recomputed EVERY round (unlike buildInstructionsFull's once-per-thread read above) —
+      // a mid-turn state change (plan approved, worktree entered/exited via the same-turn
+      // bridges, a bg task started/exited) must be visible to the VERY NEXT round's specs() AND
+      // to that round's tool-call dispatch below, not just the next turn. `loaded` is NEVER
+      // mutated here — see the loadedTools NOTE above. Reused for every executeCall/
+      // requestApproval invocation triggered by THIS round's calls, further down.
+      const pins = tsEnabled ? this.pinnedTools(sessionId, meta, cwd) : new Set<string>();
+      const effectiveLoaded = pins.size ? new Set([...loaded, ...pins]) : loaded;
+
       for await (const ev of this.cfg.provider.provider.streamTurn({
         model: opts.model,
         instructions: instructionsFull,
         input,
-        tools: this.cfg.registry.specs(cwd, tsEnabled ? { loaded, deferThreshold } : undefined)
+        tools: this.cfg.registry.specs(cwd, tsEnabled
+            ? { loaded: effectiveLoaded, deferThreshold, builtinDeferral: true, deferExternals: this.toolSearchDeferExternals() }
+            : undefined)
           .filter((s) => !excludeTools?.has(s.name))
           .filter((s) => !allowTools || allowTools.has(s.name)),
         signal,
@@ -495,6 +562,21 @@ export class AgentEngine {
           const agentType = typeof parsed.agentType === "string" ? parsed.agentType : undefined;
           const modelOverride = typeof parsed.model === "string" ? parsed.model : undefined;
           const description = typeof parsed.description === "string" ? parsed.description : undefined;
+
+          // 4g-ii (CC parity): spawn_agent's `description` is now a REQUIRED arg (spawn.ts's own
+          // zod schema enforces this — but this concurrent bridge hand-parses call.argsJson and
+          // short-circuits BEFORE executeCall's registry.execute() ever runs its zod validation,
+          // same reason the model-override check below can't rely on the schema either. Must be
+          // checked BEFORE thread_started/registerThread/subagents.run, mirroring the model-
+          // override early-return just below. Message format matches registry.execute()'s own
+          // "invalid arguments for X: field" wording for a consistent typed-error shape. No
+          // `.trim()` here — matches spawn.ts's `z.string().min(1)` exactly (a whitespace-only
+          // description satisfies min(1) too), so both paths agree on what counts as "present".
+          if (!description) {
+            spawnOutcomes.set(call.callId, { output: `invalid arguments for spawn_agent: description`, isError: true });
+            return; // no thread_started, no thread registry entry, no subagents.run slot
+          }
+
           const def = this.cfg.agents!.resolve(agentType, opts.cwd);
 
           // Defect 1 (4e gate F9): validate an EXPLICIT model override — modelOverride (the
@@ -531,7 +613,7 @@ export class AgentEngine {
           });
           const result = await this.cfg.subagents!.run(async (childSignal) => {
             const childLoaded = new Set<string>();
-            const instructionsFull = this.buildInstructionsFull(def.instructions, opts.cwd, childLoaded, meta.approvalPolicy);
+            const instructionsFull = this.buildInstructionsFull(def.instructions, opts.cwd, childLoaded, meta.approvalPolicy, sessionId);
             return this.runThread({
               sessionId,
               threadId: childId,
@@ -546,7 +628,12 @@ export class AgentEngine {
               depth: opts.depth + 1,
               signal: childSignal,
               loaded: childLoaded,
-              excludeTools: new Set(["spawn_agent", "ask_user", "exit_plan_mode"]),
+              // enter_plan_mode excluded alongside exit_plan_mode (4g Task 4): the child inherits
+              // the PARENT's `meta` object BY REFERENCE (just above) — an unexcluded child calling
+              // enter_plan_mode would mutate the shared `meta.approvalPolicy` AND persist it via
+              // `cfg.setPolicy`, silently putting the WHOLE session into plan mode once the spawn
+              // returns. Plan-mode entry/exit stays a main-thread-only decision.
+              excludeTools: new Set(["spawn_agent", "ask_user", "exit_plan_mode", "enter_plan_mode"]),
               allowTools: def.allowTools,
             });
           });
@@ -587,6 +674,25 @@ export class AgentEngine {
           input.push({ type: "tool_result", callId: call.callId, output: outcome.output, isError: outcome.isError });
           continue;
         }
+        // 4g fix-wave-1 (T1 review): reject a deferred:true built-in that's called before being
+        // loaded/pinned — BEFORE any of the bridge intercepts below get a chance to run. Those
+        // bridges (worktree, exit_plan_mode) dispatch straight from `call.name`, bypassing
+        // executeCall entirely — so without this guard a model calling e.g. enter_worktree
+        // unloaded would silently reach the bridge and succeed, instead of being told to load its
+        // schema via ToolSearch first like every other deferred tool. Mirrors registry.execute()'s
+        // own rejection message byte-for-byte, and reuses THIS round's `effectiveLoaded` (loaded ∪
+        // pins, computed once above) — so a PINNED tool (exit_plan_mode while policy==="plan",
+        // exit_worktree while a worktree is active) is IN effectiveLoaded and naturally passes:
+        // the states that make a tool meaningful keep it callable. `isDeferredBuiltin`'s
+        // `tsEnabled` arg is this round's SAME toolSearchEnabled() flag threaded through specs()/
+        // executeCall above — when toolSearch is disabled it always returns false, so this guard
+        // is a no-op then, preserving the pre-4g byte-identical invariant.
+        if (this.cfg.registry.isDeferredBuiltin(call.name, tsEnabled) && !effectiveLoaded.has(call.name)) {
+          outcome = { output: `tool ${call.name} is deferred — load its schema via ToolSearch first`, isError: true };
+          this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
+          input.push({ type: "tool_result", callId: call.callId, output: outcome.output, isError: outcome.isError });
+          continue;
+        }
         const decision = this.cfg.gate.evaluate(call.name, meta.approvalPolicy);
         // Worktree tools are MUTATING (gate.ts), so under `ask` policy (the DEFAULT) `decision` is
         // "ask", not "allow" — checked here, BEFORE the generic `decision === "ask"` branch below,
@@ -619,7 +725,7 @@ export class AgentEngine {
               timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
               summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
               // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
-            }, async () => this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd));
+            }, loaded, async () => this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd), pins);
           } else {
             outcome = this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd);
           }
@@ -629,9 +735,14 @@ export class AgentEngine {
             timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
             summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
             // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
-          });
+          }, loaded, undefined, pins);
         } else if (call.name === "exit_plan_mode" && this.cfg.plans && meta.approvalPolicy === "plan") {
           outcome = await this.runPlanBridge(call, sessionId, threadId, meta);
+        } else if (call.name === "enter_plan_mode") {
+          // Unconditional — no PlanBroker/manager dependency to gate on (see runEnterPlanBridge's
+          // doc comment). decision is always "allow" here (enter_plan_mode is in gate.ts's
+          // READ_ONLY set under every policy), so this branch is reached for every call.
+          outcome = await this.runEnterPlanBridge(sessionId, meta);
         } else if (
           decision === "allow" && call.name === "bash" && this.cfg.reviewer &&
           this.cfg.reviewerEnabled !== false && meta.approvalPolicy === "auto"
@@ -644,7 +755,7 @@ export class AgentEngine {
             justification = typeof a.justification === "string" ? a.justification : undefined;
           } catch { /* fall through to review of "" → likely unsafe */ }
           if (command && bashLooksSafe(command, this.cfg.reviewerAllow ?? [])) {
-            outcome = await this.executeCall(call, cwd, sessionId, threadId, signal);
+            outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins);
           } else {
             let v: { verdict: "safe" | "unsafe"; reason: string };
             try {
@@ -657,13 +768,13 @@ export class AgentEngine {
                 timeoutMs: Number(process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS ?? 60_000),
                 summary: `⚠ safety reviewer: ${v.reason} — ${call.name} ${command.slice(0, 120)}`,
                 denialMessage: `blocked by the safety reviewer: ${v.reason}. No approval within 60s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.`,
-              });
+              }, loaded, undefined, pins);
             } else {
-              outcome = await this.executeCall(call, cwd, sessionId, threadId, signal);
+              outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins);
             }
           }
         } else {
-          outcome = await this.executeCall(call, cwd, sessionId, threadId, signal);
+          outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins);
         }
 
         this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
@@ -697,7 +808,14 @@ export class AgentEngine {
    *  retry-hint message; the `ask` path passes no override, preserving that exact string
    *  byte-for-byte. `onApprove` lets a caller run something OTHER than executeCall when approved
    *  (the worktree dispatch branch passes the worktree bridge here); omitted (the `ask`/reviewer
-   *  callers above), it defaults to `executeCall` — behavior-preserving for every existing caller. */
+   *  callers above), it defaults to `executeCall` — behavior-preserving for every existing caller.
+   *  `pins` (4g-i) is the CALLING round's pinnedTools() result — forwarded to executeCall's
+   *  default path unchanged; callers that pass their own `onApprove` (the worktree bridge) don't
+   *  need it, but still supply it for signature uniformity (defaults to an empty Set).
+   *  `loaded` (4g final-review fix) is the CALLING THREAD's live `loaded` set (runThread's
+   *  `opts.loaded` — the same object for every caller in this file, main or child) — forwarded
+   *  unchanged to executeCall's default path so an approved call's load/defense-in-depth check
+   *  lands on the thread that actually asked, not always the session-scoped map. */
   private async requestApproval(
     call: { callId: string; name: string; argsJson: string },
     cwd: string,
@@ -705,7 +823,9 @@ export class AgentEngine {
     threadId: string,
     signal: AbortSignal,
     opts: { timeoutMs: number; summary: string; denialMessage?: string },
+    loaded: Set<string>,
     onApprove?: () => Promise<{ output: string; isError: boolean }>,
+    pins: Set<string> = new Set(),
   ): Promise<{ output: string; isError: boolean; deniedByHuman?: boolean }> {
     const waiting = this.cfg.broker.wait(sessionId, call.callId, opts.timeoutMs);
     try {
@@ -721,7 +841,7 @@ export class AgentEngine {
     const res = await waiting;
     this.emit(sessionId, { type: "approval_resolved", sessionId, threadId, callId: call.callId, approved: res.approved, by: res.by });
     if (res.approved) {
-      return await (onApprove ? onApprove() : this.executeCall(call, cwd, sessionId, threadId, signal));
+      return await (onApprove ? onApprove() : this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins));
     }
     // An EXPLICIT human denial (any `by` other than the broker's "timeout") ends the turn and
     // hands control back to the user (Claude Code parity) — see the caller's `deniedByHuman`
@@ -797,6 +917,33 @@ export class AgentEngine {
     };
   }
 
+  /** enter_plan_mode's bridge (4g Task 4, CC parity) — mirrors runPlanBridge's `meta` mutation +
+   *  `cfg.setPolicy` persistence mechanics, but is wired UNCONDITIONALLY at the call site (no
+   *  `cfg.plans`-style optional dependency to gate on): entering plan mode needs no human
+   *  approval — it's strictly restrictive, so there's no broker wait, no `plan_presented`/
+   *  `plan_resolved` event pair, just an immediate switch. Guard: calling this while ALREADY in
+   *  plan mode is a typed error (not a gate denial — gate.ts's READ_ONLY membership allows the
+   *  call through under every policy, including "plan", precisely so this guard can produce a
+   *  clear message instead of the generic "Blocked in plan mode" text). On success,
+   *  `meta.approvalPolicy` is mutated IN PLACE on the SAME object the dispatch loop's gate check
+   *  reads every iteration — a follow-up tool call LATER IN THIS SAME TURN sees the new mode
+   *  immediately; `cfg.setPolicy` persists the switch to the SessionStore so it also survives into
+   *  the next turn (same as the exit bridge — see runPlanBridge's doc comment). */
+  private async runEnterPlanBridge(
+    sessionId: string,
+    meta: { approvalPolicy: "ask" | "auto" | "plan" },
+  ): Promise<{ output: string; isError: boolean }> {
+    if (meta.approvalPolicy === "plan") {
+      return { output: "already in plan mode", isError: true };
+    }
+    await this.cfg.setPolicy?.(sessionId, "plan");
+    meta.approvalPolicy = "plan"; // SAME-TURN: follow-up calls in this turn use the new mode
+    return {
+      output: "Plan mode ON — read-only tools only; present your plan with exit_plan_mode when ready.",
+      isError: false,
+    };
+  }
+
   /** enter_worktree/exit_worktree's bridge — wired ONLY when cfg.worktrees is set (see the
    *  `isWorktree` guard at the call site); otherwise both tools fall through to executeCall's
    *  placeholder run (tools/worktree.ts). Called from BOTH decisions the gate can produce for a
@@ -833,13 +980,18 @@ export class AgentEngine {
         };
       }
       let action: "keep" | "remove" = "keep";
-      try { const a = JSON.parse(call.argsJson || "{}"); if (a.action === "remove") action = "remove"; } catch { /* default to keep */ }
+      let discardChanges = false;
+      try {
+        const a = JSON.parse(call.argsJson || "{}");
+        if (a.action === "remove") action = "remove";
+        if (a.discard_changes === true) discardChanges = true;
+      } catch { /* default to keep, discardChanges false */ }
       // Capture the worktree dir BEFORE exit() clears the manager's active-session entry, so we
       // can drop it from SessionDirectories below — on BOTH keep and remove: once exited we're
       // back in the original repo either way, and a lingering root (especially one whose dir was
       // just deleted by {remove}) must not stick around in the allowed-roots list.
       const activeDir = worktrees.active(sessionId)?.dir;
-      const res = worktrees.exit(sessionId, action);
+      const res = worktrees.exit(sessionId, action, discardChanges);
       this.cfg.store.setCwd(sessionId, res.originalCwd);
       if (activeDir) this.cfg.dirs.remove(sessionId, activeDir);
       onCwd(res.originalCwd); // SAME-TURN revert
@@ -861,6 +1013,20 @@ export class AgentEngine {
     sessionId: string,
     threadId: string,
     signal: AbortSignal,
+    // 4g final-review fix: the CALLING THREAD's live `loaded` set — runThread's own `opts.loaded`,
+    // threaded straight through by every call site in this file (main-thread branches AND the
+    // requestApproval/executeCall calls inside a spawned child's own runThread invocation). This
+    // is THE set a load must land in and THE set the defense-in-depth check below must read —
+    // for the MAIN thread it IS `this.loadedTools.get(sessionId)` (turn() hands that exact object
+    // to runThread as opts.loaded), so main-thread behavior is byte-identical to before; for a
+    // CHILD thread it's the fresh per-spawn `childLoaded` Set (runThread's spawn bridge), never
+    // `this.loadedTools` — so a subagent's ToolSearch load now lands where its OWN specs()/guard
+    // actually look, instead of a session-wide set the child never consults.
+    loaded: Set<string>,
+    // 4g-i: the CALLING round's pinnedTools() result (runThread's `pins`, or requestApproval's
+    // forwarded copy of it) — defaulted so any caller that doesn't care about pins compiles
+    // unchanged. Unioned below with `loaded`, never mutating either.
+    pins: Set<string> = new Set(),
   ): Promise<{ output: string; isError: boolean }> {
     let args: unknown;
     try { args = call.argsJson.length ? JSON.parse(call.argsJson) : {}; }
@@ -872,14 +1038,11 @@ export class AgentEngine {
       if (!set) { set = new Set(); this.loadedSkills.set(sessionId, set); }
       set.add(n);
     };
-    // Pass the LIVE loadedTools set (mutated in place by markToolLoaded) — see the NOTE in
-    // turn() above. By the time executeCall runs, turn() has already ensured this session's
-    // entry exists, so `?? new Set()` here is a defensive fallback, never the live path.
-    const markToolLoaded = (n: string) => {
-      let set = this.loadedTools.get(sessionId);
-      if (!set) { set = new Set(); this.loadedTools.set(sessionId, set); }
-      set.add(n);
-    };
+    // Mutate the CALLING THREAD's own `loaded` set in place — never `this.loadedTools.get
+    // (sessionId)` (that lookup is what caused the bug: a child thread's load used to land in the
+    // session-wide map instead of the `childLoaded` set the child's own specs()/guard consult,
+    // AND polluted the session-wide set for good measure). See `loaded`'s doc comment above.
+    const markToolLoaded = (n: string) => { loaded.add(n); };
     const askTimeoutMs = Number(process.env.NORMA_ASK_TIMEOUT_MS ?? 300_000);
     const ask = this.cfg.questions
       ? async (questions: Question[]) => {
@@ -911,11 +1074,16 @@ export class AgentEngine {
     const taskEvent = this.cfg.tasks
       ? (task: Task) => { this.emit(sessionId, { type: "task_updated", sessionId, threadId, task }); }
       : undefined;
+    // The calling thread's own `loaded` set (see its doc comment above), unioned with this
+    // round's pins into a NEW Set — `loaded` itself is NEVER copied/mutated by this union.
+    const effectiveLoaded = pins.size ? new Set([...loaded, ...pins]) : loaded;
     return this.cfg.registry.execute(call.name, args, {
       cwd, roots, tmpDir, sessionId, signal, markSkillLoaded,
       markToolLoaded,
-      loadedTools: this.loadedTools.get(sessionId) ?? new Set(),
+      loadedTools: effectiveLoaded,
       deferThreshold: this.toolSearchThreshold(),
+      deferExternals: this.toolSearchDeferExternals(),
+      builtinDeferral: this.toolSearchEnabled(),
       ask,
       taskEvent,
     });

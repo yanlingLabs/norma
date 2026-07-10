@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { ToolRegistry } from "./registry";
 import type { BackgroundTaskRegistry } from "../bg-registry";
 
-export function registerBackgroundTools(r: ToolRegistry, deps: { bgRegistry: BackgroundTaskRegistry }): void {
+export function registerBackgroundTools(r: ToolRegistry, deps: { bgRegistry: BackgroundTaskRegistry }, opts?: { deferred?: boolean }): void {
   const { bgRegistry } = deps;
 
   r.register({
@@ -12,6 +12,7 @@ export function registerBackgroundTools(r: ToolRegistry, deps: { bgRegistry: Bac
       taskId: z.string().min(1),
       filter: z.string().max(256).optional(),
     }),
+    deferred: opts?.deferred,
     run({ taskId, filter }, { sessionId }) {
       const { chunk, status, exitCode } = bgRegistry.read(sessionId, taskId);
       let body = chunk;
@@ -32,6 +33,7 @@ export function registerBackgroundTools(r: ToolRegistry, deps: { bgRegistry: Bac
     name: "bash_kill",
     description: "Stop a running background bash task started with bash's runInBackground option.",
     args: z.object({ taskId: z.string().min(1) }),
+    deferred: opts?.deferred,
     run({ taskId }, { sessionId }) {
       bgRegistry.kill(sessionId, taskId);
       return `killed ${taskId}`;

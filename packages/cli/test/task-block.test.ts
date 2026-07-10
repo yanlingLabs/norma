@@ -46,6 +46,31 @@ describe("upsertTask", () => {
     upsertTask(original, task("2", "ship it", "pending"));
     expect(original).toEqual([t1]);
   });
+
+  // T3 review fix wave 1: a task_updated carrying status "deleted" REMOVES the entry instead of
+  // upserting it — otherwise the pinned block phantoms deleted tasks forever (the daemon never
+  // sends a follow-up event once a task is actually gone from the store).
+  describe("status: \"deleted\" removes instead of upserting (T3 review fix wave 1)", () => {
+    test("removes an existing id from the list", () => {
+      const t1 = task("1", "write tests", "pending");
+      const t2 = task("2", "ship it", "pending");
+      const deleted: Task = { ...t1, status: "deleted" };
+      expect(upsertTask([t1, t2], deleted)).toEqual([t2]);
+    });
+
+    test("deleting an id not present is a no-op (list unchanged)", () => {
+      const t1 = task("1", "write tests", "pending");
+      const deleted: Task = { id: "999", subject: "ghost", status: "deleted" };
+      expect(upsertTask([t1], deleted)).toEqual([t1]);
+    });
+
+    test("does not mutate the input array (pure)", () => {
+      const t1 = task("1", "write tests", "pending");
+      const original = [t1];
+      upsertTask(original, { ...t1, status: "deleted" });
+      expect(original).toEqual([t1]);
+    });
+  });
 });
 
 describe("renderTaskBlock (CC tree: shared sort/collapse + colored glyphs)", () => {
@@ -104,6 +129,20 @@ describe("renderTaskBlock (CC tree: shared sort/collapse + colored glyphs)", () 
     const out = renderTaskBlock(tasks).join("\n");
     expect(out).toContain(`${BLUE}■`);
     expect(out).toContain(`${GREEN}✓`);
+  });
+
+  // T3 review fix wave 1: once upsertTask removes a deleted task (see the describe block above),
+  // the count header — computed over renderTaskBlock's own `tasks` argument — must recount
+  // correctly with the deleted task simply absent, same as any other list without it.
+  test("count header recounts correctly after a deleted task is dropped via upsertTask", () => {
+    const t1 = task("1", "write tests", "completed");
+    const t2 = task("2", "ship it", "pending");
+    const t3 = task("3", "throwaway", "pending");
+    let tasks = upsertTask(upsertTask([t1], t2), t3);
+    expect(renderTaskBlock(tasks)[0]).toBe(`${DIM}3 tasks (1 done, 0 in progress, 2 open)${RESET}`);
+    tasks = upsertTask(tasks, { ...t3, status: "deleted" });
+    expect(tasks).toEqual([t1, t2]);
+    expect(renderTaskBlock(tasks)[0]).toBe(`${DIM}2 tasks (1 done, 0 in progress, 1 open)${RESET}`);
   });
 });
 
@@ -210,11 +249,14 @@ describe("truncateStatusLine (ANSI-safe width truncation for the caller-rendered
   });
 });
 
-describe("TASK_ICONS (unchanged — still used for the non-TTY one-line-per-update render)", () => {
+describe("TASK_ICONS (still used for the non-TTY one-line-per-update render)", () => {
   test("maps every status to its glyph", () => {
     expect(TASK_ICONS.pending).toBe("☐");
     expect(TASK_ICONS.in_progress).toBe("◐");
     expect(TASK_ICONS.completed).toBe("☑");
+    // T3 review fix wave 1: "deleted" now reaches this non-TTY render too — without an entry the
+    // line would print the literal string "undefined" for the glyph.
+    expect(TASK_ICONS.deleted).toBe("✗");
   });
 });
 

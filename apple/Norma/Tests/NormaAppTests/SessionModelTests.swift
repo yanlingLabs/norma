@@ -120,6 +120,48 @@ final class SessionModelTests: XCTestCase {
         XCTAssertEqual(s.taskCounts.total, 2)
     }
 
+    // MARK: Task deletion removes instead of phantoming (T3 review fix wave 1) — a task_updated
+    // carrying status "deleted" (protocol/src/events.ts's TaskSchema, packages/core's
+    // task_update deleted branch) must remove the task from `s.tasks`, not upsert it.
+
+    func testTaskDeletedRemovesFromTasksAndRecountsCorrectly() {
+        var s = OrbSessionState()
+        // Realistic ordering (create pending, THEN complete) — creating "3" pending while "1" is
+        // the only (already-completed) task must NOT hit the unrelated "new batch" reset (see
+        // testNewTaskAfterFullCompletionResetsCounts below): task 1 only becomes completed AFTER
+        // 2 and 3 already exist, so no new-id arrival ever sees an all-completed list.
+        s = SessionReducer.reduce(s, taskUpdated(id: "1", subject: "a", status: "pending"))
+        s = SessionReducer.reduce(s, taskUpdated(id: "2", subject: "b", status: "pending", seq: 7))
+        s = SessionReducer.reduce(s, taskUpdated(id: "3", subject: "c", status: "pending", seq: 8))
+        s = SessionReducer.reduce(s, taskUpdated(id: "1", subject: "a", status: "completed", seq: 9))
+        XCTAssertEqual(s.taskCounts.total, 3)
+
+        s = SessionReducer.reduce(s, taskUpdated(id: "3", subject: "c", status: "deleted", seq: 10))
+        XCTAssertEqual(s.tasks.map(\.id), ["1", "2"])
+        XCTAssertEqual(s.taskCounts.done, 1)
+        XCTAssertEqual(s.taskCounts.total, 2) // recounted, not carrying the deleted task's slot
+    }
+
+    /// Deleting an unknown/already-gone id is a no-op on `s.tasks` (nothing to remove) — the
+    /// reducer must not crash or insert a phantom entry for it either.
+    func testTaskDeletedForUnknownIdIsNoOp() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, taskUpdated(id: "1", subject: "a", status: "pending"))
+        s = SessionReducer.reduce(s, taskUpdated(id: "999", subject: "ghost", status: "deleted", seq: 7))
+        XCTAssertEqual(s.tasks.map(\.id), ["1"])
+    }
+
+    /// A deleted task must not be resurrected by the "brand-new task id" append path — once
+    /// removed, a later event about a DIFFERENT new id must not somehow reintroduce it.
+    func testTaskDeletedThenUnrelatedNewTaskDoesNotResurrectIt() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, taskUpdated(id: "1", subject: "a", status: "pending"))
+        s = SessionReducer.reduce(s, taskUpdated(id: "1", subject: "a", status: "deleted", seq: 7))
+        XCTAssertEqual(s.tasks.count, 0)
+        s = SessionReducer.reduce(s, taskUpdated(id: "2", subject: "b", status: "pending", seq: 8))
+        XCTAssertEqual(s.tasks.map(\.id), ["2"])
+    }
+
     // MARK: Task list current-run scoping (gate wave-4 item 2 — "tasks never clear")
 
     /// (a) A brand-new task id arriving right after the current list finished completely (no

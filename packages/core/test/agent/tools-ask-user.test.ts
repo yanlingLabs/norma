@@ -16,7 +16,7 @@ function buildRegistry(): ToolRegistry {
 const Q = (over: Record<string, unknown> = {}) => ({
   question: "Pick one",
   header: "Pick",
-  options: [{ label: "A" }, { label: "B" }],
+  options: [{ label: "A", description: "Option A" }, { label: "B", description: "Option B" }],
   multiSelect: false,
   ...over,
 });
@@ -37,6 +37,19 @@ describe("ask_user tool", () => {
     }
   });
 
+  // 4g-ii (CC parity): option description is now REQUIRED — a label without one is invalid args,
+  // distinct from the count-bounds cases above (this option list is otherwise well-formed).
+  test("option missing description → invalid args", async () => {
+    const r = buildRegistry();
+    const out = await r.execute(
+      "ask_user",
+      { questions: [Q({ options: [{ label: "A", description: "Option A" }, { label: "B" }] })] },
+      ctx(),
+    );
+    expect(out.isError).toBe(true);
+    expect(out.output).toContain("description");
+  });
+
   test("formats answers by header, keyed by question text", async () => {
     const r = buildRegistry();
     const out = await r.execute(
@@ -54,7 +67,7 @@ describe("ask_user tool", () => {
       "ask_user",
       {
         questions: [
-          Q({ question: "Q1", header: "First", options: [{ label: "A" }, { label: "C" }], multiSelect: true }),
+          Q({ question: "Q1", header: "First", options: [{ label: "A", description: "Option A" }, { label: "C", description: "Option C" }], multiSelect: true }),
           Q({ question: "Q2", header: "Second" }),
         ],
       },
