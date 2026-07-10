@@ -92,7 +92,7 @@ struct HelperApprovalRow: View {
 /// in `HelperShared/NormaHelperProtocol.swift`) and a lazy, invalidation-resilient
 /// `NSXPCConnection` for the two `NormaHelperProtocol` calls.
 ///
-/// LIVE-GATE: `register()`/`unregister()`/`refreshStatus()` drive real `SMAppService` state, and
+/// LIVE-GATE: `register()`/`refreshStatus()` drive real `SMAppService` state, and
 /// `setChargeLimit`/`getChargeLimit` drive a real XPC round-trip to a real `NormaHelper` process —
 /// neither is meaningful under XCTest (no daemon to register/approve/connect to in CI, and the
 /// `NormaAppTests` bundle loader is the real `Norma.app`, so a REAL `service.register()` call here
@@ -114,8 +114,8 @@ final class HelperClient: ObservableObject {
         refreshStatus()
     }
 
-    /// Snapshots `service.status` into the published enum. Called on init, after register/
-    /// unregister, and available for the dashboard row's own manual/periodic refresh.
+    /// Snapshots `service.status` into the published enum. Called on init, after register, and
+    /// available for the dashboard row's own manual/periodic refresh.
     func refreshStatus() {
         status = HelperApprovalStatus(service.status)
     }
@@ -131,16 +131,6 @@ final class HelperClient: ObservableObject {
             NSLog("[HelperClient] register failed: \(error)")
         }
         refreshStatus()
-    }
-
-    /// `SMAppService.unregister(completionHandler:)` is itself async (server round-trip) —
-    /// `refreshStatus()` runs from its completion handler, not synchronously after the call like
-    /// `register()`.
-    func unregister() {
-        service.unregister { [weak self] error in
-            if let error { NSLog("[HelperClient] unregister failed: \(error)") }
-            Task { @MainActor in self?.refreshStatus() }
-        }
     }
 
     // MARK: - XPC calls (NormaHelperProtocol)
@@ -196,15 +186,22 @@ final class HelperClient: ObservableObject {
     }
 
     /// The shared XPC-call body: a checked continuation resumed EXACTLY ONCE by whichever fires
-    /// first — the method's reply block or the proxy's connection-level error handler. XPC
-    /// guarantees one of the two per call, but they arrive on non-main queues, so the once-latch
-    /// is a real lock (`ResumeOnce`), not a bare Bool.
+    /// first — the method's reply block, the proxy's connection-level error handler, or (Task 4,
+    /// Phase 4d-cleanup) an 8s fallback timer. XPC guarantees one of the first two per call, but
+    /// a wedged/silent `NormaHelper` (hung, deadlocked, killed mid-call without the connection
+    /// noticing) satisfies neither, so the timer is a THIRD race participant, not a replacement
+    /// for the other two. 8s is deliberately under norma-core's `HardwareBroker` 10s timeout, so
+    /// this typed error resolves first and the broker never has to fire its own. All three arrive
+    /// on non-main queues/timers, so the once-latch is a real lock (`ResumeOnce`), not a bare Bool.
     private func call(_ invoke: (NormaHelperProtocol, @escaping (String?, String?) -> Void) -> Void) async -> (resultJson: String?, errorJson: String?) {
         await withCheckedContinuation { continuation in
             let once = ResumeOnce()
             let resume: (String?, String?) -> Void = { result, error in
                 guard once.claim() else { return }
                 continuation.resume(returning: (result, error))
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+                resume(nil, Self.errorJson(code: "timeout", message: "helper did not reply within 8s"))
             }
             guard let proxy = remoteProxy(errorHandler: { error in
                 resume(nil, Self.xpcErrorJson("\(error)"))

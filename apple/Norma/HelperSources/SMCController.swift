@@ -66,6 +66,11 @@ final class SMCController {
         case keyNotFound(String)
     }
 
+    /// NOT internally synchronized — this class has no lock around `connection` or the SMC calls
+    /// built on it. Every caller must serialize all access itself; `ChargeManager`'s serial queue
+    /// is the sole sanctioned caller (Task 4, Phase 4d-cleanup doc note — no code change here, since
+    /// a functional change to this file would require the user to `sudo launchctl kickstart` the
+    /// installed root helper to pick it up).
     private var connection: io_connect_t = 0
 
     // MARK: Public API
