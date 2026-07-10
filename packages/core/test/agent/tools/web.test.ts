@@ -32,6 +32,19 @@ describe("htmlToText", () => {
     expect(htmlToText('<a href="https://x.com">click</a>')).toBe("click (https://x.com)");
     expect(htmlToText("<ul><li>one</li><li>two</li></ul>")).toBe("- one\n- two");
   });
+
+  test("does not create false bullet points from <link> tags", () => {
+    const html = '<html><head><link rel="icon" href="favicon.ico"><title>Page</title></head><body><p>content</p></body></html>';
+    const result = htmlToText(html);
+    expect(result).not.toContain("- ");
+  });
+
+  test("strips <head> section before text conversion to avoid title leakage", () => {
+    const html = "<head><title>T</title></head><body><h1>H</h1>hello</body>";
+    const result = htmlToText(html);
+    expect(result).toBe("# H\nhello");
+    expect(result).not.toContain("T");
+  });
 });
 
 // --- followRedirects: fake fetch, no live network ---------------------------------------------
