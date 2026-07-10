@@ -646,6 +646,25 @@ export class AgentEngine {
           input.push({ type: "tool_result", callId: call.callId, output: outcome.output, isError: outcome.isError });
           continue;
         }
+        // 4g fix-wave-1 (T1 review): reject a deferred:true built-in that's called before being
+        // loaded/pinned — BEFORE any of the bridge intercepts below get a chance to run. Those
+        // bridges (worktree, exit_plan_mode) dispatch straight from `call.name`, bypassing
+        // executeCall entirely — so without this guard a model calling e.g. enter_worktree
+        // unloaded would silently reach the bridge and succeed, instead of being told to load its
+        // schema via ToolSearch first like every other deferred tool. Mirrors registry.execute()'s
+        // own rejection message byte-for-byte, and reuses THIS round's `effectiveLoaded` (loaded ∪
+        // pins, computed once above) — so a PINNED tool (exit_plan_mode while policy==="plan",
+        // exit_worktree while a worktree is active) is IN effectiveLoaded and naturally passes:
+        // the states that make a tool meaningful keep it callable. `isDeferredBuiltin`'s
+        // `tsEnabled` arg is this round's SAME toolSearchEnabled() flag threaded through specs()/
+        // executeCall above — when toolSearch is disabled it always returns false, so this guard
+        // is a no-op then, preserving the pre-4g byte-identical invariant.
+        if (this.cfg.registry.isDeferredBuiltin(call.name, tsEnabled) && !effectiveLoaded.has(call.name)) {
+          outcome = { output: `tool ${call.name} is deferred — load its schema via ToolSearch first`, isError: true };
+          this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
+          input.push({ type: "tool_result", callId: call.callId, output: outcome.output, isError: outcome.isError });
+          continue;
+        }
         const decision = this.cfg.gate.evaluate(call.name, meta.approvalPolicy);
         // Worktree tools are MUTATING (gate.ts), so under `ask` policy (the DEFAULT) `decision` is
         // "ask", not "allow" — checked here, BEFORE the generic `decision === "ask"` branch below,

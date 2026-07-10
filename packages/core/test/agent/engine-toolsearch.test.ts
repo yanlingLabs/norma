@@ -1,15 +1,39 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync } from "node:fs";
+import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import { ToolRegistry } from "../../src/agent/tools/registry";
 import { registerToolSearchTool } from "../../src/agent/tools/toolsearch";
+import { registerWorktreeTools } from "../../src/agent/tools/worktree";
+import { WorktreeManager } from "../../src/agent/worktree";
 import { FakeProvider } from "../../src/agent/fake-provider";
 import { setupEngine } from "./engine-steer.test";
 
 // Mirrors engine-skills.test.ts's `done` helper.
 const done = (reason: "end_turn" | "tool_calls") => ({ type: "done" as const, stopReason: reason });
+
+// 4g fix-wave-1 tests below exercise the REAL worktree bridge (a git-backed WorktreeManager),
+// mirroring engine-worktree.test.ts's isMac gate + repo() helper — the bridge shells out to real
+// git, so these are skipped off-mac exactly like that file's own worktree bridge tests.
+const isMac = process.platform === "darwin";
+
+function git(args: string[], cwd: string): { code: number; stdout: string; stderr: string } {
+  const p = Bun.spawnSync(["git", "-C", cwd, ...args]);
+  return { code: p.exitCode ?? 0, stdout: p.stdout.toString(), stderr: p.stderr.toString() };
+}
+
+/** mkdtemp + git init + an initial commit so HEAD exists. Mirrors engine-worktree.test.ts's repo(). */
+function repo(): string {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "norma-ts-wt-")));
+  git(["init"], dir);
+  git(["config", "user.email", "test@norma.dev"], dir);
+  git(["config", "user.name", "Norma Test"], dir);
+  writeFileSync(join(dir, "README.md"), "hello\n");
+  git(["add", "-A"], dir);
+  git(["commit", "-m", "init"], dir);
+  return dir;
+}
 
 // 13 trivial stub mcp__ tools (one over the {deferThreshold: 12} used throughout) + the real
 // registerToolSearchTool — NO real MCP spawn. `ran` tracks which stubs actually executed, so
@@ -253,5 +277,102 @@ describe("engine: built-in deferral + state pins (4g-i)", () => {
     expect(names).not.toContain("mcp__s__t1");
     expect(names).toContain("ToolSearch");
     expect(provider.requests[0]!.instructions).toContain("mcp__s__t1"); // listed as a deferred tool
+  });
+});
+
+// -------------------------------------------------------------------------------------------
+// Phase 4g fix-wave-1 (T1 review): the engine's dispatch loop intercepts enter_worktree/
+// exit_worktree (and exit_plan_mode) BEFORE execute() ever runs, via a bridge that shells
+// straight to the WorktreeManager. registry.execute()'s deferred-rejection check never gets a
+// chance to fire for those tools — so before this fix, calling enter_worktree unloaded reached
+// the bridge and silently succeeded instead of being told to load its schema first. These tests
+// exercise the REAL worktree bridge (git-backed WorktreeManager), like engine-worktree.test.ts.
+// -------------------------------------------------------------------------------------------
+describe.if(isMac)("engine: deferred-tool guard runs before the worktree bridge (4g fix-wave-1)", () => {
+  test("REJECT: enter_worktree called unloaded is rejected before the bridge runs — no worktree created", async () => {
+    const cwd = repo();
+    const registry = new ToolRegistry();
+    registerToolSearchTool(registry);
+    registerWorktreeTools(registry, { deferred: true });
+    const worktrees = new WorktreeManager({ baseRef: "head" });
+    const provider = new FakeProvider([
+      [{ type: "tool_call", callId: "e1", name: "enter_worktree", argsJson: JSON.stringify({ name: "feat" }) }, done("tool_calls")],
+      [{ type: "text_delta", delta: "ok" }, done("end_turn")],
+    ]);
+    const { engine, sessionId, events } = setupEngine(provider, { registry, cwd, worktrees, toolSearch: { deferThreshold: 12 } });
+
+    await engine.runTurn(sessionId);
+
+    const toolResult = events.find((e) => e.type === "tool_result" && e.callId === "e1");
+    if (!toolResult || toolResult.type !== "tool_result") throw new Error("expected a tool_result for e1");
+    expect(toolResult.isError).toBe(true);
+    expect(toolResult.output).toContain("deferred");
+    expect(toolResult.output).toContain("ToolSearch");
+    // The bridge did NOT run: no worktree_entered event, and the manager itself never registered
+    // an active worktree for this session (the ground-truth "did the bridge actually fire" check).
+    expect(events.some((e) => e.type === "worktree_entered")).toBe(false);
+    expect(worktrees.active(sessionId)).toBeUndefined();
+  });
+
+  test("LOAD THEN CALL: ToolSearch-loading enter_worktree lets the SAME tool reach the bridge", async () => {
+    const cwd = repo();
+    const registry = new ToolRegistry();
+    registerToolSearchTool(registry);
+    registerWorktreeTools(registry, { deferred: true });
+    const worktrees = new WorktreeManager({ baseRef: "head" });
+    const provider = new FakeProvider([
+      [{ type: "tool_call", callId: "s1", name: "ToolSearch", argsJson: JSON.stringify({ query: "select:enter_worktree" }) }, done("tool_calls")],
+      [{ type: "tool_call", callId: "e1", name: "enter_worktree", argsJson: JSON.stringify({ name: "feat" }) }, done("tool_calls")],
+      [{ type: "text_delta", delta: "ok" }, done("end_turn")],
+    ]);
+    const { engine, sessionId, events } = setupEngine(provider, { registry, cwd, worktrees, toolSearch: { deferThreshold: 12 } });
+
+    await engine.runTurn(sessionId);
+
+    expect(events.some((e) => e.type === "worktree_entered")).toBe(true);
+    expect(worktrees.active(sessionId)).toBeDefined();
+    const enterResult = events.find((e) => e.type === "tool_result" && e.callId === "e1");
+    expect(enterResult).toMatchObject({ isError: false });
+  });
+
+  test("PIN PASSES: exit_worktree called unloaded works while a worktree is active (pinned)", async () => {
+    const cwd = repo();
+    const registry = new ToolRegistry();
+    registerToolSearchTool(registry);
+    registerWorktreeTools(registry, { deferred: true });
+    const worktrees = new WorktreeManager({ baseRef: "head" });
+    const provider = new FakeProvider([
+      [{ type: "tool_call", callId: "s1", name: "ToolSearch", argsJson: JSON.stringify({ query: "select:enter_worktree" }) }, done("tool_calls")],
+      [{ type: "tool_call", callId: "e1", name: "enter_worktree", argsJson: JSON.stringify({ name: "feat" }) }, done("tool_calls")],
+      // exit_worktree is NEVER loaded via ToolSearch — only pinned, because a worktree is active.
+      [{ type: "tool_call", callId: "x1", name: "exit_worktree", argsJson: JSON.stringify({ action: "keep" }) }, done("tool_calls")],
+      [{ type: "text_delta", delta: "ok" }, done("end_turn")],
+    ]);
+    const { engine, sessionId, events } = setupEngine(provider, { registry, cwd, worktrees, toolSearch: { deferThreshold: 12 } });
+
+    await engine.runTurn(sessionId);
+
+    expect(events.some((e) => e.type === "worktree_exited")).toBe(true);
+    const exitResult = events.find((e) => e.type === "tool_result" && e.callId === "x1");
+    expect(exitResult).toMatchObject({ isError: false });
+  });
+
+  test("DISABLED: toolSearch disabled → enter_worktree unloaded works exactly as pre-4g (guard is a no-op)", async () => {
+    const cwd = repo();
+    const registry = new ToolRegistry();
+    registerWorktreeTools(registry, { deferred: true }); // deferred:true, but inert without toolSearch enabled
+    const worktrees = new WorktreeManager({ baseRef: "head" });
+    const provider = new FakeProvider([
+      [{ type: "tool_call", callId: "e1", name: "enter_worktree", argsJson: JSON.stringify({ name: "feat" }) }, done("tool_calls")],
+      [{ type: "text_delta", delta: "ok" }, done("end_turn")],
+    ]);
+    const { engine, sessionId, events } = setupEngine(provider, { registry, cwd, worktrees }); // toolSearch undefined
+
+    await engine.runTurn(sessionId);
+
+    expect(events.some((e) => e.type === "worktree_entered")).toBe(true);
+    expect(worktrees.active(sessionId)).toBeDefined();
+    const enterResult = events.find((e) => e.type === "tool_result" && e.callId === "e1");
+    expect(enterResult).toMatchObject({ isError: false });
   });
 });

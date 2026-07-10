@@ -122,6 +122,22 @@ export class ToolRegistry {
       .map((d) => ({ name: d.name, description: d.description.slice(0, 150) }));
   }
 
+  /** Read-only: is `name` a registered built-in whose `deferred: true` flag is CURRENTLY active
+   *  (builtinActive mirrors the engine's toolSearchEnabled() — the same flag threaded through
+   *  specs()/execute() as ctx.builtinDeferral)? Delegates to the single isDeferred predicate with
+   *  countActive forced false — externals (mcp__/plugin__) never ride this path, only registered
+   *  `deferred: true` built-ins do — so this can never disagree with specs()/execute() about what
+   *  is deferred right now. Exists for callers OUTSIDE execute(): the engine's dispatch loop needs
+   *  to know, BEFORE running a bridge that intercepts a call ahead of execute() (the worktree/
+   *  exit_plan_mode bridges), whether that call should be deferred-rejected instead — those
+   *  bridges never reach execute()'s own check. Returns false for an unknown name (nothing to
+   *  defer) — mirrors execute()'s own "unknown tool" handling, which is a separate error path. */
+  isDeferredBuiltin(name: string, builtinActive: boolean): boolean {
+    const def = this.defs.get(name);
+    if (!def) return false;
+    return this.isDeferred(def, false, builtinActive);
+  }
+
   specFor(name: string, cwd?: string | null): ToolSpec | undefined {
     const d = this.defs.get(name);
     if (!d || (d.scope && !(cwd && isWithin(cwd, d.scope)))) return undefined;
