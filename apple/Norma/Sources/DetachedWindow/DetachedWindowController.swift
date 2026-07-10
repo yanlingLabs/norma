@@ -286,7 +286,8 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
                 keyCode: event.keyCode,
                 chars: event.charactersIgnoringModifiers,
                 topmost: topmost,
-                composerDraft: self.adapter.composerDraft
+                composerDraft: self.adapter.composerDraft,
+                textFieldFocused: isTextEditingFocused(in: self.window)
             ) {
                 self.dispatchCardKeyAction(action, topmost: topmost)
                 return nil
