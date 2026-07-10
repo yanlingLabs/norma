@@ -257,9 +257,10 @@ final class DashboardTests: XCTestCase {
         delegate.dashboardWindow?.close()
     }
 
-    /// The regression this fix targets: "Manage Plugins…" (`initialPane: .pluginManager`) fired
-    /// while the Dashboard is ALREADY open must switch the already-open window to that pane, not
-    /// just refocus it while leaving whatever pane was showing untouched.
+    /// The regression this fix targets: a TARGETED entry ("Manage Plugins…" →
+    /// `openDashboard(initialPane: .pluginManager)`) fired while the Dashboard is ALREADY open
+    /// must switch the already-open window to that pane, not just refocus it while leaving
+    /// whatever pane was showing untouched.
     func testOpenDashboardRefocusSwitchesPaneOnAnAlreadyOpenWindow() {
         let delegate = AppDelegate()
         XCTAssertTrue(delegate.boot())
@@ -273,7 +274,43 @@ final class DashboardTests: XCTestCase {
         delegate.openDashboard(initialPane: .pluginManager)
 
         XCTAssertTrue(delegate.dashboardWindow === first, "a second invocation must reuse the existing controller")
-        XCTAssertEqual(delegate.dashboardWindow?.selectionForTesting, .pluginManager, "refocusing must also retarget the pane")
+        XCTAssertEqual(delegate.dashboardWindow?.selectionForTesting, .pluginManager, "a targeted open must retarget the pane")
+        delegate.dashboardWindow?.close()
+    }
+
+    /// Phase 4d-cleanup Task 3 fix wave 1 (the over-correction this wave fixes): a PLAIN
+    /// "Dashboard…" refocus — `openDashboard()` with no `initialPane` — must PRESERVE whatever
+    /// pane the user had already navigated to. `testOpenDashboardRefocusSwitchesPaneOnAnAlreadyOpenWindow`
+    /// above proves the TARGETED path still retargets; this proves the untargeted path no longer
+    /// does, closing the regression where the plain menu entry silently snapped an already-open
+    /// window back to the default pane on every refocus.
+    func testOpenDashboardPlainRefocusPreservesTheCurrentPane() {
+        let delegate = AppDelegate()
+        XCTAssertTrue(delegate.boot())
+        delegate.openDashboard()
+        guard let first = delegate.dashboardWindow else {
+            XCTFail("openDashboard() must construct a controller when booted")
+            return
+        }
+        // Simulate the user having navigated away from the default pane before refocusing.
+        first.selectPane(.trust)
+        XCTAssertEqual(first.selectionForTesting, .trust)
+
+        delegate.openDashboard() // plain refocus — no pane requested
+
+        XCTAssertTrue(delegate.dashboardWindow === first, "a second invocation must reuse the existing controller")
+        XCTAssertEqual(delegate.dashboardWindow?.selectionForTesting, .trust, "a plain refocus must preserve the current pane")
+        delegate.dashboardWindow?.close()
+    }
+
+    /// A FRESH open via the plain "Dashboard…" entry (no window yet, no `initialPane` requested)
+    /// still lands on the default pane — unaffected by this fix, since the selection model itself
+    /// seeds to `defaultDashboardPane` regardless of whether `openDashboard` passes it explicitly.
+    func testOpenDashboardPlainFreshOpenLandsOnDefaultPane() {
+        let delegate = AppDelegate()
+        XCTAssertTrue(delegate.boot())
+        delegate.openDashboard()
+        XCTAssertEqual(delegate.dashboardWindow?.selectionForTesting, defaultDashboardPane)
         delegate.dashboardWindow?.close()
     }
 
