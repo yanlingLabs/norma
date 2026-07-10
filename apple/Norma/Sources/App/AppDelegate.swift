@@ -194,8 +194,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Phase 4d-iii Task 2: the menu bar's "Manage Plugins…" entry — opens the SAME singleton
-    /// Dashboard window `openDashboard()` owns, landed on `.pluginManager` when a fresh window is
-    /// spawned (mirrors that method's own doc comment on the refocus-vs-fresh-window distinction).
+    /// Dashboard window `openDashboard()` owns, landed on `.pluginManager` whether the window is
+    /// spawned fresh or already open (a targeted `initialPane` retargets an open window; only the
+    /// plain nil-pane "Dashboard…" path preserves the user's current pane — 4d-cleanup T3).
     func openPluginManager() {
         openDashboard(initialPane: .pluginManager)
     }
