@@ -70,6 +70,11 @@ export class ContextAssembler {
     const trusted = cwd ? this.trust.isTrusted(cwd) : false;
     const sections: string[] = [this.basePrompt];
 
+    // F2 (4e gate ledger): the model has no other way to know the current date — recomputed each
+    // assemble() call (once per turn) so it stays current across long sessions. Locale-stable
+    // (toISOString, not toLocaleDateString).
+    sections.push(`Today's date is ${new Date().toISOString().slice(0, 10)}.`);
+
     const userInstr = readCapped(join(this.normaHome, "NORMA.md"), this.caps.instructionsBytes);
     if (userInstr) sections.push(`## User instructions (~/.norma/NORMA.md)\n${userInstr}`);
 

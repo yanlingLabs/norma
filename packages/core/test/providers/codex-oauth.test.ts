@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FileSecretStore } from "../../src/auth/secret-store";
 import { CodexAuthStore, CodexOAuthProvider } from "../../src/providers/codex-oauth";
+import { CODEX_MODELS } from "../../src/providers/codex-config";
 
 let server: ReturnType<typeof Bun.serve> | null = null;
 afterEach(() => { server?.stop(true); server = null; });
@@ -96,5 +97,36 @@ describe("CodexOAuthProvider", () => {
     const events = [];
     for await (const e of p.streamTurn({ model: "m", input: [] })) events.push(e);
     expect(events).toEqual([{ type: "error", code: "auth", message: expect.stringContaining("norma login") }]);
+  });
+});
+
+describe("CODEX_MODELS", () => {
+  // F4 (4e gate ledger): live-verified 2026-07-10 from /models?client_version=1.0.0 — the
+  // gpt-5.6 family (sol/terra/luna, 372K ctx) is new; gpt-5.4 was wrongly 128_000 (real: 272_000,
+  // which made auto-compaction fire ~2x early).
+  test("includes the live gpt-5.6 family at 372K context", () => {
+    for (const id of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+      const m = CODEX_MODELS.find((mi) => mi.id === id);
+      expect(m).toBeDefined();
+      expect(m?.family).toBe("gpt-5");
+      expect(m?.contextWindow).toBe(372_000);
+      expect(m?.supportsVision).toBe(true);
+    }
+  });
+
+  test("gpt-5.4 context window is 272_000 (was wrongly 128_000)", () => {
+    const m = CODEX_MODELS.find((mi) => mi.id === "gpt-5.4");
+    expect(m?.contextWindow).toBe(272_000);
+  });
+
+  test("gpt-5.5 and gpt-5.4-mini remain at 272K", () => {
+    for (const id of ["gpt-5.5", "gpt-5.4-mini"]) {
+      const m = CODEX_MODELS.find((mi) => mi.id === id);
+      expect(m?.contextWindow).toBe(272_000);
+    }
+  });
+
+  test("codex-auto-review is excluded (hidden model)", () => {
+    expect(CODEX_MODELS.find((mi) => mi.id === "codex-auto-review")).toBeUndefined();
   });
 });

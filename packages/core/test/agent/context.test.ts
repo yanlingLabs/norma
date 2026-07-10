@@ -32,6 +32,14 @@ describe("ContextAssembler", () => {
     expect(trusted).toContain("USER_RULE_SENTINEL");
   });
 
+  test("F2 (4e gate ledger): assembled output states today's date (YYYY-MM-DD, locale-stable)", () => {
+    const { home, trust } = setup();
+    const a = new ContextAssembler({ normaHome: home, trust, skills: new SkillStore({ normaHome: home, trust }) });
+    const out = a.assemble({ cwd: null });
+    const today = new Date().toISOString().slice(0, 10);
+    expect(out).toContain(`Today's date is ${today}.`);
+  });
+
   test("base prompt present; capability stub present; empty sources omit their headers", () => {
     const { home, trust } = setup();
     const a = new ContextAssembler({ normaHome: home, trust, skills: new SkillStore({ normaHome: home, trust }) });

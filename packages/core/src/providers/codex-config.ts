@@ -55,34 +55,25 @@ export const CODEX = {
 } as const;
 
 /**
- * Static Codex model list — verified live 2026-06-13 from /models?client_version=1.0.0.
+ * Static Codex model list — verified live 2026-07-10 from /models?client_version=1.0.0.
  *
  * The backend returns only these slugs for ChatGPT-account auth (OAuth).
  * The v1 static list (gpt-5.2-codex, gpt-5.1-codex, etc.) was stale; those models
  * return HTTP 400 "not supported when using Codex with a ChatGPT account."
  *
- * Live fetch response: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "codex-auto-review"]
+ * Live fetch response slugs: gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna (372K ctx, new since
+ * 2026-06-13), gpt-5.5 / gpt-5.4 / gpt-5.4-mini (272K ctx — gpt-5.4 was previously wrongly
+ * recorded as 128_000, which made auto-compaction fire ~2x early), and codex-auto-review
+ * (hidden — excluded from this list, not offered as a user-selectable model).
  * Context windows and vision flags from /models payload field values.
  * codex-rs fetches models dynamically; this list is the best available static set.
  * TODO-verify: add a live /models fetch path to keep this current.
  */
 export const CODEX_MODELS: ModelInfo[] = [
-  {
-    id: "gpt-5.5",
-    family: "gpt-5",
-    contextWindow: 272_000,
-    supportsVision: true,
-  },
-  {
-    id: "gpt-5.4",
-    family: "gpt-5",
-    contextWindow: 128_000,
-    supportsVision: true,
-  },
-  {
-    id: "gpt-5.4-mini",
-    family: "gpt-5",
-    contextWindow: 128_000,
-    supportsVision: true,
-  },
+  { id: "gpt-5.6-sol", family: "gpt-5", contextWindow: 372_000, supportsVision: true },
+  { id: "gpt-5.6-terra", family: "gpt-5", contextWindow: 372_000, supportsVision: true },
+  { id: "gpt-5.6-luna", family: "gpt-5", contextWindow: 372_000, supportsVision: true },
+  { id: "gpt-5.5", family: "gpt-5", contextWindow: 272_000, supportsVision: true },
+  { id: "gpt-5.4", family: "gpt-5", contextWindow: 272_000, supportsVision: true },
+  { id: "gpt-5.4-mini", family: "gpt-5", contextWindow: 272_000, supportsVision: true },
 ];

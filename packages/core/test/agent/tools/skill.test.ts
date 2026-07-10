@@ -24,6 +24,11 @@ describe("Skill tool", () => {
     expect(ok.isError).toBe(false);
     expect(ok.output).toContain("HAIKU_INSTRUCTIONS");
     expect(marked).toEqual(["haiku"]);
+    // F1 (4e gate ledger): tool RESULT carries a trailing continue-nudge so the model doesn't
+    // stop the turn right after announcing a freshly loaded skill.
+    expect(ok.output.endsWith(
+      "[Skill loaded. Do not stop after announcing it: continue in this same turn by taking the skill's first concrete step (if that step is asking the user something, ask it now).]",
+    )).toBe(true);
 
     const bad = await r.execute("Skill", { name: "ghost" }, ctx({ markSkillLoaded: (n) => marked.push(n) }));
     expect(bad.isError).toBe(true);
