@@ -157,7 +157,7 @@ export class NormaClient {
   }> {
     return this.validated(PluginsListResult, await this.request(METHODS.pluginsList, {}), METHODS.pluginsList);
   }
-  async askUserRespond(params: { sessionId: string; callId: string; answers: Record<string, string> }): Promise<{ ok: true; alreadyResolved: boolean }> {
+  async askUserRespond(params: { sessionId: string; callId: string; answers: Record<string, string>; notes?: Record<string, string> }): Promise<{ ok: true; alreadyResolved: boolean }> {
     return this.validated(AskUserRespondResult, await this.request(METHODS.askUserRespond, params), METHODS.askUserRespond);
   }
   async taskList(params: { sessionId: string }): Promise<{ ok: true; tasks: Array<{ id: string; subject: string; status: "pending" | "in_progress" | "completed"; activeForm?: string }> }> {

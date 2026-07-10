@@ -150,6 +150,39 @@ describe("NormaClient", () => {
     client.close();
   });
 
+  // Task 3 (ask_user CC parity): proves the CLI client's askUserRespond ACTUALLY forwards an
+  // optional `notes` map over the wire — the protocol/core sides already have their own T1/T2
+  // tests, but nothing else exercises client.ts's (hand-written, non-generated) param type, which
+  // is what main.ts's new note prompt calls through.
+  test("askUserRespond forwards optional notes, mirrored onto the persisted question_resolved event", async () => {
+    const fake = new FakeProvider([
+      [{ type: "tool_call", callId: "q1", name: "ask_user", argsJson: JSON.stringify({
+        questions: [{ question: "Pick one", header: "Pick", options: [{ label: "A", description: "Option A" }, { label: "B", description: "Option B" }], multiSelect: false }],
+      }) }, { type: "done", stopReason: "tool_calls" }],
+      [{ type: "text_delta", delta: "done" }, { type: "done", stopReason: "end_turn" }],
+    ]);
+    await boot(fake);
+    const events: any[] = [];
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "aqn", onEvent: (e) => events.push(e) });
+    const { sessionId } = await client.createSession("global", { cwd: mkdtempSync(join(tmpdir(), "norma-aqn-")), approvalPolicy: "auto" });
+    await client.attach(sessionId);
+    await client.send(sessionId, "ask");
+
+    for (let i = 0; i < 50 && !events.some((e) => e.type === "question_asked"); i++) await new Promise((r) => setTimeout(r, 10));
+    const asked = events.find((e) => e.type === "question_asked");
+    expect(asked).toBeTruthy();
+
+    const result = await client.askUserRespond({
+      sessionId, callId: asked.callId, answers: { "Pick one": "B" }, notes: { "Pick one": "went with B because it's simpler" },
+    });
+    expect(result).toEqual({ ok: true, alreadyResolved: false });
+
+    for (let i = 0; i < 50 && !events.some((e) => e.type === "question_resolved"); i++) await new Promise((r) => setTimeout(r, 10));
+    const resolved = events.find((e) => e.type === "question_resolved");
+    expect(resolved.notes).toEqual({ "Pick one": "went with B because it's simpler" });
+    client.close();
+  });
+
   test("threadList client method round-trip (main thread seeded lazily on first read)", async () => {
     await boot();
     const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "th", onEvent: () => {} });

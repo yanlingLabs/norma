@@ -42,7 +42,7 @@ import {
 } from "./plugin-cli";
 import { parseModelArgs, validateEffort, validateModelSlug } from "./model-cli";
 import { formatElapsed, formatTokens } from "./task-display";
-import { isOtherChoice, parseQuestionAnswer } from "./questions";
+import { formatOptionLines, isOtherChoice, parseQuestionAnswer } from "./questions";
 import { parsePlanResponse } from "./plan-response";
 
 const AQUA = "\x1b[38;2;53;214;232m";
@@ -540,10 +540,15 @@ async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boole
       if (process.stdin.isTTY) {
         void (async () => {
           const answers: Record<string, string> = {};
+          const notes: Record<string, string> = {}; // Task 3 (CC parity): optional per-question free-text note
           for (const q of e.questions) {
             emit(`\n${AQUA}${q.header}${RESET} — ${q.question}\n`);
-            q.options.forEach((o: { label: string; description?: string }, i: number) => {
-              emit(`  ${i + 1}) ${o.label}${o.description ? ` ${DIM}${o.description}${RESET}` : ""}\n`);
+            // Task 3: each option's numbered line, plus (when present) its `preview` rendered as
+            // extra indented "┆"-rail lines right under it — formatOptionLines is pure/TTY-only
+            // (questions.ts); every returned line still goes through emit() so the pinned block's
+            // erase/reprint bookkeeping (which every emit() call re-derives) stays correct.
+            q.options.forEach((o: { label: string; description?: string; preview?: string }, i: number) => {
+              for (const line of formatOptionLines(i + 1, o)) emit(line);
             });
             emit(`  ${q.options.length + 1}) Other (type your answer)\n`);
             // The prompt text is written via emit() (so the block's erase/reprint bookkeeping
@@ -562,8 +567,18 @@ async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boole
             } else {
               answers[q.question] = parseQuestionAnswer(input, q.options.map((o: { label: string }) => o.label), q.multiSelect);
             }
+            // Task 3 (CC parity): a single optional free-text note per question, separate from the
+            // answer itself (e.g. "why I picked this"). Blank input means "skip" — nothing is
+            // collected, so a no-note run sends the exact same `{ sessionId, callId, answers }`
+            // payload as before this feature (notes omitted below, not sent as `{}`).
+            emit("note (enter to skip): ");
+            const note = ((await readLine("")) ?? "").trim();
+            if (note !== "") notes[q.question] = note;
           }
-          await c.askUserRespond({ sessionId, callId: e.callId, answers });
+          await c.askUserRespond({
+            sessionId, callId: e.callId, answers,
+            ...(Object.keys(notes).length > 0 ? { notes } : {}),
+          });
         })();
       }
     } else if (e.type === "plan_presented") {

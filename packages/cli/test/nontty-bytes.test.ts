@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { NONTTY_TASK_LINE, NONTTY_SPAWN_LINE, NONTTY_FINISH_LINE } from "../src/task-block";
+import { formatOptionLines, parseQuestionAnswer } from "../src/questions";
 
 // Byte-equality pin (2e-iii-b design §9 "Non-TTY byte-equality"; closes the 2e-ii final-review
 // minor "no non-TTY test pin"). main.ts's non-TTY (piped/`-p`) branches for task_updated /
@@ -48,5 +49,26 @@ describe("NONTTY_FINISH_LINE — thread_completed non-TTY line", () => {
     expect(NONTTY_FINISH_LINE("aborted")).toBe(`${DIM}✓ subagent done (aborted)${RESET}\n`);
     expect(NONTTY_FINISH_LINE("error")).toBe(`${DIM}✓ subagent done (error)${RESET}\n`);
     expect(NONTTY_FINISH_LINE("aborted")).toBe("\x1b[2m✓ subagent done (aborted)\x1b[0m\n");
+  });
+});
+
+// question_asked has NO non-TTY line at all — unlike task_updated/thread_started/thread_completed
+// above, main.ts's whole question renderer (options, previews, the note prompt) sits behind a
+// single `if (process.stdin.isTTY)` gate and is a complete no-op when it's false: headless (`-p`)
+// relies on QuestionBroker's server-side timeout (packages/core/src/agent/questions.ts) to resolve
+// the question, never on CLI-side rendering or answering. Task 3 (option preview + note prompt)
+// added lines ONLY inside that same pre-existing gate, so this invariant — zero bytes for
+// question_asked when !isTTY — is unchanged. There is deliberately no NONTTY_QUESTION_LINE to pin
+// (there was never non-TTY question output to begin with); instead this pins the two production
+// functions a headless answer path would have to go through if one ever existed, proving a
+// preview can't leak into either:
+describe("question_asked — no non-TTY renderer exists (Task 3: preview/note additions don't change that)", () => {
+  test("formatOptionLines (the new TTY-only preview formatter) is additive-only: with no `preview`, the option line is byte-identical to the pre-Task-3 inline format", () => {
+    expect(formatOptionLines(1, { label: "Falcon" })).toEqual(["  1) Falcon\n"]);
+  });
+
+  test("parseQuestionAnswer (the answer-computation function, called from both the TTY branch and — were one ever added — a headless one) only ever sees option LABELS, never `preview` text, so a preview can't alter the computed answer either way", () => {
+    const labels = ["Falcon", "Osprey", "Heron"]; // main.ts extracts labels via q.options.map(o => o.label) — preview is never passed in
+    expect(parseQuestionAnswer("2", labels, false)).toBe("Osprey");
   });
 });
