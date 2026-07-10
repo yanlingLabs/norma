@@ -69,7 +69,7 @@ export function registerSpawnAgentTool(r: ToolRegistry, opts: { models?: string[
       `agentType: optional subagent type; ${modelClause}; description: a short (3-5 word) summary of the task (required); ` +
       "max_turns: optional cap (1-50) on the child's own tool-use iterations, after which it stops with an error (omit to inherit the default cap); " +
       "mode: optional child permission-mode override (default/plan/acceptEdits/dontAsk/bypassPermissions) — RESTRICT-ONLY: it can only make the child MORE restrictive than this session, never less; a request that would widen permissions is ignored and the child keeps this session's policy. " +
-      "isolation: optional; \"worktree\" runs the child in a fresh git worktree (an isolated copy of the repo, not the parent's own working directory) — its file tools are fenced to that worktree; the worktree is automatically removed when the child finishes IF it's clean (no uncommitted changes), otherwise it's left on disk for you to review (no auto-merge). Requires the session's cwd to be a git repository.",
+      "isolation: optional; \"worktree\" runs the child in a fresh git worktree (an isolated copy of the repo, not the parent's own working directory) — its read/write/edit/glob/grep and foreground bash are fenced to that worktree (note: a background bash task it starts is NOT yet fenced and still runs against the session's own working directory); the worktree is automatically removed when the child finishes IF it's clean (no uncommitted changes), otherwise it's left on disk for you to review (no auto-merge). Requires the session's cwd to be a git repository.",
     args: SpawnArgs,
     run(_args: z.infer<typeof SpawnArgs>) {
       return "subagents are not available in this session";
