@@ -73,6 +73,13 @@ export const Settings = z.object({
   }).optional(),
   subagents: z.object({
     maxConcurrent: z.number().int().positive().optional(),
+    // 4h-i Task 3 (CC parity: nesting depth up to 5): how many levels of spawn_agent nesting are
+    // allowed — a thread at depth < maxDepth may spawn a child; a thread AT maxDepth cannot.
+    // Default 2 when unset (engine.ts's `subagentMaxDepth ?? 2`): one level deeper than the old
+    // hardcoded depth-1 cap (a depth-0 main thread could always spawn a depth-1 child; the OLD
+    // behavior — a depth-1 child could never spawn further — is now `maxDepth: 1` explicitly).
+    // CC itself allows depth 5, hence the upper bound here.
+    maxDepth: z.number().int().min(1).max(5).optional(),
   }).optional(),
   /** Peripheral lease v1 (Phase 2f, spec §A1): "Heartbeat 5s / expiry 15s (user-confirmed;
    *  settings-overridable peripheral.heartbeatMs/expiryMs)". Both optional — PeripheralBroker

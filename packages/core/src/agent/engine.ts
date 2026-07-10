@@ -4,7 +4,7 @@ import type { SessionStore } from "../sessions/store";
 import type { SessionHub } from "../sessions/hub";
 import type { Provider, ProviderEvent, TurnInputItem } from "../providers/types";
 import type { ToolRegistry } from "./tools/registry";
-import type { PermissionGate } from "./gate";
+import type { PermissionGate, SessionApprovalPolicy } from "./gate";
 import type { ApprovalBroker } from "./approvals";
 import type { QuestionBroker } from "./questions";
 import type { TaskStore } from "./task-store";
@@ -29,6 +29,39 @@ export interface BgTaskLister {
 
 const MAIN_THREAD = "main";
 const MAX_TOOL_ITERATIONS = 24; // runaway guard until 1b-ii budgets land
+
+// 4h-i (CC parity: spawn_agent `mode`) — permissiveness order, LEAST to MOST permissive: "plan"
+// is read-only (most restrictive), "ask" is human-gated (middle), "auto" auto-allows non-
+// destructive tools (least restrictive). Mirrors gate.ts's own PermissionGate.evaluate() ordering
+// (plan denies everything mutating outright; ask/auto both gate mutating tools, auto auto-allows).
+const POLICY_RESTRICTIVENESS: Record<SessionApprovalPolicy, number> = { plan: 0, ask: 1, auto: 2 };
+
+/** RESTRICT-ONLY: returns the MORE RESTRICTIVE of {parent, requested} — a spawn_agent `mode`
+ *  override can only NARROW a child's effective approval policy relative to its parent thread's,
+ *  never WIDEN it. A request that would widen (e.g. parent "ask" + requested "auto", or parent
+ *  "plan" + requested "auto") is silently ignored — the parent's policy wins. Pure and exported
+ *  for direct unit testing: this is the security-critical piece of the `mode` feature (a bug here
+ *  is a privilege-escalation bug, not a UX one). */
+export function restrictPolicy(parent: SessionApprovalPolicy, requested: SessionApprovalPolicy): SessionApprovalPolicy {
+  return POLICY_RESTRICTIVENESS[requested] < POLICY_RESTRICTIVENESS[parent] ? requested : parent;
+}
+
+/** Maps a CC-parity spawn `mode` arg to Norma's `approvalPolicy`. Only `plan` maps to Norma's
+ *  "plan" (read-only); `acceptEdits`/`dontAsk`/`bypassPermissions` all collapse to "auto" — Norma
+ *  has no finer-grained distinction between them (CC parity here is at the arg-surface level, not
+ *  full behavioral parity with CC's own distinct modes). `default`, absent, or any unrecognized
+ *  string maps to `undefined` — "no override", i.e. the child inherits the parent's policy
+ *  unchanged (this is what lets the spawn bridge skip building a child-scoped meta entirely when
+ *  there's nothing to narrow — see the bridge's `childMeta` computation). */
+export function mapSpawnMode(mode: string | undefined): SessionApprovalPolicy | undefined {
+  switch (mode) {
+    case "plan": return "plan";
+    case "acceptEdits":
+    case "dontAsk":
+    case "bypassPermissions": return "auto";
+    default: return undefined; // "default", absent, or an unrecognized string
+  }
+}
 
 /** Mirrors protocol's ThreadInfoSchema (methods.ts) — kept as a plain local type rather than a
  *  zod import here since engine.ts only needs the shape, not a schema/validator of its own. */
@@ -112,6 +145,16 @@ export interface EngineConfig {
   // the bridge to activate — see the `spawnCalls` filter in runThread's dispatch loop.
   subagents?: SubagentManager;
   agents?: AgentStore;
+  // 4h-i Task 3 (CC parity: configurable nesting depth, settings.subagents.maxDepth): how many
+  // levels of spawn_agent nesting are allowed, orthogonal to SubagentManager's maxConcurrent
+  // (fan-out width) — this is depth, not count or concurrency. Undefined → defaults to 2
+  // (runThread reads `subagentMaxDepth ?? 2`), one level deeper than the old hardcoded depth-1
+  // cap: a depth-0 main thread could always spawn a depth-1 child; that child could never spawn
+  // further. `maxDepth: 1` reproduces that old behavior explicitly. A thread at `depth <
+  // maxDepth` may spawn (spawn_agent stays in its specs, the bridge runs its calls); a thread AT
+  // `depth >= maxDepth` has spawn_agent excluded from its specs and, belt-and-braces, rejects any
+  // spawn_agent call it receives anyway.
+  subagentMaxDepth?: number;
   // SessionTitler (Phase 2e-iii Task 3): optional — absent means no session gets an
   // auto-generated title. Fired fire-and-forget, only at the main thread's (depth 0) turn
   // completion, never on the error paths (an errored first turn has nothing worth titling).
@@ -461,17 +504,43 @@ export class AgentEngine {
     loaded: Set<string>;
     excludeTools?: Set<string>;
     allowTools?: Set<string>;
+    // 4h-i (CC parity: Agent.max_turns): a per-thread override of MAX_TOOL_ITERATIONS. Only the
+    // spawn bridge (below) ever passes this — main-thread callers (turn()) never set it, so the
+    // main thread's bound is unchanged (MAX_TOOL_ITERATIONS, 24). A child's effective bound is
+    // 1-50 (spawn.ts's zod range / the bridge's own clamp); omitted → the default 24. Note this
+    // can go EITHER direction relative to the default — a child asking for max_turns > 24 (up to
+    // 50) gets a LARGER cap than the main thread's default, not just a smaller one. Additive/sync
+    // only: no new async surface, just a different bound for that one child thread's own loop.
+    maxTurns?: number;
+    // 4h-i Task 4 (CC parity: Agent.isolation "worktree"): a per-thread override of the allowed
+    // fs-tool roots. Only the spawn bridge (below) ever passes this, and only for a child
+    // spawned with `isolation:"worktree"` — set to EXACTLY `[worktreeDir]`, not an addition to
+    // the session's own roots (this.cfg.dirs.roots(sessionId) is SESSION-scoped, keyed by
+    // sessionId not threadId — widening it here would leak the worktree into the PARENT's own
+    // roots too, and persist past the child's lifetime). Undefined (every other caller) means
+    // executeCall falls back to the session's normal live roots, unchanged behavior. roots[0]
+    // MUST be the primary cwd (registry.ts's own contract) — the spawn bridge sets this to
+    // exactly `[childCwd]` where childCwd is also what's passed as this same call's `cwd`.
+    rootsOverride?: string[];
   }): Promise<{ finalText: string; stopReason: "end_turn" | "aborted" | "error"; errorMessage?: string }> {
-    const { sessionId, threadId, instructionsFull, input, meta, signal, loaded, excludeTools, allowTools } = opts;
+    const { sessionId, threadId, instructionsFull, input, meta, signal, loaded, excludeTools, allowTools, rootsOverride } = opts;
     let cwd = opts.cwd;
     const tsEnabled = this.toolSearchEnabled();
     const deferThreshold = this.toolSearchThreshold();
     const usage = { inputTokens: 0, outputTokens: 0 };
     let lastText = "";
+    // The effective iteration bound for THIS thread — opts.maxTurns (spawn bridge only) or the
+    // shared default. Computed once so the loop condition and the cap message below always agree
+    // on the exact number.
+    const effectiveMaxIterations = opts.maxTurns ?? MAX_TOOL_ITERATIONS;
+    // 4h-i Task 3: the nesting-depth cap for THIS thread's own spawn attempts — see
+    // EngineConfig.subagentMaxDepth's doc comment. Computed once so the spawn-gather filter below
+    // and the belt-and-braces reject agree on the exact same number.
+    const maxDepth = this.cfg.subagentMaxDepth ?? 2;
 
     this.emit(sessionId, { type: "turn_started", sessionId, threadId });
 
-    for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
+    for (let iteration = 0; iteration < effectiveMaxIterations; iteration++) {
       if (threadId === MAIN_THREAD) {
         const steers = this.steerQueue.get(sessionId);
         if (steers && steers.length) { for (const t of steers) input.push({ type: "message", role: "user", content: t }); steers.length = 0; }
@@ -549,19 +618,63 @@ export class AgentEngine {
       // order of Promise.all). Only active when both cfg.subagents and cfg.agents are wired
       // (daemon.ts) AND this is a depth-0 thread — a depth>0 (child) thread trying to spawn is
       // denied in the loop below instead (belt-and-braces: its own specs already exclude
-      // spawn_agent via excludeTools, so this only matters if a provider ignores that).
+      // spawn_agent via excludeTools, so this only matters if a provider ignores that). 4h-i Task
+      // 3: "depth-0 thread" generalizes to "depth < maxDepth" — any thread below the configured
+      // nesting cap (not just the main thread) gathers its own spawn_agent calls through this SAME
+      // bridge, recursively, so a depth-1 child can itself spawn a depth-2 grandchild when
+      // maxDepth allows it.
       const spawnOutcomes = new Map<string, { output: string; isError: boolean }>();
-      const spawnCalls = this.cfg.subagents && this.cfg.agents && opts.depth === 0
+      const spawnCalls = this.cfg.subagents && this.cfg.agents && opts.depth < maxDepth
         ? calls.filter((c) => c.name === "spawn_agent")
         : [];
       if (spawnCalls.length > 0) {
         await Promise.all(spawnCalls.map(async (call) => {
-          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown } = {};
+          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown; max_turns?: unknown; mode?: unknown; isolation?: unknown } = {};
           try { parsed = JSON.parse(call.argsJson || "{}"); } catch { /* defensive: empty prompt below */ }
           const prompt = typeof parsed.prompt === "string" ? parsed.prompt : "";
           const agentType = typeof parsed.agentType === "string" ? parsed.agentType : undefined;
           const modelOverride = typeof parsed.model === "string" ? parsed.model : undefined;
           const description = typeof parsed.description === "string" ? parsed.description : undefined;
+          // 4h-i (CC parity: Agent.max_turns): this bridge hand-parses raw argsJson BEFORE
+          // spawn.ts's own zod validation would ever run (same reason model/description are
+          // hand-checked above), so a provider that ignores the declared `.int().positive().max(50)`
+          // schema could still send an out-of-range or non-integer value through — clamp
+          // defensively here rather than trusting the schema. Non-finite/non-integer/non-positive
+          // → ignored (undefined), same as omitting the arg (falls back to MAX_TOOL_ITERATIONS).
+          const maxTurns = typeof parsed.max_turns === "number" && Number.isInteger(parsed.max_turns) && parsed.max_turns > 0
+            ? Math.min(parsed.max_turns, 50)
+            : undefined;
+          // 4h-i (CC parity: spawn_agent `mode`) — same hand-parse-before-zod reasoning as
+          // max_turns/model/description above: only accept one of the 5 known mode strings;
+          // anything else (wrong type, typo, provider hallucination) → undefined, same as omitting
+          // the arg entirely (no override, child inherits the parent's policy). mapSpawnMode below
+          // further narrows "default"/unrecognized to "no override" too.
+          const modeRaw = typeof parsed.mode === "string" ? parsed.mode : undefined;
+          // RESTRICT-ONLY (the security-critical bit — see restrictPolicy's own doc comment):
+          // requestedPolicy is undefined when there's nothing to apply (mode absent/"default"/
+          // unrecognized) — in that case childPolicy is EXACTLY meta.approvalPolicy (the parent's),
+          // so childMeta below stays the SAME object as `meta`, byte-identical to pre-4h-i
+          // behavior. When a mode DOES map to a policy, restrictPolicy takes the more restrictive
+          // of {parent, requested} — a request that would WIDEN the child's permissions relative to
+          // the parent (e.g. parent "ask" + requested "auto"/bypassPermissions) is silently denied
+          // and the parent's policy wins; only a NARROWING request actually changes childPolicy.
+          const requestedPolicy = mapSpawnMode(modeRaw);
+          const childPolicy = requestedPolicy !== undefined ? restrictPolicy(meta.approvalPolicy, requestedPolicy) : meta.approvalPolicy;
+          // 4h-i Task 4 (CC parity: Agent.isolation "worktree") — same hand-parse-before-zod
+          // reasoning as mode/max_turns/model/description above: only the literal "worktree" is
+          // recognized; anything else (wrong type, typo, provider hallucination) → false, same as
+          // omitting the arg entirely (no isolation, child runs in the parent's own cwd — today's
+          // unchanged behavior).
+          const wantsWorktreeIsolation = parsed.isolation === "worktree";
+          // Child-scoped meta: a shallow copy ONLY when childPolicy actually narrows (differs from
+          // the parent's) — never mutate the shared `meta` object itself (that object is the SAME
+          // one `turn()`'s dispatch loop uses for the REST of the parent's turn; mutating
+          // `meta.approvalPolicy` here would corrupt the parent's own policy for later tool calls
+          // in this same turn, and this bridge runs N spawns concurrently via Promise.all — a
+          // second spawn's read of `meta.approvalPolicy` must never see a first spawn's override).
+          // When childPolicy === meta.approvalPolicy (no mode, or an escalation request that was
+          // denied), childMeta IS `meta` — the identical object, not just an equal-valued copy.
+          const childMeta = childPolicy !== meta.approvalPolicy ? { ...meta, approvalPolicy: childPolicy } : meta;
 
           // 4g-ii (CC parity): spawn_agent's `description` is now a REQUIRED arg (spawn.ts's own
           // zod schema enforces this — but this concurrent bridge hand-parses call.argsJson and
@@ -603,6 +716,42 @@ export class AgentEngine {
             }
           }
 
+          // 4h-i Task 4 (CC parity: Agent.isolation "worktree") — create the child's isolation
+          // worktree BEFORE thread_started/registerThread/subagents.run, same as the
+          // description/model checks above: a create failure (no git repo, or
+          // WorktreeManager not wired into this session) must fail the spawn as a typed
+          // isError tool_result with NO ghost thread, never a half-spawned child.
+          // `createDetached` is a STATELESS WorktreeManager method (worktree.ts) — it does NOT
+          // touch the per-session `sessions` map that enter_worktree/exit_worktree use, so a
+          // child's ephemeral isolation worktree can never collide with (or be silently torn
+          // down by) this session's own concurrent enter_worktree/exit_worktree state. Base off
+          // opts.cwd (THIS spawning thread's own cwd — for a depth>0 spawner that is itself an
+          // isolated child, that's already its own worktree dir, so a grandchild's isolation
+          // worktree nests off the child's, not the top-level session repo).
+          let isolatedWorktree: { dir: string; branch: string } | undefined;
+          if (wantsWorktreeIsolation) {
+            if (!this.cfg.worktrees) {
+              spawnOutcomes.set(call.callId, {
+                output: `isolation:"worktree" is not available in this session`,
+                isError: true,
+              });
+              return; // no thread_started, no thread registry entry, no subagents.run slot
+            }
+            try {
+              isolatedWorktree = this.cfg.worktrees.createDetached(opts.cwd, `spawn-${randomUUID().slice(0, 8)}`);
+            } catch (err) {
+              spawnOutcomes.set(call.callId, {
+                output: `isolation:"worktree" requires a git repository (${err instanceof Error ? err.message : String(err)})`,
+                isError: true,
+              });
+              return; // no thread_started, no thread registry entry, no subagents.run slot
+            }
+          }
+          // The child's own cwd: the fresh worktree dir when isolated, otherwise unchanged
+          // (opts.cwd, today's behavior). This is what the child's runThread actually runs at
+          // AND what buildInstructionsFull below resolves project context relative to.
+          const childCwd = isolatedWorktree?.dir ?? opts.cwd;
+
           const childId = "th_" + randomUUID().slice(0, 8);
           this.emit(sessionId, {
             type: "thread_started", sessionId, threadId: childId, parentThreadId: threadId,
@@ -611,46 +760,98 @@ export class AgentEngine {
           this.registerThread(sessionId, {
             threadId: childId, parentThreadId: threadId, agentType: agentType ?? "general-purpose", status: "running",
           });
-          const result = await this.cfg.subagents!.run(async (childSignal) => {
-            const childLoaded = new Set<string>();
-            const instructionsFull = this.buildInstructionsFull(def.instructions, opts.cwd, childLoaded, meta.approvalPolicy, sessionId);
-            return this.runThread({
-              sessionId,
-              threadId: childId,
-              instructionsFull,
-              input: [{ type: "message", role: "user", content: prompt }], // FRESH — no parent history
-              cwd: opts.cwd,
-              model: effectiveOverride ?? opts.model,
-              // Subagents inherit the PARENT thread's resolved reasoning effort — no per-agent-def
-              // override (agent defs only carry a model override, never an effort one).
-              reasoningEffort: opts.reasoningEffort,
-              meta, // SAME object — the child inherits the parent's (possibly later-mutated) approval policy
-              depth: opts.depth + 1,
-              signal: childSignal,
-              loaded: childLoaded,
-              // enter_plan_mode excluded alongside exit_plan_mode (4g Task 4): the child inherits
-              // the PARENT's `meta` object BY REFERENCE (just above) — an unexcluded child calling
-              // enter_plan_mode would mutate the shared `meta.approvalPolicy` AND persist it via
-              // `cfg.setPolicy`, silently putting the WHOLE session into plan mode once the spawn
-              // returns. Plan-mode entry/exit stays a main-thread-only decision.
-              excludeTools: new Set(["spawn_agent", "ask_user", "exit_plan_mode", "enter_plan_mode"]),
-              allowTools: def.allowTools,
-            });
-          });
-          const stopReason = result.ok ? result.value.stopReason : "error";
-          this.emit(sessionId, { type: "thread_completed", sessionId, threadId: childId, stopReason });
-          this.completeThread(sessionId, childId, stopReason);
-          // Defect 2 (4e gate F10): a child that ran to completion (result.ok) but whose OWN
-          // final round hit a provider error (runThread's error branch, stopReason "error") must
-          // be reported to the parent as a FAILURE, not as a quiet "finished without a final
-          // message" success — the parent's tool_result is the only channel a child has back to
-          // its caller (unlike the main thread, whose agent_error event the user sees directly).
-          // The `!result.ok` branch (SubagentManager timeout / thrown error) is unchanged.
-          spawnOutcomes.set(call.callId, !result.ok
-            ? { output: `subagent (${agentType ?? "general-purpose"}) ${result.error}`, isError: true }
-            : result.value.stopReason === "error"
-              ? { output: `subagent (${agentType ?? "general-purpose"}) failed: ${result.value.errorMessage ?? "provider error"}`, isError: true }
-              : { output: result.value.finalText || "the subagent finished without a final message", isError: false });
+          // 4h-i Task 3: spawn_agent is excluded from the child's own specs ONLY when the child
+          // itself sits AT (or past) the nesting cap — i.e. it has no room left to spawn a
+          // grandchild. `childDepth < maxDepth` keeps spawn_agent visible so the child can spawn
+          // one more level (recursing into this SAME bridge, via its own runThread call, with the
+          // gate-1 spawnCalls filter above reading ITS OWN opts.depth). ask_user/exit_plan_mode/
+          // enter_plan_mode stay excluded from every child regardless of depth (unchanged).
+          const childDepth = opts.depth + 1;
+          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode"]);
+          if (childDepth >= maxDepth) childExcludeTools.add("spawn_agent");
+          // Nested-spawn saturation fix (T3 review): `opts.depth` is THIS spawning thread's own
+          // depth — >0 means it already holds a concurrency slot (it's itself a child), so this
+          // run() call is a REENTRANT acquire. SubagentManager bounds a reentrant wait
+          // (acquireTimeoutMs) instead of queueing unbounded, so pool saturation under nesting
+          // fails fast with a typed error instead of stalling for the full per-run timeoutMs
+          // (300s) — see SubagentManager.acquire's doc comment. A depth-0 (top-level) spawn is
+          // never reentrant and keeps its existing unbounded queueing behind busy siblings.
+          try {
+            const result = await this.cfg.subagents!.run(async (childSignal) => {
+              const childLoaded = new Set<string>();
+              const instructionsFull = this.buildInstructionsFull(def.instructions, childCwd, childLoaded, childPolicy, sessionId);
+              return this.runThread({
+                sessionId,
+                threadId: childId,
+                instructionsFull,
+                input: [{ type: "message", role: "user", content: prompt }], // FRESH — no parent history
+                cwd: childCwd,
+                model: effectiveOverride ?? opts.model,
+                // Subagents inherit the PARENT thread's resolved reasoning effort — no per-agent-def
+                // override (agent defs only carry a model override, never an effort one).
+                reasoningEffort: opts.reasoningEffort,
+                // childMeta: the SAME object as `meta` (byte-identical, no copy) when there's no
+                // narrowing `mode` override — the child inherits the parent's (possibly
+                // later-mutated) approval policy, exactly as before 4h-i. Only a NARROWING `mode`
+                // (restrictPolicy above) produces a child-scoped shallow copy, so the parent's own
+                // `meta.approvalPolicy` is NEVER mutated by a spawn's mode override — see
+                // `childMeta`'s own doc comment above for why (concurrent spawns, same-turn parent
+                // policy corruption).
+                meta: childMeta,
+                depth: childDepth,
+                signal: childSignal,
+                loaded: childLoaded,
+                // enter_plan_mode excluded alongside exit_plan_mode (4g Task 4): the child inherits
+                // the parent's (or, with a narrowing `mode` override, its OWN child-scoped) `meta`
+                // object BY REFERENCE (just above) — an unexcluded child calling enter_plan_mode
+                // would mutate that object's `approvalPolicy` AND persist it via `cfg.setPolicy`
+                // (when it's the SAME object as the parent's, that would silently put the WHOLE
+                // session into plan mode once the spawn returns). Plan-mode entry/exit stays a
+                // main-thread-only decision regardless of which meta object the child got.
+                // spawn_agent's presence/absence here is depth-conditional — see childExcludeTools
+                // above (4h-i Task 3).
+                excludeTools: childExcludeTools,
+                allowTools: def.allowTools,
+                maxTurns,
+                // 4h-i Task 4: isolated child's fs tools are fenced to EXACTLY the worktree dir
+                // (not additive to the session's own roots — see rootsOverride's own doc comment
+                // on RunThreadOpts). Undefined (no isolation) → executeCall falls back to the
+                // session's normal live roots, unchanged behavior.
+                rootsOverride: isolatedWorktree ? [isolatedWorktree.dir] : undefined,
+              });
+            }, { reentrant: opts.depth > 0 });
+            const stopReason = result.ok ? result.value.stopReason : "error";
+            this.emit(sessionId, { type: "thread_completed", sessionId, threadId: childId, stopReason });
+            this.completeThread(sessionId, childId, stopReason);
+            // Defect 2 (4e gate F10): a child that ran to completion (result.ok) but whose OWN
+            // final round hit a provider error (runThread's error branch, stopReason "error") must
+            // be reported to the parent as a FAILURE, not as a quiet "finished without a final
+            // message" success — the parent's tool_result is the only channel a child has back to
+            // its caller (unlike the main thread, whose agent_error event the user sees directly).
+            // The `!result.ok` branch (SubagentManager timeout / thrown error) is unchanged.
+            spawnOutcomes.set(call.callId, !result.ok
+              ? { output: `subagent (${agentType ?? "general-purpose"}) ${result.error}`, isError: true }
+              : result.value.stopReason === "error"
+                ? { output: `subagent (${agentType ?? "general-purpose"}) failed: ${result.value.errorMessage ?? "provider error"}`, isError: true }
+                : { output: result.value.finalText || "the subagent finished without a final message", isError: false });
+          } finally {
+            // 4h-i Task 4: teardown runs whether the child succeeded, errored, or timed out —
+            // clean-only (mirrors exit_worktree's default guard AND CC's own isolation
+            // teardown): a CLEAN worktree (no uncommitted changes) is removed; a DIRTY one is
+            // left on disk for the user to review (logged) — NO auto-merge, NO force-remove
+            // (no data loss). `this.cfg.worktrees` is guaranteed set here (isolatedWorktree is
+            // only ever assigned after that same guard above).
+            if (isolatedWorktree) {
+              try {
+                const removed = this.cfg.worktrees!.removeDetached(isolatedWorktree.dir, opts.cwd, true);
+                if (!removed) {
+                  console.error(`spawn_agent isolation:"worktree": left dirty worktree at ${isolatedWorktree.dir} (uncommitted changes) — not auto-removed`);
+                }
+              } catch (err) {
+                console.error(`spawn_agent isolation:"worktree": teardown failed for ${isolatedWorktree.dir}: ${err instanceof Error ? err.message : String(err)}`);
+              }
+            }
+          }
         }));
       }
 
@@ -666,9 +867,12 @@ export class AgentEngine {
           input.push({ type: "tool_result", callId: call.callId, output: outcome.output, isError: outcome.isError });
           continue;
         }
-        if (call.name === "spawn_agent" && opts.depth > 0) {
-          // Belt-and-braces: a child thread's specs already exclude spawn_agent (excludeTools
-          // above), so this only fires if a provider ignores the tool list and calls it anyway.
+        if (call.name === "spawn_agent" && opts.depth >= maxDepth) {
+          // Belt-and-braces: a thread AT the nesting cap already had spawn_agent excluded from its
+          // specs (childExcludeTools above), so this only fires if a provider ignores the tool
+          // list and calls it anyway. A thread BELOW the cap (opts.depth < maxDepth) never reaches
+          // here for spawn_agent — its calls were already siphoned off into spawnOutcomes by the
+          // spawn-gather filter earlier in this same round (4h-i Task 3).
           outcome = { output: "subagents cannot spawn further subagents", isError: true };
           this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
           input.push({ type: "tool_result", callId: call.callId, output: outcome.output, isError: outcome.isError });
@@ -725,7 +929,7 @@ export class AgentEngine {
               timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
               summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
               // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
-            }, loaded, async () => this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd), pins);
+            }, loaded, async () => this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd), pins, rootsOverride);
           } else {
             outcome = this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd);
           }
@@ -735,7 +939,7 @@ export class AgentEngine {
             timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
             summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
             // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
-          }, loaded, undefined, pins);
+          }, loaded, undefined, pins, rootsOverride);
         } else if (call.name === "exit_plan_mode" && this.cfg.plans && meta.approvalPolicy === "plan") {
           outcome = await this.runPlanBridge(call, sessionId, threadId, meta);
         } else if (call.name === "enter_plan_mode") {
@@ -755,7 +959,7 @@ export class AgentEngine {
             justification = typeof a.justification === "string" ? a.justification : undefined;
           } catch { /* fall through to review of "" → likely unsafe */ }
           if (command && bashLooksSafe(command, this.cfg.reviewerAllow ?? [])) {
-            outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins);
+            outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride);
           } else {
             let v: { verdict: "safe" | "unsafe"; reason: string };
             try {
@@ -768,13 +972,13 @@ export class AgentEngine {
                 timeoutMs: Number(process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS ?? 60_000),
                 summary: `⚠ safety reviewer: ${v.reason} — ${call.name} ${command.slice(0, 120)}`,
                 denialMessage: `blocked by the safety reviewer: ${v.reason}. No approval within 60s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.`,
-              }, loaded, undefined, pins);
+              }, loaded, undefined, pins, rootsOverride);
             } else {
-              outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins);
+              outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride);
             }
           }
         } else {
-          outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins);
+          outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride);
         }
 
         this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
@@ -793,7 +997,7 @@ export class AgentEngine {
       }
     }
 
-    const capMessage = `tool-iteration cap (${MAX_TOOL_ITERATIONS}) reached`;
+    const capMessage = `tool-iteration cap (${effectiveMaxIterations}) reached`;
     this.emit(sessionId, { type: "agent_error", sessionId, threadId, message: capMessage });
     this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "error", ...usage });
     return { finalText: lastText, stopReason: "error", errorMessage: capMessage };
@@ -815,7 +1019,9 @@ export class AgentEngine {
    *  `loaded` (4g final-review fix) is the CALLING THREAD's live `loaded` set (runThread's
    *  `opts.loaded` — the same object for every caller in this file, main or child) — forwarded
    *  unchanged to executeCall's default path so an approved call's load/defense-in-depth check
-   *  lands on the thread that actually asked, not always the session-scoped map. */
+   *  lands on the thread that actually asked, not always the session-scoped map.
+   *  `rootsOverride` (4h-i Task 4) — forwarded unchanged to executeCall's default path; callers
+   *  that pass their own `onApprove` (the worktree bridge) don't need it. */
   private async requestApproval(
     call: { callId: string; name: string; argsJson: string },
     cwd: string,
@@ -826,6 +1032,7 @@ export class AgentEngine {
     loaded: Set<string>,
     onApprove?: () => Promise<{ output: string; isError: boolean }>,
     pins: Set<string> = new Set(),
+    rootsOverride?: string[],
   ): Promise<{ output: string; isError: boolean; deniedByHuman?: boolean }> {
     const waiting = this.cfg.broker.wait(sessionId, call.callId, opts.timeoutMs);
     try {
@@ -841,7 +1048,7 @@ export class AgentEngine {
     const res = await waiting;
     this.emit(sessionId, { type: "approval_resolved", sessionId, threadId, callId: call.callId, approved: res.approved, by: res.by });
     if (res.approved) {
-      return await (onApprove ? onApprove() : this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins));
+      return await (onApprove ? onApprove() : this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride));
     }
     // An EXPLICIT human denial (any `by` other than the broker's "timeout") ends the turn and
     // hands control back to the user (Claude Code parity) — see the caller's `deniedByHuman`
@@ -1027,11 +1234,16 @@ export class AgentEngine {
     // forwarded copy of it) — defaulted so any caller that doesn't care about pins compiles
     // unchanged. Unioned below with `loaded`, never mutating either.
     pins: Set<string> = new Set(),
+    // 4h-i Task 4: forwarded straight from runThread's own `opts.rootsOverride` (see its doc
+    // comment) — undefined for every caller except a worktree-isolated child, in which case it's
+    // EXACTLY that child's `[worktreeDir]`, replacing (not extending) the session-wide roots
+    // this.cfg.dirs.roots(sessionId) would otherwise return.
+    rootsOverride?: string[],
   ): Promise<{ output: string; isError: boolean }> {
     let args: unknown;
     try { args = call.argsJson.length ? JSON.parse(call.argsJson) : {}; }
     catch { return Promise.resolve({ output: `tool arguments were not valid JSON`, isError: true }); }
-    const roots = this.cfg.dirs.roots(sessionId);
+    const roots = rootsOverride ?? this.cfg.dirs.roots(sessionId);
     const tmpDir = sessionTmpDir(sessionId);
     const markSkillLoaded = (n: string) => {
       let set = this.loadedSkills.get(sessionId);

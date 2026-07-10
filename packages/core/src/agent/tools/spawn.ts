@@ -36,11 +36,29 @@ export function registerSpawnAgentTool(r: ToolRegistry, opts: { models?: string[
   const modelClause = hasModels
     ? `model: optional override, one of: ${opts.models!.join(", ")} (omit to inherit the session model)`
     : "model: optional model override";
+  // `mode` (4h-i, CC parity: Agent's permission-mode override): a RESTRICT-ONLY override of the
+  // child's approval policy. The runtime enforcement lives in engine.ts's spawn bridge
+  // (restrictPolicy/mapSpawnMode) — this schema enum is the same two-layer shape as `model`
+  // above (steering/UX one layer, the bridge's own hand-parsed check the authoritative one),
+  // since the bridge hand-parses call.argsJson BEFORE this zod schema would ever run. The child
+  // can only end up MORE restrictive than this session's own policy, never less — a request that
+  // would widen permissions (e.g. this session is "ask" and the child asks for
+  // "bypassPermissions") is silently ignored and the child keeps this session's policy.
+  // `isolation` (4h-i Task 4, CC parity: Agent.isolation): "worktree" runs the child in a
+  // fresh git worktree — an isolated copy of the repo — instead of the parent's own cwd. Same
+  // two-layer shape as `model`/`mode` above: the engine's spawn bridge hand-parses argsJson
+  // BEFORE this zod schema would ever run, and is the ONLY thing that actually creates/tears
+  // down the worktree (via WorktreeManager's stateless createDetached/removeDetached, NOT the
+  // per-session enter()/exit() a user's own enter_worktree/exit_worktree calls use — a child's
+  // isolation worktree must never collide with the session's own active-worktree state).
   const SpawnArgs = z.object({
     prompt: z.string().min(1),
     agentType: z.string().optional(),
     model: modelField,
     description: z.string().min(1),
+    max_turns: z.number().int().positive().max(50).optional(),
+    mode: z.enum(["default", "plan", "acceptEdits", "dontAsk", "bypassPermissions"]).optional(),
+    isolation: z.literal("worktree").optional(),
   });
   r.register({
     name: "spawn_agent",
@@ -48,7 +66,10 @@ export function registerSpawnAgentTool(r: ToolRegistry, opts: { models?: string[
       "Launch a child agent to handle a task autonomously with its own fresh context. It runs its own tool loop and returns its final report. " +
       "Delegate multi-step work; run several in parallel by emitting multiple spawn_agent calls in one message. " +
       "The child does NOT see this conversation — put everything it needs in `prompt`. " +
-      `agentType: optional subagent type; ${modelClause}; description: a short (3-5 word) summary of the task (required).`,
+      `agentType: optional subagent type; ${modelClause}; description: a short (3-5 word) summary of the task (required); ` +
+      "max_turns: optional cap (1-50) on the child's own tool-use iterations, after which it stops with an error (omit to inherit the default cap); " +
+      "mode: optional child permission-mode override (default/plan/acceptEdits/dontAsk/bypassPermissions) — RESTRICT-ONLY: it can only make the child MORE restrictive than this session, never less; a request that would widen permissions is ignored and the child keeps this session's policy. " +
+      "isolation: optional; \"worktree\" runs the child in a fresh git worktree (an isolated copy of the repo, not the parent's own working directory) — its read/write/edit/glob/grep and foreground bash are fenced to that worktree (note: a background bash task it starts is NOT yet fenced and still runs against the session's own working directory); the worktree is automatically removed when the child finishes IF it's clean (no uncommitted changes), otherwise it's left on disk for you to review (no auto-merge). Requires the session's cwd to be a git repository.",
     args: SpawnArgs,
     run(_args: z.infer<typeof SpawnArgs>) {
       return "subagents are not available in this session";

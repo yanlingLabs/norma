@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SessionEvent } from "@norma/protocol";
@@ -24,14 +24,15 @@ import { SkillStore } from "../../src/agent/skills";
 import { Compactor } from "../../src/agent/compactor";
 import { AgentStore } from "../../src/agent/agents";
 import { SubagentManager } from "../../src/agent/subagents";
-import type { Provider, ProviderEvent } from "../../src/providers/types";
+import { WorktreeManager } from "../../src/agent/worktree";
+import type { ModelInfo, Provider, ProviderEvent, TurnRequest } from "../../src/providers/types";
 
 export function setup(
   script: ProviderEvent[][],
   opts: {
     approvalPolicy?: "ask" | "auto" | "plan";
     withSubagents?: boolean; // default true; false → cfg.subagents/agents both omitted
-    subagentsOpts?: { maxConcurrent?: number; timeoutMs?: number };
+    subagentsOpts?: { maxConcurrent?: number; timeoutMs?: number; acquireTimeoutMs?: number };
     provider?: Provider; // override — script ignored when set (e.g. a hanging provider for timeout tests)
     // undefined (default) → EngineConfig.provider.live absent, matching every pre-existing test
     // here (unchanged behavior: every turn uses the "fake-1" boot snapshot below).
@@ -44,6 +45,10 @@ export function setup(
     // undefined (default) → no deferral anywhere, matching every pre-existing test here
     // (unchanged behavior). Mirrors engine-steer.test.ts's setupEngine `toolSearch` opt.
     toolSearch?: { enabled?: boolean; deferThreshold?: number; deferExternals?: "count" | "always" };
+    // 4h-i Task 3: undefined (default) → EngineConfig.subagentMaxDepth absent → engine.ts defaults
+    // it to 2 itself (one level deeper than the old hardcoded depth-1 cap). Pass 1 explicitly to
+    // pin the OLD default behavior (a depth-1 child could never spawn further) as a regression.
+    maxDepth?: number;
   } = {},
 ) {
   const withSubagents = opts.withSubagents !== false;
@@ -82,6 +87,7 @@ export function setup(
     compactor,
     agents,
     subagents,
+    subagentMaxDepth: opts.maxDepth,
     toolSearch: opts.toolSearch,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: opts.approvalPolicy ?? "auto" });
@@ -97,7 +103,7 @@ const text = (t: string): ProviderEvent[] => [{ type: "text_delta", delta: t }, 
 // don't all need individual edits; `extra.description` still overrides it (see the "description
 // rides thread_started" test below). The dedicated "without description" test constructs its
 // tool_call by hand, bypassing this default, to pin the required-arg behavior itself.
-const spawnCall = (callId: string, prompt: string, extra?: { agentType?: string; model?: string; description?: string }): ProviderEvent =>
+const spawnCall = (callId: string, prompt: string, extra?: { agentType?: string; model?: string; description?: string; max_turns?: number; mode?: string; isolation?: string }): ProviderEvent =>
   ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "test task", ...extra }) });
 
 describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
@@ -180,12 +186,15 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     expect(r2).toMatchObject({ isError: false, output: "child result" });
   });
 
-  test("depth>0 spawn (a child trying to spawn) is denied without running the bridge", async () => {
-    const { engine, store, sessionId } = setup([
-      [spawnCall("s1", "do X"), done("tool_calls")], // parent spawns a child
-      [spawnCall("s2", "grandchild"), done("tool_calls")], // the child tries to spawn again (depth 1)
-      text("child gave up on spawning further"), // the child's final round after the denial
-    ]);
+  test("maxDepth:1 (regression pin, today's old default): depth>0 spawn (a child trying to spawn) is denied without running the bridge", async () => {
+    const { engine, store, sessionId } = setup(
+      [
+        [spawnCall("s1", "do X"), done("tool_calls")], // parent spawns a child
+        [spawnCall("s2", "grandchild"), done("tool_calls")], // the child tries to spawn again (depth 1, at the cap)
+        text("child gave up on spawning further"), // the child's final round after the denial
+      ],
+      { maxDepth: 1 },
+    );
     await engine.runTurn(sessionId);
     const events = store.read(sessionId);
 
@@ -197,11 +206,14 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     expect(denied).toMatchObject({ isError: true, output: "subagents cannot spawn further subagents" });
   });
 
-  test("child specs exclude spawn_agent, ask_user, exit_plan_mode", async () => {
-    const { provider, engine, sessionId } = setup([
-      [spawnCall("s1", "do X"), done("tool_calls")],
-      text("done"),
-    ]);
+  test("maxDepth:1 (regression pin, today's old default): child specs exclude spawn_agent, ask_user, exit_plan_mode", async () => {
+    const { provider, engine, sessionId } = setup(
+      [
+        [spawnCall("s1", "do X"), done("tool_calls")],
+        text("done"),
+      ],
+      { maxDepth: 1 },
+    );
     await engine.runTurn(sessionId);
     const fp = provider as FakeProvider;
     const childTools = fp.requests[1]!.tools ?? [];
@@ -552,5 +564,737 @@ describe("AgentEngine: subagent ToolSearch-load-then-call (4g final-review fix)"
     expect(callResult).toMatchObject({ isError: false });
     const turnCompleted = events.find((e) => e.type === "turn_completed" && e.threadId === "main");
     expect(turnCompleted).toMatchObject({ stopReason: "end_turn" });
+  });
+});
+
+// -------------------------------------------------------------------------------------------
+// Phase 4h-i: spawn_agent's `max_turns` — a per-child cap on the tool-iteration loop (CC parity
+// with Agent.max_turns). Only the spawn bridge ever passes this; main-thread turns are unaffected.
+// -------------------------------------------------------------------------------------------
+describe("AgentEngine: spawn_agent max_turns (4h-i)", () => {
+  const loopingToolCall = (callId: string): ProviderEvent =>
+    ({ type: "tool_call", callId, name: "glob", argsJson: '{"pattern":"*"}' });
+
+  test("max_turns: 2 caps the child at exactly 2 iterations — parent sees the cap message as an isError tool_result", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "loop forever", { max_turns: 2 }), done("tool_calls")], // parent round 0: spawn
+      [loopingToolCall("loop0"), done("tool_calls")], // child iteration 0
+      [loopingToolCall("loop1"), done("tool_calls")], // child iteration 1 — bound reached, cap fires
+      text("parent wrap-up"), // parent's continuation round, after the child's isError tool_result
+    ];
+    const { engine, store, sessionId, provider } = setup(script);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const started = events.find((e) => e.type === "thread_started");
+    const childId = (started as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+
+    const childCapError = events.find((e) => e.type === "agent_error" && e.threadId === childId);
+    expect(childCapError).toMatchObject({ message: "tool-iteration cap (2) reached" });
+
+    const completed = events.find((e) => e.type === "thread_completed" && e.threadId === childId);
+    expect(completed).toMatchObject({ stopReason: "error" });
+
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({
+      isError: true,
+      output: "subagent (general-purpose) failed: tool-iteration cap (2) reached",
+    });
+
+    // The parent's own turn still completes normally — an isError tool_result doesn't itself end
+    // the turn (only a human denial does); the parent just sees it and continues.
+    const mainTurnCompleted = events.find((e) => e.type === "turn_completed" && e.threadId === "main");
+    expect(mainTurnCompleted).toMatchObject({ stopReason: "end_turn" });
+
+    // 4 provider calls: parent round 0 (spawn), the child's 2 capped iterations, then the
+    // parent's own continuation round.
+    const fp = provider as FakeProvider;
+    expect(fp.requests.length).toBe(4);
+  });
+
+  test("no max_turns → child still uses the default cap (24), unchanged from before this feature", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "loop forever"), done("tool_calls")], // parent round 0: spawn, no max_turns
+      ...Array.from({ length: 24 }, (_, i): ProviderEvent[] => [loopingToolCall(`loop${i}`), done("tool_calls")]),
+      text("parent wrap-up"), // parent's continuation round, after the child's isError tool_result
+    ];
+    const { engine, store, sessionId, provider } = setup(script);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const started = events.find((e) => e.type === "thread_started");
+    const childId = (started as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+
+    const childCapError = events.find((e) => e.type === "agent_error" && e.threadId === childId);
+    expect(childCapError).toMatchObject({ message: "tool-iteration cap (24) reached" });
+
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({
+      isError: true,
+      output: "subagent (general-purpose) failed: tool-iteration cap (24) reached",
+    });
+
+    // 26 provider calls: parent round 0 (spawn), the child's 24 capped iterations, then the
+    // parent's own continuation round.
+    const fp = provider as FakeProvider;
+    expect(fp.requests.length).toBe(26);
+  });
+
+  test("max_turns: 1 — the tight boundary caps after exactly 1 iteration", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "loop forever", { max_turns: 1 }), done("tool_calls")], // parent round 0: spawn
+      [loopingToolCall("loop0"), done("tool_calls")], // child iteration 0 — bound reached, cap fires
+      text("parent wrap-up"), // parent's continuation round
+    ];
+    const { engine, store, sessionId, provider } = setup(script);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const started = events.find((e) => e.type === "thread_started");
+    const childId = (started as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+    const childCapError = events.find((e) => e.type === "agent_error" && e.threadId === childId);
+    expect(childCapError).toMatchObject({ message: "tool-iteration cap (1) reached" });
+
+    // 3 provider calls: parent round 0 (spawn), the child's single capped iteration, then the
+    // parent's own continuation round.
+    const fp = provider as FakeProvider;
+    expect(fp.requests.length).toBe(3);
+  });
+
+  // The bridge hand-parses raw argsJson BEFORE spawn.ts's own zod validation would ever run (a
+  // provider could send an out-of-schema value even though the declared arg is
+  // `.int().positive().max(50)`) — the guard must IGNORE an invalid value, not pass it through
+  // as-is. A bug here (e.g. clamping a negative number up to 1 instead of ignoring it, or worse,
+  // leaving it negative/zero) would make the loop bound `iteration < 0` — the child would hit the
+  // cap message WITHOUT ever calling the provider. This pins that it's ignored (falls back to the
+  // default 24), not misapplied.
+  test("invalid max_turns (non-positive) is ignored — not passed through as a 0/negative bound", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "do X", { max_turns: -5 }), done("tool_calls")], // parent round 0: spawn, invalid max_turns
+      text("child final report"), // child round 0: completes normally — proves the bound wasn't clamped to <= 0
+      text("parent wrap-up"), // parent's continuation round
+    ];
+    const { engine, store, sessionId } = setup(script);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({ isError: false, output: "child final report" });
+  });
+});
+
+// -------------------------------------------------------------------------------------------
+// Phase 4h-i Task 2: spawn_agent's `mode` — a RESTRICT-ONLY child permission-mode override (CC
+// parity with Agent's permission-mode arg). A child may run NARROWER than its parent, NEVER
+// wider — see restrictPolicy/mapSpawnMode's own unit tests (spawn-mode-policy.test.ts) for the
+// pure min-permissiveness logic itself. These engine tests pin the end-to-end wiring: the bridge
+// actually applies the narrowed policy to the CHILD's own runThread, and never mutates the
+// parent's shared `meta` object.
+// -------------------------------------------------------------------------------------------
+describe("AgentEngine: spawn_agent mode (restrict-only, 4h-i Task 2)", () => {
+  test("mode: 'plan' narrows a parent-'auto' child to plan policy — the child's write tool_call is gate-denied (Blocked in plan mode)", async () => {
+    const { engine, store, sessionId } = setup(
+      [
+        [spawnCall("s1", "do X", { mode: "plan" }), done("tool_calls")], // parent policy "auto"; mode narrows the child to "plan"
+        [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "x.txt", content: "y" }) }, done("tool_calls")],
+        text("child acknowledged the block"),
+      ],
+      { approvalPolicy: "auto" },
+    );
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({ isError: false }); // spawning itself is never blocked (read-only/orchestration)
+
+    const writeResult = events.find((e) => e.type === "tool_result" && e.callId === "w1");
+    expect(writeResult).toMatchObject({ isError: true });
+    expect((writeResult as Extract<SessionEvent, { type: "tool_result" }>).output).toContain("Blocked in plan mode");
+
+    // sanity: the PARENT's own session policy is untouched by the child's narrowed mode
+    expect(store.meta(sessionId).approvalPolicy).toBe("auto");
+  });
+
+  test("mode: 'bypassPermissions' from a parent-'ask' session is an ESCALATION — denied; the child's write still requires human approval, is not auto-allowed", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "do X", { mode: "bypassPermissions" }), done("tool_calls")], // parent policy "ask"
+      [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "x.txt", content: "y" }) }, done("tool_calls")],
+      text("child acknowledged the denial"),
+      text("parent wrap-up"),
+    ];
+    const { engine, store, sessionId, hub, broker } = setup(script, { approvalPolicy: "ask" });
+    const watcher = {
+      clientName: "auto-denier",
+      deliver: (e: SessionEvent) => { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, false, "auto-denier"); return true; },
+    };
+    hub.attach(watcher, sessionId, 0);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({ isError: false }); // spawn_agent itself is read-only, always allowed
+
+    // The child's write call REQUIRED approval — proof the "bypassPermissions" (→ Norma "auto")
+    // escalation was denied and the child stayed at the parent's "ask" policy. If the escalation
+    // had gone through, this would have been an auto-allow with NO approval_requested at all.
+    const approvalReq = events.find((e) => e.type === "approval_requested" && e.callId === "w1");
+    expect(approvalReq).toBeDefined();
+    expect(events.find((e) => e.type === "approval_resolved" && e.callId === "w1")).toMatchObject({ approved: false, by: "auto-denier" });
+
+    const writeResult = events.find((e) => e.type === "tool_result" && e.callId === "w1");
+    expect(writeResult).toMatchObject({ isError: true });
+
+    // sanity: the PARENT's own session policy is untouched by the denied escalation attempt
+    expect(store.meta(sessionId).approvalPolicy).toBe("ask");
+  });
+
+  test("no mode → child inherits the parent's policy exactly, and the spawn NEVER mutates the shared parent meta (a same-turn parent write still follows the original 'ask' policy)", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "do X"), done("tool_calls")], // parent round 0: spawn, no mode at all
+      text("child final report"), // the child's only round
+      // the parent's OWN continuation round makes its OWN write call — must still be gated under
+      // the session's ORIGINAL "ask" policy; if the spawn bridge had mutated the shared `meta`
+      // object (e.g. widened it while building childMeta), this call would see the corruption.
+      [{ type: "tool_call", callId: "p1", name: "write", argsJson: JSON.stringify({ path: "after.txt", content: "z" }) }, done("tool_calls")],
+      text("parent wrap-up"),
+    ];
+    const { engine, store, sessionId, hub, broker } = setup(script, { approvalPolicy: "ask" });
+    const watcher = {
+      clientName: "auto-approver",
+      deliver: (e: SessionEvent) => { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, true, "auto-approver"); return true; },
+    };
+    hub.attach(watcher, sessionId, 0);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const completed = events.find((e) => e.type === "thread_completed");
+    expect(completed).toMatchObject({ stopReason: "end_turn" });
+
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({ isError: false, output: "child final report" });
+
+    // the parent's post-spawn write still went through the normal "ask" approval flow
+    const approvalReq = events.find((e) => e.type === "approval_requested" && e.callId === "p1");
+    expect(approvalReq).toBeDefined();
+    const p1Result = events.find((e) => e.type === "tool_result" && e.callId === "p1");
+    expect(p1Result).toMatchObject({ isError: false }); // approved
+
+    // the session's persisted policy is untouched (only enter/exit_plan_mode ever calls setPolicy)
+    expect(store.meta(sessionId).approvalPolicy).toBe("ask");
+  });
+
+  test("mode: 'default' behaves exactly like an absent mode — no override, child inherits the parent's 'auto' policy (a child write is NOT blocked)", async () => {
+    const { engine, store, sessionId } = setup(
+      [
+        [spawnCall("s1", "do X", { mode: "default" }), done("tool_calls")],
+        [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "x.txt", content: "y" }) }, done("tool_calls")],
+        text("child wrote the file"),
+      ],
+      { approvalPolicy: "auto" },
+    );
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const writeResult = events.find((e) => e.type === "tool_result" && e.callId === "w1");
+    expect(writeResult).toMatchObject({ isError: false });
+  });
+
+  // T2 security review: the invariant above ("no mode → the spawn NEVER mutates the shared parent
+  // meta") is pinned for the single-spawn case, but nothing yet proved it for the two CRITICAL
+  // scenarios a copy-vs-mutate regression would actually break: (a) TWO concurrent spawns in one
+  // assistant message, one narrowing + one not — a regression that did
+  // `meta.approvalPolicy = childPolicy; childMeta = meta` (mutating the shared object instead of
+  // copying) would make the FIRST (narrowing) spawn's mutation visible to the SECOND spawn's read
+  // of `meta.approvalPolicy`, since the bridge's per-call setup runs synchronously up to its first
+  // `await` (Promise.all(calls.map(...)) invokes each callback in order; the narrowing spawn's
+  // sync prefix — including the mutation, under the regression — completes before the next spawn's
+  // callback starts); (b) after a narrowing spawn returns, the PARENT's own same-turn continuation
+  // tool call must still see the ORIGINAL policy, not the mutated one. Both pass on the current
+  // (copy-on-narrow) code and both would fail under the regression — see the doc comment on
+  // `childMeta` at engine.ts ~643.
+  test("concurrent spawns, one narrowing + one not: the un-narrowed sibling's write still runs at the parent's ORIGINAL 'auto' policy (narrowing spawn A does not leak into spawn B via shared meta)", async () => {
+    // A custom provider (not the shared script-array harness) because the two children must
+    // behave DIFFERENTLY (child A's write is plan-denied, child B's write is auto-allowed) while
+    // running CONCURRENTLY via Promise.all inside the engine's spawn bridge — dispatch here is
+    // keyed off each request's OWN input content (each child's fresh thread input is exactly
+    // `[{message,user,<prompt>}]` — see the spawn bridge's `input: [{type:"message",...}]`), not
+    // provider-call order, so the test is robust regardless of which child's synchronous setup the
+    // engine happens to run first.
+    class ConcurrentModeProvider implements Provider {
+      readonly id = "fake";
+      readonly requests: TurnRequest[] = [];
+      private parentRound = 0;
+      models(): ModelInfo[] { return [{ id: "fake-1", family: "fake", contextWindow: 100_000, supportsVision: false }]; }
+      async *streamTurn(req: TurnRequest): AsyncIterable<ProviderEvent> {
+        this.requests.push(req);
+        const first = req.input[0] as { type?: string; content?: unknown } | undefined;
+        const isChildA = first?.type === "message" && first.content === "task A";
+        const isChildB = first?.type === "message" && first.content === "task B";
+        if (isChildA || isChildB) {
+          const callId = isChildA ? "wA" : "wB";
+          const path = isChildA ? "a.txt" : "b.txt";
+          if (req.input.length === 1) {
+            // this child's first round: attempt a write
+            yield { type: "tool_call", callId, name: "write", argsJson: JSON.stringify({ path, content: "y" }) };
+            yield done("tool_calls");
+          } else {
+            // this child's second round, after the write's tool_result comes back: wrap up
+            yield { type: "text_delta", delta: `${isChildA ? "child A" : "child B"} wrap-up` };
+            yield done("end_turn");
+          }
+          return;
+        }
+        // the PARENT thread's own rounds — its own input never has input[0].content === "task A"/
+        // "task B" (its history holds the spawn_agent function_calls, not the children's fresh
+        // per-thread user messages), so it always falls through to here.
+        const n = this.parentRound++;
+        if (n === 0) {
+          yield spawnCall("s1", "task A", { mode: "plan" }); // narrowing
+          yield spawnCall("s2", "task B"); // no mode
+          yield done("tool_calls");
+          return;
+        }
+        yield { type: "text_delta", delta: "parent wrap-up" };
+        yield done("end_turn");
+      }
+    }
+    const { engine, store, sessionId } = setup([], { provider: new ConcurrentModeProvider(), approvalPolicy: "auto" });
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    // both children ran to completion
+    expect(events.filter((e) => e.type === "thread_started").length).toBe(2);
+    expect(events.filter((e) => e.type === "thread_completed").length).toBe(2);
+
+    // child A (mode: "plan") — its write was plan-denied
+    const wA = events.find((e) => e.type === "tool_result" && e.callId === "wA");
+    expect(wA).toMatchObject({ isError: true });
+    expect((wA as Extract<SessionEvent, { type: "tool_result" }>).output).toContain("Blocked in plan mode");
+
+    // child B (no mode) — its write was NOT plan-denied; it ran under the parent's original "auto"
+    // policy, proving A's narrowing never leaked into B via the shared `meta` object
+    const wB = events.find((e) => e.type === "tool_result" && e.callId === "wB");
+    expect(wB).toMatchObject({ isError: false });
+
+    // sanity: the parent's own session policy is untouched
+    expect(store.meta(sessionId).approvalPolicy).toBe("auto");
+  });
+
+  test("after a narrowing (mode: 'plan') spawn returns, the PARENT's own same-turn write is still gated at the parent's ORIGINAL 'auto' policy, not the child's narrowed 'plan'", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "do X", { mode: "plan" }), done("tool_calls")], // parent round 0: spawn, narrowing mode
+      text("child final report"), // the child's only round, running under the narrowed "plan" policy
+      // the parent's OWN continuation round makes its OWN write call — must still be gated under
+      // the session's ORIGINAL "auto" policy, NOT the child's narrowed "plan". If the spawn bridge
+      // had mutated the shared `meta` object in place (regression: `meta.approvalPolicy =
+      // childPolicy; childMeta = meta`) instead of copying, this call would see "plan" and be
+      // denied ("Blocked in plan mode") even though the PARENT itself was never narrowed.
+      [{ type: "tool_call", callId: "p1", name: "write", argsJson: JSON.stringify({ path: "after.txt", content: "z" }) }, done("tool_calls")],
+      text("parent wrap-up"),
+    ];
+    const { engine, store, sessionId } = setup(script, { approvalPolicy: "auto" });
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const completed = events.find((e) => e.type === "thread_completed");
+    expect(completed).toMatchObject({ stopReason: "end_turn" });
+
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({ isError: false, output: "child final report" });
+
+    // the parent's post-spawn write was NOT plan-denied — proof the narrowing spawn didn't corrupt
+    // the parent's own `meta.approvalPolicy` for the rest of the turn
+    const p1Result = events.find((e) => e.type === "tool_result" && e.callId === "p1");
+    expect(p1Result).toMatchObject({ isError: false });
+
+    const mainTurnCompleted = events.find((e) => e.type === "turn_completed" && e.threadId === "main");
+    expect(mainTurnCompleted).toMatchObject({ stopReason: "end_turn" });
+
+    // the session's persisted policy is untouched (only enter/exit_plan_mode ever calls setPolicy)
+    expect(store.meta(sessionId).approvalPolicy).toBe("auto");
+  });
+});
+
+describe("AgentEngine: configurable subagent nesting depth (4h-i Task 3)", () => {
+  test("default maxDepth (2, no explicit setting): a depth-1 child's specs DO include spawn_agent — nesting one level deeper than the old hardcoded cap", async () => {
+    const { provider, engine, sessionId } = setup([
+      [spawnCall("s1", "do X"), done("tool_calls")],
+      text("done"),
+    ]);
+    await engine.runTurn(sessionId);
+    const fp = provider as FakeProvider;
+    const childTools = fp.requests[1]!.tools ?? [];
+    const names = childTools.map((t) => t.name);
+    expect(names).toContain("spawn_agent");
+    // the depth-agnostic exclusions still apply regardless of maxDepth
+    expect(names).not.toContain("ask_user");
+    expect(names).not.toContain("exit_plan_mode");
+    expect(names).not.toContain("enter_plan_mode");
+  });
+
+  test("default maxDepth (2): a depth-1 child spawns a depth-2 grandchild end-to-end — thread_started/completed nest correctly, results bubble up two levels, grandchild's specs exclude spawn_agent (at the cap)", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "do X"), done("tool_calls")], // parent (depth 0) round 0: spawns the child
+      [spawnCall("s2", "grandchild task"), done("tool_calls")], // child (depth 1) round 0: spawns the grandchild
+      text("grandchild final report"), // grandchild (depth 2) round 0: no further spawn — ends its turn
+      text("child wrapped up after grandchild"), // child's own continuation round, after the grandchild bridge returns
+      text("parent final report"), // parent's own continuation round, after the child bridge returns
+    ];
+    const { engine, store, sessionId, provider } = setup(script);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const starts = events.filter((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>[];
+    expect(starts.length).toBe(2); // child + grandchild
+
+    const childStart = starts.find((e) => e.parentThreadId === "main")!;
+    expect(childStart).toBeDefined();
+    const grandchildStart = starts.find((e) => e.parentThreadId === childStart.threadId)!;
+    expect(grandchildStart).toBeDefined(); // proves the grandchild nests UNDER the child, not under main
+
+    const completions = events.filter((e) => e.type === "thread_completed");
+    expect(completions.length).toBe(2);
+    expect(completions.every((e) => (e as Extract<SessionEvent, { type: "thread_completed" }>).stopReason === "end_turn")).toBe(true);
+
+    // the grandchild's own result bubbles up as the CHILD's tool_result for s2
+    const s2Result = events.find((e) => e.type === "tool_result" && e.callId === "s2");
+    expect(s2Result).toMatchObject({ isError: false, output: "grandchild final report" });
+    // and the child's own final text (after the grandchild returns) bubbles up as the PARENT's
+    // tool_result for s1 — proves the child kept running its OWN loop after the nested spawn
+    const s1Result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(s1Result).toMatchObject({ isError: false, output: "child wrapped up after grandchild" });
+
+    const fp = provider as FakeProvider;
+    // request[1] = child's round 0 (depth 1) — spawn_agent still visible, one level of room left
+    expect((fp.requests[1]!.tools ?? []).map((t) => t.name)).toContain("spawn_agent");
+    // request[2] = grandchild's round 0 (depth 2, AT the cap) — spawn_agent excluded
+    expect((fp.requests[2]!.tools ?? []).map((t) => t.name)).not.toContain("spawn_agent");
+  });
+
+  test("default maxDepth (2): a depth-2 grandchild that calls spawn_agent anyway (provider ignoring the excluded specs) is rejected via belt-and-braces — no great-grandchild thread runs", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "do X"), done("tool_calls")], // parent (depth 0): spawns the child
+      [spawnCall("s2", "grandchild task"), done("tool_calls")], // child (depth 1): spawns the grandchild
+      [spawnCall("s3", "great-grandchild attempt"), done("tool_calls")], // grandchild (depth 2, AT the cap) tries anyway
+      text("grandchild gave up on spawning further"), // grandchild's continuation round after the denial
+      text("child wrapped up"), // child's continuation round after the grandchild bridge returns
+      text("parent final report"), // parent's continuation round after the child bridge returns
+    ];
+    const { engine, store, sessionId } = setup(script);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    // only TWO thread_started/completed pairs (child + grandchild) — the great-grandchild attempt
+    // never ran the bridge
+    expect(events.filter((e) => e.type === "thread_started").length).toBe(2);
+    expect(events.filter((e) => e.type === "thread_completed").length).toBe(2);
+
+    const denied = events.find((e) => e.type === "tool_result" && e.callId === "s3");
+    expect(denied).toMatchObject({ isError: true, output: "subagents cannot spawn further subagents" });
+
+    const s2Result = events.find((e) => e.type === "tool_result" && e.callId === "s2");
+    expect(s2Result).toMatchObject({ isError: false, output: "grandchild gave up on spawning further" });
+  });
+
+  test("maxDepth: 1 explicit — a depth-1 child cannot spawn (regression pin, identical to today's hardcoded default)", async () => {
+    const { engine, store, sessionId } = setup(
+      [
+        [spawnCall("s1", "do X"), done("tool_calls")],
+        [spawnCall("s2", "grandchild"), done("tool_calls")],
+        text("child gave up on spawning further"),
+      ],
+      { maxDepth: 1 },
+    );
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(events.filter((e) => e.type === "thread_started").length).toBe(1);
+    const denied = events.find((e) => e.type === "tool_result" && e.callId === "s2");
+    expect(denied).toMatchObject({ isError: true, output: "subagents cannot spawn further subagents" });
+  });
+
+  test("maxDepth: 5 — a depth-4 great-great-grandchild's specs still include spawn_agent (below the cap), same excludeTools logic applies at any depth", async () => {
+    // Not a full 5-level e2e (heavy) — pins the depth-parameterized excludeTools construction
+    // itself by checking BOTH boundary depths in one setup: the main thread's own child (depth 1)
+    // keeps spawn_agent (1 < 5), same as any other below-cap depth would.
+    const { provider, engine, sessionId } = setup(
+      [
+        [spawnCall("s1", "do X"), done("tool_calls")],
+        text("done"),
+      ],
+      { maxDepth: 5 },
+    );
+    await engine.runTurn(sessionId);
+    const fp = provider as FakeProvider;
+    const names = (fp.requests[1]!.tools ?? []).map((t) => t.name);
+    expect(names).toContain("spawn_agent");
+  });
+
+  // T3 review fix: nested-spawn semaphore reentrancy stall. maxConcurrent:1 means the child
+  // (depth 1) itself holds the pool's ONLY slot for its whole run — when it tries to spawn a
+  // grandchild (depth 2), that spawn's acquire is REENTRANT (opts.depth === 1 > 0) into an
+  // already-fully-saturated pool with no other occupant ever going to release. Before the fix
+  // this queued unboundedly and only gave up after the per-run timeoutMs (300s), reporting a
+  // spurious "timed out" for a grandchild that never even started. After the fix it fails fast
+  // with the typed "pool saturated" error, well within the bounded acquireTimeoutMs.
+  test("maxConcurrent:1 nested-spawn saturation: grandchild spawn attempt fails fast with a typed pool-saturated error, not a 300s stall — parent/child turns still complete gracefully", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "do X"), done("tool_calls")], // parent (depth 0): spawns the child — takes the only slot
+      [spawnCall("s2", "grandchild task"), done("tool_calls")], // child (depth 1): reentrant spawn attempt, saturated pool
+      text("child noticed the saturation error and wrapped up"), // child's continuation round after the denial
+      text("parent final report"), // parent's continuation round after the child bridge returns
+    ];
+    const { engine, store, sessionId } = setup(script, {
+      subagentsOpts: { maxConcurrent: 1, timeoutMs: 5000, acquireTimeoutMs: 50 },
+    });
+
+    const start = Date.now();
+    await engine.runTurn(sessionId);
+    const elapsed = Date.now() - start;
+
+    // bounded by acquireTimeoutMs (50ms), nowhere near the 300s (or even the 5s timeoutMs) stall
+    expect(elapsed).toBeLessThan(3000);
+
+    const events = store.read(sessionId);
+
+    // only ONE thread_started/completed pair — the grandchild's bridge call ran (thread_started
+    // fires before subagents.run) but its subagents.run() call itself failed the reentrant
+    // acquire, so its own runThread body never executed.
+    const starts = events.filter((e) => e.type === "thread_started");
+    expect(starts.length).toBe(2); // child + the grandchild attempt (thread_started fires pre-acquire)
+    const completions = events.filter((e) => e.type === "thread_completed") as Extract<SessionEvent, { type: "thread_completed" }>[];
+    expect(completions.length).toBe(2);
+    // the grandchild's own completion is reported as an error (its subagents.run() call
+    // resolved !ok), even though its runThread body never actually ran
+    expect(completions.some((e) => e.stopReason === "error")).toBe(true);
+
+    // the grandchild spawn's tool_result on the CHILD's turn: typed saturation error, not a
+    // generic timeout and not a hang
+    const s2Result = events.find((e) => e.type === "tool_result" && e.callId === "s2");
+    expect(s2Result).toMatchObject({ isError: true });
+    const s2Output = (s2Result as Extract<SessionEvent, { type: "tool_result" }>).output;
+    expect(s2Output).toContain("pool saturated");
+    expect(s2Output).not.toContain("timed out after"); // must NOT be the generic per-run timeout message
+
+    // the parent's own turn still completes normally afterward — no stall propagates upward
+    const s1Result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(s1Result).toMatchObject({ isError: false, output: "child noticed the saturation error and wrapped up" });
+  });
+});
+
+// -------------------------------------------------------------------------------------------
+// Phase 4h-i Task 4: spawn_agent `isolation: "worktree"` (CC parity with Agent.isolation) — a
+// spawned child runs in a FRESH git worktree instead of the parent's own cwd. Mac-gated (real
+// git repos, mirroring engine-worktree.test.ts's isMac/repo() convention) since WorktreeManager
+// shells out to the real `git` binary.
+// -------------------------------------------------------------------------------------------
+const isMac = process.platform === "darwin";
+
+function git(args: string[], cwd: string): { code: number; stdout: string; stderr: string } {
+  const p = Bun.spawnSync(["git", "-C", cwd, ...args]);
+  return { code: p.exitCode ?? 0, stdout: p.stdout.toString(), stderr: p.stderr.toString() };
+}
+
+/** mkdtemp + git init + an initial commit so HEAD exists. Mirrors engine-worktree.test.ts's helper. */
+function repo(): string {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-spawn-wt-")));
+  git(["init"], dir);
+  git(["config", "user.email", "test@norma.dev"], dir);
+  git(["config", "user.name", "Norma Test"], dir);
+  writeFileSync(join(dir, "README.md"), "hello\n");
+  git(["add", "-A"], dir);
+  git(["commit", "-m", "init"], dir);
+  return dir;
+}
+
+function setupIsolation(
+  script: ProviderEvent[][],
+  opts: { cwd?: string; withWorktrees?: boolean } = {},
+) {
+  const home = mkdtempSync(join(tmpdir(), "norma-engine-spawn-wt-home-"));
+  const cwd = opts.cwd ?? repo();
+  const store = new SessionStore(home);
+  const hub = new SessionHub(store);
+  const registry = new ToolRegistry();
+  registerReadTools(registry);
+  registerWriteTools(registry);
+  registerSpawnAgentTool(registry);
+  const broker = new ApprovalBroker();
+  const provider = new FakeProvider(script);
+  // Mirrors engine-worktree.test.ts's setup: roots are derived LIVE from store.meta(sid).cwd —
+  // irrelevant to the isolated CHILD (its roots come from rootsOverride, not this), but this is
+  // what the PARENT thread's own tool calls (before/after the spawn) still resolve against.
+  const dirs = new SessionDirectories((sid) => {
+    const m = store.meta(sid);
+    return m.cwd ? [m.cwd] : [];
+  });
+  const worktrees = opts.withWorktrees !== false ? new WorktreeManager({ baseRef: "head" }) : undefined;
+  const assemblerHome = mkdtempSync(join(tmpdir(), "norma-engine-spawn-wt-actx-"));
+  const assemblerTrust = new TrustStore(join(assemblerHome, "trust.json"));
+  const assembler = new ContextAssembler({
+    normaHome: assemblerHome,
+    trust: assemblerTrust,
+    skills: new SkillStore({ normaHome: assemblerHome, trust: assemblerTrust }),
+  });
+  const compactor = new Compactor({ provider: { provider, model: "fake-1" }, store, hub });
+  const agentsHome = mkdtempSync(join(tmpdir(), "norma-engine-spawn-wt-agents-"));
+  const agentsTrust = new TrustStore(join(agentsHome, "trust.json"));
+  const agents = new AgentStore({ normaHome: agentsHome, trust: agentsTrust });
+  const subagents = new SubagentManager({});
+  const engine = new AgentEngine({
+    store, hub, registry, broker,
+    gate: new PermissionGate(),
+    provider: { provider, model: "fake-1" },
+    dirs,
+    approvalTimeoutMs: 500,
+    assembler,
+    compactor,
+    agents,
+    subagents,
+    worktrees,
+  });
+  const sessionId = store.createSession("global", { cwd, approvalPolicy: "auto" });
+  return { engine, store, hub, broker, sessionId, cwd, provider, dirs };
+}
+
+describe.if(isMac)("AgentEngine: spawn_agent isolation:\"worktree\" (4h-i Task 4)", () => {
+  test("child writes a file under isolation:\"worktree\" → the file lands in the worktree dir, NOT the parent repo; the (dirty) worktree is left on disk (no auto-remove, no auto-merge)", async () => {
+    const { engine, store, sessionId, cwd } = setupIsolation([
+      [spawnCall("s1", "write a note", { isolation: "worktree" }), done("tool_calls")], // parent round 0: spawn, isolated
+      [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "note.txt", content: "isolated" }) }, done("tool_calls")], // child round 0
+      text("wrote the note"), // child round 1: end turn
+      text("parent wrap-up"), // parent's continuation round
+    ]);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const started = events.find((e) => e.type === "thread_started");
+    expect(started).toBeDefined();
+    const completed = events.find((e) => e.type === "thread_completed");
+    expect(completed).toMatchObject({ stopReason: "end_turn" });
+
+    const writeResult = events.find((e) => e.type === "tool_result" && e.callId === "w1");
+    expect(writeResult).toMatchObject({ isError: false });
+
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({ isError: false, output: "wrote the note" });
+
+    // the parent repo itself was never touched
+    expect(existsSync(join(cwd, "note.txt"))).toBe(false);
+
+    // the file DID land in a freshly created worktree under .norma/worktrees — discovered via
+    // the filesystem since isolation doesn't emit a worktree_entered event (that's the
+    // session-scoped enter_worktree/exit_worktree bridge, a different, unrelated mechanism)
+    const wtParent = join(cwd, ".norma", "worktrees");
+    const names = readdirSync(wtParent);
+    expect(names.length).toBe(1);
+    const wtDir = join(wtParent, names[0]!);
+    expect(existsSync(join(wtDir, "note.txt"))).toBe(true);
+
+    // dirty (uncommitted note.txt) → clean-only teardown refused to remove it; left on disk
+    const status = git(["status", "--short"], wtDir);
+    expect(status.stdout).toContain("note.txt");
+
+    // sanity: still a real git worktree, on its own norma/ branch
+    const branchList = git(["branch", "--list", `norma/${names[0]}`], cwd);
+    expect(branchList.stdout.trim().length).toBeGreaterThan(0);
+  });
+
+  test("a CLEAN isolated child (no changes) → the worktree is auto-removed after it returns — `git worktree list` shows only the original repo", async () => {
+    const { engine, store, sessionId, cwd } = setupIsolation([
+      [spawnCall("s1", "just look around", { isolation: "worktree" }), done("tool_calls")],
+      text("nothing to change"), // child makes no tool calls at all — worktree stays pristine
+      text("parent wrap-up"),
+    ]);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const completed = events.find((e) => e.type === "thread_completed");
+    expect(completed).toMatchObject({ stopReason: "end_turn" });
+    const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(spawnResult).toMatchObject({ isError: false, output: "nothing to change" });
+
+    // clean → auto-removed: `git worktree list` shows ONLY the main repo, no leftover worktree
+    const list = git(["worktree", "list"], cwd);
+    const lines = list.stdout.trim().split("\n").filter((l) => l.length > 0);
+    expect(lines.length).toBe(1);
+  });
+
+  test("no isolation arg → child runs in the parent's own cwd, unchanged from before this feature (no .norma/worktrees created)", async () => {
+    const { engine, store, sessionId, cwd } = setupIsolation([
+      [spawnCall("s1", "write a note"), done("tool_calls")], // no isolation
+      [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "plain.txt", content: "x" }) }, done("tool_calls")],
+      text("wrote it"),
+      text("parent wrap-up"),
+    ]);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const writeResult = events.find((e) => e.type === "tool_result" && e.callId === "w1");
+    expect(writeResult).toMatchObject({ isError: false });
+    // the file lands directly in the parent repo — no worktree involved
+    expect(existsSync(join(cwd, "plain.txt"))).toBe(true);
+    expect(existsSync(join(cwd, ".norma", "worktrees"))).toBe(false);
+  });
+
+  test("cwd is NOT a git repository → isolation:\"worktree\" fails as a typed isError tool_result, no thread_started (no ghost thread)", async () => {
+    const plainDir = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-spawn-wt-notgit-")));
+    const { engine, store, sessionId } = setupIsolation(
+      [
+        [spawnCall("s1", "do X", { isolation: "worktree" }), done("tool_calls")],
+        text("parent noticed the failure and wrapped up"),
+      ],
+      { cwd: plainDir },
+    );
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(events.some((e) => e.type === "thread_started")).toBe(false);
+    expect(events.some((e) => e.type === "thread_completed")).toBe(false);
+
+    const result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(result).toMatchObject({ isError: true });
+    const output = (result as Extract<SessionEvent, { type: "tool_result" }>).output;
+    expect(output).toContain("requires a git repository");
+  });
+
+  test("cfg.worktrees not wired (WorktreeManager unavailable) → isolation:\"worktree\" fails as a typed isError tool_result, no thread_started", async () => {
+    const { engine, store, sessionId } = setupIsolation(
+      [
+        [spawnCall("s1", "do X", { isolation: "worktree" }), done("tool_calls")],
+        text("parent noticed the failure and wrapped up"),
+      ],
+      { withWorktrees: false },
+    );
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(events.some((e) => e.type === "thread_started")).toBe(false);
+    expect(events.some((e) => e.type === "thread_completed")).toBe(false);
+
+    const result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(result).toMatchObject({ isError: true });
+    const output = (result as Extract<SessionEvent, { type: "tool_result" }>).output;
+    expect(output).toContain("isolation:\"worktree\" is not available in this session");
+  });
+
+  test("PARENT cwd/roots are unaffected by a sibling isolated spawn: the parent's own post-spawn write still lands in the original repo", async () => {
+    const { engine, store, sessionId, cwd } = setupIsolation([
+      [spawnCall("s1", "write a note", { isolation: "worktree" }), done("tool_calls")], // parent round 0: spawn, isolated
+      [{ type: "tool_call", callId: "cw1", name: "write", argsJson: JSON.stringify({ path: "child.txt", content: "y" }) }, done("tool_calls")], // child round 0
+      text("child done"), // child round 1
+      // parent's OWN continuation round: writes its own file — must land in the ORIGINAL repo,
+      // proving the isolated child's cwd/roots override never leaked into the parent's own state
+      [{ type: "tool_call", callId: "p1", name: "write", argsJson: JSON.stringify({ path: "parent.txt", content: "z" }) }, done("tool_calls")],
+      text("parent wrap-up"),
+    ]);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const p1Result = events.find((e) => e.type === "tool_result" && e.callId === "p1");
+    expect(p1Result).toMatchObject({ isError: false });
+    expect(existsSync(join(cwd, "parent.txt"))).toBe(true);
+    // the child's own file did NOT land in the parent repo
+    expect(existsSync(join(cwd, "child.txt"))).toBe(false);
   });
 });
