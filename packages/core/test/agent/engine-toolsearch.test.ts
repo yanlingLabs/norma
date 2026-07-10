@@ -236,4 +236,22 @@ describe("engine: built-in deferral + state pins (4g-i)", () => {
     expect(namesA).toEqual(namesB);
     expect(namesA).toContain("notebook_edit"); // present either way — deferred:true is inert without toolSearch enabled
   });
+
+  test("deferExternals:'always' end-to-end: a single external tool (well under a high deferThreshold) is still deferred", async () => {
+    const registry = new ToolRegistry();
+    registerToolSearchTool(registry);
+    registry.register({ name: "mcp__s__t1", description: "a lone external tool", args: z.object({}).passthrough(), run: () => "ok" });
+
+    const provider = new FakeProvider([[{ type: "text_delta", delta: "ok" }, done("end_turn")]]);
+    // deferThreshold 12 would normally leave a single external tool visible ("count" mode) —
+    // deferExternals:"always" defers it anyway, ignoring the count comparison entirely.
+    const { engine, sessionId } = setupEngine(provider, { registry, toolSearch: { deferThreshold: 12, deferExternals: "always" } });
+
+    await engine.runTurn(sessionId);
+
+    const names = provider.requests[0]!.tools?.map((t) => t.name) ?? [];
+    expect(names).not.toContain("mcp__s__t1");
+    expect(names).toContain("ToolSearch");
+    expect(provider.requests[0]!.instructions).toContain("mcp__s__t1"); // listed as a deferred tool
+  });
 });
