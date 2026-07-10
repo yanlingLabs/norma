@@ -7,6 +7,15 @@ const MAX_FETCH_BYTES = 5 * 1024 * 1024; // hard cap on bytes READ off the wire 
 const PREVIEW_BYTES = 8192;
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_REDIRECT_HOPS = 3;
+const DEFAULT_SEARCH_RESULTS = 5;
+const MAX_SEARCH_RESULTS = 10;
+
+/** Keychain secret name for the Brave Search API key (4g Task 6) — shared between the daemon's
+ *  `registerWebTools` wiring (packages/core/src/daemon.ts) and the CLI's `norma login
+ *  --web-search-key` (packages/cli/src/main.ts), same precedent as providers/manager.ts's
+ *  OPENAI_API_KEY_SECRET: ONE exported const so the two call sites can never drift apart on the
+ *  literal string. */
+export const WEB_SEARCH_API_KEY_SECRET = "web-search-api-key";
 
 // module-level, per-process — names saved files webfetch-<n>-<host>.md (USER DESIGN, task-5-brief.md)
 let fetchCounter = 0;
@@ -185,6 +194,12 @@ export interface WebToolDeps {
    *  lets the file-write/result-shape test drive the FULL run() through registerWebTools without
    *  live network, the same way followRedirects' own tests drive it directly. */
   fetchFn?: typeof fetch;
+  /** web_search's ONLY route to its Brave API key — daemon.ts wires this as `(name) =>
+   *  secrets.get(name)` over the SAME KeychainSecretStore instance the daemon already builds
+   *  (auth/secret-store.ts). Plain function (not the SecretStore interface) so this file doesn't
+   *  need a cross-directory import into auth/ just for a type. Undefined (test default) is treated
+   *  identically to "no key stored" — web_search's no-key error path covers both. */
+  secret?: (name: string) => Promise<string | null>;
 }
 
 export function registerWebTools(r: ToolRegistry, deps: WebToolDeps = {}): void {
@@ -262,6 +277,72 @@ export function registerWebTools(r: ToolRegistry, deps: WebToolDeps = {}): void 
           ...(finalUrl !== undefined && finalUrl !== url ? { finalUrl } : {}),
           outcome,
         });
+      }
+    },
+  });
+
+  r.register({
+    name: "web_search",
+    description:
+      "Search the web (Brave Search) and return a numbered list of results (title, url, description). Norma's only search tool — pair with web_fetch to read a result's full page. Requires a stored Brave Search API key (norma login --web-search-key).",
+    args: z.object({
+      query: z.string().min(1),
+      // Default 5, hard-clamped to 10 below — caller-tunable but never unbounded (same DoS
+      // posture as web_fetch's fixed byte caps, just expressed as a result-count cap instead).
+      max_results: z.number().int().positive().optional(),
+    }),
+    deferred: true, // same class as web_fetch — rides ToolSearch deferral, not visible/callable until loaded
+    async run({ query, max_results }, ctx) {
+      let outcome = "network_error";
+      try {
+        const key = (await deps.secret?.(WEB_SEARCH_API_KEY_SECRET)) ?? null;
+        if (!key) {
+          outcome = "no_key";
+          throw new Error(
+            "web_search needs an API key — store one with: norma login --web-search-key <key> (Brave Search API)",
+          );
+        }
+
+        const count = Math.min(Math.max(max_results ?? DEFAULT_SEARCH_RESULTS, 1), MAX_SEARCH_RESULTS);
+        const fetchFn = deps.fetchFn ?? fetch;
+        const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+        const signal = AbortSignal.any([ctx.signal, timeoutSignal].filter((s): s is AbortSignal => Boolean(s)));
+        const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}`;
+
+        let res: Response;
+        try {
+          res = await fetchFn(url, { headers: { "X-Subscription-Token": key, Accept: "application/json" }, signal });
+        } catch (e) {
+          const name = e instanceof Error ? e.name : "";
+          if (name === "AbortError" || name === "TimeoutError") {
+            outcome = "timeout";
+            throw new Error(`request timed out searching for ${query}`);
+          }
+          outcome = "network_error";
+          throw new Error(`fetch failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+
+        if (res.status !== 200) {
+          outcome = "http_error";
+          throw new Error(`web_search failed: HTTP ${res.status}`);
+        }
+
+        let data: { web?: { results?: Array<{ title?: string; url?: string; description?: string }> } };
+        try {
+          data = (await res.json()) as typeof data;
+        } catch (e) {
+          outcome = "parse_error";
+          throw new Error(`web_search failed: could not parse response (${e instanceof Error ? e.message : String(e)})`);
+        }
+
+        const results = (data.web?.results ?? []).slice(0, count);
+        outcome = "ok";
+        if (results.length === 0) return `no results for ${query}`;
+        return results
+          .map((r, i) => `${i + 1}. ${r.title ?? "-"}\n   ${r.url ?? "-"}\n   ${r.description ?? "-"}`)
+          .join("\n");
+      } finally {
+        deps.audit?.({ kind: "network", tool: "web_search", query, outcome });
       }
     },
   });

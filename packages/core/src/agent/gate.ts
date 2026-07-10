@@ -40,7 +40,7 @@ const SELF_GATING = new Set(["request_directory"]);
 // to allow) — but OUTSIDE plan mode it rides the SAME branch as MUTATING/bash (ask under `ask`,
 // allow under `auto`), because a live network call is still an external side effect worth a human's
 // visibility. See evaluate() below for exactly where each half of this is implemented.
-const NETWORK = new Set(["web_fetch"]);
+const NETWORK = new Set(["web_fetch", "web_search"]);
 
 /**
  * v1 policy matrix (spec §4.10 arrives fully in 1b-ii with the AI reviewer):

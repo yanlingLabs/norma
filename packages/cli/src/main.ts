@@ -1151,13 +1151,24 @@ if (import.meta.main) {
     break;
   }
   case "login": {
-    const { KeychainSecretStore, CodexAuthStore, runLoginFlow, CODEX, OPENAI_API_KEY_SECRET } = await import("@norma/core");
+    const { KeychainSecretStore, CodexAuthStore, runLoginFlow, CODEX, OPENAI_API_KEY_SECRET, WEB_SEARCH_API_KEY_SECRET } = await import("@norma/core");
     const secrets = new KeychainSecretStore();
     if (process.argv.includes("--api-key")) {
       const key = (await readSecret("Paste your OpenAI API key: ")).trim();
       if (!key.startsWith("sk-")) { console.error("that does not look like an API key"); process.exit(1); }
       await secrets.set(OPENAI_API_KEY_SECRET, key);
       console.log(`${AQUA}API key stored in Keychain${RESET} — set provider type in ~/.norma/settings.json (openai-compatible)`);
+      break;
+    }
+    // 4g Task 6: web_search's Brave Search API key. Mirrors the --api-key branch above exactly
+    // (readSecret → validate → secrets.set → confirm → break) — the only difference is the
+    // validation, since Brave keys carry no known "sk-"-style prefix to sniff, so this just
+    // rejects an empty paste instead of a format check.
+    if (process.argv.includes("--web-search-key")) {
+      const key = (await readSecret("Paste your Brave Search API key: ")).trim();
+      if (!key) { console.error("that does not look like an API key"); process.exit(1); }
+      await secrets.set(WEB_SEARCH_API_KEY_SECRET, key);
+      console.log(`${AQUA}Brave Search API key stored in Keychain${RESET} — web_search is ready to use`);
       break;
     }
     const tokens = await runLoginFlow({
@@ -1299,7 +1310,7 @@ if (import.meta.main) {
   mcp                                              list configured MCP servers and their tools
   plugin list | install <git-url> [name] | enable <name> | disable <name> | remove <name> | restart <name>
   bg list <session> | bg peek <session> <taskId> | bg kill <session> <taskId>
-  login [--api-key] | logout | provider | provider-smoke [--prompt <text>]
+  login [--api-key] [--web-search-key] | logout | provider | provider-smoke [--prompt <text>]
   init                                            generate/update NORMA.md by surveying the project
   -p "<prompt>" [--auto|--plan] [--trust|--no-trust]   headless agent turn (asks for tool approval unless --auto/--plan)`);
   }

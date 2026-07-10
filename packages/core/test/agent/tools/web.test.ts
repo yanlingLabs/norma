@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } fr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ToolRegistry } from "../../../src/agent/tools/registry";
-import { registerWebTools, ssrfGuard, htmlToText, followRedirects } from "../../../src/agent/tools/web";
+import { registerWebTools, ssrfGuard, htmlToText, followRedirects, WEB_SEARCH_API_KEY_SECRET } from "../../../src/agent/tools/web";
 
 function tmp(): string {
   return realpathSync(mkdtempSync(join(tmpdir(), "norma-webfetch-")));
@@ -269,6 +269,123 @@ describe("web_fetch tool", () => {
     registerWebTools(r);
     const dir = tmp();
     const out = await r.execute("web_fetch", {}, { cwd: dir, roots: [dir], sessionId: "s1", tmpDir: dir });
+    expect(out.isError).toBe(true);
+  });
+});
+
+// --- web_search tool (4g Task 6, Brave backend): no-key error, canned-fixture mapping, request
+// shape, clamping, empty/non-200 outcomes — all driven via the SAME injectable fetchFn as
+// web_fetch above, no live network. ------------------------------------------------------------
+
+function fakeSecret(value: string | null): (name: string) => Promise<string | null> {
+  return async (name) => {
+    expect(name).toBe(WEB_SEARCH_API_KEY_SECRET);
+    return value;
+  };
+}
+
+function braveFetch(body: unknown, status = 200): typeof fetch {
+  return (async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(body), { status })) as typeof fetch;
+}
+
+describe("web_search tool", () => {
+  test("no key stored is a typed isError with the exact login hint, and is audited outcome no_key", async () => {
+    const r = new ToolRegistry();
+    const audited: Record<string, unknown>[] = [];
+    registerWebTools(r, { audit: (l) => audited.push(l), secret: fakeSecret(null) });
+    const dir = tmp();
+    const out = await r.execute("web_search", { query: "norma agent" }, { cwd: dir, roots: [dir], sessionId: "s1", tmpDir: dir });
+    expect(out.isError).toBe(true);
+    expect(out.output).toBe("web_search needs an API key — store one with: norma login --web-search-key <key> (Brave Search API)");
+    expect(audited.length).toBe(1);
+    expect(audited[0]).toMatchObject({ kind: "network", tool: "web_search", query: "norma agent", outcome: "no_key" });
+  });
+
+  test("no secret accessor at all (deps.secret undefined) behaves identically to no key stored", async () => {
+    const r = new ToolRegistry();
+    registerWebTools(r); // no secret, no fetchFn
+    const dir = tmp();
+    const out = await r.execute("web_search", { query: "x" }, { cwd: dir, roots: [dir], sessionId: "s1", tmpDir: dir });
+    expect(out.isError).toBe(true);
+    expect(out.output).toContain("web_search needs an API key");
+  });
+
+  test("canned Brave response maps to a numbered title/url/description list, default-capped at 5", async () => {
+    const results = Array.from({ length: 8 }, (_, i) => ({ title: `Title ${i + 1}`, url: `https://x.com/${i + 1}`, description: `Desc ${i + 1}` }));
+    const r = new ToolRegistry();
+    const audited: Record<string, unknown>[] = [];
+    registerWebTools(r, { audit: (l) => audited.push(l), secret: fakeSecret("brave-key"), fetchFn: braveFetch({ web: { results } }) });
+    const dir = tmp();
+    const out = await r.execute("web_search", { query: "example" }, { cwd: dir, roots: [dir], sessionId: "s1", tmpDir: dir });
+    expect(out.isError).toBe(false);
+    expect(out.output).toBe(
+      [1, 2, 3, 4, 5].map((n) => `${n}. Title ${n}\n   https://x.com/${n}\n   Desc ${n}`).join("\n"),
+    );
+    expect(out.output).not.toContain("Title 6");
+    expect(audited[0]).toMatchObject({ kind: "network", tool: "web_search", query: "example", outcome: "ok" });
+  });
+
+  test("max_results is honored up to the cap; requests above 10 clamp to 10", async () => {
+    const results = Array.from({ length: 10 }, (_, i) => ({ title: `T${i + 1}`, url: `https://x.com/${i + 1}`, description: "d" }));
+    const r1 = new ToolRegistry();
+    registerWebTools(r1, { secret: fakeSecret("k"), fetchFn: braveFetch({ web: { results: results.slice(0, 3) } }) });
+    const dir = tmp();
+    const out1 = await r1.execute("web_search", { query: "q", max_results: 3 }, { cwd: dir, roots: [dir], sessionId: "s1", tmpDir: dir });
+    expect(out1.output.split("\n").filter((l) => /^\d+\./.test(l)).length).toBe(3);
+
+    let capturedUrl = "";
+    const fetchFn = (async (url: string) => { capturedUrl = url; return new Response(JSON.stringify({ web: { results } }), { status: 200 }); }) as typeof fetch;
+    const r2 = new ToolRegistry();
+    registerWebTools(r2, { secret: fakeSecret("k"), fetchFn });
+    const out2 = await r2.execute("web_search", { query: "q", max_results: 999 }, { cwd: dir, roots: [dir], sessionId: "s1", tmpDir: dir });
+    expect(capturedUrl).toContain("count=10");
+    expect(out2.output.split("\n").filter((l) => /^\d+\./.test(l)).length).toBe(10);
+  });
+
+  test("request shape: URL is Brave's search endpoint with encoded query + count, header carries the key", async () => {
+    let capturedUrl = "";
+    let capturedHeaders: Record<string, string> = {};
+    const fetchFn = (async (url: string, init?: RequestInit) => {
+      capturedUrl = url;
+      capturedHeaders = Object.fromEntries(new Headers(init?.headers).entries());
+      return new Response(JSON.stringify({ web: { results: [] } }), { status: 200 });
+    }) as typeof fetch;
+    const r = new ToolRegistry();
+    registerWebTools(r, { secret: fakeSecret("my-brave-key"), fetchFn });
+    const dir = tmp();
+    await r.execute("web_search", { query: "hello world" }, { cwd: dir, roots: [dir], sessionId: "s1", tmpDir: dir });
+    expect(capturedUrl).toBe("https://api.search.brave.com/res/v1/web/search?q=hello%20world&count=5");
+    expect(capturedHeaders["x-subscription-token"]).toBe("my-brave-key");
+    expect(capturedHeaders["accept"]).toBe("application/json");
+  });
+
+  test("empty results is 'no results for <query>', not an error", async () => {
+    const r = new ToolRegistry();
+    const audited: Record<string, unknown>[] = [];
+    registerWebTools(r, { audit: (l) => audited.push(l), secret: fakeSecret("k"), fetchFn: braveFetch({ web: { results: [] } }) });
+    const dir = tmp();
+    const out = await r.execute("web_search", { query: "asdkjhasdkjhasd" }, { cwd: dir, roots: [dir], sessionId: "s1", tmpDir: dir });
+    expect(out.isError).toBe(false);
+    expect(out.output).toBe("no results for asdkjhasdkjhasd");
+    expect(audited[0]).toMatchObject({ outcome: "ok" });
+  });
+
+  test("non-200 response is a typed isError carrying the status, audited http_error", async () => {
+    const r = new ToolRegistry();
+    const audited: Record<string, unknown>[] = [];
+    registerWebTools(r, { audit: (l) => audited.push(l), secret: fakeSecret("k"), fetchFn: braveFetch({}, 401) });
+    const dir = tmp();
+    const out = await r.execute("web_search", { query: "q" }, { cwd: dir, roots: [dir], sessionId: "s1", tmpDir: dir });
+    expect(out.isError).toBe(true);
+    expect(out.output).toBe("web_search failed: HTTP 401");
+    expect(audited[0]).toMatchObject({ outcome: "http_error" });
+  });
+
+  test("bad args (missing query) is a registry-level tool error, not a throw", async () => {
+    const r = new ToolRegistry();
+    registerWebTools(r);
+    const dir = tmp();
+    const out = await r.execute("web_search", {}, { cwd: dir, roots: [dir], sessionId: "s1", tmpDir: dir });
     expect(out.isError).toBe(true);
   });
 });

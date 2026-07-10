@@ -35,6 +35,7 @@ export { registerNotebookTool } from "./agent/tools/notebook";
 export { registerBashTool } from "./agent/tools/bash";
 export { registerBackgroundTools } from "./agent/tools/background";
 export { registerRequestDirTool, type RequestDirDeps } from "./agent/tools/request-dir";
+export { registerWebTools, WEB_SEARCH_API_KEY_SECRET, type WebToolDeps } from "./agent/tools/web";
 export { registerToolSearchTool } from "./agent/tools/toolsearch";
 export { registerAskUserTool } from "./agent/tools/ask-user";
 export { registerPlanTool } from "./agent/tools/plan";

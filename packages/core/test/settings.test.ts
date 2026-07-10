@@ -36,12 +36,12 @@ describe("loadSettings", () => {
   });
 
   test("legacy v1-app settings (no schemaVersion) migrate, preserving v1 keys", () => {
-    const p = tmpSettings({ webSearch: { provider: "disabled" } });
+    const p = tmpSettings({ legacyCustom: { provider: "disabled" } });
     const s = loadSettings(p);
     expect(s.schemaVersion).toBe(2);
     expect(s.provider.type).toBe("codex-oauth");
     const onDisk = JSON.parse(readFileSync(p, "utf8"));
-    expect(onDisk.webSearch).toEqual({ provider: "disabled" }); // v1 data preserved on disk
+    expect(onDisk.legacyCustom).toEqual({ provider: "disabled" }); // v1 data preserved on disk
     expect(onDisk.schemaVersion).toBe(2);
   });
 
@@ -62,7 +62,7 @@ describe("loadSettings", () => {
   });
 
   test("legacy no-schemaVersion file with permissions migrates and keeps them", () => {
-    const p = tmpSettings({ webSearch: { provider: "disabled" }, permissions: { additionalDirectories: ["/opt/x"] } });
+    const p = tmpSettings({ legacyCustom: { provider: "disabled" }, permissions: { additionalDirectories: ["/opt/x"] } });
     const s = loadSettings(p);
     expect(s.schemaVersion).toBe(2);
     expect(s.permissions?.additionalDirectories).toEqual(["/opt/x"]);
@@ -83,7 +83,7 @@ describe("loadSettings", () => {
   });
 
   test("legacy migration keeps working with reviewer field absent", () => {
-    const p = tmpSettings({ webSearch: { provider: "disabled" } });
+    const p = tmpSettings({ legacyCustom: { provider: "disabled" } });
     const s = loadSettings(p);
     expect(s.schemaVersion).toBe(2);
     expect(s.reviewer).toBeUndefined();
@@ -96,7 +96,7 @@ describe("loadSettings", () => {
   });
 
   test("legacy migration keeps working with plugins field absent", () => {
-    const p = tmpSettings({ webSearch: { provider: "disabled" } });
+    const p = tmpSettings({ legacyCustom: { provider: "disabled" } });
     const s = loadSettings(p);
     expect(s.schemaVersion).toBe(2);
     expect(s.plugins).toBeUndefined();
@@ -118,7 +118,7 @@ describe("loadSettings", () => {
   });
 
   test("legacy migration keeps working with toolSearch field absent", () => {
-    const p = tmpSettings({ webSearch: { provider: "disabled" } });
+    const p = tmpSettings({ legacyCustom: { provider: "disabled" } });
     const s = loadSettings(p);
     expect(s.schemaVersion).toBe(2);
     expect(s.toolSearch).toBeUndefined();
@@ -132,7 +132,7 @@ describe("loadSettings", () => {
   });
 
   test("legacy migration keeps working with worktree field absent", () => {
-    const p = tmpSettings({ webSearch: { provider: "disabled" } });
+    const p = tmpSettings({ legacyCustom: { provider: "disabled" } });
     const s = loadSettings(p);
     expect(s.schemaVersion).toBe(2);
     expect(s.worktree).toBeUndefined();
@@ -147,10 +147,27 @@ describe("loadSettings", () => {
   });
 
   test("legacy migration keeps working with subagents field absent", () => {
-    const p = tmpSettings({ webSearch: { provider: "disabled" } });
+    const p = tmpSettings({ legacyCustom: { provider: "disabled" } });
     const s = loadSettings(p);
     expect(s.schemaVersion).toBe(2);
     expect(s.subagents).toBeUndefined();
+  });
+
+  // 4g Task 6: webSearch.provider defaults (unset) to Brave; "brave" is the only accepted literal
+  // today (forward-room for other backends later).
+  test("webSearch config parses; absent → undefined; non-brave provider rejected", () => {
+    const s = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, webSearch: { provider: "brave" } });
+    expect(s.webSearch).toEqual({ provider: "brave" });
+    expect(Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" } }).webSearch).toBeUndefined();
+    expect(Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, webSearch: {} }).webSearch).toEqual({});
+    expect(() => Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, webSearch: { provider: "disabled" } })).toThrow();
+  });
+
+  test("legacy migration keeps working with webSearch field absent", () => {
+    const p = tmpSettings({ legacyCustom: { provider: "disabled" } });
+    const s = loadSettings(p);
+    expect(s.schemaVersion).toBe(2);
+    expect(s.webSearch).toBeUndefined();
   });
 
   test("provider.reasoningEffort parses on both provider variants; absent → undefined", () => {

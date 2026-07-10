@@ -282,7 +282,10 @@ export async function startDaemon(opts: {
     // by design). Shares the SAME `audit` appender instance as peripheral/hardware below (hoisted
     // above this gate for exactly this reason) — every call (success, ssrf-refusal, http error,
     // timeout) gets one `{kind:"network", tool:"web_fetch", url, outcome}` line on audit.jsonl.
-    registerWebTools(registry, { audit: (line) => audit.append(line) });
+    // 4g Task 6: web_search's Brave API key rides the SAME `secrets` store (KeychainSecretStore,
+    // built at the top of startDaemon) `norma login --web-search-key` writes into — one
+    // SecretStore instance, one Keychain, no separate store to keep in sync.
+    registerWebTools(registry, { audit: (line) => audit.append(line), secret: (name) => secrets.get(name) });
     const agents = new AgentStore({
       normaHome, trust: trustStore, baseInstructions: SYSTEM_PROMPT,
       plugins: { disabled: settings?.plugins?.disabled ?? [] },

@@ -118,4 +118,14 @@ describe("PermissionGate v1", () => {
     expect(g.evaluate("web_fetch", "ask")).toBe(g.evaluate("bash", "ask"));
     expect(g.evaluate("web_fetch", "auto")).toBe(g.evaluate("bash", "auto"));
   });
+
+  // 4g Task 6: web_search joins web_fetch in the NETWORK class — same live-network-call posture
+  // (read-only research, no arbitrary fs/process mutation, but still a real outbound HTTP call to
+  // a third party), so it gets the IDENTICAL plan/ask/auto answer as web_fetch above.
+  test("web_search is gate-classed NETWORK: allow under plan and auto, ask under ask", () => {
+    const g = new PermissionGate();
+    expect(g.evaluate("web_search", "plan")).toBe("allow");
+    expect(g.evaluate("web_search", "auto")).toBe("allow");
+    expect(g.evaluate("web_search", "ask")).toBe("ask");
+  });
 });
