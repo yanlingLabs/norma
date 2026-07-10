@@ -147,13 +147,13 @@ export interface EngineConfig {
   agents?: AgentStore;
   // 4h-i Task 3 (CC parity: configurable nesting depth, settings.subagents.maxDepth): how many
   // levels of spawn_agent nesting are allowed, orthogonal to SubagentManager's maxConcurrent
-  // (fan-out width) and the 1000-total-agent backstop (AgentStore.resolve) — this is depth, not
-  // count or concurrency. Undefined → defaults to 2 (runThread reads `subagentMaxDepth ?? 2`),
-  // one level deeper than the old hardcoded depth-1 cap: a depth-0 main thread could always spawn
-  // a depth-1 child; that child could never spawn further. `maxDepth: 1` reproduces that old
-  // behavior explicitly. A thread at `depth < maxDepth` may spawn (spawn_agent stays in its specs,
-  // the bridge runs its calls); a thread AT `depth >= maxDepth` has spawn_agent excluded from its
-  // specs and, belt-and-braces, rejects any spawn_agent call it receives anyway.
+  // (fan-out width) — this is depth, not count or concurrency. Undefined → defaults to 2
+  // (runThread reads `subagentMaxDepth ?? 2`), one level deeper than the old hardcoded depth-1
+  // cap: a depth-0 main thread could always spawn a depth-1 child; that child could never spawn
+  // further. `maxDepth: 1` reproduces that old behavior explicitly. A thread at `depth <
+  // maxDepth` may spawn (spawn_agent stays in its specs, the bridge runs its calls); a thread AT
+  // `depth >= maxDepth` has spawn_agent excluded from its specs and, belt-and-braces, rejects any
+  // spawn_agent call it receives anyway.
   subagentMaxDepth?: number;
   // SessionTitler (Phase 2e-iii Task 3): optional — absent means no session gets an
   // auto-generated title. Fired fire-and-forget, only at the main thread's (depth 0) turn
@@ -717,6 +717,13 @@ export class AgentEngine {
           const childDepth = opts.depth + 1;
           const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode"]);
           if (childDepth >= maxDepth) childExcludeTools.add("spawn_agent");
+          // Nested-spawn saturation fix (T3 review): `opts.depth` is THIS spawning thread's own
+          // depth — >0 means it already holds a concurrency slot (it's itself a child), so this
+          // run() call is a REENTRANT acquire. SubagentManager bounds a reentrant wait
+          // (acquireTimeoutMs) instead of queueing unbounded, so pool saturation under nesting
+          // fails fast with a typed error instead of stalling for the full per-run timeoutMs
+          // (300s) — see SubagentManager.acquire's doc comment. A depth-0 (top-level) spawn is
+          // never reentrant and keeps its existing unbounded queueing behind busy siblings.
           const result = await this.cfg.subagents!.run(async (childSignal) => {
             const childLoaded = new Set<string>();
             const instructionsFull = this.buildInstructionsFull(def.instructions, opts.cwd, childLoaded, childPolicy, sessionId);
@@ -754,7 +761,7 @@ export class AgentEngine {
               allowTools: def.allowTools,
               maxTurns,
             });
-          });
+          }, { reentrant: opts.depth > 0 });
           const stopReason = result.ok ? result.value.stopReason : "error";
           this.emit(sessionId, { type: "thread_completed", sessionId, threadId: childId, stopReason });
           this.completeThread(sessionId, childId, stopReason);

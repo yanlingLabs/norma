@@ -31,7 +31,7 @@ export function setup(
   opts: {
     approvalPolicy?: "ask" | "auto" | "plan";
     withSubagents?: boolean; // default true; false → cfg.subagents/agents both omitted
-    subagentsOpts?: { maxConcurrent?: number; timeoutMs?: number };
+    subagentsOpts?: { maxConcurrent?: number; timeoutMs?: number; acquireTimeoutMs?: number };
     provider?: Provider; // override — script ignored when set (e.g. a hanging provider for timeout tests)
     // undefined (default) → EngineConfig.provider.live absent, matching every pre-existing test
     // here (unchanged behavior: every turn uses the "fake-1" boot snapshot below).
@@ -1027,5 +1027,56 @@ describe("AgentEngine: configurable subagent nesting depth (4h-i Task 3)", () =>
     const fp = provider as FakeProvider;
     const names = (fp.requests[1]!.tools ?? []).map((t) => t.name);
     expect(names).toContain("spawn_agent");
+  });
+
+  // T3 review fix: nested-spawn semaphore reentrancy stall. maxConcurrent:1 means the child
+  // (depth 1) itself holds the pool's ONLY slot for its whole run — when it tries to spawn a
+  // grandchild (depth 2), that spawn's acquire is REENTRANT (opts.depth === 1 > 0) into an
+  // already-fully-saturated pool with no other occupant ever going to release. Before the fix
+  // this queued unboundedly and only gave up after the per-run timeoutMs (300s), reporting a
+  // spurious "timed out" for a grandchild that never even started. After the fix it fails fast
+  // with the typed "pool saturated" error, well within the bounded acquireTimeoutMs.
+  test("maxConcurrent:1 nested-spawn saturation: grandchild spawn attempt fails fast with a typed pool-saturated error, not a 300s stall — parent/child turns still complete gracefully", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "do X"), done("tool_calls")], // parent (depth 0): spawns the child — takes the only slot
+      [spawnCall("s2", "grandchild task"), done("tool_calls")], // child (depth 1): reentrant spawn attempt, saturated pool
+      text("child noticed the saturation error and wrapped up"), // child's continuation round after the denial
+      text("parent final report"), // parent's continuation round after the child bridge returns
+    ];
+    const { engine, store, sessionId } = setup(script, {
+      subagentsOpts: { maxConcurrent: 1, timeoutMs: 5000, acquireTimeoutMs: 50 },
+    });
+
+    const start = Date.now();
+    await engine.runTurn(sessionId);
+    const elapsed = Date.now() - start;
+
+    // bounded by acquireTimeoutMs (50ms), nowhere near the 300s (or even the 5s timeoutMs) stall
+    expect(elapsed).toBeLessThan(3000);
+
+    const events = store.read(sessionId);
+
+    // only ONE thread_started/completed pair — the grandchild's bridge call ran (thread_started
+    // fires before subagents.run) but its subagents.run() call itself failed the reentrant
+    // acquire, so its own runThread body never executed.
+    const starts = events.filter((e) => e.type === "thread_started");
+    expect(starts.length).toBe(2); // child + the grandchild attempt (thread_started fires pre-acquire)
+    const completions = events.filter((e) => e.type === "thread_completed") as Extract<SessionEvent, { type: "thread_completed" }>[];
+    expect(completions.length).toBe(2);
+    // the grandchild's own completion is reported as an error (its subagents.run() call
+    // resolved !ok), even though its runThread body never actually ran
+    expect(completions.some((e) => e.stopReason === "error")).toBe(true);
+
+    // the grandchild spawn's tool_result on the CHILD's turn: typed saturation error, not a
+    // generic timeout and not a hang
+    const s2Result = events.find((e) => e.type === "tool_result" && e.callId === "s2");
+    expect(s2Result).toMatchObject({ isError: true });
+    const s2Output = (s2Result as Extract<SessionEvent, { type: "tool_result" }>).output;
+    expect(s2Output).toContain("pool saturated");
+    expect(s2Output).not.toContain("timed out after"); // must NOT be the generic per-run timeout message
+
+    // the parent's own turn still completes normally afterward — no stall propagates upward
+    const s1Result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(s1Result).toMatchObject({ isError: false, output: "child noticed the saturation error and wrapped up" });
   });
 });

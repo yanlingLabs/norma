@@ -52,4 +52,71 @@ describe("SubagentManager", () => {
     expect(r1.ok).toBe(false);
     expect(r2).toEqual({ ok: true, value: "second ok" });
   });
+
+  // T3 review fix: nested-spawn semaphore reentrancy stall — a reentrant acquire (a thread
+  // that already holds its own slot, re-entering to spawn a nested child) must fail fast
+  // under saturation instead of queueing unbounded behind the full per-run timeoutMs (300s),
+  // AND must not leak the slot it never got.
+  describe("reentrant acquire (nested spawn saturation)", () => {
+    test("a reentrant acquire under full saturation fails with the typed 'pool saturated' error within the bounded acquireTimeoutMs, not the (much longer) per-run timeoutMs", async () => {
+      const m = new SubagentManager({ maxConcurrent: 1, timeoutMs: 5000, acquireTimeoutMs: 30 });
+      // saturate the single slot with a long-running non-reentrant task that never releases
+      // in time for the reentrant probe below
+      const holder = m.run(() => new Promise((res) => setTimeout(() => res("holder done"), 2000)));
+
+      const start = Date.now();
+      const nested = await m.run(async () => "should never run", { reentrant: true });
+      const elapsed = Date.now() - start;
+
+      expect(nested.ok).toBe(false);
+      if (!nested.ok) {
+        expect(nested.error).toContain("pool saturated");
+        expect(nested.error).toContain("nested");
+      }
+      // bounded by acquireTimeoutMs (30ms), nowhere near timeoutMs (5000ms)
+      expect(elapsed).toBeLessThan(1000);
+
+      const holderResult = await holder;
+      expect(holderResult).toEqual({ ok: true, value: "holder done" });
+    });
+
+    test("no slot leak: after a reentrant give-up, the internal queue is empty and a subsequent acquire still hands the slot to a LIVE waiter", async () => {
+      const m = new SubagentManager({ maxConcurrent: 1, timeoutMs: 5000, acquireTimeoutMs: 30 });
+      let releaseHolder!: (v: string) => void;
+      const holder = m.run(() => new Promise<string>((res) => { releaseHolder = res; }));
+
+      // reentrant probe queues behind the holder, then gives up (spliced out of the queue)
+      const nested = await m.run(async () => "nested", { reentrant: true });
+      expect(nested.ok).toBe(false);
+
+      // explicit per the review's own wording: "the internal queue is EMPTY" — not just
+      // inferred from the live-waiter behavior below
+      expect((m as unknown as { queue: unknown[] }).queue.length).toBe(0);
+
+      // release the original holder's slot — if the timed-out reentrant resolver were still in
+      // the queue (not spliced), release() would hand the slot to it instead of a live waiter,
+      // and this next acquire would hang until ITS OWN timeoutMs elapsed (or forever).
+      releaseHolder("holder done");
+      await holder;
+
+      const live = await m.run(async () => "live waiter got the slot");
+      expect(live).toEqual({ ok: true, value: "live waiter got the slot" });
+    });
+
+    test("a NON-reentrant queued acquire is NOT prematurely timed out — it still waits for a real release, even past acquireTimeoutMs", async () => {
+      const m = new SubagentManager({ maxConcurrent: 1, timeoutMs: 5000, acquireTimeoutMs: 20 });
+      let releaseHolder!: (v: string) => void;
+      const holder = m.run(() => new Promise<string>((res) => { releaseHolder = res; }));
+
+      // queues (default, non-reentrant) behind the holder — must NOT be timed out by
+      // acquireTimeoutMs even though we wait well past it before releasing
+      const queued = m.run(async () => "queued eventually ran");
+      await new Promise((r) => setTimeout(r, 100)); // well past acquireTimeoutMs (20ms)
+
+      releaseHolder("holder done");
+      const [holderResult, queuedResult] = await Promise.all([holder, queued]);
+      expect(holderResult).toEqual({ ok: true, value: "holder done" });
+      expect(queuedResult).toEqual({ ok: true, value: "queued eventually ran" });
+    });
+  });
 });
