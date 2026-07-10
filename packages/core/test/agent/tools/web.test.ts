@@ -35,6 +35,12 @@ describe("ssrfGuard", () => {
     }
   });
 
+  test("still allows public domains that merely START with fc/fd/fe80 (the ULA/link-local check is IPv6-literal-only)", () => {
+    for (const ok of ["https://fcc.gov/", "https://fdic.gov/", "https://fc-barcelona.com/", "https://fe80.example.com/"]) {
+      expect(ssrfGuard(ok)).toBeNull();
+    }
+  });
+
   test("rejects IPv4-mapped IPv6 loopback/private addresses (dotted and canonical hex forms)", () => {
     for (const bad of ["http://[::ffff:127.0.0.1]/", "http://[::ffff:7f00:1]/", "http://[::ffff:10.0.0.5]/"]) {
       expect(ssrfGuard(bad)).not.toBeNull();

@@ -36,8 +36,10 @@ export function ssrfGuard(raw: string): string | null {
   if (h.endsWith(".")) h = h.slice(0, -1);
   // IPv6 literals arrive bracketed from URL.hostname ("[fe80::1]") — unwrap BEFORE any check,
   // else every prefix/equality check below is structurally dead (nothing starts with "fc" once
-  // bracketed).
-  if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, -1);
+  // bracketed). Remember it WAS a literal so the ULA/link-local prefix check below only applies to
+  // real IPv6 literals, never to a domain that merely starts with "fc"/"fd"/"fe80" (fcc.gov etc.).
+  const wasIpv6Literal = h.startsWith("[") && h.endsWith("]");
+  if (wasIpv6Literal) h = h.slice(1, -1);
 
   if (h === "localhost" || h.endsWith(".local") || h === "0.0.0.0") return `refusing to fetch a local address`;
 
@@ -61,7 +63,9 @@ export function ssrfGuard(raw: string): string | null {
     if (refusal) return refusal;
   }
 
-  if (h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80")) return `refusing to fetch a private address`;
+  // IPv6 ULA (fc00::/7) + link-local (fe80::/10) — ONLY for actual IPv6 literals, else a bare
+  // string-prefix match wrongly refuses public domains like fcc.gov / fdic.gov / fc-barcelona.com.
+  if (wasIpv6Literal && (h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80"))) return `refusing to fetch a private address`;
   return null;
 }
 
