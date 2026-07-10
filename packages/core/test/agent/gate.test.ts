@@ -100,4 +100,22 @@ describe("PermissionGate v1", () => {
       expect(g.evaluate(t, "plan")).toBe("deny");
     }
   });
+
+  // 4g Task 5: web_fetch is Norma's only network-capable tool. It gets its OWN gate class
+  // (NETWORK), distinct from both READ_ONLY and MUTATING, because its plan-mode answer differs
+  // from MUTATING's (allow, not deny — read-only research is legitimate while planning) while its
+  // ask/auto answer is IDENTICAL to MUTATING's/bash's (ask under `ask`, allow under `auto`).
+  test("web_fetch is gate-classed NETWORK: allow under plan and auto, ask under ask", () => {
+    const g = new PermissionGate();
+    expect(g.evaluate("web_fetch", "plan")).toBe("allow");
+    expect(g.evaluate("web_fetch", "auto")).toBe("allow");
+    expect(g.evaluate("web_fetch", "ask")).toBe("ask");
+  });
+
+  test("web_fetch must NOT be classed READ_ONLY: it diverges from bash in plan mode (allow) but must match bash's ask/auto answer exactly, not read-only's unconditional allow", () => {
+    const g = new PermissionGate();
+    // If web_fetch were accidentally READ_ONLY, "ask" policy would wrongly return "allow" here.
+    expect(g.evaluate("web_fetch", "ask")).toBe(g.evaluate("bash", "ask"));
+    expect(g.evaluate("web_fetch", "auto")).toBe(g.evaluate("bash", "auto"));
+  });
 });

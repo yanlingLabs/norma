@@ -30,6 +30,17 @@ export type SessionApprovalPolicy = "ask" | "auto" | "plan";
 const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent"]);
 const MUTATING = new Set(["write", "edit", "bash", "bash_kill", "notebook_edit", "enter_worktree", "exit_worktree"]);
 const SELF_GATING = new Set(["request_directory"]);
+// web_fetch (4g Task 5, T6 adds web_search here) is Norma's ONLY network-capable tool — it does NOT
+// belong in READ_ONLY (it makes a live outbound request; the response bytes are DATA that could
+// carry adversarial "instructions", so an unattended session shouldn't get an implicit pass) and it
+// is NOT quite MUTATING either (unlike write/edit/bash it never touches an arbitrary fs/process
+// path on its own — it only ever saves into the session's own sandboxed tmp scratch dir). It gets
+// its own class because its PLAN-mode answer diverges from both: like READ_ONLY, it's ALLOWED under
+// `plan` (fetching a doc while researching is exactly the read-only-research case plan mode exists
+// to allow) — but OUTSIDE plan mode it rides the SAME branch as MUTATING/bash (ask under `ask`,
+// allow under `auto`), because a live network call is still an external side effect worth a human's
+// visibility. See evaluate() below for exactly where each half of this is implemented.
+const NETWORK = new Set(["web_fetch"]);
 
 /**
  * v1 policy matrix (spec §4.10 arrives fully in 1b-ii with the AI reviewer):
@@ -43,11 +54,15 @@ export class PermissionGate {
     // since the whole point of plan mode is that nothing mutates until the plan is approved.
     if (policy === "plan") {
       if (READ_ONLY.has(toolName)) return "allow"; // incl. exit_plan_mode, ask_user, task_*
+      if (NETWORK.has(toolName)) return "allow"; // web_fetch: read-only research — see NETWORK's doc comment above
       if (SELF_GATING.has(toolName)) return "allow"; // request_directory only asks for a dir
       return "deny"; // write/edit/bash/mcp__/plugin__/unclassified — all blocked while planning
     }
     if (READ_ONLY.has(toolName)) return "allow";
-    if (MUTATING.has(toolName)) return policy === "auto" ? "allow" : "ask";
+    // NETWORK (web_fetch) rides the SAME branch as MUTATING outside plan mode (ask under `ask`,
+    // allow under `auto`) — the ONLY place it diverges from bash/mcp externals is the plan-mode
+    // allow above. Do NOT move web_fetch into READ_ONLY — a live network call always gets this branch.
+    if (MUTATING.has(toolName) || NETWORK.has(toolName)) return policy === "auto" ? "allow" : "ask";
     // request_directory self-gates via ApprovalBroker (path+persist-aware) — a generic gate prompt here would double-prompt
     if (SELF_GATING.has(toolName)) return "allow";
     // MCP tools AND Phase 4b platform-plugin tools are external code (network/fs/arbitrary) →
