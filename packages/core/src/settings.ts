@@ -2,10 +2,16 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
+import { DEFAULT_CODEX_MODEL } from "./providers/codex-config";
+
+/** Reasoning-effort slugs — the live /models payload (2026-07-10) lists exactly these across
+ *  the gpt-5.6 family (luna lacks "ultra", but validating per-model effort support is NOT done
+ *  here — the backend rejects unsupported combos itself; this enum is the full universe). */
+export const REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
 
 export const ProviderSettings = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("codex-oauth"), model: z.string().min(1) }),
-  z.object({ type: z.literal("openai-compatible"), model: z.string().min(1), baseUrl: z.string().url() }),
+  z.object({ type: z.literal("codex-oauth"), model: z.string().min(1), reasoningEffort: z.enum(REASONING_EFFORTS).optional() }),
+  z.object({ type: z.literal("openai-compatible"), model: z.string().min(1), baseUrl: z.string().url(), reasoningEffort: z.enum(REASONING_EFFORTS).optional() }),
 ]);
 
 export const PermissionsSettings = z.object({
@@ -75,7 +81,10 @@ export const Settings = z.object({
 });
 export type Settings = z.infer<typeof Settings>;
 
-const DEFAULT_PROVIDER = { type: "codex-oauth", model: "gpt-5.4" } as const;
+// gpt-5.4 was the pre-deprecation default; fully deprecated per the 2026-07-10 user decision
+// (packages/core/src/providers/codex-config.ts) — a fresh v1→v2 migration must not persist a
+// dead slug to disk, so this points at the current default instead.
+const DEFAULT_PROVIDER = { type: "codex-oauth", model: DEFAULT_CODEX_MODEL } as const;
 
 export function loadSettings(path: string): Settings {
   let raw: any;
@@ -107,6 +116,22 @@ export function loadSettings(path: string): Settings {
 export function saveSettings(path: string, s: Settings): void {
   Settings.parse(s); // validate before writing — never persist an invalid settings file
   writeFileSync(path, JSON.stringify(s, null, 2) + "\n");
+}
+
+/** Pure `Settings -> Settings` provider-model transform (mirrors plugins/lifecycle.ts's
+ *  `setPluginEnabled` pattern) — used by `norma model <slug>`. Preserves every other field,
+ *  including `provider.reasoningEffort` if set. Validation (codex-oauth slug membership,
+ *  non-empty for openai-compatible) is the CALLER's job — this never throws on the slug itself,
+ *  only on whatever Settings.parse would already reject (e.g. an empty string, caught by the
+ *  schema's `z.string().min(1)`). */
+export function setProviderModel(settings: Settings, model: string): Settings {
+  return { ...settings, provider: { ...settings.provider, model } };
+}
+
+/** Pure `Settings -> Settings` reasoning-effort transform — used by `norma model --effort
+ *  <level>` (effort-only or combined with a model change). `effort: undefined` clears it. */
+export function setReasoningEffort(settings: Settings, effort: (typeof REASONING_EFFORTS)[number] | undefined): Settings {
+  return { ...settings, provider: { ...settings.provider, reasoningEffort: effort } };
 }
 
 function expandTilde(p: string): string {

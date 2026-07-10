@@ -70,6 +70,14 @@ export class ContextAssembler {
     const trusted = cwd ? this.trust.isTrusted(cwd) : false;
     const sections: string[] = [this.basePrompt];
 
+    // F2 (4e gate ledger): the model has no other way to know the current date — recomputed each
+    // assemble() call (once per turn) so it stays current across long sessions. LOCAL time, not
+    // UTC (review-caught: the daemon runs on the user's own Mac, so toISOString would report the
+    // wrong date for up to a third of every day off-UTC); built by hand for locale stability.
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    sections.push(`Today's date is ${today}.`);
+
     const userInstr = readCapped(join(this.normaHome, "NORMA.md"), this.caps.instructionsBytes);
     if (userInstr) sections.push(`## User instructions (~/.norma/NORMA.md)\n${userInstr}`);
 

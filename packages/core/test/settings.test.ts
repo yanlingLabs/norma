@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadSettings, loadPermissionDirs, addLocalDir, saveSettings, Settings } from "../src/settings";
+import { loadSettings, loadPermissionDirs, addLocalDir, saveSettings, Settings, REASONING_EFFORTS, setProviderModel, setReasoningEffort } from "../src/settings";
+import { DEFAULT_CODEX_MODEL } from "../src/providers/codex-config";
 import { mkdirSync, writeFileSync as wf } from "node:fs";
 
 function tmpSettings(content: unknown): string {
@@ -16,7 +17,7 @@ describe("loadSettings", () => {
     const p = tmpSettings({ schemaVersion: 1 });
     const s = loadSettings(p);
     expect(s.schemaVersion).toBe(2);
-    expect(s.provider).toEqual({ type: "codex-oauth", model: "gpt-5.4" });
+    expect(s.provider).toEqual({ type: "codex-oauth", model: DEFAULT_CODEX_MODEL }); // gpt-5.4 fully deprecated — default points at the current model
     expect(JSON.parse(readFileSync(p, "utf8")).schemaVersion).toBe(2); // migration persisted
   });
 
@@ -142,6 +143,23 @@ describe("loadSettings", () => {
     expect(s.schemaVersion).toBe(2);
     expect(s.subagents).toBeUndefined();
   });
+
+  test("provider.reasoningEffort parses on both provider variants; absent → undefined", () => {
+    const codex = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.6-sol", reasoningEffort: "high" } });
+    expect(codex.provider.reasoningEffort).toBe("high");
+    const openai = Settings.parse({ schemaVersion: 2, provider: { type: "openai-compatible", model: "gpt-5.2", baseUrl: "https://x", reasoningEffort: "xhigh" } });
+    expect(openai.provider.reasoningEffort).toBe("xhigh");
+    expect(Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.6-sol" } }).provider.reasoningEffort).toBeUndefined();
+  });
+
+  test("every documented reasoning-effort slug parses; an invalid slug is rejected", () => {
+    expect(REASONING_EFFORTS).toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
+    for (const effort of REASONING_EFFORTS) {
+      const s = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.6-sol", reasoningEffort: effort } });
+      expect(s.provider.reasoningEffort).toBe(effort);
+    }
+    expect(() => Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.6-sol", reasoningEffort: "bogus" } })).toThrow();
+  });
 });
 
 describe("saveSettings", () => {
@@ -155,6 +173,35 @@ describe("saveSettings", () => {
   test("throws on an invalid object (bad schemaVersion) and does not write", () => {
     const p = join(mkdtempSync(join(tmpdir(), "norma-save-")), "settings.json");
     expect(() => saveSettings(p, { schemaVersion: 1, provider: { type: "codex-oauth", model: "gpt-5.4" } } as unknown as Settings)).toThrow();
+  });
+});
+
+describe("setProviderModel / setReasoningEffort (norma model CLI's pure transforms)", () => {
+  test("setProviderModel changes only provider.model, preserving every other field", () => {
+    const s: Settings = { schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.6-sol", reasoningEffort: "high" }, plugins: { enabled: ["a"] } };
+    const next = setProviderModel(s, "gpt-5.6-luna");
+    expect(next.provider).toEqual({ type: "codex-oauth", model: "gpt-5.6-luna", reasoningEffort: "high" });
+    expect(next.plugins).toEqual({ enabled: ["a"] });
+  });
+
+  test("setProviderModel preserves openai-compatible's baseUrl", () => {
+    const s: Settings = { schemaVersion: 2, provider: { type: "openai-compatible", model: "gpt-5.2", baseUrl: "https://x" } };
+    const next = setProviderModel(s, "gpt-5.9");
+    expect(next.provider).toEqual({ type: "openai-compatible", model: "gpt-5.9", baseUrl: "https://x" });
+  });
+
+  test("setReasoningEffort sets/clears provider.reasoningEffort, preserving model", () => {
+    const s: Settings = { schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.6-sol" } };
+    const withEffort = setReasoningEffort(s, "xhigh");
+    expect(withEffort.provider).toEqual({ type: "codex-oauth", model: "gpt-5.6-sol", reasoningEffort: "xhigh" });
+    const cleared = setReasoningEffort(withEffort, undefined);
+    expect(cleared.provider.model).toBe("gpt-5.6-sol");
+    expect(cleared.provider.reasoningEffort).toBeUndefined();
+  });
+
+  test("both transforms produce Settings.parse-valid output", () => {
+    const s: Settings = { schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.6-sol" } };
+    expect(() => Settings.parse(setReasoningEffort(setProviderModel(s, "gpt-5.6-terra"), "max"))).not.toThrow();
   });
 });
 

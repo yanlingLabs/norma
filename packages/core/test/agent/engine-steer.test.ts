@@ -30,6 +30,10 @@ export function setupEngine(provider: Provider, opts?: {
   reviewer?: BashReviewer; reviewerEnabled?: boolean; reviewerAllow?: string[]; policy?: "ask" | "auto";
   // undefined (default) → no deferral anywhere; every pre-existing engine test omits this and is unaffected.
   toolSearch?: { enabled?: boolean; deferThreshold?: number };
+  // undefined (default) → EngineConfig.provider.live is absent, matching every pre-existing
+  // engine test (every turn just uses the "gated-1" boot snapshot below, unchanged). Set this to
+  // exercise the no-restart live model/effort resolution path (task 4e-fix2 test key 1).
+  live?: () => { model: string; reasoningEffort?: string };
 }) {
   const home = mkdtempSync(join(tmpdir(), "norma-engine-steer-"));
   const cwd = opts?.cwd ?? realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-steer-cwd-")));
@@ -70,7 +74,7 @@ export function setupEngine(provider: Provider, opts?: {
   const engine = new AgentEngine({
     store, hub, registry, broker,
     gate: new PermissionGate(),
-    provider: { provider, model: "gated-1" },
+    provider: { provider, model: "gated-1", live: opts?.live },
     dirs,
     approvalTimeoutMs: 500,
     assembler,

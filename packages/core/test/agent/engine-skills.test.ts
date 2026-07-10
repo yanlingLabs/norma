@@ -45,5 +45,8 @@ describe("engine: session-sticky loaded skills", () => {
     await engine.runTurn(sessionId); // turn 2: plain end_turn, but now sticky
     expect(provider.requests.length).toBe(3);
     expect(provider.requests[2]!.instructions).toContain("HAIKU_STICKY_BODY");
+    // F1 (4e gate ledger): the continue-nudge belongs on the Skill tool RESULT only — the
+    // sticky per-turn re-injection (SkillStore.load, feeding the assembler) must NOT repeat it.
+    expect(provider.requests[2]!.instructions).not.toContain("Skill loaded. Do not stop after announcing it");
   });
 });
