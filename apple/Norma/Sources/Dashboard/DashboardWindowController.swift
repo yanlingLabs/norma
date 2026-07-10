@@ -129,8 +129,10 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
 
     /// Phase 4d-cleanup Task 3 fix 1: retargets the ALREADY-OPEN window's pane — the refocus half
     /// of the pane-refocus fix. `AppDelegate.openDashboard(initialPane:)`'s refocus branch calls
-    /// this BEFORE `show()` so the pane switch is visible the instant the window comes to front,
-    /// rather than showing the old pane for one frame.
+    /// this BEFORE `show()` (when a pane was explicitly requested — fix wave 1 made that call
+    /// conditional on `initialPane != nil`, since a PLAIN refocus must preserve the current pane
+    /// instead) so the pane switch is visible the instant the window comes to front, rather than
+    /// showing the old pane for one frame.
     func selectPane(_ pane: DashboardPane) {
         selectionModel.selection = pane
     }
