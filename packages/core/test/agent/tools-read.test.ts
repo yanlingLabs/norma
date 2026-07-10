@@ -31,6 +31,26 @@ describe("read tools", () => {
     return r;
   }
 
+  // web_fetch (4g) saves full pages into the session tmp dir, which is NOT in the write-fence
+  // `roots`; the read-only fs tools must still be able to read/grep/glob what landed there.
+  test("read/grep/glob reach a file in ctx.tmpDir even though it is outside roots", async () => {
+    const d = proj();
+    const t = realpathSync(mkdtempSync(join(tmpdir(), "norma-session-")));
+    writeFileSync(join(t, "webfetch-1-example.com.md"), "# Example Domain\nThis domain is for use in examples.\n");
+    const r = makeRegistry(d);
+    const ctx = { cwd: d, roots: [d], tmpDir: t, sessionId: "s1" };
+    const read = await r.execute("read", { path: join(t, "webfetch-1-example.com.md") }, ctx);
+    expect(read.isError).toBe(false);
+    expect(read.output).toContain("# Example Domain");
+    const grep = await r.execute("grep", { pattern: "Example Domain", glob: "**/*" }, ctx);
+    expect(grep.isError).toBe(false);
+    expect(grep.output).toContain("Example Domain");
+    // and WITHOUT tmpDir in ctx, the same absolute path is still rejected (fence intact)
+    const denied = await r.execute("read", { path: join(t, "webfetch-1-example.com.md") }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(denied.isError).toBe(true);
+    expect(denied.output).toContain("outside the allowed directories");
+  });
+
   test("specs are exposed for the provider", () => {
     const r = makeRegistry(proj());
     const names = r.specs().map((s) => s.name);

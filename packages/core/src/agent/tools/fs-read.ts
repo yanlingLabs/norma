@@ -14,13 +14,23 @@ function combine(root: string, p: string): string {
   return isAbsolute(p) ? p : join(root, p);
 }
 
+// The session tmp dir (where web_fetch saves full pages, bg-task output lives, etc.) is a
+// Norma-managed, session-private, sandbox-writable location that is NOT in the write-fence `roots`.
+// The READ-ONLY fs tools append it as an allowed READ/scan root so the agent can read/grep/glob
+// what its own tools wrote there (e.g. web_fetch's saved page). roots[0] stays the primary cwd, so
+// relative-path resolution and grep's `relative(cwd, …)` are unchanged; no write fence is widened
+// (these tools never write).
+function readRootsOf(roots: string[], tmpDir?: string): string[] {
+  return tmpDir ? [...roots, tmpDir] : roots;
+}
+
 export function registerReadTools(r: ToolRegistry): void {
   r.register({
     name: "read",
     description: "Read a file's contents. Path is relative to the session directory. Optional offset (1-based start line) and limit (line count) read part of a large file — outputs over 64KB truncate, so page large files with offset/limit. Returns plain text without line numbers.",
     args: z.object({ path: z.string().min(1), offset: z.number().int().min(1).optional(), limit: z.number().int().positive().optional() }),
-    run({ path, offset = 1, limit }, { roots }) {
-      const content = readFileSync(resolveWithinAny(roots, path), "utf8");
+    run({ path, offset = 1, limit }, { roots, tmpDir }) {
+      const content = readFileSync(resolveWithinAny(readRootsOf(roots, tmpDir), path), "utf8");
       if (offset === 1 && limit === undefined) {
         return content;
       }
@@ -36,9 +46,9 @@ export function registerReadTools(r: ToolRegistry): void {
     description:
       "Lists files and directories in a given path (non-recursive, one level deep). `path` must be an absolute path, not a relative path. Optionally pass `ignore`, an array of glob patterns matched against entry names to exclude from the listing. Prefer `glob` or `grep` when you already know what you're looking for and want a targeted search rather than a full directory listing.",
     args: z.object({ path: z.string().min(1), ignore: z.array(z.string()).optional() }),
-    run({ path, ignore }, { roots }) {
+    run({ path, ignore }, { roots, tmpDir }) {
       if (!isAbsolute(path)) throw new Error(`path must be absolute: ${path}`);
-      const target = resolveWithinAny(roots, path);
+      const target = resolveWithinAny(readRootsOf(roots, tmpDir), path);
       let st;
       try {
         st = statSync(target);
@@ -71,10 +81,11 @@ export function registerReadTools(r: ToolRegistry): void {
     name: "glob",
     description: "List files matching a glob pattern (relative paths, newline-separated).",
     args: z.object({ pattern: z.string().min(1), budgetMs: z.number().int().positive().max(10_000).default(2000) }),
-    async run({ pattern, budgetMs }, { roots }) {
+    async run({ pattern, budgetMs }, { roots, tmpDir }) {
       const out = new Set<string>();
       const deadline = Date.now() + budgetMs;
-      for (const root of roots) {
+      const scanRoots = readRootsOf(roots, tmpDir);
+      for (const root of scanRoots) {
         const glob = new Bun.Glob(pattern);
         try {
           // explicit: symlinks must not let matches escape the scoped roots
@@ -84,7 +95,7 @@ export function registerReadTools(r: ToolRegistry): void {
               return [...out].sort().join("\n") + (out.size ? "\n" : "") + "[scan time budget reached]";
             }
             const candidate = combine(root, p);
-            try { out.add(resolveWithinAny(roots, candidate)); } catch { /* outside all roots: never listed */ }
+            try { out.add(resolveWithinAny(scanRoots, candidate)); } catch { /* outside all roots: never listed */ }
           }
         } catch {
           // Iterator threw mid-walk (e.g. EACCES): an absolute recursive pattern
@@ -103,19 +114,20 @@ export function registerReadTools(r: ToolRegistry): void {
     name: "grep",
     description: "Search file contents with a regular expression. Returns file:line:text matches.",
     args: z.object({ pattern: z.string().min(1).max(256), glob: z.string().default("**/*"), budgetMs: z.number().int().positive().max(10_000).default(2000) }),
-    async run({ pattern, glob: g, budgetMs }, { cwd, roots }) {
+    async run({ pattern, glob: g, budgetMs }, { cwd, roots, tmpDir }) {
       // Pattern is model-controlled: length-capped as a cheap ReDoS bound.
       // Full guard (linear-time engine or scan timeout) tracked in phase-1 carryover.
       const re = new RegExp(pattern);
       const hits: string[] = [];
       const deadline = Date.now() + budgetMs;
-      for (const root of roots) {
+      const scanRoots = readRootsOf(roots, tmpDir);
+      for (const root of scanRoots) {
         const scanner = new Bun.Glob(g);
         try {
           for await (const p of scanner.scan({ cwd: root, onlyFiles: true, followSymlinks: false })) {
             if (Date.now() > deadline) { hits.push("[scan time budget reached]"); return hits.join("\n"); }
             let abs: string;
-            try { abs = resolveWithinAny(roots, combine(root, p)); } catch { continue; }
+            try { abs = resolveWithinAny(scanRoots, combine(root, p)); } catch { continue; }
             let text: string;
             try { text = readFileSync(abs, "utf8"); } catch { continue; }
             const lines = text.split("\n");
