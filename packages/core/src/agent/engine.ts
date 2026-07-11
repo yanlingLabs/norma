@@ -282,17 +282,23 @@ export class AgentEngine {
 
   /**
    * 4h-ii-b Task 4 (CC SendMessage): deliver `text` to a RUNNING child thread. The child receives
-   * it at its next step. Two effects, both scoped to the child (never the parent/main):
-   *  - persist a child-scoped `user_message` for the record (same pattern as the resume path's
-   *    persist) — verified not to leak into the parent: both client reducers no-op a child-threadId
-   *    user_message, and historyInput (the MAIN thread's input builder) drops every non-main event;
-   *  - push `text` into this child thread's own steer queue (keyed by threadId), which the child's
-   *    runThread drains at its next round boundary (the round-top drain), exactly like the main
-   *    loop drains steerQueue. This is the running-target half of the send_message bridge (SM4);
-   *    the finished-target half reuses resumeThread instead.
+   * it at its next step. QUEUE-ONLY — push `text` into this child thread's own steer queue (keyed by
+   * threadId), which the child's runThread drains at its next round boundary (the round-top drain),
+   * exactly like the main loop drains steerQueue. This is the running-target half of the
+   * send_message bridge (SM4); the finished-target half reuses resumeThread instead.
+   *
+   * The child-scoped `user_message` is NO LONGER persisted here — it is persisted at the CHILD
+   * round-top DRAIN (see runThread's child branch) instead (whole-branch review C1/I1). Persisting
+   * at SEND time was a bug: a send that lands while the child is AWAITING executeCall (a real
+   * multi-second bash/web_fetch/nested-spawn window) would slot the user_message BETWEEN that
+   * round's tool_call and its tool_result in the child's persisted log — an INTERIOR corruption the
+   * resume clean-termination guard (which only inspects the LAST event) misses. On resume,
+   * childHistoryInput (a blind 1:1 seq map, no coalescing) then reconstructs an orphan
+   * function_call immediately followed by a user turn → a hard provider reject. Persisting at the
+   * drain instead guarantees the message lands AFTER the prior round's tool_result (clean
+   * alternation), and a message that is never drained (child finishing, I1) is never persisted.
    */
   sendToThread(sessionId: string, threadId: string, text: string): void {
-    this.emit(sessionId, { type: "user_message", sessionId, threadId, text, clientName: "send_message" });
     const q = this.threadSteerQueue.get(threadId) ?? [];
     q.push(text);
     this.threadSteerQueue.set(threadId, q);
@@ -679,8 +685,22 @@ export class AgentEngine {
         // SEPARATE parallel branch to the MAIN branch above (which is untouched). A send_message to
         // this running child (sendToThread) queued into threadSteerQueue[threadId]; drain it into
         // this round's input exactly like the main loop drains steerQueue.
+        // Whole-branch review C1/I1: PERSIST each drained message as a child user_message HERE, at
+        // the drain — NOT at send time (sendToThread is queue-only now). The drain runs at the TOP of
+        // a round: AFTER the prior round's tool_result was emitted+persisted (during that round's
+        // dispatch), BEFORE the next provider call — so the persisted user_message gets a seq
+        // strictly after the tool_result, never between a tool_call and its tool_result. That is
+        // clean alternation on resume (childHistoryInput reconstructs [...tool_result, user], no
+        // interior orphan function_call). A message that is never drained (child finishing before
+        // this runs, I1) is simply never persisted → no trailing-user-turn corruption.
         const msgs = this.threadSteerQueue.get(threadId);
-        if (msgs && msgs.length) { for (const t of msgs) input.push({ type: "message", role: "user", content: t }); msgs.length = 0; }
+        if (msgs && msgs.length) {
+          for (const t of msgs) {
+            this.emit(sessionId, { type: "user_message", sessionId, threadId, text: t, clientName: "send_message" });
+            input.push({ type: "message", role: "user", content: t });
+          }
+          msgs.length = 0;
+        }
       }
 
       let textBuf = "";

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { z } from "zod";
 import type { SessionEvent } from "@norma/protocol";
 import type { ModelInfo, Provider, ProviderEvent, TurnRequest } from "../../src/providers/types";
 import { FakeProvider } from "../../src/agent/fake-provider";
@@ -39,6 +40,19 @@ const hasUserMsg = (input: readonly unknown[], content: string): boolean =>
   });
 const toolResult = (events: readonly SessionEvent[], callId: string): Extract<SessionEvent, { type: "tool_result" }> | undefined =>
   events.find((e) => e.type === "tool_result" && e.callId === callId) as Extract<SessionEvent, { type: "tool_result" }> | undefined;
+// C1 regression detector: is there a `function_call` NOT immediately followed by its `tool_result`
+// (a trailing call, or one followed by any other item)? On a real openai-compatible provider
+// (`mapInput` is a blind 1:1 map, no coalescing) that is an orphaned function_call → a hard reject.
+const orphanFunctionCall = (input: readonly unknown[]): boolean => {
+  for (let i = 0; i < input.length; i++) {
+    if ((input[i] as { type?: string })?.type !== "function_call") continue;
+    const next = input[i + 1] as { type?: string } | undefined;
+    if (!next || next.type !== "tool_result") return true;
+  }
+  return false;
+};
+const indexOfType = (input: readonly unknown[], type: string): number =>
+  input.findIndex((it) => (it as { type?: string })?.type === type);
 
 // A registry pre-loaded with send_message; setup() adds the standard tool set (read/write/spawn/…)
 // on top. send_message must be registered for test (d)'s child-exclusion assertion (the child's
@@ -305,4 +319,120 @@ describe("AgentEngine: send_message (4h-ii-b Task 4 — CC SendMessage parity)",
     expect((engine as any).threadSteerQueue.has(worker.threadId)).toBe(false);
     expect(bgAgents.get("worker", sessionId)).toMatchObject({ status: "completed" });
   });
+
+  // (g) C1/I1 REGRESSION (whole-branch review): a message delivered to a running child WHILE it is
+  // MID-TOOL — parked INSIDE executeCall between the child's tool_call and its tool_result — must NOT
+  // be persisted between that pair. Tests (a)/(f) park in the PROVIDER GENERATOR (before/after a
+  // round), so they never expose the interior window; this test parks in a real TOOL's run(). If the
+  // message is persisted at SEND time (the pre-fix bug), the child's stored log becomes
+  // [tool_call, user_message, tool_result, assistant] and, on RESUME, childHistoryInput reconstructs
+  // [function_call, user, tool_result, ...] — an orphan function_call immediately followed by a user
+  // turn → a hard provider reject. The fix persists at the child's round-top DRAIN, so the message
+  // lands AFTER the tool_result: [tool_call, tool_result, user_message, assistant] → clean on resume.
+  test("(g) a send_message delivered MID-TOOL is persisted at the drain, not between the tool_call/tool_result pair — no orphan on resume", async () => {
+    // The park tool lets the child stop INSIDE executeCall (a real multi-second tool window). run()
+    // signals it has entered the tool (childInTool), then blocks until the test releases it.
+    let resolveChildInTool!: () => void;
+    const childInTool = new Promise<void>((r) => { resolveChildInTool = r; });
+    let releaseTool!: () => void;
+    const toolReleased = new Promise<void>((r) => { releaseTool = r; });
+
+    const registry = new ToolRegistry();
+    registerSendMessageTool(registry);
+    // An mcp__-prefixed (external) name so the gate auto-allows it under "auto" policy and it runs
+    // directly via executeCall — an unclassified name would fall to the gate's fail-closed "ask"
+    // branch and stall on the 500ms approval timeout instead of parking. No toolSearch is wired, so
+    // it is never deferred.
+    registry.register({
+      name: "mcp__test__park",
+      description: "test-only: parks inside executeCall until released",
+      args: z.object({}),
+      async run() { resolveChildInTool(); await toolReleased; return "parked-done"; },
+    });
+
+    class MidToolProvider implements Provider {
+      readonly id = "fake";
+      readonly requests: TurnRequest[] = [];
+      private mainRound = 0;
+      models(): ModelInfo[] { return [{ id: "fake-1", family: "fake", contextWindow: 100_000, supportsVision: false }]; }
+      async *streamTurn(req: TurnRequest): AsyncIterable<ProviderEvent> {
+        const { signal, ...cloneable } = req;
+        this.requests.push({ ...structuredClone(cloneable), ...(signal ? { signal } : {}) });
+        const input = req.input;
+        if (isChildRun(input, "child-task")) {
+          // Dispatch the child branch on the LAST user turn alone — round0 "child-task",
+          // round1 "INJECT-MSG", resume "go on" are all distinct (the resumed input ALSO contains
+          // INJECT-MSG, so a hasUserMsg check would be ambiguous).
+          const last = lastUserOf(input);
+          if (last === "go on") { yield { type: "text_delta", delta: "child resumed cleanly" }; yield done("end_turn"); return; }
+          if (last === "INJECT-MSG") { yield { type: "text_delta", delta: "child saw the mid-tool message" }; yield done("end_turn"); return; }
+          // round 0: emit a tool_call for the park tool → the engine emits tool_call, then enters
+          // executeCall, where the park tool's run() PARKS. The message is delivered during that park.
+          yield { type: "tool_call", callId: "child-park", name: "mcp__test__park", argsJson: "{}" };
+          yield done("tool_calls");
+          return;
+        }
+        const n = this.mainRound++;
+        if (n === 0) {
+          yield { type: "tool_call", callId: "s1", name: "spawn_agent", argsJson: JSON.stringify({ prompt: "child-task", description: "task", name: "worker", run_in_background: true }) };
+          yield done("tool_calls");
+          return;
+        }
+        if (n === 1) {
+          // wait until the child is INSIDE the park tool (mid-tool_call/tool_result window) so the
+          // delivery deterministically lands there, not at a round boundary
+          await childInTool;
+          yield sendMessage("m1", "worker", "INJECT-MSG");
+          yield done("tool_calls");
+          return;
+        }
+        if (n === 2) { yield { type: "text_delta", delta: "parent turn1 done" }; yield done("end_turn"); return; }
+        if (n === 3) {
+          // turn 2: RESUME the now-finished child. Its reconstructed input must be clean.
+          yield { type: "tool_call", callId: "r1", name: "spawn_agent", argsJson: JSON.stringify({ resume: "worker", prompt: "go on" }) };
+          yield done("tool_calls");
+          return;
+        }
+        yield { type: "text_delta", delta: "parent turn2 done" };
+        yield done("end_turn");
+      }
+    }
+
+    const provider = new MidToolProvider();
+    const { engine, store, sessionId, bgAgents } = setup([], { provider, registry });
+
+    // turn 1: spawn bg child → child parks mid-tool → send_message lands mid-tool → parent finishes
+    await engine.runTurn(sessionId);
+    expect(toolResult(store.read(sessionId), "m1")!.output).toBe("message delivered to 'worker'");
+
+    // release the parked tool; poll until the child drains the message and completes cleanly
+    releaseTool();
+    for (let i = 0; i < 800 && bgAgents.get("worker", sessionId)?.status === "running"; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(bgAgents.get("worker", sessionId)).toMatchObject({ status: "completed" });
+
+    // turn 2: resume the finished child (sync spawn_agent resume) — this reconstructs its history
+    await engine.runTurn(sessionId);
+
+    // Discriminate the RESUMED provider request by its last user turn ("go on") — NOT by
+    // hasUserMsg("INJECT-MSG"), which is true for the resumed input too (the message survives in the
+    // reconstruction, just after the tool_result). The live round-1 request is clean pre-fix anyway
+    // (its input is built in dispatch order); the orphan only appears in the RESUME reconstruction.
+    const resumed = provider.requests.find((r) => isChildRun(r.input, "child-task") && lastUserOf(r.input) === "go on");
+    expect(resumed).toBeDefined();
+
+    // THE C1 ASSERTION: the resumed input has no orphan function_call, and the injected message sits
+    // AFTER the tool_result (never between the function_call and its tool_result).
+    expect(orphanFunctionCall(resumed!.input)).toBe(false);
+    const fcIdx = indexOfType(resumed!.input, "function_call");
+    const trIdx = indexOfType(resumed!.input, "tool_result");
+    const injIdx = resumed!.input.findIndex((it) => {
+      const m = it as { type?: string; role?: string; content?: unknown };
+      return m.type === "message" && m.role === "user" && m.content === "INJECT-MSG";
+    });
+    expect(fcIdx).toBeGreaterThanOrEqual(0);
+    expect(trIdx).toBe(fcIdx + 1);          // tool_result immediately follows its function_call
+    expect(injIdx).toBeGreaterThan(trIdx);  // the injected message lands AFTER the tool_result
+  }, 15_000); // headroom above the release-poll budget; the happy path settles in well under a second
 });
