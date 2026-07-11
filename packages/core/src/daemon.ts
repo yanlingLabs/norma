@@ -35,6 +35,7 @@ import { PlanBroker } from "./agent/plans";
 import { WorktreeManager } from "./agent/worktree";
 import { AgentStore } from "./agent/agents";
 import { SubagentManager } from "./agent/subagents";
+import { BackgroundAgentRegistry } from "./agent/bg-agent-registry";
 import { AgentEngine, SYSTEM_PROMPT } from "./agent/engine";
 import { BashReviewer } from "./agent/reviewer";
 import { SessionTitler } from "./agent/titles";
@@ -82,14 +83,12 @@ function buildLeasePolicy(deps: {
   return async (sessionId: string, cls: PeripheralClass): Promise<"granted" | "denied"> => {
     let approvalPolicy: "ask" | "auto" | "plan";
     try {
-      // COUPLING (4h-i): this reads the PERSISTED session policy as a proxy for "the current
-      // caller's policy". That's safe TODAY only because peripheral.lease is IPC/app-initiated
-      // (ipc/server.ts) and never reachable from a subagent's tool loop — so the caller is always
-      // the session itself. A spawn_agent `mode`-narrowed CHILD now runs at a policy that diverges
-      // from the persisted session policy (its narrowed childMeta is never written back to the
-      // store), so if a lease path ever becomes reachable from a child (or from an async/4h-ii
-      // child that outlives the turn), this proxy would grant against the SESSION policy, not the
-      // child's narrower one. Make the lease policy thread-aware before that lands.
+      // COUPLING (4h-i, refined 4h-ii-a): this reads the PERSISTED session policy as a proxy for
+      // "the current caller's policy". That's safe because peripheral.lease is a harness-only RPC
+      // (ipc/server.ts line 654), NEVER registered as an agent tool — so NO thread (main or
+      // subagent, sync or async/4h-ii) can ever reach it from a tool call. If a thread-correlated
+      // lease path is ever added to the registry in the future, gate approval on the calling
+      // thread's policy (opts.threadId, or a thread_policy map), not the persisted session policy.
       approvalPolicy = deps.store.meta(sessionId).approvalPolicy;
     } catch {
       return "denied"; // unknown session — fail closed (ipc/server.ts already validates first)
@@ -299,6 +298,12 @@ export async function startDaemon(opts: {
       plugins: { disabled: settings?.plugins?.disabled ?? [] },
     });
     const subagents = new SubagentManager({ maxConcurrent: settings?.subagents?.maxConcurrent });
+    // Async spawn (4h-ii-a): tracks DETACHED (`run_in_background:true`) child threads — see
+    // bg-agent-registry.ts's own doc comment for why this is separate from `bgRegistry` above
+    // (that one owns backgrounded bash processes; this one owns agent threads). Built
+    // unconditionally alongside `subagents` — both are required together for the spawn bridge's
+    // async branch to activate (engine.ts's EngineConfig.bgAgents doc comment).
+    const bgAgents = new BackgroundAgentRegistry();
     // `agentProvider` is already narrowed non-null here (we're inside `if (agentProvider)`), and
     // its `.provider` is the SAME provider instance the engine's spawn bridge calls .models() on
     // to validate a spawn_agent model override (4e gate F9) — so this list is exactly what the
@@ -384,6 +389,7 @@ export async function startDaemon(opts: {
       bgRegistry,
       agents,
       subagents,
+      bgAgents,
       // 4h-i Task 3: undefined (settings.subagents.maxDepth unset) → engine.ts's runThread
       // defaults it to 2 itself (`subagentMaxDepth ?? 2`) — mirrors the maxConcurrent line above,
       // which leans on SubagentManager's own internal default the same way.
