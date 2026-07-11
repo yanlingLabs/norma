@@ -121,4 +121,91 @@ describe("Compactor", () => {
     expect(res.compacted).toBe(false);
     expect(store.read(sid).some((e) => e.type === "checkpoint")).toBe(false);
   });
+
+  // Reachable in production: AgentEngine.steer() appends user_message events IMMEDIATELY, even
+  // while a tool call sits mid-flight awaiting approval (default timeout 5 min). If a steer flood
+  // of > keepTail messages lands during that window and a manual `compact` IPC call (a live method,
+  // callable mid-turn) fires in it, the naive candidate uptoSeq computed purely from MESSAGE seqs
+  // can land strictly BETWEEN a pending tool_call's seq and its (future or nonexistent) tool_result's
+  // seq. historyInput's `seq <= uptoSeq` then folds the function_call but keeps the later
+  // tool_result -> an orphaned tool_result in the provider input -> hard reject. These three tests
+  // pin the Compactor's pair-aware clamp that prevents it.
+  describe("clamp: never folds inside an unresolved main-thread tool_call/tool_result pair", () => {
+    function emptySession() {
+      const home = realpathSync(mkdtempSync(join(tmpdir(), "norma-cmp-pair-")));
+      const store = new SessionStore(home);
+      const hub = new SessionHub(store);
+      const sid = store.createSession("global", { cwd: "/tmp", approvalPolicy: "auto" });
+      return { store, hub, sid };
+    }
+
+    test("manual compact mid-approval, steer flood, result eventually arrives -> clamps to before the pending tool_call", async () => {
+      const { store, hub, sid } = emptySession();
+      const evUser0 = store.append(sid, { type: "user_message", sessionId: sid, threadId: "main", text: "u0", clientName: "test" });
+      const evAsst0 = store.append(sid, { type: "assistant_message", sessionId: sid, threadId: "main", text: "a0" });
+      const evCall = store.append(sid, { type: "tool_call", sessionId: sid, threadId: "main", callId: "c1", name: "read", argsJson: "{}" });
+      const steerSeqs: number[] = [];
+      for (let i = 0; i < 7; i++) {
+        const ev = store.append(sid, { type: "user_message", sessionId: sid, threadId: "main", text: `steer${i}`, clientName: "test" });
+        steerSeqs.push(ev.seq);
+      }
+      store.append(sid, { type: "tool_result", sessionId: sid, threadId: "main", callId: "c1", output: "result", isError: false });
+      store.append(sid, { type: "assistant_message", sessionId: sid, threadId: "main", text: "a-final" });
+
+      const c = new Compactor({ provider: { provider: summarizer("SUMMARY"), model: "fake" }, store, hub, keepTail: 4 });
+      const res = await c.compact(sid);
+
+      expect(res.compacted).toBe(true);
+      // clamped to the last message strictly before the pending tool_call — never inside the pair
+      expect(res.uptoSeq).toBe(evAsst0.seq);
+      expect(res.uptoSeq).toBeLessThan(evCall.seq);
+      for (const s of steerSeqs) expect(res.uptoSeq).not.toBe(s);
+      const cp: any = store.read(sid).find((e) => e.type === "checkpoint");
+      expect(cp.uptoSeq).toBe(evAsst0.seq);
+      // never even touches evUser0's seq minus 1 territory unexpectedly — sanity that evAsst0 > evUser0
+      expect(evAsst0.seq).toBeGreaterThan(evUser0.seq);
+    });
+
+    test("manual compact mid-approval, steer flood, NO result yet -> same clamp", async () => {
+      const { store, hub, sid } = emptySession();
+      const evUser0 = store.append(sid, { type: "user_message", sessionId: sid, threadId: "main", text: "u0", clientName: "test" });
+      const evAsst0 = store.append(sid, { type: "assistant_message", sessionId: sid, threadId: "main", text: "a0" });
+      const evCall = store.append(sid, { type: "tool_call", sessionId: sid, threadId: "main", callId: "c1", name: "read", argsJson: "{}" });
+      for (let i = 0; i < 7; i++) {
+        store.append(sid, { type: "user_message", sessionId: sid, threadId: "main", text: `steer${i}`, clientName: "test" });
+      }
+      // events end here: the tool call is still pending, no tool_result exists at all
+
+      const c = new Compactor({ provider: { provider: summarizer("SUMMARY"), model: "fake" }, store, hub, keepTail: 4 });
+      const res = await c.compact(sid);
+
+      expect(res.compacted).toBe(true);
+      expect(res.uptoSeq).toBe(evAsst0.seq);
+      expect(res.uptoSeq).toBeLessThan(evCall.seq);
+      expect(evUser0.seq).toBeLessThan(evAsst0.seq);
+    });
+
+    test("happy path unaffected: a tool_call/tool_result pair fully resolved before the tail compacts to the unclamped candidate", async () => {
+      const { store, hub, sid } = emptySession();
+      store.append(sid, { type: "user_message", sessionId: sid, threadId: "main", text: "u0", clientName: "test" });
+      store.append(sid, { type: "assistant_message", sessionId: sid, threadId: "main", text: "a0" });
+      store.append(sid, { type: "tool_call", sessionId: sid, threadId: "main", callId: "c1", name: "read", argsJson: "{}" });
+      store.append(sid, { type: "tool_result", sessionId: sid, threadId: "main", callId: "c1", output: "result", isError: false });
+      store.append(sid, { type: "assistant_message", sessionId: sid, threadId: "main", text: "a1" });
+      for (let i = 0; i < 4; i++) {
+        store.append(sid, { type: "user_message", sessionId: sid, threadId: "main", text: `u${i + 1}`, clientName: "test" });
+        store.append(sid, { type: "assistant_message", sessionId: sid, threadId: "main", text: `a${i + 2}` });
+      }
+
+      const c = new Compactor({ provider: { provider: summarizer("SUMMARY"), model: "fake" }, store, hub, keepTail: 4 });
+      const res = await c.compact(sid);
+
+      expect(res.compacted).toBe(true);
+      // Independently recompute what the UNCLAMPED candidate would be (mirrors the source's own
+      // `older[older.length - 1].seq` derivation) to pin exact no-behavior-change on the happy path.
+      const msgs = store.read(sid).filter((e) => e.type === "user_message" || e.type === "assistant_message");
+      const expectedCandidate = msgs[msgs.length - 1 - 4]!.seq;
+      expect(res.uptoSeq).toBe(expectedCandidate);
+    });
+  });
 });

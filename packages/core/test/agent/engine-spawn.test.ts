@@ -355,8 +355,14 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     const req = fp.requests[fp.requests.length - 1]!;
     const input = req.input as { type: string; role?: string; content?: unknown; callId?: string; output?: unknown }[];
 
-    // the child's OWN assistant_message (a different threadId) never leaks as a message item
-    expect(input.some((it) => it.type === "message" && it.role === "assistant" && it.content === "SECRET-CHILD-CHATTER")).toBe(false);
+    // the child's OWN assistant_message (a different threadId) never leaks as a message item —
+    // scanned as a substring across ALL message-role items (any role, not just assistant), since a
+    // message item legitimately carrying this text under ANY role would mean the same leak. A
+    // tool_result item legitimately containing the text (replayed by design, asserted below) is
+    // untouched by this check because it's type "tool_result", not "message".
+    expect(
+      input.every((it) => !(it.type === "message" && typeof it.content === "string" && it.content.includes("SECRET-CHILD-CHATTER"))),
+    ).toBe(true);
     // but the parent's OWN spawn_agent tool_result (a main-thread event) legitimately carries the
     // child's report as its output, and — per history-parity Task 1 — main-thread tool_result
     // events are now replayed across turns

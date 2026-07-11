@@ -415,7 +415,15 @@ export class AgentEngine {
       // no longer "forgets" what its tools did across turns. A checkpoint's `uptoSeq` is always a
       // MESSAGE seq (Compactor only ever folds up to a user/assistant boundary — see
       // compactor.ts's isMessage filter), so a tool_call/tool_result pair can never be split by a
-      // checkpoint: either both are folded into the summary, or both survive as tail.
+      // checkpoint: either both are folded into the summary, or both survive as tail. That
+      // guarantee is jointly held by TWO things, not one: (1) auto-compact runs at the start of a
+      // turn (see maybeAutoCompact's doc comment above), before this turn's tool calls exist, so
+      // there is never an in-flight pair for it to land inside; and (2) a manual `compact` IPC
+      // call is live mid-turn and CAN race a pending tool call (e.g. a steer flood during a slow
+      // approval), so compactor.ts's `compact` additionally clamps its candidate `uptoSeq` so it
+      // never lands inside an unresolved main-thread tool_call/tool_result pair — see that
+      // method's clamp comment. Only together do the two paths make the "never split" guarantee
+      // hold unconditionally.
       const item = this.eventToInput(e);
       if (item) input.push(item);
     }

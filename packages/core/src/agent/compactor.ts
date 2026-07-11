@@ -14,12 +14,20 @@ const MAIN_THREAD = "main";
 
 type Message = Extract<SessionEvent, { type: "user_message" | "assistant_message" }>;
 type Checkpoint = Extract<SessionEvent, { type: "checkpoint" }>;
+type ToolCall = Extract<SessionEvent, { type: "tool_call" }>;
+type ToolResult = Extract<SessionEvent, { type: "tool_result" }>;
 
 function isMessage(e: SessionEvent): e is Message {
   return e.type === "user_message" || e.type === "assistant_message";
 }
 function isCheckpoint(e: SessionEvent): e is Checkpoint {
   return e.type === "checkpoint";
+}
+function isToolCall(e: SessionEvent): e is ToolCall {
+  return e.type === "tool_call";
+}
+function isToolResult(e: SessionEvent): e is ToolResult {
+  return e.type === "tool_result";
 }
 
 const NOT_COMPACTED = { compacted: false, uptoSeq: 0, summaryChars: 0 } as const;
@@ -51,11 +59,47 @@ export class Compactor {
     if (afterCp.length <= this.keepTail) return NOT_COMPACTED;
 
     const older = afterCp.slice(0, afterCp.length - this.keepTail);
-    const uptoSeq = older[older.length - 1]!.seq;
+    const candidateUptoSeq = older[older.length - 1]!.seq;
+
+    // Clamp the candidate so it never lands strictly INSIDE an unresolved main-thread
+    // tool_call/tool_result pair. This is reachable in production, not just theoretical:
+    // AgentEngine.steer() appends `user_message` events to the store IMMEDIATELY, even while a
+    // tool call sits mid-flight awaiting approval (default approval timeout is 5 minutes). If a
+    // steer flood of more than `keepTail` messages lands during that window and a manual
+    // `compact` IPC call (a live method, callable mid-turn — see AgentEngine.compact) fires in
+    // it, the naive candidate above — derived purely from MESSAGE seqs — can sit strictly between
+    // the pending tool_call's seq and its (not-yet-emitted, or never-emitted) tool_result's seq.
+    // historyInput's `seq <= uptoSeq` would then fold the function_call but keep the later
+    // tool_result, orphaning it in the provider input on replay -> hard reject. So: find the
+    // EARLIEST main-thread tool_call at or before the candidate whose matching tool_result (same
+    // callId) is missing or lands AFTER the candidate, and pull the boundary back to the last
+    // message strictly before that call — folding only what's fully resolved. Scoped to the MAIN
+    // thread only, consistent with historyInput's own thread filter (child-thread tool events
+    // never enter main replay, so they can never be split by a main checkpoint either).
+    const mainToolCalls = events.filter(isToolCall).filter((e) => e.threadId === MAIN_THREAD);
+    const mainToolResultSeqByCallId = new Map<string, number>();
+    for (const e of events) {
+      if (isToolResult(e) && e.threadId === MAIN_THREAD) mainToolResultSeqByCallId.set(e.callId, e.seq);
+    }
+    let earliestOffenderSeq: number | null = null;
+    for (const tc of mainToolCalls) {
+      if (tc.seq > candidateUptoSeq) continue;
+      const resultSeq = mainToolResultSeqByCallId.get(tc.callId);
+      if (resultSeq === undefined || resultSeq > candidateUptoSeq) {
+        if (earliestOffenderSeq === null || tc.seq < earliestOffenderSeq) earliestOffenderSeq = tc.seq;
+      }
+    }
+    let uptoSeq = candidateUptoSeq;
+    if (earliestOffenderSeq !== null) {
+      const safeOlder = afterCp.filter((m) => m.seq < earliestOffenderSeq!);
+      if (safeOlder.length === 0) return NOT_COMPACTED; // nothing safely foldable before the pending pair
+      uptoSeq = safeOlder[safeOlder.length - 1]!.seq;
+    }
+    const olderClamped = afterCp.filter((m) => m.seq <= uptoSeq);
 
     // Only the new "older" messages go to the model — the prior summary is never re-fed, so it
     // can never be eroded by re-summarization.
-    const input: TurnInputItem[] = older.map((m) => ({
+    const input: TurnInputItem[] = olderClamped.map((m) => ({
       type: "message",
       role: m.type === "user_message" ? "user" : "assistant",
       content: m.text,
