@@ -13,7 +13,13 @@
  * state exists (unknown ids are no-ops / undefined / false, never errors).
  */
 
-export type AgentStatus = "running" | "completed" | "failed" | "stopped";
+// 4h-ii-c: "timeout" — a bg spawn whose SubagentManager.run() call rejected via its own clock
+// (SubagentResult.timedOut:true) reports distinctly from a generic "failed", so a client can
+// render/handle "timed out" separately from "errored". TERMINAL like completed/failed/stopped:
+// takeCompletedForSession surfaces it (unnotified), reopen() accepts it, stop() rejects it — see
+// each method's own doc comment; none needed a code change for the new status, since all three
+// already key off "running" vs. "not running" rather than an enumerated terminal set.
+export type AgentStatus = "running" | "completed" | "failed" | "stopped" | "timeout";
 
 /**
  * Everything a future `resume` (4h-ii-b Task 3) needs to re-run this child thread EXCEPT its
@@ -110,7 +116,7 @@ export class BackgroundAgentRegistry {
     return { ok: true };
   }
 
-  /** running → completed|failed, stores the result. No-op if unknown or already terminal.
+  /** running → completed|failed|timeout, stores the result. No-op if unknown or already terminal.
    *  `opts.notified` (4h-ii-b Task 1): set `true` for a SYNC spawn's own completion — the
    *  synchronous caller already received this result directly as its tool_result, in the SAME
    *  turn, so `takeCompletedForSession`'s later completion-reminder sweep (engine.ts's
@@ -118,11 +124,15 @@ export class BackgroundAgentRegistry {
    *  never re-surface it on a future turn — that would leak the child's raw result text into a
    *  turn that never asked for it (Seam #1: a child's internal output must stay scoped to its own
    *  turn). Omitted/false (the `run_in_background` path's own call site) is unchanged: a bg
-   *  completion starts unnotified so the sweep picks it up exactly once. */
-  complete(agentId: string, outcome: { ok: boolean; result: string }, opts?: { notified?: boolean }): void {
+   *  completion starts unnotified so the sweep picks it up exactly once.
+   *  `opts.timedOut` (4h-ii-c): set `true` when this completion is reporting a
+   *  SubagentResult.timedOut:true (the child's own SubagentManager.run() call hit its clock) —
+   *  status becomes `"timeout"` instead of the outcome.ok-derived completed/failed, so a timed-
+   *  out child is never misreported as a generic failure. Omitted/false is unchanged. */
+  complete(agentId: string, outcome: { ok: boolean; result: string }, opts?: { notified?: boolean; timedOut?: boolean }): void {
     const e = this.agents.get(agentId);
     if (!e || e.status !== "running") return;
-    e.status = outcome.ok ? "completed" : "failed";
+    e.status = opts?.timedOut ? "timeout" : outcome.ok ? "completed" : "failed";
     e.result = outcome.result;
     if (opts?.notified) e.notified = true;
   }
@@ -132,7 +142,7 @@ export class BackgroundAgentRegistry {
    * spawn bridge) can re-run its child thread. `register()` REJECTS a known agentId (re-
    * registration is a caller bug there), so resume needs this dedicated re-open path instead.
    *
-   * If the entry exists AND is terminal (completed/failed/stopped): flips status → running, clears
+   * If the entry exists AND is terminal (completed/failed/stopped/timeout): flips status → running, clears
    * the stale `result`, resets `notified` to false (so the resumed run's OWN completion reminder
    * re-fires — CC parity: a resumed agent that finishes again notifies again), and swaps in the
    * resume attempt's fresh AbortController (`abort` is never reused across runs). Returns true.

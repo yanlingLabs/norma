@@ -7,7 +7,11 @@
  * via a `finally` block.
  */
 
-export type SubagentResult<T> = { ok: true; value: T } | { ok: false; error: string };
+export type SubagentResult<T> =
+  | { ok: true; value: T }
+  // 4h-ii-c: `timedOut` is additive and set ONLY on the timer-fired rejection path below — every
+  // other failure (a thrown `fn`, pool saturation) leaves it absent, never `false`.
+  | { ok: false; error: string; timedOut?: true };
 
 export interface SubagentRunOptions {
   // 4h-i nested-spawn fix: true when the CALLING thread already holds its own concurrency
@@ -17,7 +21,20 @@ export interface SubagentRunOptions {
   // doc comment for why unbounded reentrant queueing can deadlock the whole pool. Omitted
   // (or false) → today's unbounded top-level-spawn queueing, unchanged.
   reentrant?: boolean;
+  // 4h-ii-c: per-call override of the constructor's own `timeoutMs`. `undefined` (omitted) —
+  // the default for every existing caller — keeps today's behavior exactly (the constructor's
+  // `timeoutMs`, 300s unless overridden there). A positive number overrides it for THIS call
+  // only. `null` means NO timer is ever set for this call: it can only end via `fn` itself
+  // settling or its `AbortSignal` being aborted some OTHER way (e.g. a future task_stop) — never
+  // by SubagentManager's own clock. Used by a detached `run_in_background` spawn (engine.ts),
+  // which has no waiting parent to time out FOR.
+  timeoutMs?: number | null;
 }
+
+/** Internal marker so run()'s catch block can distinguish ITS OWN timer-fired rejection (typed
+ *  `timedOut: true` on the result) from any other rejection `fn` itself produces — including one
+ *  whose message happens to also contain the substring "timed out". */
+class SubagentTimeoutError extends Error {}
 
 export class SubagentManager {
   private readonly maxConcurrent: number;
@@ -103,21 +120,30 @@ export class SubagentManager {
     }
     try {
       const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(), this.timeoutMs);
+      // 4h-ii-c: `undefined` opts.timeoutMs (every pre-existing caller) resolves to the
+      // constructor default, unchanged; `null` skips the timer entirely — see
+      // SubagentRunOptions.timeoutMs's own doc comment.
+      const effectiveTimeout = opts?.timeoutMs === undefined ? this.timeoutMs : opts.timeoutMs;
+      const timer = effectiveTimeout === null ? undefined : setTimeout(() => ac.abort(), effectiveTimeout);
       try {
         const value = await Promise.race([
           fn(ac.signal),
           new Promise<never>((_, rej) => {
             ac.signal.addEventListener("abort", () => {
-              rej(new Error(`timed out after ${Math.round(this.timeoutMs / 1000)}s`));
+              rej(new SubagentTimeoutError(`timed out after ${Math.round(effectiveTimeout! / 1000)}s`));
             });
           }),
         ]);
         return { ok: true, value };
       } finally {
-        clearTimeout(timer);
+        // guard: no timer was ever set when effectiveTimeout is null (opts.timeoutMs: null) — a
+        // bare clearTimeout(undefined) is harmless, but the guard documents the no-timer case.
+        if (timer !== undefined) clearTimeout(timer);
       }
     } catch (e) {
+      if (e instanceof SubagentTimeoutError) {
+        return { ok: false, error: e.message, timedOut: true };
+      }
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     } finally {
       this.release();

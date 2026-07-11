@@ -34,7 +34,15 @@ export type SessionApprovalPolicy = "ask" | "auto" | "plan";
 // consulted, so this classification only backstops a stray depth>0 call (send_message is excluded
 // from child tool sets, so this can only fire if a provider ignores that) — allow it to return the
 // bridge/placeholder path cleanly rather than hang on an approval prompt.
-const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message"]);
+// task_stop is read-only too (4h-ii-c Task 2): orchestration like spawn_agent/send_message — it
+// only aborts Norma's OWN child work (a bg agent's AbortController, or a bg bash task it started)
+// and never touches anything external on its own; CC's TaskStop prompts no approval either.
+// REVIEWER NOTE: bash_kill (below) sits in MUTATING, not here — that distinction is deliberate,
+// not an oversight: bash_kill's target is an OS process the user may independently care about
+// (any bash caller can reach the exact same kill via bash_kill under ITS OWN gate), whereas
+// task_stop's primary target is Norma's own subagent bookkeeping. Flagged here explicitly so a
+// whole-branch review adjudicates the split rather than silently accepting it.
+const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop"]);
 const MUTATING = new Set(["write", "edit", "bash", "bash_kill", "notebook_edit", "enter_worktree", "exit_worktree"]);
 const SELF_GATING = new Set(["request_directory"]);
 // web_fetch (4g Task 5, T6 adds web_search here) is Norma's ONLY network-capable tool — it does NOT

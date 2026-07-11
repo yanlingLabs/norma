@@ -119,4 +119,46 @@ describe("SubagentManager", () => {
       expect(queuedResult).toEqual({ ok: true, value: "queued eventually ran" });
     });
   });
+
+  // 4h-ii-c: per-call `timeoutMs` override on run() — `undefined` (omitted) keeps the
+  // constructor's own default; a positive number overrides it for THIS call only; `null` means
+  // NO timer at all (task_stop/abort is the only way that call ever ends). The timeout
+  // rejection itself is also now TYPED — `timedOut: true` on the result, additive, set ONLY on
+  // the timer-fired path.
+  describe("per-call timeoutMs override + typed timedOut (4h-ii-c)", () => {
+    test("run(fn, {timeoutMs: 50}) with a slow fn rejects in ~50ms (the per-call override), NOT the constructor's much larger default, and the result is typed timedOut:true", async () => {
+      const m = new SubagentManager({ timeoutMs: 300000 }); // constructor default stays huge
+      const start = Date.now();
+      const r = await m.run(() => new Promise((res) => setTimeout(res, 5000)), { timeoutMs: 50 });
+      const elapsed = Date.now() - start;
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error).toContain("timed out");
+        expect(r.timedOut).toBe(true);
+      }
+      expect(elapsed).toBeLessThan(1000); // bounded by the 50ms per-call override
+    });
+
+    test("run(fn, {timeoutMs: null}) never times out — resolves OK even when fn is slower than the constructor's own (small) default", async () => {
+      const m = new SubagentManager({ timeoutMs: 50 }); // small constructor default
+      const r = await m.run(() => new Promise((res) => setTimeout(() => res("done"), 150)), { timeoutMs: null });
+      expect(r).toEqual({ ok: true, value: "done" });
+    });
+
+    test("a plain constructor-default timeout (no per-call opts) is ALSO typed timedOut:true — additive, not just the override path", async () => {
+      const m = new SubagentManager({ timeoutMs: 20 });
+      const r = await m.run(() => new Promise((res) => setTimeout(res, 1000)));
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.timedOut).toBe(true);
+    });
+
+    test("a non-timeout failure (thrown error) is NOT typed timedOut — the field stays absent", async () => {
+      const m = new SubagentManager({});
+      const r = await m.run(async () => {
+        throw new Error("boom");
+      });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.timedOut).toBeUndefined();
+    });
+  });
 });

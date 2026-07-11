@@ -344,7 +344,12 @@ export class AgentEngine {
     if (meta.approvalPolicy === "plan") pins.add("exit_plan_mode");
     if (this.cfg.worktrees?.active(sessionId)) pins.add("exit_worktree");
     const bgTasks = this.cfg.bgRegistry?.list(sessionId) ?? [];
-    if (bgTasks.some((t) => t.status === "running")) { pins.add("bash_output"); pins.add("bash_kill"); }
+    // 4h-ii-c Task 2: task_stop can kill a running bg TASK too (its bash-unify path, mirroring
+    // bash_kill) — pinned alongside bash_output/bash_kill whenever one is running.
+    if (bgTasks.some((t) => t.status === "running")) { pins.add("bash_output"); pins.add("bash_kill"); pins.add("task_stop"); }
+    // task_stop is ALSO pinned whenever a bg AGENT is running (independent of any bg bash task) —
+    // that's its primary target (CC TaskStop parity: stop a running background agent).
+    if (this.cfg.bgAgents?.list(sessionId).some((e) => e.status === "running")) pins.add("task_stop");
     return pins;
   }
 
@@ -1013,8 +1018,11 @@ export class AgentEngine {
           // thread orchestrates. Belt-and-braces with the bridge's own `opts.depth === 0` gate on
           // sendMessageCalls above. Captured into resumeCtx.excludeTools below, so a resumed child
           // stays excluded too.
+          // 4h-ii-c Task 2: task_stop is excluded from EVERY child UNCONDITIONALLY too, same
+          // rationale — v1 depth-0-only: a child must not be able to kill its siblings' or its
+          // parent's OWN background agents/tasks, only the main thread orchestrates.
           const childDepth = opts.depth + 1;
-          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode", "send_message"]);
+          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode", "send_message", "task_stop"]);
           if (childDepth >= maxDepth) childExcludeTools.add("spawn_agent");
           // 4h-ii-b Task 1: instructionsFull is computed ONCE here — hoisted out of the bg and
           // sync closures below, which used to each build their own copy independently — so it
@@ -1055,11 +1063,12 @@ export class AgentEngine {
           // child through the SAME SubagentManager slot (concurrency-limited) + depth cap as the
           // synchronous path below, but does NOT await it. `entryAbort` is THIS bg entry's own
           // controller (bg-agent-registry.ts's `stop()` fires it) — the child's own runThread
-          // signal is `AbortSignal.any([childSignal, entryAbort.signal])` so EITHER the
-          // SubagentManager's own per-run timeout (childSignal) OR a future stop() call
-          // (entryAbort) can abort it. This call's tool_result is set SYNCHRONOUSLY, right here,
-          // before any of the child's own work has run — Promise.all resolves as soon as this
-          // closure returns, without waiting on the detached chain below.
+          // signal is `AbortSignal.any([childSignal, entryAbort.signal])`. 4h-ii-c: this call's own
+          // `subagents.run` now passes `timeoutMs: null` (below), so `childSignal` itself never
+          // aborts on a clock anymore — `entryAbort` (a future task_stop) is this detached child's
+          // ONLY kill mechanism. This call's tool_result is set SYNCHRONOUSLY, right here, before
+          // any of the child's own work has run — Promise.all resolves as soon as this closure
+          // returns, without waiting on the detached chain below.
           if (runInBackground) {
             const entryAbort = new AbortController();
             const registered = this.cfg.bgAgents!.register({
@@ -1098,10 +1107,9 @@ export class AgentEngine {
                 reasoningEffort: opts.reasoningEffort,
                 meta: childMeta,
                 depth: childDepth,
-                // BOTH the SubagentManager's own per-run timeout (childSignal) AND a future
-                // registry.stop() (entryAbort.signal) must be able to abort this detached child —
-                // see this branch's own doc comment above. This is the ONLY functional difference
-                // (besides not awaiting) from the synchronous path's childFn just below.
+                // registry.stop() (entryAbort.signal) is now the ONLY thing that can abort this
+                // detached child — see this branch's own doc comment above (4h-ii-c: childSignal
+                // itself never fires on a clock anymore, `timeoutMs: null` just below).
                 signal: AbortSignal.any([childSignal, entryAbort.signal]),
                 loaded: childLoaded,
                 excludeTools: childExcludeTools,
@@ -1109,7 +1117,24 @@ export class AgentEngine {
                 maxTurns,
                 rootsOverride: isolatedWorktree ? [isolatedWorktree.dir] : undefined,
               });
-            }, { reentrant: opts.depth > 0 })
+            }, {
+              reentrant: opts.depth > 0,
+              // 4h-ii-c: a detached `run_in_background` child has no waiting parent to time out
+              // FOR — the 4h-ii-a T3 review flagged the bg spawn's inherited SubagentManager
+              // timeout as something to "relax only once a manual kill exists" (a runaway
+              // detached child was previously bounded ONLY by this clock, with no way to kill it
+              // early). task_stop (this same phase) now IS that manual kill via `entryAbort`
+              // above — but task_stop is main-thread-only (it's in childExcludeTools, and only the
+              // MAIN thread ever learns a bg agentId from the tool_result), so it can only reach a
+              // DEPTH-0 detached child. A depth>0 spawner's own bg grandchild would be untimed AND
+              // unkillable (entryAbort doesn't cascade from a stopped parent into a grandchild's
+              // AbortSignal.any set, and there's no session-level kill-all) — so the relax is
+              // scoped to depth 0 only: `timeoutMs: null` there (untimed, task_stop reaches it),
+              // `undefined` at depth>0 (falls back to SubagentManager's own 300s default, the
+              // pre-4h-ii-c bound, since nothing could stop it manually). Whole-branch review C1
+              // (4h-ii-c): "untimed ⟺ killable".
+              timeoutMs: opts.depth === 0 ? null : undefined,
+            })
               .then((result) => {
                 const stopReason = result.ok ? result.value.stopReason : "error";
                 this.emit(sessionId, { type: "thread_completed", sessionId, threadId: childId, stopReason });
@@ -1123,7 +1148,11 @@ export class AgentEngine {
                   ? { ok: false, result: `subagent (${agentType ?? "general-purpose"}) ${result.error}` }
                   : result.value.stopReason === "error"
                     ? { ok: false, result: `subagent (${agentType ?? "general-purpose"}) failed: ${result.value.errorMessage ?? "provider error"}` }
-                    : { ok: true, result: result.value.finalText || "the subagent finished without a final message" });
+                    : { ok: true, result: result.value.finalText || "the subagent finished without a final message" },
+                  // 4h-ii-c: only reachable today if a future config re-adds a bg timeout (this
+                  // call itself now runs with `timeoutMs: null`, above) — wired now so a timed-out
+                  // detached child is never misreported as a generic "failed" once one exists.
+                  !result.ok && result.timedOut ? { timedOut: true } : undefined);
               })
               .catch((err) => {
                 // Defensive only — SubagentManager.run() itself never throws (see its own doc
@@ -1275,7 +1304,13 @@ export class AgentEngine {
             // completions) would re-surface it as a "background agent finished" reminder,
             // leaking the child's raw output into a turn that never asked for it (see
             // BackgroundAgentRegistry.complete's own doc comment).
-            if (registeredInBg) this.cfg.bgAgents!.complete(childId, { ok: !outcome.isError, result: outcome.output }, { notified: true });
+            // 4h-ii-c: this sync spawn's own `subagents.run` call above is UNCHANGED (no
+            // `timeoutMs` override — still the constructor default, 300s), but `timedOut` is
+            // threaded through here too for correctness/consistency with the bg path's own
+            // `.then` handler above, in case `result` ever IS a timeout (it still can be, since
+            // this path's run() call has no override).
+            if (registeredInBg) this.cfg.bgAgents!.complete(childId, { ok: !outcome.isError, result: outcome.output },
+              { notified: true, timedOut: !result.ok && result.timedOut });
           } finally {
             // 4h-i Task 4: teardown runs whether the child succeeded, errored, or timed out —
             // clean-only (mirrors exit_worktree's default guard AND CC's own isolation
@@ -1323,7 +1358,7 @@ export class AgentEngine {
           sendMessageOutcomes.set(call.callId, { output: `message delivered to '${to}'`, isError: false });
           continue;
         }
-        // terminal (completed/failed/stopped) → resume it in the background. Its {output,isError}
+        // terminal (completed/failed/stopped/timeout) → resume it in the background. Its {output,isError}
         // (a bg resume returns {agentId,status:"running"} immediately, or a T3 guard's typed error)
         // becomes this send_message call's tool_result.
         sendMessageOutcomes.set(call.callId, await this.resumeThread({
@@ -1644,7 +1679,19 @@ export class AgentEngine {
     // D6 — same sync/bg fork the fresh path uses; `reentrant` keys off the RESUMING thread's depth
     // (a depth>0 resumer already holds a SubagentManager slot), exactly like the fresh spawn.
     if (runInBackground) {
-      void this.cfg.subagents!.run(async (childSignal) => runResumed(childSignal), { reentrant: depth > 0 })
+      void this.cfg.subagents!.run(async (childSignal) => runResumed(childSignal), {
+        reentrant: depth > 0,
+        // 4h-ii-c (T1 follow-up): a RESUMED detached child is as untimed as a freshly-spawned one
+        // — same rationale as the fresh bg spawn branch's own `timeoutMs` relax (no waiting parent
+        // to time out FOR; the 4h-ii-a T3 review's "relax only once a manual kill exists" is
+        // satisfied by task_stop firing `entryAbort` above). This path is MAINSTREAM, not an edge:
+        // a send_message to a finished agent always resumes with runInBackground:true. Same depth
+        // gate as the fresh path (whole-branch review C1, 4h-ii-c): `depth` here is the RESUMING
+        // thread's own depth — task_stop is main-thread-only, so only a depth-0 resumer's bg child
+        // can actually be killed manually. `depth > 0` keeps the SubagentManager default (300s)
+        // instead, since nothing could stop it early ("untimed ⟺ killable").
+        timeoutMs: depth === 0 ? null : undefined,
+      })
         .then((result) => {
           const stopReason = result.ok ? result.value.stopReason : "error";
           this.emit(sessionId, { type: "thread_completed", sessionId, threadId: entry.threadId, stopReason });
@@ -1653,7 +1700,11 @@ export class AgentEngine {
             ? { ok: false, result: `subagent (${agentType}) ${result.error}` }
             : result.value.stopReason === "error"
               ? { ok: false, result: `subagent (${agentType}) failed: ${result.value.errorMessage ?? "provider error"}` }
-              : { ok: true, result: result.value.finalText || "the subagent finished without a final message" });
+              : { ok: true, result: result.value.finalText || "the subagent finished without a final message" },
+            // 4h-ii-c: only reachable if a future config re-adds a bg timeout (this call runs with
+            // `timeoutMs: null` above) — wired now, same as the fresh bg spawn's `.then`, so a
+            // timed-out resumed child is never misreported as generic "failed".
+            !result.ok && result.timedOut ? { timedOut: true } : undefined);
         })
         .catch((err) => {
           // Defensive: SubagentManager.run() never throws; this guards a throw in the .then handler
@@ -1678,8 +1729,11 @@ export class AgentEngine {
         : { output: result.value.finalText || "the subagent finished without a final message", isError: false };
     // { notified: true }: this sync resume's result reached the caller directly as its own
     // tool_result this same turn, so the next turn's completion-reminder sweep must not re-surface
-    // it (same reasoning as the fresh sync path).
-    this.cfg.bgAgents!.complete(entry.agentId, { ok: !outcome.isError, result: outcome.output }, { notified: true });
+    // it (same reasoning as the fresh sync path). `timedOut` (4h-ii-c): the sync resume's run()
+    // call above is still on the constructor-default clock (no override), so a timeout IS
+    // reachable here — mirror the fresh sync path's threading so it reports "timeout", not "failed".
+    this.cfg.bgAgents!.complete(entry.agentId, { ok: !outcome.isError, result: outcome.output },
+      { notified: true, timedOut: !result.ok && result.timedOut });
     return outcome;
   }
 
