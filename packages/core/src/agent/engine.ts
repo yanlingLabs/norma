@@ -725,12 +725,18 @@ export class AgentEngine {
         : [];
       if (spawnCalls.length > 0) {
         await Promise.all(spawnCalls.map(async (call) => {
-          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown; max_turns?: unknown; mode?: unknown; isolation?: unknown; run_in_background?: unknown } = {};
+          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown; max_turns?: unknown; mode?: unknown; isolation?: unknown; run_in_background?: unknown; name?: unknown } = {};
           try { parsed = JSON.parse(call.argsJson || "{}"); } catch { /* defensive: empty prompt below */ }
           const prompt = typeof parsed.prompt === "string" ? parsed.prompt : "";
           const agentType = typeof parsed.agentType === "string" ? parsed.agentType : undefined;
           const modelOverride = typeof parsed.model === "string" ? parsed.model : undefined;
           const description = typeof parsed.description === "string" ? parsed.description : undefined;
+          // 4h-ii-b Task 2 (CC parity: stable per-session handle for resume/send_message) — same
+          // hand-parse-before-zod reasoning as model/description/mode/isolation/run_in_background
+          // above: only a string is recognized; anything else (wrong type, absent) → undefined,
+          // same as omitting the arg entirely (the child is addressable by agentId only, today's
+          // unchanged behavior).
+          const spawnName = typeof parsed.name === "string" ? parsed.name : undefined;
           // 4h-i (CC parity: Agent.max_turns): this bridge hand-parses raw argsJson BEFORE
           // spawn.ts's own zod validation would ever run (same reason model/description are
           // hand-checked above), so a provider that ignores the declared `.int().positive().max(50)`
@@ -830,6 +836,28 @@ export class AgentEngine {
             return; // no thread_started, no thread registry entry, no subagents.run slot
           }
 
+          // 4h-ii-b Task 2 (CC parity: stable per-session handle for resume/send_message,
+          // Tasks 3-4) — a `name` colliding with an EXISTING agent in this session must fail the
+          // spawn BEFORE thread_started/registerThread/subagents.run, same reason the
+          // description/model/run_in_background checks above do: a caller must never get a ghost
+          // thread for a name that `registry.get` would just resolve to the OTHER agent. The
+          // message is byte-identical to what BackgroundAgentRegistry.register() itself produces
+          // on the same collision (bg-agent-registry.ts) so both paths agree. This is only a
+          // PRE-check for the common case — a name already registered from a prior spawn/turn; it
+          // cannot see two sibling spawns in the SAME batch reusing one name (neither has
+          // registered yet when this runs) — register()'s own collision result (surfaced at the
+          // bg register() call below) is the backstop for that rare edge, unchanged.
+          if (spawnName) {
+            const existing = this.cfg.bgAgents?.get(spawnName, sessionId);
+            if (existing) {
+              spawnOutcomes.set(call.callId, {
+                output: `name '${spawnName}' already in use by agent ${existing.agentId}`,
+                isError: true,
+              });
+              return; // no thread_started, no thread registry entry, no subagents.run slot
+            }
+          }
+
           // 4h-i Task 4 (CC parity: Agent.isolation "worktree") — create the child's isolation
           // worktree BEFORE thread_started/registerThread/subagents.run, same as the
           // description/model checks above: a create failure (no git repo, or
@@ -920,18 +948,20 @@ export class AgentEngine {
               agentId: childId,
               sessionId,
               threadId: childId,
-              // `name` (4h-ii-b) is a follow-up arg — this task never passes one, so every bg
-              // entry is addressed by agentId (childId) only, same as thread.list today.
-              name: undefined,
+              // `name` (4h-ii-b Task 2): the caller's own stable per-session handle (spawn.ts's
+              // `name` arg) — undefined when omitted, unchanged register() behavior.
+              name: spawnName,
               abort: entryAbort,
               resume: resumeCtx,
             });
             if (!registered.ok) {
-              // Not reachable today (childId is a fresh randomUUID and name is always undefined
-              // here, so register() can only ever reject on a collision this task never produces)
-              // — handled defensively rather than assumed impossible, mirroring the guard style
-              // used throughout this bridge. thread_started already fired above, so this must
-              // still complete that thread entry rather than leaving a ghost "running" thread.
+              // childId itself can't collide (a fresh randomUUID), so this can only ever be a
+              // NAME collision — the pre-check above already rejects the common case (a name
+              // already registered from a prior spawn/turn) before thread_started even fires, so
+              // this is the backstop for the one thing the pre-check can't see: two sibling
+              // spawns in the SAME batch reusing one name (neither had registered yet when the
+              // pre-check ran for either). thread_started already fired above for THIS call, so
+              // this must still complete that thread entry rather than leaving a ghost "running" thread.
               this.emit(sessionId, { type: "thread_completed", sessionId, threadId: childId, stopReason: "error" });
               this.completeThread(sessionId, childId, "error");
               spawnOutcomes.set(call.callId, { output: registered.error, isError: true });
@@ -1029,17 +1059,20 @@ export class AgentEngine {
           // this bridge again. Gated on `this.cfg.bgAgents` being wired at all (optional, same as
           // the bg path's own guard) — when it's absent this block is a no-op and the sync spawn
           // runs exactly as it did before this task (plain `childSignal`, no registry entry).
-          // Registration failure is defensive-only (same "not reachable today" reasoning as the
-          // bg path's own register() call: childId is a fresh randomUUID and name is always
-          // undefined here) — unlike the bg path, a failure here must NOT fail the sync spawn
-          // itself (the registry is a BONUS here, not the only channel back to the caller like it
-          // is for a detached child), so `registeredInBg` just guards the later complete() call.
+          // Registration failure is defensive-only, same reasoning as the bg path's own
+          // register() call above: childId can't collide (a fresh randomUUID) and a `name`
+          // collision with an EXISTING agent was already rejected by the pre-check before
+          // thread_started fired — the only thing this register() can still reject is a
+          // same-batch sibling reusing one name (see the bg path's own comment above). Unlike the
+          // bg path, a failure here must NOT fail the sync spawn itself (the registry is a BONUS
+          // here, not the only channel back to the caller like it is for a detached child), so
+          // `registeredInBg` just guards the later complete() call.
           const entryAbort = this.cfg.bgAgents ? new AbortController() : undefined;
           const registeredInBg = !!(entryAbort && this.cfg.bgAgents!.register({
             agentId: childId,
             sessionId,
             threadId: childId,
-            name: undefined,
+            name: spawnName,
             abort: entryAbort,
             resume: resumeCtx,
           }).ok);
