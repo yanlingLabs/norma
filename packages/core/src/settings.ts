@@ -75,9 +75,12 @@ export const Settings = z.object({
     maxConcurrent: z.number().int().positive().optional(),
     // 4h-i Task 3 (CC parity: nesting depth up to 5): how many levels of spawn_agent nesting are
     // allowed — a thread at depth < maxDepth may spawn a child; a thread AT maxDepth cannot.
-    // Default 2 when unset (engine.ts's `subagentMaxDepth ?? 2`): one level deeper than the old
-    // hardcoded depth-1 cap (a depth-0 main thread could always spawn a depth-1 child; the OLD
-    // behavior — a depth-1 child could never spawn further — is now `maxDepth: 1` explicitly).
+    // Default 5 when unset (engine.ts's `subagentMaxDepth ?? 5`) — matches Claude Code's fixed
+    // max nesting depth of 5 (user decision 2026-07-11: "whatever Claude Code does"). Lower it
+    // (e.g. `maxDepth: 1`, the pre-4h-i behavior where a depth-1 child could never spawn further)
+    // to restrict nesting. Concurrency (maxConcurrent, default 4) and total fan-out are separate:
+    // total spawns per session are UNLIMITED by design (user decision), bounded only by the
+    // concurrency semaphore at any instant.
     // CC itself allows depth 5, hence the upper bound here.
     maxDepth: z.number().int().min(1).max(5).optional(),
   }).optional(),

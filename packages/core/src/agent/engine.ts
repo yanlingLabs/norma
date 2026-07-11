@@ -147,10 +147,10 @@ export interface EngineConfig {
   agents?: AgentStore;
   // 4h-i Task 3 (CC parity: configurable nesting depth, settings.subagents.maxDepth): how many
   // levels of spawn_agent nesting are allowed, orthogonal to SubagentManager's maxConcurrent
-  // (fan-out width) — this is depth, not count or concurrency. Undefined → defaults to 2
-  // (runThread reads `subagentMaxDepth ?? 2`), one level deeper than the old hardcoded depth-1
-  // cap: a depth-0 main thread could always spawn a depth-1 child; that child could never spawn
-  // further. `maxDepth: 1` reproduces that old behavior explicitly. A thread at `depth <
+  // (fan-out width) — this is depth, not count or concurrency. Undefined → defaults to 5
+  // (runThread reads `subagentMaxDepth ?? 5`), matching Claude Code's fixed max nesting depth of
+  // 5 (user decision: "whatever Claude Code does"). `maxDepth: 1` reproduces the pre-4h-i
+  // behavior (a depth-1 child could never spawn further). A thread at `depth <
   // maxDepth` may spawn (spawn_agent stays in its specs, the bridge runs its calls); a thread AT
   // `depth >= maxDepth` has spawn_agent excluded from its specs and, belt-and-braces, rejects any
   // spawn_agent call it receives anyway.
@@ -536,7 +536,7 @@ export class AgentEngine {
     // 4h-i Task 3: the nesting-depth cap for THIS thread's own spawn attempts — see
     // EngineConfig.subagentMaxDepth's doc comment. Computed once so the spawn-gather filter below
     // and the belt-and-braces reject agree on the exact same number.
-    const maxDepth = this.cfg.subagentMaxDepth ?? 2;
+    const maxDepth = this.cfg.subagentMaxDepth ?? 5;
 
     this.emit(sessionId, { type: "turn_started", sessionId, threadId });
 

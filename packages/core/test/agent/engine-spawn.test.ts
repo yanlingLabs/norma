@@ -932,7 +932,7 @@ describe("AgentEngine: configurable subagent nesting depth (4h-i Task 3)", () =>
     expect(names).not.toContain("enter_plan_mode");
   });
 
-  test("default maxDepth (2): a depth-1 child spawns a depth-2 grandchild end-to-end — thread_started/completed nest correctly, results bubble up two levels, grandchild's specs exclude spawn_agent (at the cap)", async () => {
+  test("maxDepth: 2 (explicit): a depth-1 child spawns a depth-2 grandchild end-to-end — thread_started/completed nest correctly, results bubble up two levels, grandchild's specs exclude spawn_agent (at the cap)", async () => {
     const script: ProviderEvent[][] = [
       [spawnCall("s1", "do X"), done("tool_calls")], // parent (depth 0) round 0: spawns the child
       [spawnCall("s2", "grandchild task"), done("tool_calls")], // child (depth 1) round 0: spawns the grandchild
@@ -940,7 +940,7 @@ describe("AgentEngine: configurable subagent nesting depth (4h-i Task 3)", () =>
       text("child wrapped up after grandchild"), // child's own continuation round, after the grandchild bridge returns
       text("parent final report"), // parent's own continuation round, after the child bridge returns
     ];
-    const { engine, store, sessionId, provider } = setup(script);
+    const { engine, store, sessionId, provider } = setup(script, { maxDepth: 2 });
     await engine.runTurn(sessionId);
     const events = store.read(sessionId);
 
@@ -971,7 +971,7 @@ describe("AgentEngine: configurable subagent nesting depth (4h-i Task 3)", () =>
     expect((fp.requests[2]!.tools ?? []).map((t) => t.name)).not.toContain("spawn_agent");
   });
 
-  test("default maxDepth (2): a depth-2 grandchild that calls spawn_agent anyway (provider ignoring the excluded specs) is rejected via belt-and-braces — no great-grandchild thread runs", async () => {
+  test("maxDepth: 2 (explicit): a depth-2 grandchild that calls spawn_agent anyway (provider ignoring the excluded specs) is rejected via belt-and-braces — no great-grandchild thread runs", async () => {
     const script: ProviderEvent[][] = [
       [spawnCall("s1", "do X"), done("tool_calls")], // parent (depth 0): spawns the child
       [spawnCall("s2", "grandchild task"), done("tool_calls")], // child (depth 1): spawns the grandchild
@@ -980,7 +980,7 @@ describe("AgentEngine: configurable subagent nesting depth (4h-i Task 3)", () =>
       text("child wrapped up"), // child's continuation round after the grandchild bridge returns
       text("parent final report"), // parent's continuation round after the child bridge returns
     ];
-    const { engine, store, sessionId } = setup(script);
+    const { engine, store, sessionId } = setup(script, { maxDepth: 2 });
     await engine.runTurn(sessionId);
     const events = store.read(sessionId);
 
@@ -994,6 +994,21 @@ describe("AgentEngine: configurable subagent nesting depth (4h-i Task 3)", () =>
 
     const s2Result = events.find((e) => e.type === "tool_result" && e.callId === "s2");
     expect(s2Result).toMatchObject({ isError: false, output: "grandchild gave up on spawning further" });
+  });
+
+  test("default maxDepth (5, CC parity): a depth-2 grandchild's specs INCLUDE spawn_agent — the default allows deeper nesting than 2 (proves the default is >2, i.e. 5)", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "do X"), done("tool_calls")], // parent (depth 0): spawns child
+      [spawnCall("s2", "grandchild"), done("tool_calls")], // child (depth 1): spawns grandchild
+      text("grandchild final report"), // grandchild (depth 2): ends — but its specs are what we check
+      text("child wrapped"),
+      text("parent report"),
+    ];
+    const { engine, sessionId, provider } = setup(script); // NO maxDepth → default 5
+    const fp = provider as FakeProvider;
+    await engine.runTurn(sessionId);
+    // requests[2] is the grandchild's (depth 2) turn — under default 5, depth 2 < 5 so it still has spawn_agent
+    expect((fp.requests[2]!.tools ?? []).map((t) => t.name)).toContain("spawn_agent");
   });
 
   test("maxDepth: 1 explicit — a depth-1 child cannot spawn (regression pin, identical to today's hardcoded default)", async () => {
