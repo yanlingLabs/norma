@@ -66,18 +66,27 @@ export class HookRunner {
       return { status: "error", stdout: "", reason: err instanceof Error ? err.message : String(err) };
     }
 
-    try {
-      // Bun's FileSink write()/end() are typed `number | Promise<number>` — when the child has
-      // already exited (or exits mid-write) the write can fail asynchronously (EPIPE) rather than
-      // throwing synchronously. Awaiting here routes that failure into this catch instead of
-      // becoming an unhandled rejection, which would otherwise crash the whole daemon process.
-      await proc.stdin.write(JSON.stringify(payload));
-      await proc.stdin.end();
-    } catch {
-      // A process that exits immediately (e.g. `exit 1` before reading stdin) can make the write
-      // itself throw/reject (incl. EPIPE) — irrelevant to the exit-code outcome decided below, so
-      // swallow it; the child just won't see (all of) the payload.
-    }
+    // Fire-and-forget: write/end the stdin payload as a CONCURRENT task, not one the timeout race
+    // below awaits. Bun's FileSink write()/end() are typed `number | Promise<number>` — a bare
+    // `.catch()` can't chain on the sync-number fast path, so this async IIFE (whose `await`
+    // normalizes both) is what reliably contains a rejection. If this write were awaited here
+    // (pre-C3-fix), a non-draining-but-alive hook + a payload above the pipe-buffer threshold
+    // (~512-600KB) would block it forever — BEFORE the race/timer below is ever constructed — so
+    // the timeout would never fire and run() would hang unboundedly. Not awaiting it means the
+    // race is always armed immediately, regardless of whether the write drains. A write blocked on
+    // a hung hook gets unblocked when the timeout path SIGKILLs the child below: the pipe breaks,
+    // the write rejects (EPIPE), and that rejection is caught right here — never an unhandled
+    // rejection (C1 stays closed). A normal, well-behaved child still receives the full payload +
+    // EOF, since write+end complete long before any realistic timeout fires.
+    void (async () => {
+      try {
+        await proc.stdin.write(JSON.stringify(payload));
+        await proc.stdin.end();
+      } catch {
+        // Child gone early (exit before reading stdin) or pipe closed by our own SIGKILL on
+        // timeout — either way irrelevant to the outcome decided below; swallow it.
+      }
+    })();
 
     const timeoutMs = spec.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     let timer: ReturnType<typeof setTimeout> | undefined;

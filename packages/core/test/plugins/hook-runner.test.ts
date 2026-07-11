@@ -181,4 +181,31 @@ describe("HookRunner.run", () => {
     },
     3000,
   );
+
+  // C3 regression (4f T1 re-review, post-C1): the C1 fix awaited the stdin write/end BEFORE the
+  // timeout `Promise.race` was constructed. A non-draining but ALIVE hook (never reads stdin)
+  // combined with a payload above the pipe-buffer threshold (~512-600KB) blocks that awaited write
+  // forever — the race/timer is never armed, so run() hangs unboundedly instead of resolving
+  // "timeout". Fix: the stdin write/end is now a fire-and-forget task the race does not wait on, so
+  // the timer is always armed immediately regardless of whether the write drains. `exec sleep 15`
+  // (not `sleep 30`, to avoid the tools-bash.test.ts pgrep-sleep-30 collision) replaces the shell
+  // with `sleep` via `exec` so it never reads stdin and the pipe never drains. The explicit 5000ms
+  // bun-test-level timeout (3rd arg) is a fail-fast guard for the RED state: pre-fix, this hangs
+  // indefinitely (no timeout, ever) rather than reporting a clean failure.
+  test(
+    "(k) C3: non-draining alive hook + oversized (~1MB) payload + short timeout → resolves timeout promptly, write does not gate the race",
+    async () => {
+      const runner = new HookRunner();
+      const bigPayload = mkPayload({ padding: "x".repeat(1_000_000) });
+      const start = Date.now();
+      const result = await runner.run(mkSpec({ command: "exec sleep 15", timeoutMs: 200 }), bigPayload);
+      const elapsed = Date.now() - start;
+
+      expect(result.status).toBe("timeout");
+      // Budget well under the 15s sleep and well past the 200ms timeoutMs — proves the timer won
+      // the race rather than the write blocking it indefinitely.
+      expect(elapsed).toBeLessThan(1500);
+    },
+    5000,
+  );
 });
