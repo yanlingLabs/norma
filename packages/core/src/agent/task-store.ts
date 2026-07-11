@@ -35,7 +35,14 @@ export class TaskStore {
     return task;
   }
 
-  update(sessionId: string, id: string, patch: { status?: Task["status"]; subject?: string; activeForm?: string }): Task | undefined {
+  /** Patch shape widened to every patchable Task field (4h-ii-d, CC parity: owner/blocks/
+   *  blockedBy/metadata joined status/subject/activeForm) — `Partial<Omit<Task, "id">>` tracks
+   *  @norma/protocol's `Task` automatically, so a future protocol-side field needs no store change.
+   *  The store itself still just shallow-merges the patch onto the existing task (`{...t, ...patch}`);
+   *  the addBlocks/addBlockedBy append+dedupe and metadata shallow-merge computation happens in the
+   *  TOOL (tools/tasks.ts's task_update), which reads the current task via `get()`, computes the
+   *  new full arrays/object, and passes them here as a plain "set" patch. */
+  update(sessionId: string, id: string, patch: Partial<Omit<Task, "id">>): Task | undefined {
     const m = this.forSession(sessionId);
     const t = m.get(id);
     if (!t) return undefined;

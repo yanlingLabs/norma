@@ -98,6 +98,17 @@ export const TaskSchema = z.object({
   // upserting a phantom entry that outlives the delete. Terminal — no event ever transitions a
   // task OUT of "deleted".
   status: z.enum(["pending", "in_progress", "completed", "deleted"]), activeForm: z.string().optional(),
+  // Task-graph fields (4h-ii-d, CC parity) — all optional/additive so old-shaped tasks (none of
+  // these) keep parsing identically. owner: an agent name/id or "user" that owns the task.
+  // blocks/blockedBy: ids of tasks this task blocks / is blocked by — task_update's
+  // addBlocks/addBlockedBy append+dedupe into these (tools/tasks.ts); referenced ids are NOT
+  // validated to exist here or there, since the referenced task may be created later. metadata:
+  // a free-form shallow-mergeable bag (task_update's metadata arg merges new keys in; no delete
+  // mechanism — YAGNI).
+  owner: z.string().min(1).optional(),
+  blocks: z.array(z.string()).optional(),
+  blockedBy: z.array(z.string()).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
 });
 export type QuestionOption = z.infer<typeof QuestionOptionSchema>;
 export type Question = z.infer<typeof QuestionSchema>;

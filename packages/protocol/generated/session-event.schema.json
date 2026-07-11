@@ -994,6 +994,29 @@
             },
             "activeForm": {
               "type": "string"
+            },
+            "owner": {
+              "type": "string",
+              "minLength": 1
+            },
+            "blocks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "blockedBy": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "metadata": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {}
             }
           },
           "required": [

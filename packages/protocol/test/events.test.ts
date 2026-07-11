@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { SessionEvent, SYSTEM_SESSION_ID } from "../src/events";
+import { SessionEvent, SYSTEM_SESSION_ID, TaskSchema } from "../src/events";
 import { HelloParams, HelloResult, PROTOCOL_VERSION } from "../src/methods";
 
 describe("SessionEvent discriminated union", () => {
@@ -114,6 +114,26 @@ describe("SessionEvent discriminated union", () => {
       task: { id: "1", subject: "rename", status: "deleted" },
     } as const;
     expect(SessionEvent.parse(tuDeleted)).toEqual(tuDeleted);
+  });
+
+  // 4h-ii-d (CC parity): Task gains owner/blocks/blockedBy/metadata, all optional/additive.
+  test("TaskSchema: owner/blocks/blockedBy/metadata parse when present, and are absent when omitted (old shape)", () => {
+    const withGraphFields = {
+      id: "1", subject: "rename", status: "pending" as const,
+      owner: "researcher", blocks: ["2", "3"], blockedBy: ["0"], metadata: { priority: "high", count: 2 },
+    };
+    expect(TaskSchema.parse(withGraphFields)).toEqual(withGraphFields);
+
+    const oldShape = { id: "1", subject: "rename", status: "pending" as const };
+    expect(TaskSchema.parse(oldShape)).toEqual(oldShape);
+  });
+
+  test("task_updated round-trips a task with owner/blocks/blockedBy/metadata present", () => {
+    const tu = {
+      type: "task_updated" as const, sessionId: "s", threadId: "t", seq: 5, ts: 5,
+      task: { id: "1", subject: "rename", status: "pending" as const, owner: "user", blocks: ["2"], blockedBy: [] as string[], metadata: { k: "v" } },
+    };
+    expect(SessionEvent.parse(tu)).toEqual(tu);
   });
 
   // CC AskUserQuestion parity: per-option `preview` and per-answer `notes` are additive/optional —
