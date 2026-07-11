@@ -427,7 +427,9 @@ export class AgentEngine {
       // `result` is only set by registry.complete() — a `stop()`-terminated entry never gets one,
       // so this must tolerate undefined rather than assume every terminal entry has a result.
       const resultHead = this.sanitizeForReminder((e.result ?? "").slice(0, 120));
-      return `- agent ${e.name ?? e.agentId} finished (${e.status}): ${resultHead}`;
+      // sanitize the label too: agentId is a safe th_+uuid today, but `name` becomes model-supplied
+      // in 4h-ii-b — route it through sanitizeForReminder now so it can never inject a fake block.
+      return `- agent ${this.sanitizeForReminder(e.name ?? e.agentId)} finished (${e.status}): ${resultHead}`;
     }).join("\n");
     const content = "<system-reminder>\nBackground agent"
       + (finished.length > 1 ? "s" : "")
@@ -939,6 +941,14 @@ export class AgentEngine {
                     console.error(`spawn_agent isolation:"worktree": teardown failed for ${isolatedWorktree.dir}: ${err instanceof Error ? err.message : String(err)}`);
                   }
                 }
+              })
+              .catch(() => {
+                // Terminal net (whole-branch review): the `.catch` above re-calls emit/
+                // completeThread, which can throw again for the same PERSISTENT cause (e.g. an
+                // appendFileSync IO fault on the completion emit), and `.finally` re-propagates —
+                // leaving the void-ed detached chain rejected with no handler. The synchronous
+                // path surfaces the same fault as a caught turn error, but a detached child has no
+                // caller to surface to, so swallow it here rather than emit an unhandled rejection.
               });
             // NOTE: only {agentId, status} — never the AbortController/registry entry itself —
             // ever reaches the model, via this tool_result JSON.
