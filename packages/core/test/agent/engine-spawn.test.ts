@@ -328,7 +328,16 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     expect(threads[1]!.threadId).toMatch(/^th_/);
   });
 
-  test("multi-turn: a child's internal chatter does NOT leak into the 2nd turn's history input (Seam #1 regression)", async () => {
+  // (Seam #1 regression, updated for history-parity Task 1): the invariant this guards is that the
+  // CHILD's OWN thread-tagged events (threadId != main) never leak into main's historyInput as
+  // separate message items — the thread filter is unchanged. What's now DIFFERENT (intentional,
+  // CC parity): the parent's OWN spawn_agent tool_result is a MAIN-thread event whose `output`
+  // legitimately embeds the child's final report text (that's how the bridge always reported it —
+  // see engine.ts's `outcome.output = result.value.finalText`), and main-thread tool_result events
+  // ARE now replayed across turns. So "SECRET-CHILD-CHATTER" DOES now appear — but only once, as
+  // that tool_result's `output`, never as a distinct `{type:"message",role:"assistant"}` item (which
+  // would mean the child's OWN assistant_message, mistagged or thread-filter-bypassed, leaked in).
+  test("multi-turn: a child's own thread-tagged assistant_message never leaks as a message item — its report legitimately appears only as the spawn_agent tool_result's output (Seam #1 regression)", async () => {
     const { engine, hub, sessionId, provider } = setup([
       [spawnCall("s1", "do X"), done("tool_calls")], // turn 1, parent round 0: spawn
       text("SECRET-CHILD-CHATTER"), // the child's only round — its assistant_message is tagged with the CHILD's threadId, not main
@@ -344,9 +353,23 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     const fp = provider as FakeProvider;
     // turn 2's only provider request is the last one recorded
     const req = fp.requests[fp.requests.length - 1]!;
-    const asText = JSON.stringify(req.input);
-    expect(asText).not.toContain("SECRET-CHILD-CHATTER");
+    const input = req.input as { type: string; role?: string; content?: unknown; callId?: string; output?: unknown }[];
+
+    // the child's OWN assistant_message (a different threadId) never leaks as a message item —
+    // scanned as a substring across ALL message-role items (any role, not just assistant), since a
+    // message item legitimately carrying this text under ANY role would mean the same leak. A
+    // tool_result item legitimately containing the text (replayed by design, asserted below) is
+    // untouched by this check because it's type "tool_result", not "message".
+    expect(
+      input.every((it) => !(it.type === "message" && typeof it.content === "string" && it.content.includes("SECRET-CHILD-CHATTER"))),
+    ).toBe(true);
+    // but the parent's OWN spawn_agent tool_result (a main-thread event) legitimately carries the
+    // child's report as its output, and — per history-parity Task 1 — main-thread tool_result
+    // events are now replayed across turns
+    expect(input.some((it) => it.type === "tool_result" && it.callId === "s1" && it.output === "SECRET-CHILD-CHATTER")).toBe(true);
+
     // sanity: the parent's own turn-1 assistant_message and the new user message ARE present
+    const asText = JSON.stringify(input);
     expect(asText).toContain("parent turn1 final report");
     expect(asText).toContain("second question");
   });

@@ -352,6 +352,22 @@ describe("SessionEvent discriminated union", () => {
     const t = { seq: 1, sessionId: SYSTEM_SESSION_ID, ts: 1 };
     expect(SessionEvent.safeParse({ ...t, type: "tile_action", actionId: "" }).success).toBe(false);
   });
+
+  // history-parity Task 3 (CC/Codex parity): an opaque provider reasoning item (Responses API),
+  // captured at output_item.done, persisted to the session JSONL and replayed verbatim into later
+  // requests. itemJson is SENSITIVE opaque state (encrypted_content) — clients deliberately don't
+  // model this variant (they skip unknown types, so it never renders) and NO generator fixture
+  // exists (see events.ts's doc comment). z.string().min(1) rejects an empty itemJson.
+  test("reasoning_item round-trips; the union accepts it; empty itemJson rejected", () => {
+    const e = {
+      ...base, threadId: "main", type: "reasoning_item",
+      itemJson: '{"type":"reasoning","summary":[],"encrypted_content":"EC1"}',
+    } as const;
+    const parsed = SessionEvent.parse(e);
+    expect(parsed).toEqual(e);
+    expect(parsed.type).toBe("reasoning_item" as SessionEvent["type"]);
+    expect(SessionEvent.safeParse({ ...base, threadId: "main", type: "reasoning_item", itemJson: "" }).success).toBe(false);
+  });
 });
 
 describe("hello method schemas", () => {

@@ -3,6 +3,7 @@ import { z } from "zod";
 export const ProviderEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("text_delta"), delta: z.string() }),
   z.object({ type: z.literal("tool_call"), callId: z.string().min(1), name: z.string().min(1), argsJson: z.string() }),
+  z.object({ type: z.literal("reasoning_item"), itemJson: z.string() }),
   z.object({ type: z.literal("usage"), inputTokens: z.number().int().nonnegative(), outputTokens: z.number().int().nonnegative() }),
   z.object({ type: z.literal("done"), stopReason: z.enum(["end_turn", "tool_calls", "aborted"]) }),
   z.object({
@@ -24,7 +25,8 @@ export interface ModelInfo {
 export type TurnInputItem =
   | { type: "message"; role: "user" | "assistant" | "system"; content: string }
   | { type: "function_call"; callId: string; name: string; argsJson: string }
-  | { type: "tool_result"; callId: string; output: string; isError?: boolean };
+  | { type: "tool_result"; callId: string; output: string; isError?: boolean }
+  | { type: "reasoning"; itemJson: string };
 
 export interface ToolSpec {
   name: string;

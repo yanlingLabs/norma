@@ -54,6 +54,13 @@ export const ToolCallEvent = ThreadBase.extend({
 export const ToolResultEvent = ThreadBase.extend({
   type: z.literal("tool_result"), callId: z.string().min(1), output: z.string(), isError: z.boolean(),
 });
+/** Opaque provider reasoning item (Responses API), captured at output_item.done and replayed
+ *  verbatim into later requests (CC/Codex parity — see the history-parity spec). itemJson is
+ *  SENSITIVE opaque state (encrypted_content): the session JSONL is its only sink; clients
+ *  (CLI/app) deliberately do NOT model this variant — both skip unknown event types, so it
+ *  never renders. Do NOT add a generator fixture: Swift's all-fixtures round-trip would degrade
+ *  it to unknownEvent and fail equality; TS tests cover the variant. */
+export const ReasoningItemEvent = ThreadBase.extend({ type: z.literal("reasoning_item"), itemJson: z.string().min(1) });
 export const ApprovalRequestedEvent = ThreadBase.extend({
   type: z.literal("approval_requested"), callId: z.string().min(1), toolName: z.string().min(1), summary: z.string(),
 });
@@ -262,6 +269,7 @@ export const SessionEvent = z.discriminatedUnion("type", [
   AssistantDeltaEvent,
   ToolCallEvent,
   ToolResultEvent,
+  ReasoningItemEvent,
   ApprovalRequestedEvent,
   ApprovalResolvedEvent,
   TurnCompletedEvent,

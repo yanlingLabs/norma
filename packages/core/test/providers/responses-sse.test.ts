@@ -37,6 +37,48 @@ describe("ResponsesSseParser", () => {
     expect(p.push(chunk)).toEqual([]);
   });
 
+  test("reasoning item on output_item.done → reasoning_item event (id/status stripped, encrypted_content verbatim)", () => {
+    const p = new ResponsesSseParser();
+    const chunk = new TextEncoder().encode(
+      'data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":"s"}],"encrypted_content":"OPAQUE"}}\n\n'
+    );
+    const events = p.push(chunk);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.type).toBe("reasoning_item");
+    expect(JSON.parse((events[0] as any).itemJson)).toEqual({
+      type: "reasoning",
+      summary: [{ type: "summary_text", text: "s" }],
+      encrypted_content: "OPAQUE",
+    });
+  });
+
+  test("reasoning item WITHOUT encrypted_content yields nothing (gate on replayable state, history-parity minor)", () => {
+    // With reasoning effort UNSET (no include:["reasoning.encrypted_content"]), a backend may still
+    // emit a summary-only reasoning item that carries NO encrypted_content — capturing + replaying it
+    // would persist opaque state with nothing to restore. Capture ONLY the replayable ones.
+    const p = new ResponsesSseParser();
+    const chunk = new TextEncoder().encode(
+      'data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":"s"}]}}\n\n'
+    );
+    expect(p.push(chunk)).toEqual([]);
+  });
+
+  test("reasoning item with EMPTY encrypted_content also yields nothing (non-empty gate)", () => {
+    const p = new ResponsesSseParser();
+    const chunk = new TextEncoder().encode(
+      'data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","status":"completed","summary":[],"encrypted_content":""}}\n\n'
+    );
+    expect(p.push(chunk)).toEqual([]);
+  });
+
+  test("unrecognized output_item.done item type still yields nothing (unchanged)", () => {
+    const p = new ResponsesSseParser();
+    const chunk = new TextEncoder().encode(
+      'data: {"type":"response.output_item.done","item":{"id":"ws_1","type":"web_search_call"}}\n\n'
+    );
+    expect(p.push(chunk)).toEqual([]);
+  });
+
   test("CRLF line endings are normalized (proxy compat)", () => {
     const p = new ResponsesSseParser();
     const chunk = new TextEncoder().encode(

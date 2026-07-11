@@ -410,29 +410,91 @@ export class AgentEngine {
     for (const e of events) {
       if (e.seq <= uptoSeq) continue;
       if ("threadId" in e && e.threadId !== MAIN_THREAD) continue;
-      if (e.type === "user_message") input.push({ type: "message", role: "user", content: e.text });
-      else if (e.type === "assistant_message") input.push({ type: "message", role: "assistant", content: e.text });
-      // Prior turns' tool calls are summarized by their assistant_message; current-turn
-      // call/result items are threaded in-memory below.
+      // CC parity: prior turns' tool calls/results are replayed verbatim (via the shared
+      // eventToInput mapper below), not just summarized by their assistant_message — the model
+      // no longer "forgets" what its tools did across turns. A checkpoint's `uptoSeq` is always a
+      // MESSAGE seq (Compactor only ever folds up to a user/assistant boundary — see
+      // compactor.ts's isMessage filter), so a tool_call/tool_result pair can never be split by a
+      // checkpoint: either both are folded into the summary, or both survive as tail. That
+      // guarantee is jointly held by TWO things, not one: (1) auto-compact runs at the start of a
+      // turn (see maybeAutoCompact's doc comment above), before this turn's tool calls exist, so
+      // there is never an in-flight pair for it to land inside; and (2) a manual `compact` IPC
+      // call is live mid-turn and CAN race a pending tool call (e.g. a steer flood during a slow
+      // approval), so compactor.ts's `compact` additionally clamps its candidate `uptoSeq` so it
+      // never lands inside an unresolved main-thread tool_call/tool_result pair — see that
+      // method's clamp comment. Only together do the two paths make the "never split" guarantee
+      // hold unconditionally.
+      const item = this.eventToInput(e);
+      if (item) input.push(item);
     }
-    return input;
+    return this.normalizeReplayOrder(input);
+  }
+
+  /** The ONE event→TurnInputItem mapping for history reconstruction (main + child threads must
+   *  stay in lockstep — both feed the provider). Returns null for events with no provider shape. */
+  private eventToInput(e: SessionEvent): TurnInputItem | null {
+    if (e.type === "user_message") return { type: "message", role: "user", content: e.text };
+    if (e.type === "assistant_message") return { type: "message", role: "assistant", content: e.text };
+    if (e.type === "tool_call") return { type: "function_call", callId: e.callId, name: e.name, argsJson: e.argsJson };
+    if (e.type === "tool_result") return { type: "tool_result", callId: e.callId, output: e.output, isError: e.isError };
+    // history-parity Task 3: opaque reasoning items replay verbatim (CC/Codex parity). This ONE
+    // case gives BOTH historyInput (cross-turn) and childHistoryInput (subagent resume) the replay.
+    if (e.type === "reasoning_item") return { type: "reasoning", itemJson: e.itemJson };
+    return null;
+  }
+
+  /** Replay-order normalization (whole-branch C1): a main-thread steer() persists its user_message
+   *  at SEND time, which can land in seq between a tool_call and its tool_result (the live loop
+   *  only drains steers at the next round top, so the PROVIDER never saw that interleaving). Replay
+   *  must mirror what the provider actually received: any message items found between a
+   *  function_call and its matching tool_result are deferred to immediately after that tool_result,
+   *  preserving their relative order. Reasoning/tool items are never reordered.
+   *
+   *  Single pass with a per-open-pair buffer: on a function_call, subsequent `{type:"message"}`
+   *  items buffer until the matching tool_result (same callId) is emitted, then flush in order right
+   *  after it. Edge cases (never drop an item): sequential pairs (fc1,res1,fc2,res2) buffer
+   *  independently; a function_call opening while a prior pair is still unresolved flushes that
+   *  prior buffer first (degenerate — shouldn't exist post-compactor-clamp); a function_call whose
+   *  matching tool_result never appears flushes its buffered messages at the end. Reasoning items
+   *  and any non-matching tool_result between a pair pass through in place — only messages defer. */
+  private normalizeReplayOrder(input: TurnInputItem[]): TurnInputItem[] {
+    const out: TurnInputItem[] = [];
+    let openCallId: string | null = null; // the function_call whose matching tool_result we await
+    let buffer: TurnInputItem[] = []; // message items deferred while that pair is open
+    for (const item of input) {
+      if (item.type === "function_call") {
+        // A new pair opens. If a prior pair never resolved (degenerate), flush its buffered
+        // messages before this call so nothing is dropped or reordered ahead of it.
+        if (buffer.length > 0) { out.push(...buffer); buffer = []; }
+        openCallId = item.callId;
+        out.push(item);
+      } else if (item.type === "tool_result" && openCallId !== null && item.callId === openCallId) {
+        // Close the open pair: result right after its call, then the deferred messages flush right
+        // after the result (mirroring the live [fc, result, steer] order).
+        out.push(item);
+        if (buffer.length > 0) { out.push(...buffer); buffer = []; }
+        openCallId = null;
+      } else if (item.type === "message" && openCallId !== null) {
+        buffer.push(item); // a message between a call and its matching result — defer it
+      } else {
+        out.push(item); // reasoning / non-matching tool_result / message outside any pair — in place
+      }
+    }
+    if (buffer.length > 0) out.push(...buffer); // open pair with no matching result — never drop
+    return out;
   }
 
   /** Reconstructs a SPECIFIC child thread's own history from the store, in seq order — the
-   *  foundation for `resume` (4h-ii-b Task 3). CRUCIAL DIFFERENCE from `historyInput` above:
-   *  historyInput replays only user/assistant MESSAGES (a main-thread turn's tool calls are
-   *  already summarized by the assistant's own text, so replaying tool_call/tool_result would
-   *  just duplicate context) — but a RESUMED child has no such summary to fall back on. Without
-   *  its own tool_call/tool_result pairs, a resumed child's replayed assistant_message text would
-   *  reference tool results (file contents, command output) the resumed model can no longer see,
-   *  and it has no way to re-run those tools mid-history. So this maps ALL FOUR event types,
-   *  reproducing the exact TurnInputItem shapes runThread's own dispatch loop pushes into `input`
-   *  live (see runThread's `input.push({type:"function_call",...})` / `input.push({type:
-   *  "tool_result",...})` calls above) — a resumed child's reconstructed history is
-   *  indistinguishable, shape-wise, from a child that never stopped.
-   *
-   *  No checkpoint/compaction handling (unlike historyInput): child threads are never compacted
-   *  today, so there is no per-child checkpoint event to fast-forward past.
+   *  foundation for `resume` (4h-ii-b Task 3). CRUCIAL DIFFERENCE from `historyInput` above is now
+   *  FILTERING, not mapping: both callers delegate to the same `eventToInput` mapper above, so a
+   *  main-thread turn's tool calls/results and a child's replay exactly the same shapes. The
+   *  difference is which events reach the mapper — historyInput fast-forwards past a checkpoint's
+   *  `uptoSeq` and keeps only the MAIN thread; this reconstructs ALL of one specific child
+   *  thread's events, unfiltered by any checkpoint (child threads are never compacted today, so
+   *  there is no per-child checkpoint event to fast-forward past). A resumed child needs its own
+   *  tool_call/tool_result pairs (unlike a main-thread turn, it has no assistant-text summary to
+   *  fall back on for what its tools did), so this reconstruction is indistinguishable, shape-wise,
+   *  from a child that never stopped.
    *
    *  KNOWN GAP (not fixed here — see this task's report): a child thread's ORIGINAL spawn prompt
    *  is never itself persisted as a `user_message` event scoped to that threadId — the spawn
@@ -448,12 +510,13 @@ export class AgentEngine {
     const input: TurnInputItem[] = [];
     for (const e of events) {
       if (!("threadId" in e) || e.threadId !== threadId) continue;
-      if (e.type === "user_message") input.push({ type: "message", role: "user", content: e.text });
-      else if (e.type === "assistant_message") input.push({ type: "message", role: "assistant", content: e.text });
-      else if (e.type === "tool_call") input.push({ type: "function_call", callId: e.callId, name: e.name, argsJson: e.argsJson });
-      else if (e.type === "tool_result") input.push({ type: "tool_result", callId: e.callId, output: e.output, isError: e.isError });
+      const item = this.eventToInput(e);
+      if (item) input.push(item);
     }
-    return input;
+    // whole-branch C1: child history is already structurally clean (send_message persists at the
+    // DRAIN, not at send), so this is a pure no-op today — applied here for uniformity and to guard
+    // any future child-scoped persist-at-send source (mirrors historyInput above).
+    return this.normalizeReplayOrder(input);
   }
 
   // Shared by every <system-reminder> builder below (taskListReminder, buildBgCompletionReminder):
@@ -802,6 +865,11 @@ export class AgentEngine {
 
       let textBuf = "";
       const calls: Extract<ProviderEvent, { type: "tool_call" }>[] = [];
+      // history-parity Task 3: this round's opaque reasoning items, in provider emission order.
+      // Prefixed ahead of the round's message/function_calls below, then cleared (must not leak
+      // into the next round of the same turn). Empty when the provider emits none → the round's
+      // input assembly is byte-identical to the pre-change behavior.
+      const roundReasoning: string[] = [];
       let stop: "end_turn" | "tool_calls" | "aborted" | null = null;
 
       // Pins recomputed EVERY round (unlike buildInstructionsFull's once-per-thread read above) —
@@ -831,6 +899,12 @@ export class AgentEngine {
           if (ev.delta.length > 0) this.cfg.hub.broadcastTransient(sessionId, { type: "assistant_delta", sessionId, threadId, delta: ev.delta });
         }
         else if (ev.type === "tool_call") calls.push(ev);
+        else if (ev.type === "reasoning_item") {
+          roundReasoning.push(ev.itemJson);
+          // Persist AT ARRIVAL so seq order = provider emission order (the replay-order invariant,
+          // spec §B4/§B6). itemJson is sensitive-opaque: this append is its only sink — never log it.
+          this.emit(sessionId, { type: "reasoning_item", sessionId, threadId, itemJson: ev.itemJson });
+        }
         else if (ev.type === "usage") { usage.inputTokens += ev.inputTokens; usage.outputTokens += ev.outputTokens; }
         else if (ev.type === "done") stop = ev.stopReason;
         else if (ev.type === "error") {
@@ -846,6 +920,15 @@ export class AgentEngine {
           return { finalText: lastText, stopReason: "error", errorMessage: ev.message };
         }
       }
+
+      // Emission-order replay (spec §B4): reasoning items precede the round's message/function_calls.
+      // Simplification, documented: all of a round's reasoning items are prefixed as a block in
+      // arrival order (the Responses API emits reasoning before the items it reasons for — codex
+      // report §13.1; a hypothetical mid-batch reasoning item would be hoisted to the block, never
+      // dropped/reordered relative to other reasoning items). Empty roundReasoning → no-op, so the
+      // no-reasoning path (every non-reasoning provider) is byte-identical to before.
+      for (const r of roundReasoning) input.push({ type: "reasoning", itemJson: r });
+      roundReasoning.length = 0;
 
       if (textBuf.length > 0) {
         this.emit(sessionId, { type: "assistant_message", sessionId, threadId, text: textBuf });
@@ -1734,7 +1817,16 @@ export class AgentEngine {
     // right — only the last-event shape does. "Resume a capped agent for more turns" is a headline
     // use case, so reject it GRACEFULLY here rather than let a malformed provider input through.
     const priorHistory = this.childHistoryInput(sessionId, entry.threadId);
-    const lastPrior = priorHistory[priorHistory.length - 1];
+    // whole-branch #3: a cleanly-finished child whose FINAL round emitted a reasoning item then
+    // ended the turn with EMPTY assistant text (see runThread's `if (textBuf.length > 0)` — no
+    // assistant_message persisted) leaves a TRAILING reasoning item as its last reconstructed item.
+    // Reasoning is opaque, ORDER-TRANSPARENT state (it always PRECEDES the item it reasons for), so
+    // it must not count as the terminal shape: walk back past any trailing reasoning items to the
+    // last REAL item, then apply the assistant-turn check on THAT. A [tool_result, reasoning] tail
+    // (mid-tool + stray reasoning) still lands on the tool_result → correctly still rejected.
+    let lastIdx = priorHistory.length - 1;
+    while (lastIdx >= 0 && priorHistory[lastIdx]!.type === "reasoning") lastIdx--;
+    const lastPrior = priorHistory[lastIdx];
     if (!lastPrior || !(lastPrior.type === "message" && lastPrior.role === "assistant")) {
       return { output: `agent '${resumeArg}' didn't finish cleanly and can't be resumed`, isError: true };
     }
