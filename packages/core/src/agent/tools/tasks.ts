@@ -99,7 +99,7 @@ export function registerTaskTools(r: ToolRegistry, deps: { tasks: TaskStore }): 
   });
   r.register({
     name: "task_get",
-    description: "Get a task's full details (subject, description, status, activeForm) by id from task_list.",
+    description: "Get a task's full details (subject, description, status, activeForm, owner, blocks, blockedBy, metadata) by id from task_list.",
     args: TaskGetArgsSchema,
     // New in 4g Task 4 (CC parity: task_create/task_update/task_list already existed — this
     // rounds out the CRUD set with a single-task read). Registered deferred: true on just this
