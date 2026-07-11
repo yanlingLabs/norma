@@ -174,4 +174,90 @@ describe("task tools", () => {
       expect(out.isError).toBe(true);
     });
   });
+
+  // task-graph fields (4h-ii-d, CC parity): task_update gains addBlocks/addBlockedBy/owner/metadata.
+  describe("task_update task-graph fields", () => {
+    test("addBlocks appends + dedupes (Set union, insertion order preserved)", async () => {
+      const events: Task[] = [];
+      const store = new TaskStore();
+      const r = buildRegistry(store);
+      await r.execute("task_create", { subject: "work", description: "do it" }, ctx());
+      const u1 = await r.execute("task_update", { taskId: "1", addBlocks: ["2"] }, ctx({ taskEvent: (t) => events.push(t) }));
+      expect(u1.isError).toBe(false);
+      expect(events.at(-1)!.blocks).toEqual(["2"]);
+      const u2 = await r.execute("task_update", { taskId: "1", addBlocks: ["2", "3"] }, ctx({ taskEvent: (t) => events.push(t) }));
+      expect(u2.isError).toBe(false);
+      expect(events.at(-1)!.blocks).toEqual(["2", "3"]);
+    });
+
+    test("addBlockedBy appends + dedupes the same way", async () => {
+      const events: Task[] = [];
+      const store = new TaskStore();
+      const r = buildRegistry(store);
+      await r.execute("task_create", { subject: "work", description: "do it" }, ctx());
+      await r.execute("task_update", { taskId: "1", addBlockedBy: ["9"] }, ctx({ taskEvent: (t) => events.push(t) }));
+      expect(events.at(-1)!.blockedBy).toEqual(["9"]);
+      await r.execute("task_update", { taskId: "1", addBlockedBy: ["9", "10"] }, ctx({ taskEvent: (t) => events.push(t) }));
+      expect(events.at(-1)!.blockedBy).toEqual(["9", "10"]);
+    });
+
+    test("owner sets then replaces", async () => {
+      const events: Task[] = [];
+      const store = new TaskStore();
+      const r = buildRegistry(store);
+      await r.execute("task_create", { subject: "work", description: "do it" }, ctx());
+      await r.execute("task_update", { taskId: "1", owner: "researcher" }, ctx({ taskEvent: (t) => events.push(t) }));
+      expect(events.at(-1)!.owner).toBe("researcher");
+      await r.execute("task_update", { taskId: "1", owner: "user" }, ctx({ taskEvent: (t) => events.push(t) }));
+      expect(events.at(-1)!.owner).toBe("user");
+    });
+
+    test("metadata shallow-merges: new keys win, old keys survive", async () => {
+      const events: Task[] = [];
+      const store = new TaskStore();
+      const r = buildRegistry(store);
+      await r.execute("task_create", { subject: "work", description: "do it" }, ctx());
+      await r.execute("task_update", { taskId: "1", metadata: { a: 1 } }, ctx({ taskEvent: (t) => events.push(t) }));
+      expect(events.at(-1)!.metadata).toEqual({ a: 1 });
+      await r.execute("task_update", { taskId: "1", metadata: { b: 2 } }, ctx({ taskEvent: (t) => events.push(t) }));
+      expect(events.at(-1)!.metadata).toEqual({ a: 1, b: 2 });
+    });
+
+    test("a plain status update on a task with graph fields preserves them", async () => {
+      const store = new TaskStore();
+      const r = buildRegistry(store);
+      await r.execute("task_create", { subject: "work", description: "do it" }, ctx());
+      await r.execute("task_update", { taskId: "1", addBlocks: ["2"], owner: "researcher", metadata: { a: 1 } }, ctx());
+      const u = await r.execute("task_update", { taskId: "1", status: "in_progress" }, ctx());
+      expect(u.isError).toBe(false);
+      const got = store.get("s", "1");
+      expect(got).toMatchObject({ status: "in_progress", blocks: ["2"], owner: "researcher", metadata: { a: 1 } });
+    });
+
+    test("task_get renders owner/blocks/blockedBy/metadata when present; omits when absent", async () => {
+      const store = new TaskStore();
+      const r = buildRegistry(store);
+      await r.execute("task_create", { subject: "work", description: "do it" }, ctx());
+      const bare = await r.execute("task_get", { taskId: "1" }, ctx());
+      expect(bare.output).not.toContain("owner:");
+      expect(bare.output).not.toContain("blocks:");
+      expect(bare.output).not.toContain("blockedBy:");
+      expect(bare.output).not.toContain("metadata:");
+
+      await r.execute("task_update", { taskId: "1", owner: "researcher", addBlocks: ["2", "3"], addBlockedBy: ["9"], metadata: { k: "v" } }, ctx());
+      const out = await r.execute("task_get", { taskId: "1" }, ctx());
+      expect(out.output).toContain("owner: researcher");
+      expect(out.output).toContain("blocks: 2, 3");
+      expect(out.output).toContain("blockedBy: 9");
+      expect(out.output).toContain(`metadata: ${JSON.stringify({ k: "v" })}`);
+    });
+
+    test("addBlocks/addBlockedBy/metadata on an unknown taskId → isError 'no such task'", async () => {
+      const store = new TaskStore();
+      const r = buildRegistry(store);
+      const out = await r.execute("task_update", { taskId: "999", addBlocks: ["1"] }, ctx());
+      expect(out.isError).toBe(true);
+      expect(out.output).toContain("no such task");
+    });
+  });
 });

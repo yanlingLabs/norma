@@ -218,6 +218,15 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         public let subject: String
         public let status: String
         public let activeForm: String?
+        /// Task-graph fields (4h-ii-d, CC parity) — optional/additive, decode-only: absent in
+        /// older-shaped payloads, which decode with all four nil. `metadata` mirrors TS's
+        /// `z.record(z.string(), z.unknown())`, hence the existing `JSONValue` type (declared
+        /// below, reused here rather than `[String: String]`) — a task's metadata is
+        /// heterogeneous (e.g. `"priority": "high"` alongside `"sprint": 12`).
+        public let owner: String?
+        public let blocks: [String]?
+        public let blockedBy: [String]?
+        public let metadata: [String: JSONValue]?
     }
 
     public struct QuestionAsked: Codable, Equatable, Sendable {

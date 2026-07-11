@@ -1,0 +1,25 @@
+{
+  "type": "task_updated",
+  "sessionId": "s_1",
+  "threadId": "t_1",
+  "seq": 30,
+  "ts": 1700000000020,
+  "task": {
+    "id": "4",
+    "subject": "wire the task graph",
+    "status": "in_progress",
+    "activeForm": "Wiring the task graph",
+    "owner": "researcher",
+    "blocks": [
+      "5",
+      "6"
+    ],
+    "blockedBy": [
+      "2"
+    ],
+    "metadata": {
+      "priority": "high",
+      "sprint": 12
+    }
+  }
+}
