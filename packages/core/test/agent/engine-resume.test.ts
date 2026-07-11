@@ -341,4 +341,76 @@ describe("AgentEngine: spawn_agent resume (4h-ii-b Task 3)", () => {
     // so the next turn's completion reminder can surface it (CC parity)
     expect(bgAgents.get("worker", sessionId)).toMatchObject({ status: "completed", notified: false });
   });
+
+  // FINDING 1 (T3 review, IMPORTANT): resuming a child whose stored history does NOT end on an
+  // assistant turn (a capped/failed/mid-tool child — its last event is a tool_result or an orphan
+  // function_call) must be REJECTED with a typed error BEFORE any side effect, never handed to the
+  // provider as [...tool_result, user(newPrompt)] (a non-standard adjacency; the orphan-function_call
+  // variant is a near-certain hard provider reject — openai-compatible mapInput is a blind 1:1 map).
+  // This is a HISTORY-SHAPE check, not a status check: status is orthogonal to last-event shape (a
+  // human-denied child is `completed` yet ends on a tool_result; a capped child is `failed`; a
+  // cleanly-stopped child is `stopped` yet ends on an assistant turn and SHOULD resume). Seed the
+  // child's stored history to END ON A TOOL_RESULT. Doubles as the tool-interleaving coverage the
+  // review flagged as missing.
+  test("(F1) resume a child whose history ends on a tool_result → typed isError, no ghost thread, no persist", async () => {
+    const { engine, store, sessionId, provider, bgAgents } = setup([
+      [spawnNamed("s1", "do the task", "worker"), done("tool_calls")], // turn 1: spawn (completes clean)
+      text("child-out-1"),                                             // child run 1 (ends on assistant)
+      text("parent turn1"),
+      [resumeCall("r1", "worker", "continue"), done("tool_calls")],    // turn 2: resume attempt → guard fires
+      text("parent turn2"),                                           // main continuation after the isError
+    ]);
+    await engine.runTurn(sessionId); // turn 1: spawn worker, it completes cleanly
+    const worker = bgAgents.get("worker", sessionId)!;
+
+    // Make the child's stored history END ON A TOOL_RESULT — a trailing tool_call + tool_result with
+    // no closing assistant_message (the shape a capped / mid-tool child leaves behind).
+    store.append(sessionId, { type: "tool_call", sessionId, threadId: worker.threadId, callId: "orphan", name: "read", argsJson: "{}" });
+    store.append(sessionId, { type: "tool_result", sessionId, threadId: worker.threadId, callId: "orphan", output: "partial", isError: false });
+
+    await engine.runTurn(sessionId); // turn 2: resume "worker" with "continue" → clean-termination guard fires
+
+    const events = store.read(sessionId);
+    const result = events.find((e) => e.type === "tool_result" && e.callId === "r1");
+    expect(result).toMatchObject({ isError: true });
+    expect((result as Extract<SessionEvent, { type: "tool_result" }>).output).toContain("didn't finish cleanly");
+
+    // no ghost thread: the guard fired BEFORE the thread_started re-emit → still exactly ONE
+    // thread_started for the child (the spawn), not a second one for the aborted resume.
+    const childStarts = events.filter((e) => e.type === "thread_started" && e.threadId === worker.threadId);
+    expect(childStarts.length).toBe(1);
+
+    // guard fired BEFORE the user_message persist → the new prompt was NOT appended to the child's history
+    const childUserMsgs = events.filter((e) => e.type === "user_message" && e.threadId === worker.threadId);
+    expect(childUserMsgs.some((e) => (e as Extract<SessionEvent, { type: "user_message" }>).text === "continue")).toBe(false);
+
+    // the child never re-ran — only turn 1's 3 calls + turn 2's 2 parent rounds hit the provider
+    expect((provider as FakeProvider).requests.length).toBe(5);
+  });
+
+  // FINDING 2 (T3 review, MINOR): an isolation:"worktree" child's worktree is torn down on clean
+  // completion, so on resume rc.roots points at a removed dir → fs/bash tools would fence to a gone
+  // directory and error confusingly. Reject with a typed error up front. Seed a CLEAN child (ends on
+  // an assistant turn, so the clean-termination guard passes and we actually reach this guard), then
+  // point its captured resume.roots at a bogus path to simulate the removed worktree.
+  test("(F2) resume an isolated child whose worktree was removed → typed isError", async () => {
+    const { engine, store, sessionId, bgAgents } = setup([
+      [spawnNamed("s1", "do the task", "worker"), done("tool_calls")], // turn 1: spawn (completes clean)
+      text("child-out-1"),                                             // child run 1 (ends on assistant)
+      text("parent turn1"),
+      [resumeCall("r1", "worker", "continue"), done("tool_calls")],    // turn 2: resume attempt → guard fires
+      text("parent turn2"),
+    ]);
+    await engine.runTurn(sessionId); // turn 1: spawn worker cleanly
+    const worker = bgAgents.get("worker", sessionId)!;
+    // simulate an isolated child whose worktree was torn down: point the captured roots at a path
+    // that does not exist (mutates the live registry entry by reference, so rc.roots sees it).
+    worker.resume!.roots = ["/norma-nonexistent-worktree-4h-ii-b/gone"];
+
+    await engine.runTurn(sessionId); // turn 2: resume → worktree guard fires
+
+    const result = store.read(sessionId).find((e) => e.type === "tool_result" && e.callId === "r1");
+    expect(result).toMatchObject({ isError: true });
+    expect((result as Extract<SessionEvent, { type: "tool_result" }>).output).toContain("worktree was removed");
+  });
 });

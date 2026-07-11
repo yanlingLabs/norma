@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import type { NewSessionEvent, Question, SessionEvent, Task } from "@norma/protocol";
 import type { SessionStore } from "../sessions/store";
 import type { SessionHub } from "../sessions/hub";
@@ -1399,6 +1400,40 @@ export class AgentEngine {
     // Defensive (Task 1's contract): an entry may predate the resume-context capture, or have been
     // registered by a caller that never built one — such an agent is simply not resumable.
     if (!rc) return { output: `agent '${resumeArg}' has no saved context to resume`, isError: true };
+
+    // T3 REVIEW (IMPORTANT) — CLEAN-TERMINATION guard, by HISTORY SHAPE, not by status. Reconstruct
+    // the child's PRE-EXISTING stored history HERE (before the reopen / thread_started re-emit /
+    // user_message persist below, so it reflects the child's TRUE end state) and require it to END ON
+    // AN ASSISTANT TURN. This directly enforces D1's alternation invariant regardless of status: a
+    // cleanly COMPLETED or cleanly STOPPED child ends on an assistant_message and IS resumable; a
+    // capped / failed / mid-tool child ends on a tool_result or an orphan function_call (or has no
+    // history) and is NOT — resuming it would persist user(newPrompt) after that trailing item and
+    // hand the provider [...tool_result, user] (non-standard adjacency) or [...function_call, user]
+    // (orphan call → near-certain hard reject), since openai-compatible.ts mapInput is a blind 1:1
+    // map with no coalescing/validation.
+    //   A STATUS CHECK IS INSUFFICIENT — status is orthogonal to last-event shape (verified against
+    // this file): the tool-iteration cap path (~:1362) returns stopReason:"error" → the completion
+    // fork (~:1188) maps that to isError:true → complete(ok:false) → status "failed" (NOT
+    // "completed"); the human-denied path (~:1354) emits the denied tool_result then returns
+    // stopReason:"end_turn" → isError:false → complete(ok:true) → status "completed" YET its last
+    // child event is a tool_result; and a cleanly-stopped child is status "stopped" yet ends on an
+    // assistant turn and SHOULD resume. So neither `=== "completed"` nor `!== "failed"` gets this
+    // right — only the last-event shape does. "Resume a capped agent for more turns" is a headline
+    // use case, so reject it GRACEFULLY here rather than let a malformed provider input through.
+    const priorHistory = this.childHistoryInput(sessionId, entry.threadId);
+    const lastPrior = priorHistory[priorHistory.length - 1];
+    if (!lastPrior || !(lastPrior.type === "message" && lastPrior.role === "assistant")) {
+      return { output: `agent '${resumeArg}' didn't finish cleanly and can't be resumed`, isError: true };
+    }
+
+    // T3 REVIEW (MINOR) — REMOVED-WORKTREE guard. An isolation:"worktree" child's worktree is torn
+    // down on clean completion, so on resume rc.roots points at a possibly-removed dir; the fs/bash
+    // tools would then fence to a gone directory and error confusingly mid-run. rc.roots is only set
+    // when the child WAS isolated (undefined → a plain-cwd child, skip); rc.roots[0] is the primary
+    // cwd by contract. Reject up front rather than fail confusingly later.
+    if (rc.roots && rc.roots[0] && !existsSync(rc.roots[0])) {
+      return { output: `cannot resume an isolated agent '${resumeArg}'; its worktree was removed`, isError: true };
+    }
 
     const agentType = rc.agentType ?? "general-purpose";
 
