@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PluginStore, consentComplete, pluginMcpEligible, pluginSpawnEligible, type PluginInfo } from "../../src/agent/plugins";
+import { PluginStore, consentComplete, pluginMcpEligible, pluginHooksEligible, pluginSpawnEligible, type PluginInfo } from "../../src/agent/plugins";
 import { execPayloadLines, loadManifest, requiredConsentClasses, type NormaManifest } from "../../src/agent/plugin-manifest";
 
 function home(): string { return mkdtempSync(join(tmpdir(), "norma-plugins-")); }
@@ -107,6 +107,35 @@ describe("PluginStore + norma-plugin.json", () => {
     // Phase 4b Task 3 addition — entry carried the same way (daemon.ts's PluginSupervisor wiring
     // reads p.entry directly, no second manifest read).
     expect(p.entry).toEqual({ command: "node", args: ["index.js"] });
+  });
+
+  test("contributes.hooks → manifestHooks carried verbatim (Phase 4f Task 2)", () => {
+    const h = home();
+    normaPlugin(h, "demo", {
+      id: "demo", tier: "capability",
+      contributes: { hooks: [{ event: "pre-tool", command: "./deny.sh", timeoutMs: 500 }, { event: "post-tool", command: "./observe.sh" }] },
+    });
+    const [p] = new PluginStore({ normaHome: h }).list();
+    if (!p) throw new Error("expected one plugin");
+    expect(p.manifestHooks).toEqual([
+      { event: "pre-tool", command: "./deny.sh", timeoutMs: 500 },
+      { event: "post-tool", command: "./observe.sh" },
+    ]);
+  });
+
+  test("no contributes.hooks → manifestHooks undefined", () => {
+    const h = home();
+    normaPlugin(h, "demo", { id: "demo", tier: "capability", contributes: { skills: true } });
+    const [p] = new PluginStore({ normaHome: h }).list();
+    if (!p) throw new Error("expected one plugin");
+    expect(p.manifestHooks).toBeUndefined();
+  });
+
+  test("legacy plugin (no norma-plugin.json) → manifestHooks undefined", () => {
+    const h = home(); plugin(h, "demo", { mcp: true });
+    const [p] = new PluginStore({ normaHome: h }).list();
+    if (!p) throw new Error("expected one plugin");
+    expect(p.manifestHooks).toBeUndefined();
   });
 
   test("no entry declared → PluginInfo.entry undefined (capability-tier / skills-only plugins)", () => {
@@ -332,6 +361,54 @@ describe("pluginMcpEligible", () => {
     }).list();
     if (!p) throw new Error("expected one plugin");
     expect(pluginMcpEligible(p)).toBe(true);
+  });
+});
+
+describe("pluginHooksEligible (Phase 4f Task 2)", () => {
+  const oneHook = [{ event: "pre-tool" as const, command: "./deny.sh" }];
+
+  test("enabled + manifestHooks + not disabled + no consent required → eligible", () => {
+    expect(pluginHooksEligible(mkPluginInfo({ mcpEnabled: true, manifestHooks: oneHook, legacy: false }))).toBe(true);
+  });
+  test("not enabled → not eligible", () => {
+    expect(pluginHooksEligible(mkPluginInfo({ mcpEnabled: false, manifestHooks: oneHook, legacy: false }))).toBe(false);
+  });
+  test("disabled beats enabled → not eligible", () => {
+    expect(pluginHooksEligible(mkPluginInfo({ mcpEnabled: true, disabled: true, manifestHooks: oneHook, legacy: false }))).toBe(false);
+  });
+  test("no hooks declared (manifestHooks undefined) → not eligible even if enabled", () => {
+    expect(pluginHooksEligible(mkPluginInfo({ mcpEnabled: true, manifestHooks: undefined, legacy: false }))).toBe(false);
+  });
+  test("empty hooks array → not eligible", () => {
+    expect(pluginHooksEligible(mkPluginInfo({ mcpEnabled: true, manifestHooks: [], legacy: false }))).toBe(false);
+  });
+  test("hooks require exec: enabled but unconsented → not eligible", () => {
+    expect(pluginHooksEligible(mkPluginInfo({
+      mcpEnabled: true, manifestHooks: oneHook, legacy: false, requiredConsents: ["exec"], consented: [],
+    }))).toBe(false);
+  });
+  test("hooks require exec: enabled + consented → eligible", () => {
+    expect(pluginHooksEligible(mkPluginInfo({
+      mcpEnabled: true, manifestHooks: oneHook, legacy: false, requiredConsents: ["exec"], consented: ["exec"],
+    }))).toBe(true);
+  });
+
+  test("end-to-end through a real PluginStore fixture: hooks present, unconsented → excluded", () => {
+    const h = home();
+    normaPlugin(h, "demo", { id: "demo", tier: "capability", contributes: { hooks: [{ event: "pre-tool", command: "./deny.sh" }] } });
+    const [p] = new PluginStore({ normaHome: h, plugins: { enabled: ["demo"] } }).list();
+    if (!p) throw new Error("expected one plugin");
+    expect(p.requiredConsents).toContain("exec");
+    expect(pluginHooksEligible(p)).toBe(false);
+  });
+  test("end-to-end: same plugin, once exec-consented → included", () => {
+    const h = home();
+    normaPlugin(h, "demo", { id: "demo", tier: "capability", contributes: { hooks: [{ event: "pre-tool", command: "./deny.sh" }] } });
+    const [p] = new PluginStore({
+      normaHome: h, plugins: { enabled: ["demo"] }, consents: { demo: { exec: Date.now() } },
+    }).list();
+    if (!p) throw new Error("expected one plugin");
+    expect(pluginHooksEligible(p)).toBe(true);
   });
 });
 

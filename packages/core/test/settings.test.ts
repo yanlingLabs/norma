@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadSettings, loadPermissionDirs, addLocalDir, saveSettings, Settings, REASONING_EFFORTS, setProviderModel, setReasoningEffort } from "../src/settings";
+import { loadSettings, loadPermissionDirs, addLocalDir, saveSettings, Settings, REASONING_EFFORTS, setProviderModel, setReasoningEffort, hooksEnabledFrom } from "../src/settings";
 import { DEFAULT_CODEX_MODEL } from "../src/providers/codex-config";
 import { mkdirSync, writeFileSync as wf } from "node:fs";
 
@@ -205,6 +205,39 @@ describe("loadSettings", () => {
       expect(s.provider.reasoningEffort).toBe(effort);
     }
     expect(() => Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.6-sol", reasoningEffort: "bogus" } })).toThrow();
+  });
+
+  test("hooks config parses; absent → undefined", () => {
+    const s = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, hooks: { enabled: false } });
+    expect(s.hooks).toEqual({ enabled: false });
+    expect(Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" } }).hooks).toBeUndefined();
+  });
+
+  test("legacy migration keeps working with hooks field absent", () => {
+    const p = tmpSettings({ legacyCustom: { provider: "disabled" } });
+    const s = loadSettings(p);
+    expect(s.schemaVersion).toBe(2);
+    expect(s.hooks).toBeUndefined();
+  });
+});
+
+describe("hooksEnabledFrom (4f: hooks.enabled default-ON semantics)", () => {
+  const base = { schemaVersion: 2 as const, provider: { type: "codex-oauth" as const, model: "gpt-5.4" } };
+
+  test("hooks block absent → enabled", () => {
+    expect(hooksEnabledFrom(Settings.parse(base))).toBe(true);
+  });
+
+  test("hooks.enabled absent (block present, field absent) → enabled", () => {
+    expect(hooksEnabledFrom(Settings.parse({ ...base, hooks: {} }))).toBe(true);
+  });
+
+  test("hooks.enabled: true → enabled", () => {
+    expect(hooksEnabledFrom(Settings.parse({ ...base, hooks: { enabled: true } }))).toBe(true);
+  });
+
+  test("hooks.enabled: false → disabled", () => {
+    expect(hooksEnabledFrom(Settings.parse({ ...base, hooks: { enabled: false } }))).toBe(false);
   });
 });
 
