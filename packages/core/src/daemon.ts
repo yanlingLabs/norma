@@ -26,6 +26,7 @@ import { registerNotebookTool } from "./agent/tools/notebook";
 import { registerWorktreeTools } from "./agent/tools/worktree";
 import { registerSpawnAgentTool } from "./agent/tools/spawn";
 import { registerSendMessageTool } from "./agent/tools/send-message";
+import { registerTaskStopTool } from "./agent/tools/task-stop";
 import { registerWebTools } from "./agent/tools/web";
 import { McpManager } from "./agent/mcp/manager";
 import { PermissionGate } from "./agent/gate";
@@ -317,6 +318,12 @@ export async function startDaemon(opts: {
     // bridge; this DEF is what the model sees, the engine intercepts the call (see engine.ts's
     // sendMessageCalls bridge). Excluded from every child's tool set (depth-0 only).
     registerSendMessageTool(registry);
+    // 4h-ii-c Task 2 (CC TaskStop): registered alongside spawn_agent/send_message — the SAME
+    // `bgAgents`/`bgRegistry` instances the engine cfg gets below, so a stop here is visible to
+    // the engine's own pin/completion-reminder bookkeeping. Unlike spawn_agent/send_message this
+    // is a PLAIN TOOL (no engine bridge — see task-stop.ts's own doc comment), deferred like
+    // bash_kill (registerBackgroundTools above).
+    registerTaskStopTool(registry, { bgAgents, bgRegistry, deferred: true });
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
     await mcp.startAll(settings?.mcpServers ?? {});
     // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled &&

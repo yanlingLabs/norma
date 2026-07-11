@@ -344,7 +344,12 @@ export class AgentEngine {
     if (meta.approvalPolicy === "plan") pins.add("exit_plan_mode");
     if (this.cfg.worktrees?.active(sessionId)) pins.add("exit_worktree");
     const bgTasks = this.cfg.bgRegistry?.list(sessionId) ?? [];
-    if (bgTasks.some((t) => t.status === "running")) { pins.add("bash_output"); pins.add("bash_kill"); }
+    // 4h-ii-c Task 2: task_stop can kill a running bg TASK too (its bash-unify path, mirroring
+    // bash_kill) — pinned alongside bash_output/bash_kill whenever one is running.
+    if (bgTasks.some((t) => t.status === "running")) { pins.add("bash_output"); pins.add("bash_kill"); pins.add("task_stop"); }
+    // task_stop is ALSO pinned whenever a bg AGENT is running (independent of any bg bash task) —
+    // that's its primary target (CC TaskStop parity: stop a running background agent).
+    if (this.cfg.bgAgents?.list(sessionId).some((e) => e.status === "running")) pins.add("task_stop");
     return pins;
   }
 
@@ -1013,8 +1018,11 @@ export class AgentEngine {
           // thread orchestrates. Belt-and-braces with the bridge's own `opts.depth === 0` gate on
           // sendMessageCalls above. Captured into resumeCtx.excludeTools below, so a resumed child
           // stays excluded too.
+          // 4h-ii-c Task 2: task_stop is excluded from EVERY child UNCONDITIONALLY too, same
+          // rationale — v1 depth-0-only: a child must not be able to kill its siblings' or its
+          // parent's OWN background agents/tasks, only the main thread orchestrates.
           const childDepth = opts.depth + 1;
-          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode", "send_message"]);
+          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode", "send_message", "task_stop"]);
           if (childDepth >= maxDepth) childExcludeTools.add("spawn_agent");
           // 4h-ii-b Task 1: instructionsFull is computed ONCE here — hoisted out of the bg and
           // sync closures below, which used to each build their own copy independently — so it
