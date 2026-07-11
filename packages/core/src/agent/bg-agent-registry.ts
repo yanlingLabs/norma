@@ -142,7 +142,7 @@ export class BackgroundAgentRegistry {
    * spawn bridge) can re-run its child thread. `register()` REJECTS a known agentId (re-
    * registration is a caller bug there), so resume needs this dedicated re-open path instead.
    *
-   * If the entry exists AND is terminal (completed/failed/stopped): flips status → running, clears
+   * If the entry exists AND is terminal (completed/failed/stopped/timeout): flips status → running, clears
    * the stale `result`, resets `notified` to false (so the resumed run's OWN completion reminder
    * re-fires — CC parity: a resumed agent that finishes again notifies again), and swaps in the
    * resume attempt's fresh AbortController (`abort` is never reused across runs). Returns true.

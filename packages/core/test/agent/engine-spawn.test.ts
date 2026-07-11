@@ -1618,6 +1618,40 @@ describe("AgentEngine: spawn_agent run_in_background (4h-ii-a)", () => {
       spy.mockRestore();
     }
   });
+
+  // Whole-branch review C1 (4h-ii-c): the untimed relax above must be scoped to DEPTH 0 ONLY.
+  // task_stop — the sole kill mechanism for an untimed agent — is main-thread-only (it's in
+  // childExcludeTools, and only the main thread's tool_result ever learns a bg agentId), so a
+  // depth>0 spawner's OWN bg grandchild would be untimed AND unreachable by any kill: task_stop
+  // can't stop it, the parent's entryAbort doesn't cascade into the grandchild's AbortSignal.any
+  // set, and there is no session-level bg-agent kill-all. That reintroduces the unbounded-runaway
+  // the timeout existed to prevent, exactly where the kill switch can't reach. Drives a depth-1
+  // child (spawned synchronously, so its own bg spawn call is guaranteed to land as the SECOND
+  // subagents.run invocation) that itself issues a `run_in_background` spawn — mirrors the
+  // nested-spawn pattern from the "maxDepth: 2 ... depth-1 child spawns a depth-2 grandchild"
+  // test above, but the depth-1 spawn is a BG spawn rather than a sync one.
+  test("bg spawn issued FROM a depth-1 child (nested) → subagents.run receives timeoutMs:undefined, not null — the 300s default net still applies (only a depth-0 spawn gets the untimed relax)", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "do X"), done("tool_calls")], // parent (depth 0) round 0: SYNC-spawns the child — awaited, so calls[0] is recorded before calls[1] can exist
+      [spawnCall("s2", "grandchild bg task", { run_in_background: true }), done("tool_calls")], // child (depth 1) round 0: bg-spawns a depth-2 grandchild
+      text("wrap up"), // clamped script tail: covers the child's post-bg-spawn continuation, the parent's own continuation, and the detached grandchild's own round, whichever order they actually run in
+    ];
+    const { engine, store, sessionId, subagents } = setup(script);
+    const spy = spyOn(subagents!, "run");
+    try {
+      await engine.runTurn(sessionId);
+      expect(spy.mock.calls.length).toBeGreaterThanOrEqual(2);
+      // calls[0] = parent's (depth 0) own sync spawn of the child — unaffected by this task, no
+      // timeoutMs override at all (contrast test above).
+      expect(spy.mock.calls[0]?.[1]).not.toHaveProperty("timeoutMs");
+      // calls[1] = the depth-1 CHILD's bg spawn of the grandchild — depth>0, so must NOT get the
+      // untimed relax: timeoutMs undefined (SubagentManager's own 300s constructor default
+      // applies), never null.
+      expect(spy.mock.calls[1]?.[1]?.timeoutMs).toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });
 
 // -------------------------------------------------------------------------------------------

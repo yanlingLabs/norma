@@ -1124,9 +1124,16 @@ export class AgentEngine {
               // timeout as something to "relax only once a manual kill exists" (a runaway
               // detached child was previously bounded ONLY by this clock, with no way to kill it
               // early). task_stop (this same phase) now IS that manual kill via `entryAbort`
-              // above, so this call runs UNTIMED: `timeoutMs: null` removes SubagentManager's own
-              // clock entirely, leaving entryAbort (task_stop) as the sole kill mechanism.
-              timeoutMs: null,
+              // above — but task_stop is main-thread-only (it's in childExcludeTools, and only the
+              // MAIN thread ever learns a bg agentId from the tool_result), so it can only reach a
+              // DEPTH-0 detached child. A depth>0 spawner's own bg grandchild would be untimed AND
+              // unkillable (entryAbort doesn't cascade from a stopped parent into a grandchild's
+              // AbortSignal.any set, and there's no session-level kill-all) — so the relax is
+              // scoped to depth 0 only: `timeoutMs: null` there (untimed, task_stop reaches it),
+              // `undefined` at depth>0 (falls back to SubagentManager's own 300s default, the
+              // pre-4h-ii-c bound, since nothing could stop it manually). Whole-branch review C1
+              // (4h-ii-c): "untimed ⟺ killable".
+              timeoutMs: opts.depth === 0 ? null : undefined,
             })
               .then((result) => {
                 const stopReason = result.ok ? result.value.stopReason : "error";
@@ -1351,7 +1358,7 @@ export class AgentEngine {
           sendMessageOutcomes.set(call.callId, { output: `message delivered to '${to}'`, isError: false });
           continue;
         }
-        // terminal (completed/failed/stopped) → resume it in the background. Its {output,isError}
+        // terminal (completed/failed/stopped/timeout) → resume it in the background. Its {output,isError}
         // (a bg resume returns {agentId,status:"running"} immediately, or a T3 guard's typed error)
         // becomes this send_message call's tool_result.
         sendMessageOutcomes.set(call.callId, await this.resumeThread({
@@ -1675,12 +1682,15 @@ export class AgentEngine {
       void this.cfg.subagents!.run(async (childSignal) => runResumed(childSignal), {
         reentrant: depth > 0,
         // 4h-ii-c (T1 follow-up): a RESUMED detached child is as untimed as a freshly-spawned one
-        // — same rationale as the fresh bg spawn branch's own `timeoutMs: null` (no waiting parent
+        // — same rationale as the fresh bg spawn branch's own `timeoutMs` relax (no waiting parent
         // to time out FOR; the 4h-ii-a T3 review's "relax only once a manual kill exists" is
-        // satisfied by task_stop firing `entryAbort` above, this run's sole kill mechanism). This
-        // path is MAINSTREAM, not an edge: a send_message to a finished agent always resumes with
-        // runInBackground:true.
-        timeoutMs: null,
+        // satisfied by task_stop firing `entryAbort` above). This path is MAINSTREAM, not an edge:
+        // a send_message to a finished agent always resumes with runInBackground:true. Same depth
+        // gate as the fresh path (whole-branch review C1, 4h-ii-c): `depth` here is the RESUMING
+        // thread's own depth — task_stop is main-thread-only, so only a depth-0 resumer's bg child
+        // can actually be killed manually. `depth > 0` keeps the SubagentManager default (300s)
+        // instead, since nothing could stop it early ("untimed ⟺ killable").
+        timeoutMs: depth === 0 ? null : undefined,
       })
         .then((result) => {
           const stopReason = result.ok ? result.value.stopReason : "error";
