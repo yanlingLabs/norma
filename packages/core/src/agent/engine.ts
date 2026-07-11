@@ -1664,7 +1664,16 @@ export class AgentEngine {
     // D6 — same sync/bg fork the fresh path uses; `reentrant` keys off the RESUMING thread's depth
     // (a depth>0 resumer already holds a SubagentManager slot), exactly like the fresh spawn.
     if (runInBackground) {
-      void this.cfg.subagents!.run(async (childSignal) => runResumed(childSignal), { reentrant: depth > 0 })
+      void this.cfg.subagents!.run(async (childSignal) => runResumed(childSignal), {
+        reentrant: depth > 0,
+        // 4h-ii-c (T1 follow-up): a RESUMED detached child is as untimed as a freshly-spawned one
+        // — same rationale as the fresh bg spawn branch's own `timeoutMs: null` (no waiting parent
+        // to time out FOR; the 4h-ii-a T3 review's "relax only once a manual kill exists" is
+        // satisfied by task_stop firing `entryAbort` above, this run's sole kill mechanism). This
+        // path is MAINSTREAM, not an edge: a send_message to a finished agent always resumes with
+        // runInBackground:true.
+        timeoutMs: null,
+      })
         .then((result) => {
           const stopReason = result.ok ? result.value.stopReason : "error";
           this.emit(sessionId, { type: "thread_completed", sessionId, threadId: entry.threadId, stopReason });
@@ -1673,7 +1682,11 @@ export class AgentEngine {
             ? { ok: false, result: `subagent (${agentType}) ${result.error}` }
             : result.value.stopReason === "error"
               ? { ok: false, result: `subagent (${agentType}) failed: ${result.value.errorMessage ?? "provider error"}` }
-              : { ok: true, result: result.value.finalText || "the subagent finished without a final message" });
+              : { ok: true, result: result.value.finalText || "the subagent finished without a final message" },
+            // 4h-ii-c: only reachable if a future config re-adds a bg timeout (this call runs with
+            // `timeoutMs: null` above) — wired now, same as the fresh bg spawn's `.then`, so a
+            // timed-out resumed child is never misreported as generic "failed".
+            !result.ok && result.timedOut ? { timedOut: true } : undefined);
         })
         .catch((err) => {
           // Defensive: SubagentManager.run() never throws; this guards a throw in the .then handler
@@ -1698,8 +1711,11 @@ export class AgentEngine {
         : { output: result.value.finalText || "the subagent finished without a final message", isError: false };
     // { notified: true }: this sync resume's result reached the caller directly as its own
     // tool_result this same turn, so the next turn's completion-reminder sweep must not re-surface
-    // it (same reasoning as the fresh sync path).
-    this.cfg.bgAgents!.complete(entry.agentId, { ok: !outcome.isError, result: outcome.output }, { notified: true });
+    // it (same reasoning as the fresh sync path). `timedOut` (4h-ii-c): the sync resume's run()
+    // call above is still on the constructor-default clock (no override), so a timeout IS
+    // reachable here — mirror the fresh sync path's threading so it reports "timeout", not "failed".
+    this.cfg.bgAgents!.complete(entry.agentId, { ok: !outcome.isError, result: outcome.output },
+      { notified: true, timedOut: !result.ok && result.timedOut });
     return outcome;
   }
 

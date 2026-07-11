@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { ModelInfo, Provider, ProviderEvent, TurnRequest } from "../../src/providers/types";
 import type { SessionEvent } from "@norma/protocol";
 import { FakeProvider } from "../../src/agent/fake-provider";
@@ -340,6 +340,64 @@ describe("AgentEngine: spawn_agent resume (4h-ii-b Task 3)", () => {
     // the detached resumed run re-completed the entry, and (unlike a sync resume) left it UN-notified
     // so the next turn's completion reminder can surface it (CC parity)
     expect(bgAgents.get("worker", sessionId)).toMatchObject({ status: "completed", notified: false });
+  });
+
+  // 4h-ii-c (T1 follow-up): a RESUMED bg run is just as detached as a fresh bg spawn — a
+  // send_message to a finished agent ALWAYS resumes with runInBackground:true, so this path is
+  // mainstream, not an edge. Same policy as the fresh bg spawn branch: `timeoutMs: null`
+  // (untimed; entryAbort/task_stop is the only kill), and `result.timedOut` threads into the
+  // completion so a timed-out resumed agent reports "timeout", never generic "failed".
+  test("(4h-ii-c) a run_in_background resume's subagents.run receives timeoutMs:null (untimed, same as a fresh bg spawn)", async () => {
+    const { engine, sessionId, bgAgents, subagents } = setup([
+      [spawnNamed("s1", "do the task", "worker"), done("tool_calls")], // turn 1: sync spawn
+      text("child-out-1"),
+      text("parent turn1"),
+      [{ type: "tool_call", callId: "r1", name: "spawn_agent", argsJson: JSON.stringify({ resume: "worker", prompt: "keep going", run_in_background: true }) }, done("tool_calls")],
+      text("child-out-2"), // the resumed (detached) child's run
+      text("parent turn2"),
+    ]);
+    await engine.runTurn(sessionId); // turn 1: spawn "worker" sync (spy NOT yet installed — its run() call is out of frame)
+    const spy = spyOn(subagents!, "run");
+    try {
+      await engine.runTurn(sessionId); // turn 2: bg resume — the only run() call the spy sees
+      expect(spy.mock.calls.length).toBe(1);
+      expect(spy.mock.calls[0]?.[1]).toMatchObject({ timeoutMs: null });
+      // let the detached resumed run settle before the test ends (no dangling chain)
+      for (let i = 0; i < 200 && bgAgents.get("worker", sessionId)?.status === "running"; i++) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      expect(bgAgents.get("worker", sessionId)?.status).toBe("completed");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("(4h-ii-c) a bg resume whose run() result carries timedOut:true completes the entry with status 'timeout', not 'failed'", async () => {
+    const { engine, sessionId, bgAgents, subagents } = setup([
+      [spawnNamed("s1", "do the task", "worker"), done("tool_calls")], // turn 1: sync spawn
+      text("child-out-1"),
+      text("parent turn1"),
+      [{ type: "tool_call", callId: "r1", name: "spawn_agent", argsJson: JSON.stringify({ resume: "worker", prompt: "keep going", run_in_background: true }) }, done("tool_calls")],
+      text("parent turn2"), // the resumed child's own run never reaches the provider (run() is mocked below)
+    ]);
+    await engine.runTurn(sessionId); // turn 1: spawn "worker" sync
+    // Mock the RESUME's run() to resolve as a typed timeout — only reachable in production if a
+    // future config re-adds a bg timeout (the call itself now passes timeoutMs:null), but the
+    // completion mapping must already report it as "timeout", never generic "failed".
+    const spy = spyOn(subagents!, "run").mockImplementation(
+      async () => ({ ok: false as const, error: "timed out after 300s", timedOut: true as const }),
+    );
+    try {
+      await engine.runTurn(sessionId); // turn 2: bg resume — detached chain gets the mocked timeout result
+      for (let i = 0; i < 200 && bgAgents.get("worker", sessionId)?.status === "running"; i++) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      const worker = bgAgents.get("worker", sessionId);
+      expect(worker?.status).toBe("timeout");
+      expect(worker?.result).toContain("timed out after 300s");
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   // FINDING 1 (T3 review, IMPORTANT): resuming a child whose stored history does NOT end on an
