@@ -116,7 +116,7 @@ const text = (t: string): ProviderEvent[] => [{ type: "text_delta", delta: t }, 
 // don't all need individual edits; `extra.description` still overrides it (see the "description
 // rides thread_started" test below). The dedicated "without description" test constructs its
 // tool_call by hand, bypassing this default, to pin the required-arg behavior itself.
-const spawnCall = (callId: string, prompt: string, extra?: { agentType?: string; model?: string; description?: string; max_turns?: number; mode?: string; isolation?: string; run_in_background?: boolean }): ProviderEvent =>
+const spawnCall = (callId: string, prompt: string, extra?: { agentType?: string; model?: string; description?: string; max_turns?: number; mode?: string; isolation?: string; run_in_background?: boolean; name?: string }): ProviderEvent =>
   ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "test task", ...extra }) });
 
 describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
@@ -1169,6 +1169,12 @@ function setupIsolation(
   const agentsTrust = new TrustStore(join(agentsHome, "trust.json"));
   const agents = new AgentStore({ normaHome: agentsHome, trust: agentsTrust });
   const subagents = new SubagentManager({});
+  // 4h-ii-b Task 1: always wired (mirrors the top-level `setup()`'s own default) — no
+  // pre-existing isolation test here asserts on registry state, so wiring it doesn't change any
+  // of their observable behavior (a sync spawn's registry entry is a byte-identical no-op
+  // as far as the child's own execution goes: `entryAbort`'s signal never fires). Lets a NEW
+  // test assert isolation's worktree dir lands in the registry entry's `resume.roots`.
+  const bgAgents = new BackgroundAgentRegistry();
   const engine = new AgentEngine({
     store, hub, registry, broker,
     gate: new PermissionGate(),
@@ -1180,14 +1186,15 @@ function setupIsolation(
     agents,
     subagents,
     worktrees,
+    bgAgents,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: "auto" });
-  return { engine, store, hub, broker, sessionId, cwd, provider, dirs };
+  return { engine, store, hub, broker, sessionId, cwd, provider, dirs, bgAgents };
 }
 
 describe.if(isMac)("AgentEngine: spawn_agent isolation:\"worktree\" (4h-i Task 4)", () => {
   test("child writes a file under isolation:\"worktree\" → the file lands in the worktree dir, NOT the parent repo; the (dirty) worktree is left on disk (no auto-remove, no auto-merge)", async () => {
-    const { engine, store, sessionId, cwd } = setupIsolation([
+    const { engine, store, sessionId, cwd, bgAgents } = setupIsolation([
       [spawnCall("s1", "write a note", { isolation: "worktree" }), done("tool_calls")], // parent round 0: spawn, isolated
       [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "note.txt", content: "isolated" }) }, done("tool_calls")], // child round 0
       text("wrote the note"), // child round 1: end turn
@@ -1226,6 +1233,13 @@ describe.if(isMac)("AgentEngine: spawn_agent isolation:\"worktree\" (4h-i Task 4
     // sanity: still a real git worktree, on its own norma/ branch
     const branchList = git(["branch", "--list", `norma/${names[0]}`], cwd);
     expect(branchList.stdout.trim().length).toBeGreaterThan(0);
+
+    // 4h-ii-b Task 1: the registry entry's captured resume context uses the ISOLATED worktree
+    // dir as BOTH cwd and roots (exactly what this child's own runThread call actually got as
+    // `cwd`/`rootsOverride` — see the bridge's `resumeCtx` construction) — not the parent repo.
+    const entry = bgAgents.list(sessionId).find((e) => e.threadId === (started as Extract<SessionEvent, { type: "thread_started" }>).threadId);
+    expect(entry?.resume?.cwd).toBe(wtDir);
+    expect(entry?.resume?.roots).toEqual([wtDir]);
   });
 
   test("a CLEAN isolated child (no changes) → the worktree is auto-removed after it returns — `git worktree list` shows only the original repo", async () => {
@@ -1457,6 +1471,29 @@ describe("AgentEngine: spawn_agent run_in_background (4h-ii-a)", () => {
     expect(mainTurnCompleted).toMatchObject({ stopReason: "end_turn" });
   });
 
+  test("4h-ii-b Task 1: resume context is captured on the bg entry at spawn — agentType/cwd/approvalPolicy/model/maxTurns/instructions match what the child actually ran with", async () => {
+    const { engine, store, sessionId, cwd, bgAgents } = setup([
+      [spawnCall("s1", "bg task", { run_in_background: true, model: "fake-1", max_turns: 7, agentType: "general-purpose" }), done("tool_calls")],
+      text("parent wrap-up"),
+    ]);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const started = events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>;
+    const entry = bgAgents.get(started.threadId);
+    expect(entry?.resume).toMatchObject({
+      agentType: "general-purpose",
+      cwd,
+      roots: undefined, // no isolation → the resumed child falls back to the session's live roots
+      approvalPolicy: "auto", // setup()'s default policy, no mode override
+      model: "fake-1",
+      maxTurns: 7,
+    });
+    // instructions carries the child's own agent-def base prompt (subagent framing), not the
+    // parent's own instructions — proof this is genuinely the CHILD's resolved instructionsFull.
+    expect(entry?.resume?.instructions).toContain("subagent");
+  });
+
   test("no run_in_background (default false/absent) → unchanged, fully-awaited synchronous behavior; parent's tool_result is the child's final text, not a running-JSON", async () => {
     const { engine, store, sessionId, bgAgents } = setup([
       [spawnCall("s1", "do X"), done("tool_calls")],
@@ -1471,9 +1508,15 @@ describe("AgentEngine: spawn_agent run_in_background (4h-ii-a)", () => {
     const toolResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
     expect(toolResult).toMatchObject({ isError: false, output: "child final report" });
 
-    // never touches the bg registry at all — the sync path is untouched by 4h-ii-a
+    // 4h-ii-b Task 1: a sync spawn now ALSO registers (and completes) in the bg registry — CC
+    // parity, so a finished sync-spawned agent is resumable too, not just a bg-spawned one — but
+    // it's registered `notified` (see BackgroundAgentRegistry.complete's own doc comment): the
+    // parent already got this result directly as the tool_result above, this same turn, so it
+    // must never ALSO surface via the next turn's completion-reminder sweep.
     const started = events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>;
-    expect(bgAgents.list(sessionId).find((e) => e.agentId === started.threadId)).toBeUndefined();
+    const entry = bgAgents.list(sessionId).find((e) => e.agentId === started.threadId);
+    expect(entry).toMatchObject({ status: "completed", result: "child final report", notified: true });
+    expect(entry?.resume).toMatchObject({ agentType: "general-purpose", approvalPolicy: "auto" });
   });
 
   test("run_in_background:true whose child provider ERRORS → registry.complete records isError-shaped failure text, thread_completed stopReason 'error'", async () => {
@@ -1537,6 +1580,92 @@ describe("AgentEngine: spawn_agent run_in_background (4h-ii-a)", () => {
 
     // nothing was ever registered into the (unwired) registry either
     expect(bgAgents.list(sessionId)).toEqual([]);
+  });
+});
+
+// -------------------------------------------------------------------------------------------
+// Phase 4h-ii-b Task 2: spawn_agent `name` (CC parity) — a stable, per-session handle so a later
+// resume/send_message (Tasks 3-4) can address a spawned agent by name instead of its opaque
+// agentId. The engine's spawn bridge hand-parses `name` off argsJson (same two-layer shape as
+// model/mode/isolation/run_in_background) and PRE-checks it against BackgroundAgentRegistry
+// before thread_started fires — a collision with an EXISTING agent in the same session must
+// never produce a ghost thread. register() itself is the backstop for the same-batch sibling
+// race the pre-check can't see (untested here — out of scope per the task brief).
+// -------------------------------------------------------------------------------------------
+describe("AgentEngine: spawn_agent name (4h-ii-b Task 2)", () => {
+  test("spawn with name:\"researcher\" → BackgroundAgentRegistry.get(\"researcher\", sessionId) resolves that agent", async () => {
+    const { engine, store, sessionId, bgAgents } = setup([
+      [spawnCall("s1", "do X", { name: "researcher" }), done("tool_calls")],
+      text("child final report"),
+    ]);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+    const started = events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>;
+
+    const entry = bgAgents.get("researcher", sessionId);
+    expect(entry).toBeDefined();
+    expect(entry!.agentId).toBe(started.threadId);
+    expect(entry!.name).toBe("researcher");
+  });
+
+  test("a second spawn reusing an in-use name (different agent, same session) → typed isError, no ghost thread", async () => {
+    const { engine, store, hub, sessionId, bgAgents } = setup([
+      [spawnCall("s1", "do X", { name: "researcher" }), done("tool_calls")], // turn1 parent round0: spawn
+      text("child final report"), // turn1 child's only round
+      text("parent turn1 wrap-up"), // turn1 parent continuation
+      [spawnCall("s2", "do Y", { name: "researcher" }), done("tool_calls")], // turn2 parent round0: spawn (rejected pre-check)
+      text("parent turn2 wrap-up"), // turn2 parent continuation — NO child round consumed (pre-check rejects before dispatch)
+    ]);
+    await engine.runTurn(sessionId);
+    const eventsAfterTurn1 = store.read(sessionId);
+    const startedTurn1 = eventsAfterTurn1.filter((e) => e.type === "thread_started");
+    expect(startedTurn1.length).toBe(1);
+    const firstAgentId = (startedTurn1[0] as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+
+    const client = { clientName: "u", deliver: () => true };
+    hub.attach(client, sessionId, 0);
+    hub.send(client, sessionId, "second request");
+    await engine.runTurn(sessionId);
+    const eventsAfterTurn2 = store.read(sessionId);
+
+    // no NEW thread_started/thread_completed — still exactly the one thread from turn 1 (no
+    // ghost thread for the rejected spawn)
+    expect(eventsAfterTurn2.filter((e) => e.type === "thread_started").length).toBe(1);
+    expect(eventsAfterTurn2.filter((e) => e.type === "thread_completed").length).toBe(1);
+
+    const result2 = eventsAfterTurn2.find((e) => e.type === "tool_result" && e.callId === "s2");
+    expect(result2).toMatchObject({ isError: true });
+    expect((result2 as Extract<SessionEvent, { type: "tool_result" }>).output)
+      .toBe(`name 'researcher' already in use by agent ${firstAgentId}`);
+
+    // the registry still resolves "researcher" to the FIRST agent, unchanged by the rejected spawn
+    expect(bgAgents.get("researcher", sessionId)?.agentId).toBe(firstAgentId);
+  });
+
+  test("the same name in a different session is allowed (names are per-session)", async () => {
+    const { engine, store, sessionId: session1, cwd, bgAgents } = setup([
+      [spawnCall("s1", "do X", { name: "researcher" }), done("tool_calls")], // session1 parent round0: spawn
+      text("child1 final report"), // session1 child round
+      text("parent1 wrap-up"), // session1 parent continuation
+      [spawnCall("s2", "do Y", { name: "researcher" }), done("tool_calls")], // session2 parent round0: spawn
+      text("child2 final report"), // session2 child round
+      text("parent2 wrap-up"), // session2 parent continuation
+    ]);
+    await engine.runTurn(session1);
+
+    const session2 = store.createSession("global", { cwd, approvalPolicy: "auto" });
+    await engine.runTurn(session2);
+
+    const entry1 = bgAgents.get("researcher", session1);
+    const entry2 = bgAgents.get("researcher", session2);
+    expect(entry1).toBeDefined();
+    expect(entry2).toBeDefined();
+    expect(entry1!.agentId).not.toBe(entry2!.agentId);
+    expect(entry1!.sessionId).toBe(session1);
+    expect(entry2!.sessionId).toBe(session2);
+
+    const result2 = store.read(session2).find((e) => e.type === "tool_result" && e.callId === "s2");
+    expect(result2).toMatchObject({ isError: false, output: "child2 final report" });
   });
 });
 

@@ -25,6 +25,7 @@ import { registerPlanTool } from "./agent/tools/plan";
 import { registerNotebookTool } from "./agent/tools/notebook";
 import { registerWorktreeTools } from "./agent/tools/worktree";
 import { registerSpawnAgentTool } from "./agent/tools/spawn";
+import { registerSendMessageTool } from "./agent/tools/send-message";
 import { registerWebTools } from "./agent/tools/web";
 import { McpManager } from "./agent/mcp/manager";
 import { PermissionGate } from "./agent/gate";
@@ -310,6 +311,12 @@ export async function startDaemon(opts: {
     // bridge will accept. Empty (an openai-compatible provider with no static `models` configured)
     // → registerSpawnAgentTool falls back to its generic "model: optional model override" wording.
     registerSpawnAgentTool(registry, { models: agentProvider.provider.models().map((m) => m.id) });
+    // 4h-ii-b Task 4 (CC SendMessage): registered alongside spawn_agent (only when subagents are
+    // available) so the MAIN thread can address a subagent by agentId/name — a running one gets the
+    // message at its next step, a finished one is resumed with it. Like spawn_agent it's an engine
+    // bridge; this DEF is what the model sees, the engine intercepts the call (see engine.ts's
+    // sendMessageCalls bridge). Excluded from every child's tool set (depth-0 only).
+    registerSendMessageTool(registry);
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
     await mcp.startAll(settings?.mcpServers ?? {});
     // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled &&

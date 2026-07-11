@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import type { NewSessionEvent, Question, SessionEvent, Task } from "@norma/protocol";
 import type { SessionStore } from "../sessions/store";
 import type { SessionHub } from "../sessions/hub";
@@ -18,7 +19,7 @@ import { bashLooksSafe, type BashReviewer } from "./reviewer";
 import type { WorktreeManager } from "./worktree";
 import type { SubagentManager } from "./subagents";
 import type { AgentStore } from "./agents";
-import type { BackgroundAgentRegistry } from "./bg-agent-registry";
+import type { BackgroundAgentRegistry, ResumeContext } from "./bg-agent-registry";
 
 /** Structural narrowing of BackgroundTaskRegistry (bg-registry.ts) to just what pinnedTools
  *  (below) needs — lets the engine (and tests) work with anything shaped like a per-session task
@@ -173,6 +174,14 @@ export interface EngineConfig {
 export class AgentEngine {
   private runningTurns = new Set<string>();
   private steerQueue = new Map<string, string[]>();
+  // 4h-ii-b Task 4 (CC SendMessage): per-CHILD-THREAD steer queue, keyed by threadId (globally
+  // unique th_<uuid>) — SEPARATE from the sessionId-keyed `steerQueue` above, which stays
+  // MAIN-thread-only and untouched. A send_message to a RUNNING child pushes here (sendToThread);
+  // the child's runThread drains its own thread's queue at each round boundary (round-top drain),
+  // exactly mirroring how the main loop drains steerQueue. Deleted when a child thread's runThread
+  // reaches any terminal return (see cleanupThreadSteer in runThread) so an undrained message can't
+  // leak into a later resume of the SAME threadId.
+  private threadSteerQueue = new Map<string, string[]>();
   private aborters = new Map<string, AbortController>();
   // loadedSkills is SESSION-scoped (sticky across turns) — NOT cleared per turn, unlike
   // steerQueue/aborters below (which ARE deleted in runTurn's finally, being per-turn). A skill
@@ -271,6 +280,30 @@ export class AgentEngine {
     return { injected: false };
   }
 
+  /**
+   * 4h-ii-b Task 4 (CC SendMessage): deliver `text` to a RUNNING child thread. The child receives
+   * it at its next step. QUEUE-ONLY — push `text` into this child thread's own steer queue (keyed by
+   * threadId), which the child's runThread drains at its next round boundary (the round-top drain),
+   * exactly like the main loop drains steerQueue. This is the running-target half of the
+   * send_message bridge (SM4); the finished-target half reuses resumeThread instead.
+   *
+   * The child-scoped `user_message` is NO LONGER persisted here — it is persisted at the CHILD
+   * round-top DRAIN (see runThread's child branch) instead (whole-branch review C1/I1). Persisting
+   * at SEND time was a bug: a send that lands while the child is AWAITING executeCall (a real
+   * multi-second bash/web_fetch/nested-spawn window) would slot the user_message BETWEEN that
+   * round's tool_call and its tool_result in the child's persisted log — an INTERIOR corruption the
+   * resume clean-termination guard (which only inspects the LAST event) misses. On resume,
+   * childHistoryInput (a blind 1:1 seq map, no coalescing) then reconstructs an orphan
+   * function_call immediately followed by a user turn → a hard provider reject. Persisting at the
+   * drain instead guarantees the message lands AFTER the prior round's tool_result (clean
+   * alternation), and a message that is never drained (child finishing, I1) is never persisted.
+   */
+  sendToThread(sessionId: string, threadId: string, text: string): void {
+    const q = this.threadSteerQueue.get(threadId) ?? [];
+    q.push(text);
+    this.threadSteerQueue.set(threadId, q);
+  }
+
   private emit(sessionId: string, event: NewSessionEvent): SessionEvent {
     return this.cfg.hub.append(sessionId, event); // hub.append: store.append + broadcast (added below)
   }
@@ -363,6 +396,44 @@ export class AgentEngine {
       else if (e.type === "assistant_message") input.push({ type: "message", role: "assistant", content: e.text });
       // Prior turns' tool calls are summarized by their assistant_message; current-turn
       // call/result items are threaded in-memory below.
+    }
+    return input;
+  }
+
+  /** Reconstructs a SPECIFIC child thread's own history from the store, in seq order — the
+   *  foundation for `resume` (4h-ii-b Task 3). CRUCIAL DIFFERENCE from `historyInput` above:
+   *  historyInput replays only user/assistant MESSAGES (a main-thread turn's tool calls are
+   *  already summarized by the assistant's own text, so replaying tool_call/tool_result would
+   *  just duplicate context) — but a RESUMED child has no such summary to fall back on. Without
+   *  its own tool_call/tool_result pairs, a resumed child's replayed assistant_message text would
+   *  reference tool results (file contents, command output) the resumed model can no longer see,
+   *  and it has no way to re-run those tools mid-history. So this maps ALL FOUR event types,
+   *  reproducing the exact TurnInputItem shapes runThread's own dispatch loop pushes into `input`
+   *  live (see runThread's `input.push({type:"function_call",...})` / `input.push({type:
+   *  "tool_result",...})` calls above) — a resumed child's reconstructed history is
+   *  indistinguishable, shape-wise, from a child that never stopped.
+   *
+   *  No checkpoint/compaction handling (unlike historyInput): child threads are never compacted
+   *  today, so there is no per-child checkpoint event to fast-forward past.
+   *
+   *  KNOWN GAP (not fixed here — see this task's report): a child thread's ORIGINAL spawn prompt
+   *  is never itself persisted as a `user_message` event scoped to that threadId — the spawn
+   *  bridge passes it straight into runThread's in-memory `input` array (`[{type:"message",
+   *  role:"user", content:prompt}]`), never through `hub.append`/`store` — so a reconstruction
+   *  built purely from stored events for a real spawned child starts at its FIRST
+   *  assistant_message, not the prompt that kicked it off. That opening prompt only survives in
+   *  the `thread_started` event's own `prompt` field. Whatever calls this (T3's `resume`) must
+   *  account for that gap — e.g. by prepending `thread_started.prompt` itself — this function
+   *  only reconstructs what the store actually recorded for `threadId`. */
+  private childHistoryInput(sessionId: string, threadId: string): TurnInputItem[] {
+    const events = this.cfg.store.read(sessionId);
+    const input: TurnInputItem[] = [];
+    for (const e of events) {
+      if (!("threadId" in e) || e.threadId !== threadId) continue;
+      if (e.type === "user_message") input.push({ type: "message", role: "user", content: e.text });
+      else if (e.type === "assistant_message") input.push({ type: "message", role: "assistant", content: e.text });
+      else if (e.type === "tool_call") input.push({ type: "function_call", callId: e.callId, name: e.name, argsJson: e.argsJson });
+      else if (e.type === "tool_result") input.push({ type: "tool_result", callId: e.callId, output: e.output, isError: e.isError });
     }
     return input;
   }
@@ -595,6 +666,13 @@ export class AgentEngine {
     // EngineConfig.subagentMaxDepth's doc comment. Computed once so the spawn-gather filter below
     // and the belt-and-braces reject agree on the exact same number.
     const maxDepth = this.cfg.subagentMaxDepth ?? 5;
+    // 4h-ii-b Task 4 (SM3): delete THIS child thread's steer queue when its runThread terminates,
+    // so a send_message that landed but wasn't drained before the child finished can't resurface
+    // when the SAME threadId is later resumed (resume reuses the threadId; its round-top drain
+    // would otherwise pick up the stale entry). Called before EVERY terminal return below (the four
+    // returns: error, end_turn/aborted, deniedByHuman, cap). NO-OP for MAIN — the main thread never
+    // populates threadSteerQueue, so this leaves the byte-identical main path unchanged.
+    const cleanupThreadSteer = () => { if (threadId !== MAIN_THREAD) this.threadSteerQueue.delete(threadId); };
 
     this.emit(sessionId, { type: "turn_started", sessionId, threadId });
 
@@ -602,6 +680,27 @@ export class AgentEngine {
       if (threadId === MAIN_THREAD) {
         const steers = this.steerQueue.get(sessionId);
         if (steers && steers.length) { for (const t of steers) input.push({ type: "message", role: "user", content: t }); steers.length = 0; }
+      } else {
+        // 4h-ii-b Task 4 (SM2): CHILD threads drain their OWN per-thread steer queue here — a
+        // SEPARATE parallel branch to the MAIN branch above (which is untouched). A send_message to
+        // this running child (sendToThread) queued into threadSteerQueue[threadId]; drain it into
+        // this round's input exactly like the main loop drains steerQueue.
+        // Whole-branch review C1/I1: PERSIST each drained message as a child user_message HERE, at
+        // the drain — NOT at send time (sendToThread is queue-only now). The drain runs at the TOP of
+        // a round: AFTER the prior round's tool_result was emitted+persisted (during that round's
+        // dispatch), BEFORE the next provider call — so the persisted user_message gets a seq
+        // strictly after the tool_result, never between a tool_call and its tool_result. That is
+        // clean alternation on resume (childHistoryInput reconstructs [...tool_result, user], no
+        // interior orphan function_call). A message that is never drained (child finishing before
+        // this runs, I1) is simply never persisted → no trailing-user-turn corruption.
+        const msgs = this.threadSteerQueue.get(threadId);
+        if (msgs && msgs.length) {
+          for (const t of msgs) {
+            this.emit(sessionId, { type: "user_message", sessionId, threadId, text: t, clientName: "send_message" });
+            input.push({ type: "message", role: "user", content: t });
+          }
+          msgs.length = 0;
+        }
       }
 
       let textBuf = "";
@@ -645,6 +744,7 @@ export class AgentEngine {
           // just emitted are invisible to the parent model, which only sees the child's return
           // value). Main-thread callers (turn(), which just `await`s runThread without touching
           // the return value) are unaffected — see the grep note in the 4e-fix3 report.
+          cleanupThreadSteer();
           return { finalText: lastText, stopReason: "error", errorMessage: ev.message };
         }
       }
@@ -656,13 +756,17 @@ export class AgentEngine {
       }
 
       if (stop !== "tool_calls" || calls.length === 0) {
-        if (threadId === MAIN_THREAD) {
-          const pending = this.steerQueue.get(sessionId);
-          // A steer landed as we finished → drain at next iteration top, keep going. But an
-          // interrupt must win: an aborted turn ends now with turn_completed(aborted) even if a
-          // steer is queued (it stays queued for the next runTurn, e.g. via steer()'s own restart).
-          if (stop !== "aborted" && pending && pending.length) { continue; }
-        }
+        // A steer/message landed as we finished → drain at next iteration top, keep going. But an
+        // interrupt must win: an aborted turn ends now with turn_completed(aborted) even if one is
+        // queued (it stays queued for the next runTurn, e.g. via steer()'s own restart). 4h-ii-b
+        // Task 4 (SM3): GENERALIZED from MAIN-only to also continue a CHILD when a send_message
+        // landed as it finished (else a message sent while the child is on its final round would be
+        // silently dropped) — `pending` reads the MAIN steerQueue for the main thread and this
+        // child's threadSteerQueue for a child. For the MAIN thread this is byte-identical to the
+        // prior `if (threadId === MAIN_THREAD) { const pending = steerQueue.get(sessionId); ... }`.
+        const pending = threadId === MAIN_THREAD ? this.steerQueue.get(sessionId) : this.threadSteerQueue.get(threadId);
+        if (stop !== "aborted" && pending && pending.length) { continue; }
+        cleanupThreadSteer();
         this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: stop === "aborted" ? "aborted" : "end_turn", ...usage });
         if (opts.depth === 0 && this.cfg.titler) void this.cfg.titler.maybeTitle(sessionId);
         return { finalText: lastText, stopReason: stop === "aborted" ? "aborted" : "end_turn" };
@@ -685,14 +789,33 @@ export class AgentEngine {
       const spawnCalls = this.cfg.subagents && this.cfg.agents && opts.depth < maxDepth
         ? calls.filter((c) => c.name === "spawn_agent")
         : [];
+      // 4h-ii-b Task 4 (SM1 + SM6, CC SendMessage): message a subagent by agentId/name. DEPTH-0
+      // ONLY — only the main thread orchestrates in v1 (no agent-to-agent messaging), belt-and-
+      // braces with send_message's unconditional exclusion from every child's tool set below.
+      // Precomputed here (like spawnOutcomes) and consumed by the per-call dispatch loop below as a
+      // send_message call's tool_result, so it never falls through to executeCall. Processed in a
+      // simple `for` loop (not Promise.all): a running-target delivery is sync (sendToThread), a
+      // finished-target resume is async (awaited), and there's no benefit to parallelizing them.
+      const sendMessageOutcomes = new Map<string, { output: string; isError: boolean }>();
+      const sendMessageCalls = opts.depth === 0 ? calls.filter((c) => c.name === "send_message") : [];
       if (spawnCalls.length > 0) {
         await Promise.all(spawnCalls.map(async (call) => {
-          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown; max_turns?: unknown; mode?: unknown; isolation?: unknown; run_in_background?: unknown } = {};
+          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown; max_turns?: unknown; mode?: unknown; isolation?: unknown; run_in_background?: unknown; name?: unknown; resume?: unknown } = {};
           try { parsed = JSON.parse(call.argsJson || "{}"); } catch { /* defensive: empty prompt below */ }
           const prompt = typeof parsed.prompt === "string" ? parsed.prompt : "";
           const agentType = typeof parsed.agentType === "string" ? parsed.agentType : undefined;
           const modelOverride = typeof parsed.model === "string" ? parsed.model : undefined;
           const description = typeof parsed.description === "string" ? parsed.description : undefined;
+          // 4h-ii-b Task 2 (CC parity: stable per-session handle for resume/send_message) — same
+          // hand-parse-before-zod reasoning as model/description/mode/isolation/run_in_background
+          // above: only a string is recognized; anything else (wrong type, absent) → undefined,
+          // same as omitting the arg entirely (the child is addressable by agentId only, today's
+          // unchanged behavior).
+          const spawnName = typeof parsed.name === "string" ? parsed.name : undefined;
+          // 4h-ii-b Task 3 (CC parity: resume a finished agent) — same hand-parse-before-zod
+          // reasoning as name/model/mode above: only a non-empty string is recognized (an agentId
+          // or a `name` to resume); anything else → undefined, i.e. today's fresh-spawn path.
+          const resumeArg = typeof parsed.resume === "string" && parsed.resume.length > 0 ? parsed.resume : undefined;
           // 4h-i (CC parity: Agent.max_turns): this bridge hand-parses raw argsJson BEFORE
           // spawn.ts's own zod validation would ever run (same reason model/description are
           // hand-checked above), so a provider that ignores the declared `.int().positive().max(50)`
@@ -729,6 +852,27 @@ export class AgentEngine {
           // recognized; anything else (wrong type, absent, false) → false, same as omitting the arg
           // entirely (the synchronous, awaited path — today's unchanged behavior).
           const runInBackground = parsed.run_in_background === true;
+          // 4h-ii-b Task 3 (D7): a resume takes over the WHOLE callback for this call — it sits
+          // EARLY, before any fresh-spawn machinery (childId gen, description/model checks,
+          // worktree, register). resumeThread does its own typed-error guards (no prompt / unknown
+          // / still-running) BEFORE any thread_started re-emit or store write, and drives the
+          // resumed run through the SAME sync/bg fork the fresh path uses. `threadId` is the
+          // RESUMING thread (this callback's own thread) — it becomes the re-emitted child's
+          // parentThreadId (D2).
+          if (resumeArg !== undefined) {
+            spawnOutcomes.set(call.callId, await this.resumeThread({
+              sessionId,
+              resumeArg,
+              prompt,
+              runInBackground,
+              meta,
+              model: opts.model,
+              reasoningEffort: opts.reasoningEffort,
+              depth: opts.depth,
+              parentThreadId: threadId,
+            }));
+            return;
+          }
           // Child-scoped meta: a shallow copy ONLY when childPolicy actually narrows (differs from
           // the parent's) — never mutate the shared `meta` object itself (that object is the SAME
           // one `turn()`'s dispatch loop uses for the REST of the parent's turn; mutating
@@ -792,6 +936,28 @@ export class AgentEngine {
             return; // no thread_started, no thread registry entry, no subagents.run slot
           }
 
+          // 4h-ii-b Task 2 (CC parity: stable per-session handle for resume/send_message,
+          // Tasks 3-4) — a `name` colliding with an EXISTING agent in this session must fail the
+          // spawn BEFORE thread_started/registerThread/subagents.run, same reason the
+          // description/model/run_in_background checks above do: a caller must never get a ghost
+          // thread for a name that `registry.get` would just resolve to the OTHER agent. The
+          // message is byte-identical to what BackgroundAgentRegistry.register() itself produces
+          // on the same collision (bg-agent-registry.ts) so both paths agree. This is only a
+          // PRE-check for the common case — a name already registered from a prior spawn/turn; it
+          // cannot see two sibling spawns in the SAME batch reusing one name (neither has
+          // registered yet when this runs) — register()'s own collision result (surfaced at the
+          // bg register() call below) is the backstop for that rare edge, unchanged.
+          if (spawnName) {
+            const existing = this.cfg.bgAgents?.get(spawnName, sessionId);
+            if (existing) {
+              spawnOutcomes.set(call.callId, {
+                output: `name '${spawnName}' already in use by agent ${existing.agentId}`,
+                isError: true,
+              });
+              return; // no thread_started, no thread registry entry, no subagents.run slot
+            }
+          }
+
           // 4h-i Task 4 (CC parity: Agent.isolation "worktree") — create the child's isolation
           // worktree BEFORE thread_started/registerThread/subagents.run, same as the
           // description/model checks above: a create failure (no git repo, or
@@ -842,9 +1008,49 @@ export class AgentEngine {
           // one more level (recursing into this SAME bridge, via its own runThread call, with the
           // gate-1 spawnCalls filter above reading ITS OWN opts.depth). ask_user/exit_plan_mode/
           // enter_plan_mode stay excluded from every child regardless of depth (unchanged).
+          // 4h-ii-b Task 4 (SM6): send_message is excluded from EVERY child UNCONDITIONALLY (not
+          // depth-conditional like spawn_agent) — v1 has no agent-to-agent messaging; only the main
+          // thread orchestrates. Belt-and-braces with the bridge's own `opts.depth === 0` gate on
+          // sendMessageCalls above. Captured into resumeCtx.excludeTools below, so a resumed child
+          // stays excluded too.
           const childDepth = opts.depth + 1;
-          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode"]);
+          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode", "send_message"]);
           if (childDepth >= maxDepth) childExcludeTools.add("spawn_agent");
+          // 4h-ii-b Task 1: instructionsFull is computed ONCE here — hoisted out of the bg and
+          // sync closures below, which used to each build their own copy independently — so it
+          // can be captured into `resumeCtx` just below AND reused by both closures without
+          // recomputing. Every input (def.instructions, childCwd, a fresh childLoaded Set,
+          // childPolicy, sessionId) is already known at this point in the bridge either way, so
+          // this is purely a hoist: same value, computed earlier, not a behavior change.
+          const childLoaded = new Set<string>();
+          const instructionsFull = this.buildInstructionsFull(def.instructions, childCwd, childLoaded, childPolicy, sessionId);
+          // 4h-ii-b Task 1: everything a future `resume` (Task 3) needs to re-run THIS child
+          // EXCEPT input/signal — captured now, at spawn time, from the exact values this bridge
+          // already computed to start the child's own live run below. Stored on the registry
+          // entry regardless of run_in_background — BOTH the bg and sync paths register with this
+          // SAME context (see each path's own register() call just below).
+          const resumeCtx: ResumeContext = {
+            agentType: agentType ?? "general-purpose",
+            cwd: childCwd,
+            roots: isolatedWorktree ? [isolatedWorktree.dir] : undefined,
+            approvalPolicy: childPolicy,
+            model: effectiveOverride ?? opts.model,
+            instructions: instructionsFull,
+            maxTurns,
+            // 4h-ii-b Task 3 (D5): capture-at-spawn, don't re-derive-at-resume. `openingPrompt` is
+            // the child's original prompt (never persisted as a child event — the fresh run passes
+            // it straight into `input` below), so resume must prepend it by hand. `loaded` is
+            // snapshotted here (right after buildInstructionsFull, which does NOT mutate
+            // childLoaded — so it's [] at a normal spawn); a resumed run re-derives deferral from
+            // scratch rather than inheriting the child's later in-run ToolSearch loads. depth/
+            // excludeTools/allowTools are the exact runThread args this spawn computed, arrayified.
+            openingPrompt: prompt,
+            description,
+            depth: childDepth,
+            loaded: Array.from(childLoaded),
+            excludeTools: Array.from(childExcludeTools),
+            allowTools: def.allowTools ? Array.from(def.allowTools) : undefined,
+          };
           // 4h-ii-a (CC parity: Agent.run_in_background): the async/detached path — starts the
           // child through the SAME SubagentManager slot (concurrency-limited) + depth cap as the
           // synchronous path below, but does NOT await it. `entryAbort` is THIS bg entry's own
@@ -860,25 +1066,26 @@ export class AgentEngine {
               agentId: childId,
               sessionId,
               threadId: childId,
-              // `name` (4h-ii-b) is a follow-up arg — this task never passes one, so every bg
-              // entry is addressed by agentId (childId) only, same as thread.list today.
-              name: undefined,
+              // `name` (4h-ii-b Task 2): the caller's own stable per-session handle (spawn.ts's
+              // `name` arg) — undefined when omitted, unchanged register() behavior.
+              name: spawnName,
               abort: entryAbort,
+              resume: resumeCtx,
             });
             if (!registered.ok) {
-              // Not reachable today (childId is a fresh randomUUID and name is always undefined
-              // here, so register() can only ever reject on a collision this task never produces)
-              // — handled defensively rather than assumed impossible, mirroring the guard style
-              // used throughout this bridge. thread_started already fired above, so this must
-              // still complete that thread entry rather than leaving a ghost "running" thread.
+              // childId itself can't collide (a fresh randomUUID), so this can only ever be a
+              // NAME collision — the pre-check above already rejects the common case (a name
+              // already registered from a prior spawn/turn) before thread_started even fires, so
+              // this is the backstop for the one thing the pre-check can't see: two sibling
+              // spawns in the SAME batch reusing one name (neither had registered yet when the
+              // pre-check ran for either). thread_started already fired above for THIS call, so
+              // this must still complete that thread entry rather than leaving a ghost "running" thread.
               this.emit(sessionId, { type: "thread_completed", sessionId, threadId: childId, stopReason: "error" });
               this.completeThread(sessionId, childId, "error");
               spawnOutcomes.set(call.callId, { output: registered.error, isError: true });
               return;
             }
             void this.cfg.subagents!.run(async (childSignal) => {
-              const childLoaded = new Set<string>();
-              const instructionsFull = this.buildInstructionsFull(def.instructions, childCwd, childLoaded, childPolicy, sessionId);
               return this.runThread({
                 sessionId,
                 threadId: childId,
@@ -959,6 +1166,35 @@ export class AgentEngine {
             return; // Promise.all resolves without waiting on the detached chain above
           }
 
+          // 4h-ii-b Task 1: register a SYNC spawn in the bg-agent registry too — before this task
+          // only `run_in_background` spawns ever got a registry entry. CC parity: ANY finished
+          // agent (sync or async) must be resumable, and `resume` (Task 3) looks a child up by
+          // agentId in this SAME registry regardless of how it was spawned. `entryAbort` mirrors
+          // the bg path's own controller above (AgentEntry.abort is a mandatory field) and is
+          // folded into this child's own signal below via AbortSignal.any, exactly like the bg
+          // path — nothing calls registry.stop() yet (no stop tool exists today), but this keeps
+          // a future stop() working uniformly for sync- and bg-spawned children without touching
+          // this bridge again. Gated on `this.cfg.bgAgents` being wired at all (optional, same as
+          // the bg path's own guard) — when it's absent this block is a no-op and the sync spawn
+          // runs exactly as it did before this task (plain `childSignal`, no registry entry).
+          // Registration failure is defensive-only, same reasoning as the bg path's own
+          // register() call above: childId can't collide (a fresh randomUUID) and a `name`
+          // collision with an EXISTING agent was already rejected by the pre-check before
+          // thread_started fired — the only thing this register() can still reject is a
+          // same-batch sibling reusing one name (see the bg path's own comment above). Unlike the
+          // bg path, a failure here must NOT fail the sync spawn itself (the registry is a BONUS
+          // here, not the only channel back to the caller like it is for a detached child), so
+          // `registeredInBg` just guards the later complete() call.
+          const entryAbort = this.cfg.bgAgents ? new AbortController() : undefined;
+          const registeredInBg = !!(entryAbort && this.cfg.bgAgents!.register({
+            agentId: childId,
+            sessionId,
+            threadId: childId,
+            name: spawnName,
+            abort: entryAbort,
+            resume: resumeCtx,
+          }).ok);
+
           // Nested-spawn saturation fix (T3 review): `opts.depth` is THIS spawning thread's own
           // depth — >0 means it already holds a concurrency slot (it's itself a child), so this
           // run() call is a REENTRANT acquire. SubagentManager bounds a reentrant wait
@@ -968,8 +1204,6 @@ export class AgentEngine {
           // never reentrant and keeps its existing unbounded queueing behind busy siblings.
           try {
             const result = await this.cfg.subagents!.run(async (childSignal) => {
-              const childLoaded = new Set<string>();
-              const instructionsFull = this.buildInstructionsFull(def.instructions, childCwd, childLoaded, childPolicy, sessionId);
               return this.runThread({
                 sessionId,
                 threadId: childId,
@@ -989,7 +1223,11 @@ export class AgentEngine {
                 // policy corruption).
                 meta: childMeta,
                 depth: childDepth,
-                signal: childSignal,
+                // registeredInBg → entryAbort is defined (see the register block above) and its
+                // signal is folded in, mirroring the bg path's own AbortSignal.any wiring; absent
+                // registration (no bgAgents wired) → plain childSignal, unchanged pre-4h-ii-b
+                // behavior.
+                signal: registeredInBg ? AbortSignal.any([childSignal, entryAbort!.signal]) : childSignal,
                 loaded: childLoaded,
                 // enter_plan_mode excluded alongside exit_plan_mode (4g Task 4): the child inherits
                 // the parent's (or, with a narrowing `mode` override, its OWN child-scoped) `meta`
@@ -1019,11 +1257,25 @@ export class AgentEngine {
             // message" success — the parent's tool_result is the only channel a child has back to
             // its caller (unlike the main thread, whose agent_error event the user sees directly).
             // The `!result.ok` branch (SubagentManager timeout / thrown error) is unchanged.
-            spawnOutcomes.set(call.callId, !result.ok
+            // Computed ONCE (4h-ii-b Task 1) — the exact same {output,isError}-shaped outcome
+            // both feeds the parent's tool_result (spawnOutcomes, unchanged wording/behavior from
+            // before this task) AND, when this sync spawn was also registered above
+            // (registeredInBg), the registry's own complete() — same {ok,result} shape the bg
+            // path's own `.then` handler already uses just above, so a `resume`d-then-re-finished
+            // sync child and a bg child report through the exact same registry contract.
+            const outcome: { output: string; isError: boolean } = !result.ok
               ? { output: `subagent (${agentType ?? "general-purpose"}) ${result.error}`, isError: true }
               : result.value.stopReason === "error"
                 ? { output: `subagent (${agentType ?? "general-purpose"}) failed: ${result.value.errorMessage ?? "provider error"}`, isError: true }
-                : { output: result.value.finalText || "the subagent finished without a final message", isError: false });
+                : { output: result.value.finalText || "the subagent finished without a final message", isError: false };
+            spawnOutcomes.set(call.callId, outcome);
+            // { notified: true } — this sync child's result already reached the parent directly
+            // as this SAME call's tool_result, this SAME turn; without this the next turn's
+            // buildBgCompletionReminder sweep (built for run_in_background's DETACHED
+            // completions) would re-surface it as a "background agent finished" reminder,
+            // leaking the child's raw output into a turn that never asked for it (see
+            // BackgroundAgentRegistry.complete's own doc comment).
+            if (registeredInBg) this.cfg.bgAgents!.complete(childId, { ok: !outcome.isError, result: outcome.output }, { notified: true });
           } finally {
             // 4h-i Task 4: teardown runs whether the child succeeded, errored, or timed out —
             // clean-only (mirrors exit_worktree's default guard AND CC's own isolation
@@ -1045,14 +1297,59 @@ export class AgentEngine {
         }));
       }
 
+      // 4h-ii-b Task 4 (SM1/SM4): the send_message bridge. Each depth-0 send_message call resolves
+      // its `to` (agentId/name) in this session's bg-agent registry and routes: a RUNNING target
+      // gets the message queued into its thread steer queue (sendToThread); a TERMINAL target is
+      // resumed in the BACKGROUND (resumeThread with runInBackground:true — send_message never
+      // blocks the parent, and this reuses ALL of T3's guards: clean-termination, removed-worktree,
+      // policy no-widen). The precomputed {output,isError} becomes the call's tool_result in the
+      // dispatch loop below (read via `preOutcome`), so a send_message call never reaches
+      // executeCall. `to`/`message` are hand-parsed from argsJson (string-only) BEFORE any zod
+      // would run — same defensive shape as the spawn bridge — so a malformed call is a typed error.
+      for (const call of sendMessageCalls) {
+        let smParsed: { to?: unknown; message?: unknown } = {};
+        try { smParsed = JSON.parse(call.argsJson || "{}"); } catch { /* defensive: typed error below */ }
+        const to = typeof smParsed.to === "string" && smParsed.to.length > 0 ? smParsed.to : undefined;
+        const message = typeof smParsed.message === "string" && smParsed.message.length > 0 ? smParsed.message : undefined;
+        if (!to) { sendMessageOutcomes.set(call.callId, { output: "invalid arguments for send_message: to", isError: true }); continue; }
+        if (!message) { sendMessageOutcomes.set(call.callId, { output: "invalid arguments for send_message: message", isError: true }); continue; }
+        // No registry wired (daemon.ts never built bgAgents) → nothing to address, mirroring the
+        // spawn bridge's own `run_in_background && !bgAgents` guard.
+        if (!this.cfg.bgAgents) { sendMessageOutcomes.set(call.callId, { output: "send_message is not available in this session", isError: true }); continue; }
+        const target = this.cfg.bgAgents.get(to, sessionId);
+        if (!target) { sendMessageOutcomes.set(call.callId, { output: `no agent '${to}' to message`, isError: true }); continue; }
+        if (target.status === "running") {
+          this.sendToThread(sessionId, target.threadId, message);
+          sendMessageOutcomes.set(call.callId, { output: `message delivered to '${to}'`, isError: false });
+          continue;
+        }
+        // terminal (completed/failed/stopped) → resume it in the background. Its {output,isError}
+        // (a bg resume returns {agentId,status:"running"} immediately, or a T3 guard's typed error)
+        // becomes this send_message call's tool_result.
+        sendMessageOutcomes.set(call.callId, await this.resumeThread({
+          sessionId,
+          resumeArg: to,
+          prompt: message,
+          runInBackground: true,
+          meta,
+          model: opts.model,
+          reasoningEffort: opts.reasoningEffort,
+          depth: opts.depth,
+          parentThreadId: threadId,
+        }));
+      }
+
       for (const call of calls) {
         this.emit(sessionId, { type: "tool_call", sessionId, threadId, callId: call.callId, name: call.name, argsJson: call.argsJson });
         input.push({ type: "function_call", callId: call.callId, name: call.name, argsJson: call.argsJson });
 
         let outcome: { output: string; isError: boolean; deniedByHuman?: boolean };
-        const spawnOutcome = spawnOutcomes.get(call.callId);
-        if (spawnOutcome) {
-          outcome = spawnOutcome;
+        // A precomputed outcome from the spawn OR send_message bridge above becomes this call's
+        // tool_result verbatim (both are computed BEFORE this loop so N spawns/messages in one
+        // assistant message don't serialize the dispatch), so it never falls through to executeCall.
+        const preOutcome = spawnOutcomes.get(call.callId) ?? sendMessageOutcomes.get(call.callId);
+        if (preOutcome) {
+          outcome = preOutcome;
           this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
           input.push({ type: "tool_result", callId: call.callId, output: outcome.output, isError: outcome.isError });
           continue;
@@ -1180,6 +1477,7 @@ export class AgentEngine {
         // user then says. Any later calls in this same batch were never emitted/pushed (the
         // loop pushes function_call + tool_result one at a time), so nothing is left dangling.
         if (outcome.deniedByHuman) {
+          cleanupThreadSteer();
           this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "end_turn", ...usage });
           if (opts.depth === 0 && this.cfg.titler) void this.cfg.titler.maybeTitle(sessionId);
           return { finalText: lastText, stopReason: "end_turn" };
@@ -1188,9 +1486,201 @@ export class AgentEngine {
     }
 
     const capMessage = `tool-iteration cap (${effectiveMaxIterations}) reached`;
+    cleanupThreadSteer();
     this.emit(sessionId, { type: "agent_error", sessionId, threadId, message: capMessage });
     this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "error", ...usage });
     return { finalText: lastText, stopReason: "error", errorMessage: capMessage };
+  }
+
+  /**
+   * 4h-ii-b Task 3 (D6/D7): re-run a FINISHED child thread WITH its full prior context — the
+   * engine half of spawn_agent `resume`. Called from the spawn bridge's per-call callback (an
+   * early branch that takes over the whole callback for a resume call), and structured so T4's
+   * `send_message`-to-a-finished-agent can reuse the SAME "re-run this terminal thread with a new
+   * prompt" path (a resume of a finished agent IS a send_message to a finished agent).
+   *
+   * Returns the {output,isError} outcome the caller drops into `spawnOutcomes` — for a sync resume
+   * the child's final text (awaited); for a `run_in_background` resume, {agentId,status:"running"}
+   * immediately (the detached run re-completes the registry entry off-turn, exactly like a fresh
+   * bg spawn). NO worktree is created or torn down here (D6): a resume reuses `rc.roots`.
+   */
+  private async resumeThread(args: {
+    sessionId: string;
+    resumeArg: string;
+    prompt: string;
+    runInBackground: boolean;
+    meta: ReturnType<SessionStore["meta"]>;
+    model: string;
+    reasoningEffort?: string;
+    depth: number;
+    parentThreadId: string;
+  }): Promise<{ output: string; isError: boolean }> {
+    const { sessionId, resumeArg, prompt, runInBackground, meta, model, reasoningEffort, depth, parentThreadId } = args;
+
+    // D7 — all typed-error guards BEFORE any thread_started re-emit / store write / runThread.
+    if (!prompt) return { output: "resume requires a prompt (the new instruction to continue with)", isError: true };
+    const entry = this.cfg.bgAgents?.get(resumeArg, sessionId);
+    if (!entry) return { output: `no agent '${resumeArg}' to resume`, isError: true };
+    if (entry.status === "running") return { output: `agent '${resumeArg}' is still running — use send_message to message it`, isError: true };
+    const rc = entry.resume;
+    // Defensive (Task 1's contract): an entry may predate the resume-context capture, or have been
+    // registered by a caller that never built one — such an agent is simply not resumable.
+    if (!rc) return { output: `agent '${resumeArg}' has no saved context to resume`, isError: true };
+
+    // T3 REVIEW (IMPORTANT) — CLEAN-TERMINATION guard, by HISTORY SHAPE, not by status. Reconstruct
+    // the child's PRE-EXISTING stored history HERE (before the reopen / thread_started re-emit /
+    // user_message persist below, so it reflects the child's TRUE end state) and require it to END ON
+    // AN ASSISTANT TURN. This directly enforces D1's alternation invariant regardless of status: a
+    // cleanly COMPLETED or cleanly STOPPED child ends on an assistant_message and IS resumable; a
+    // capped / failed / mid-tool child ends on a tool_result or an orphan function_call (or has no
+    // history) and is NOT — resuming it would persist user(newPrompt) after that trailing item and
+    // hand the provider [...tool_result, user] (non-standard adjacency) or [...function_call, user]
+    // (orphan call → near-certain hard reject), since openai-compatible.ts mapInput is a blind 1:1
+    // map with no coalescing/validation.
+    //   A STATUS CHECK IS INSUFFICIENT — status is orthogonal to last-event shape (verified against
+    // this file): the tool-iteration cap path (~:1362) returns stopReason:"error" → the completion
+    // fork (~:1188) maps that to isError:true → complete(ok:false) → status "failed" (NOT
+    // "completed"); the human-denied path (~:1354) emits the denied tool_result then returns
+    // stopReason:"end_turn" → isError:false → complete(ok:true) → status "completed" YET its last
+    // child event is a tool_result; and a cleanly-stopped child is status "stopped" yet ends on an
+    // assistant turn and SHOULD resume. So neither `=== "completed"` nor `!== "failed"` gets this
+    // right — only the last-event shape does. "Resume a capped agent for more turns" is a headline
+    // use case, so reject it GRACEFULLY here rather than let a malformed provider input through.
+    const priorHistory = this.childHistoryInput(sessionId, entry.threadId);
+    const lastPrior = priorHistory[priorHistory.length - 1];
+    if (!lastPrior || !(lastPrior.type === "message" && lastPrior.role === "assistant")) {
+      return { output: `agent '${resumeArg}' didn't finish cleanly and can't be resumed`, isError: true };
+    }
+
+    // T3 REVIEW (MINOR) — REMOVED-WORKTREE guard. An isolation:"worktree" child's worktree is torn
+    // down on clean completion, so on resume rc.roots points at a possibly-removed dir; the fs/bash
+    // tools would then fence to a gone directory and error confusingly mid-run. rc.roots is only set
+    // when the child WAS isolated (undefined → a plain-cwd child, skip); rc.roots[0] is the primary
+    // cwd by contract. Reject up front rather than fail confusingly later.
+    if (rc.roots && rc.roots[0] && !existsSync(rc.roots[0])) {
+      return { output: `cannot resume an isolated agent '${resumeArg}'; its worktree was removed`, isError: true };
+    }
+
+    const agentType = rc.agentType ?? "general-purpose";
+
+    // 4h-ii-b Task 4 (SM3, defensive): start the resumed run with a CLEAN thread steer queue. A
+    // send_message to the prior (now-terminal) instance is stale on resume — and there is a narrow
+    // window where one can be orphaned into this queue: runThread's own cleanupThreadSteer runs at
+    // its terminal return BEFORE the detached completion handler flips bgAgents status to terminal,
+    // so a delivery in that gap sees "running" and lands here AFTER cleanup. Deleting the key here,
+    // before input reconstruction / the round-0 top-drain, guarantees such a message can't be
+    // drained into the resumed run (it would otherwise surface as a spurious extra user turn).
+    this.threadSteerQueue.delete(entry.threadId);
+
+    // D4 — POLICY ON RESUME (restrict-only, no widen): the MORE RESTRICTIVE of {current session
+    // policy, the child's ORIGINAL captured policy}. This never widens beyond the child's original
+    // grant (satisfies "a resume can't widen the child's original policy"), AND additionally caps
+    // the resumed run at the CURRENT session policy if the session has TIGHTENED since spawn (e.g.
+    // the user switched to plan mode) — strictly safer than reusing rc.approvalPolicy verbatim,
+    // never wider. Same shallow-copy-only-when-it-narrows discipline as the fresh path's childMeta.
+    const childPolicyOnResume = restrictPolicy(meta.approvalPolicy, rc.approvalPolicy);
+    const childMeta = childPolicyOnResume !== meta.approvalPolicy ? { ...meta, approvalPolicy: childPolicyOnResume } : meta;
+
+    // D3 — flip the registry entry back to running with a FRESH abort controller (register() can't
+    // re-admit a known agentId). reopen() also resets notified so the resumed completion re-fires
+    // its reminder (bg path); the sync path re-marks it notified below.
+    const entryAbort = new AbortController();
+    this.cfg.bgAgents!.reopen(entry.agentId, entryAbort);
+
+    // D2 — re-emit thread_started so both client reducers RE-ADD the child (they prune all child
+    // items on the main thread's turn_completed, and dedupe thread_started by threadId → a no-op if
+    // still present, a correct re-add if pruned). parentThreadId is the RESUMING thread. The NEW
+    // prompt rides thread_started.prompt (what the clients render as the child's prompt), so the
+    // child user_message persisted below needs no separate broadcast for display.
+    this.emit(sessionId, {
+      type: "thread_started", sessionId, threadId: entry.threadId, parentThreadId,
+      agentType, prompt, description: rc.description,
+    });
+    // registerThread would PUSH a second thread.list entry for the same child on every resume — D2
+    // says "call registerThread", but a literal push double-lists the child; refine to flip the
+    // EXISTING entry back to running in place (register it only if somehow absent). thread_started's
+    // own by-threadId dedupe already covers the client-facing event stream.
+    const existingThread = this.threadsFor(sessionId).find((t) => t.threadId === entry.threadId);
+    if (existingThread) { existingThread.status = "running"; existingThread.stopReason = undefined; }
+    else this.registerThread(sessionId, { threadId: entry.threadId, parentThreadId, agentType, status: "running" });
+
+    // D1 — persist the NEW prompt as a child-scoped user_message BEFORE reconstructing input, so
+    // childHistoryInput picks it up as the LAST child event. Without this, resume #1 works but
+    // resume #2's reconstruction loses the between-assistants user turn (see childHistoryInput's
+    // KNOWN GAP note and this task's D1). The store's first_message index special-cases
+    // threadId==="main" only, so a child user_message appends without mis-indexing. runThread does
+    // NOT re-persist its input, so this event is written exactly once (pinned by an engine test).
+    this.emit(sessionId, { type: "user_message", sessionId, threadId: entry.threadId, text: prompt, clientName: "resume" });
+    // Reconstruct: opening prompt (the fresh spawn never persisted it) + the child's OWN stored
+    // history (now ending with the prompt just persisted).
+    const input: TurnInputItem[] = [
+      { type: "message", role: "user", content: rc.openingPrompt },
+      ...this.childHistoryInput(sessionId, entry.threadId),
+    ];
+
+    // D5 — replay the EXACT runThread args captured at spawn (fresh Sets from the arrayified
+    // snapshots), NOT re-derived: rc.depth (the child's own depth, gates its grandchild spawns),
+    // rc.instructions/cwd/roots/maxTurns, rc.model ?? the resuming turn's model. reasoningEffort is
+    // the CURRENT resuming turn's effort (inherited per-turn, not frozen at spawn). Both the sync
+    // and bg forks fold entryAbort.signal into the run signal, mirroring the fresh path.
+    const runResumed = (childSignal: AbortSignal) => this.runThread({
+      sessionId,
+      threadId: entry.threadId,
+      instructionsFull: rc.instructions,
+      input,
+      cwd: rc.cwd,
+      model: rc.model ?? model,
+      reasoningEffort,
+      meta: childMeta,
+      depth: rc.depth,
+      signal: AbortSignal.any([childSignal, entryAbort.signal]),
+      loaded: new Set(rc.loaded),
+      excludeTools: new Set(rc.excludeTools),
+      allowTools: rc.allowTools ? new Set(rc.allowTools) : undefined,
+      maxTurns: rc.maxTurns,
+      rootsOverride: rc.roots,
+    });
+
+    // D6 — same sync/bg fork the fresh path uses; `reentrant` keys off the RESUMING thread's depth
+    // (a depth>0 resumer already holds a SubagentManager slot), exactly like the fresh spawn.
+    if (runInBackground) {
+      void this.cfg.subagents!.run(async (childSignal) => runResumed(childSignal), { reentrant: depth > 0 })
+        .then((result) => {
+          const stopReason = result.ok ? result.value.stopReason : "error";
+          this.emit(sessionId, { type: "thread_completed", sessionId, threadId: entry.threadId, stopReason });
+          this.completeThread(sessionId, entry.threadId, stopReason);
+          this.cfg.bgAgents!.complete(entry.agentId, !result.ok
+            ? { ok: false, result: `subagent (${agentType}) ${result.error}` }
+            : result.value.stopReason === "error"
+              ? { ok: false, result: `subagent (${agentType}) failed: ${result.value.errorMessage ?? "provider error"}` }
+              : { ok: true, result: result.value.finalText || "the subagent finished without a final message" });
+        })
+        .catch((err) => {
+          // Defensive: SubagentManager.run() never throws; this guards a throw in the .then handler
+          // above so a detached resume never leaves an unhandled rejection.
+          const message = err instanceof Error ? err.message : String(err);
+          this.emit(sessionId, { type: "thread_completed", sessionId, threadId: entry.threadId, stopReason: "error" });
+          this.completeThread(sessionId, entry.threadId, "error");
+          this.cfg.bgAgents!.complete(entry.agentId, { ok: false, result: message });
+        })
+        .catch(() => { /* terminal net: a throw in the .catch above (persistent IO fault on the completion emit) has no caller to surface to on a detached run — swallow rather than emit an unhandled rejection */ });
+      return { output: JSON.stringify({ agentId: entry.threadId, status: "running" }), isError: false };
+    }
+
+    const result = await this.cfg.subagents!.run(async (childSignal) => runResumed(childSignal), { reentrant: depth > 0 });
+    const stopReason = result.ok ? result.value.stopReason : "error";
+    this.emit(sessionId, { type: "thread_completed", sessionId, threadId: entry.threadId, stopReason });
+    this.completeThread(sessionId, entry.threadId, stopReason);
+    const outcome: { output: string; isError: boolean } = !result.ok
+      ? { output: `subagent (${agentType}) ${result.error}`, isError: true }
+      : result.value.stopReason === "error"
+        ? { output: `subagent (${agentType}) failed: ${result.value.errorMessage ?? "provider error"}`, isError: true }
+        : { output: result.value.finalText || "the subagent finished without a final message", isError: false };
+    // { notified: true }: this sync resume's result reached the caller directly as its own
+    // tool_result this same turn, so the next turn's completion-reminder sweep must not re-surface
+    // it (same reasoning as the fresh sync path).
+    this.cfg.bgAgents!.complete(entry.agentId, { ok: !outcome.isError, result: outcome.output }, { notified: true });
+    return outcome;
   }
 
   /** Shared approval-request flow for the `ask`-policy path, the reviewer's escalation path, and
