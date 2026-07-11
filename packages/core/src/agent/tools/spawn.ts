@@ -77,6 +77,15 @@ export function registerSpawnAgentTool(r: ToolRegistry, opts: { models?: string[
     // use by a DIFFERENT agent in this session fails the spawn as a typed isError tool_result;
     // omitted → the child is addressable by agentId only, unchanged from before this arg.
     name: z.string().min(1).max(64).optional(),
+    // `resume` (4h-ii-b Task 3, CC parity: continue a finished agent): an agentId or `name` of a
+    // FINISHED child in this session to CONTINUE with its full prior context (its own message +
+    // tool history), re-running the SAME child thread rather than spawning a fresh one. Requires a
+    // `prompt` (the new instruction). Same two-layer shape as the args above: the engine's spawn
+    // bridge hand-parses argsJson BEFORE this zod schema would ever run and is the ONLY thing that
+    // actually looks the agent up / replays its thread — a resume of a still-running agent, an
+    // unknown one, or one without a prompt fails as a typed isError tool_result. Omitted → today's
+    // fresh-spawn behavior, unchanged.
+    resume: z.string().min(1).optional(),
   });
   r.register({
     name: "spawn_agent",
@@ -89,7 +98,8 @@ export function registerSpawnAgentTool(r: ToolRegistry, opts: { models?: string[
       "mode: optional child permission-mode override (default/plan/acceptEdits/dontAsk/bypassPermissions) — RESTRICT-ONLY: it can only make the child MORE restrictive than this session, never less; a request that would widen permissions is ignored and the child keeps this session's policy. " +
       "isolation: optional; \"worktree\" runs the child in a fresh git worktree (an isolated copy of the repo, not the parent's own working directory) — its read/write/edit/glob/grep and foreground bash are fenced to that worktree (note: a background bash task it starts is NOT yet fenced and still runs against the session's own working directory); the worktree is automatically removed when the child finishes IF it's clean (no uncommitted changes), otherwise it's left on disk for you to review (no auto-merge). Requires the session's cwd to be a git repository. " +
       "run_in_background: optional; true launches the child detached — you get back `{agentId, status:\"running\"}` immediately instead of waiting for its final report, and your turn continues right away. The child keeps running (still subject to the concurrency/depth limits) and you're notified once it finishes; omit (or false) to wait for the child's result as usual. " +
-      "name: optional stable handle (1-64 chars) for this child, unique per session — lets you address it later by name instead of its agentId; a name already in use by a different agent in this session is rejected.",
+      "name: optional stable handle (1-64 chars) for this child, unique per session — lets you address it later by name instead of its agentId; a name already in use by a different agent in this session is rejected. " +
+      "resume: optional; an agentId or name of a FINISHED child to continue with its full prior context (it remembers its earlier work) instead of spawning a fresh one — still supply `prompt` with the new instruction. Resuming a still-running agent, an unknown one, or omitting the prompt is rejected.",
     args: SpawnArgs,
     run(_args: z.infer<typeof SpawnArgs>) {
       return "subagents are not available in this session";

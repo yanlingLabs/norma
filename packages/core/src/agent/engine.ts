@@ -725,7 +725,7 @@ export class AgentEngine {
         : [];
       if (spawnCalls.length > 0) {
         await Promise.all(spawnCalls.map(async (call) => {
-          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown; max_turns?: unknown; mode?: unknown; isolation?: unknown; run_in_background?: unknown; name?: unknown } = {};
+          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown; max_turns?: unknown; mode?: unknown; isolation?: unknown; run_in_background?: unknown; name?: unknown; resume?: unknown } = {};
           try { parsed = JSON.parse(call.argsJson || "{}"); } catch { /* defensive: empty prompt below */ }
           const prompt = typeof parsed.prompt === "string" ? parsed.prompt : "";
           const agentType = typeof parsed.agentType === "string" ? parsed.agentType : undefined;
@@ -737,6 +737,10 @@ export class AgentEngine {
           // same as omitting the arg entirely (the child is addressable by agentId only, today's
           // unchanged behavior).
           const spawnName = typeof parsed.name === "string" ? parsed.name : undefined;
+          // 4h-ii-b Task 3 (CC parity: resume a finished agent) — same hand-parse-before-zod
+          // reasoning as name/model/mode above: only a non-empty string is recognized (an agentId
+          // or a `name` to resume); anything else → undefined, i.e. today's fresh-spawn path.
+          const resumeArg = typeof parsed.resume === "string" && parsed.resume.length > 0 ? parsed.resume : undefined;
           // 4h-i (CC parity: Agent.max_turns): this bridge hand-parses raw argsJson BEFORE
           // spawn.ts's own zod validation would ever run (same reason model/description are
           // hand-checked above), so a provider that ignores the declared `.int().positive().max(50)`
@@ -773,6 +777,27 @@ export class AgentEngine {
           // recognized; anything else (wrong type, absent, false) → false, same as omitting the arg
           // entirely (the synchronous, awaited path — today's unchanged behavior).
           const runInBackground = parsed.run_in_background === true;
+          // 4h-ii-b Task 3 (D7): a resume takes over the WHOLE callback for this call — it sits
+          // EARLY, before any fresh-spawn machinery (childId gen, description/model checks,
+          // worktree, register). resumeThread does its own typed-error guards (no prompt / unknown
+          // / still-running) BEFORE any thread_started re-emit or store write, and drives the
+          // resumed run through the SAME sync/bg fork the fresh path uses. `threadId` is the
+          // RESUMING thread (this callback's own thread) — it becomes the re-emitted child's
+          // parentThreadId (D2).
+          if (resumeArg !== undefined) {
+            spawnOutcomes.set(call.callId, await this.resumeThread({
+              sessionId,
+              resumeArg,
+              prompt,
+              runInBackground,
+              meta,
+              model: opts.model,
+              reasoningEffort: opts.reasoningEffort,
+              depth: opts.depth,
+              parentThreadId: threadId,
+            }));
+            return;
+          }
           // Child-scoped meta: a shallow copy ONLY when childPolicy actually narrows (differs from
           // the parent's) — never mutate the shared `meta` object itself (that object is the SAME
           // one `turn()`'s dispatch loop uses for the REST of the parent's turn; mutating
@@ -932,6 +957,19 @@ export class AgentEngine {
             model: effectiveOverride ?? opts.model,
             instructions: instructionsFull,
             maxTurns,
+            // 4h-ii-b Task 3 (D5): capture-at-spawn, don't re-derive-at-resume. `openingPrompt` is
+            // the child's original prompt (never persisted as a child event — the fresh run passes
+            // it straight into `input` below), so resume must prepend it by hand. `loaded` is
+            // snapshotted here (right after buildInstructionsFull, which does NOT mutate
+            // childLoaded — so it's [] at a normal spawn); a resumed run re-derives deferral from
+            // scratch rather than inheriting the child's later in-run ToolSearch loads. depth/
+            // excludeTools/allowTools are the exact runThread args this spawn computed, arrayified.
+            openingPrompt: prompt,
+            description,
+            depth: childDepth,
+            loaded: Array.from(childLoaded),
+            excludeTools: Array.from(childExcludeTools),
+            allowTools: def.allowTools ? Array.from(def.allowTools) : undefined,
           };
           // 4h-ii-a (CC parity: Agent.run_in_background): the async/detached path — starts the
           // child through the SAME SubagentManager slot (concurrency-limited) + depth cap as the
@@ -1325,6 +1363,154 @@ export class AgentEngine {
     this.emit(sessionId, { type: "agent_error", sessionId, threadId, message: capMessage });
     this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "error", ...usage });
     return { finalText: lastText, stopReason: "error", errorMessage: capMessage };
+  }
+
+  /**
+   * 4h-ii-b Task 3 (D6/D7): re-run a FINISHED child thread WITH its full prior context — the
+   * engine half of spawn_agent `resume`. Called from the spawn bridge's per-call callback (an
+   * early branch that takes over the whole callback for a resume call), and structured so T4's
+   * `send_message`-to-a-finished-agent can reuse the SAME "re-run this terminal thread with a new
+   * prompt" path (a resume of a finished agent IS a send_message to a finished agent).
+   *
+   * Returns the {output,isError} outcome the caller drops into `spawnOutcomes` — for a sync resume
+   * the child's final text (awaited); for a `run_in_background` resume, {agentId,status:"running"}
+   * immediately (the detached run re-completes the registry entry off-turn, exactly like a fresh
+   * bg spawn). NO worktree is created or torn down here (D6): a resume reuses `rc.roots`.
+   */
+  private async resumeThread(args: {
+    sessionId: string;
+    resumeArg: string;
+    prompt: string;
+    runInBackground: boolean;
+    meta: ReturnType<SessionStore["meta"]>;
+    model: string;
+    reasoningEffort?: string;
+    depth: number;
+    parentThreadId: string;
+  }): Promise<{ output: string; isError: boolean }> {
+    const { sessionId, resumeArg, prompt, runInBackground, meta, model, reasoningEffort, depth, parentThreadId } = args;
+
+    // D7 — all typed-error guards BEFORE any thread_started re-emit / store write / runThread.
+    if (!prompt) return { output: "resume requires a prompt (the new instruction to continue with)", isError: true };
+    const entry = this.cfg.bgAgents?.get(resumeArg, sessionId);
+    if (!entry) return { output: `no agent '${resumeArg}' to resume`, isError: true };
+    if (entry.status === "running") return { output: `agent '${resumeArg}' is still running — use send_message to message it`, isError: true };
+    const rc = entry.resume;
+    // Defensive (Task 1's contract): an entry may predate the resume-context capture, or have been
+    // registered by a caller that never built one — such an agent is simply not resumable.
+    if (!rc) return { output: `agent '${resumeArg}' has no saved context to resume`, isError: true };
+
+    const agentType = rc.agentType ?? "general-purpose";
+
+    // D4 — POLICY ON RESUME (restrict-only, no widen): the MORE RESTRICTIVE of {current session
+    // policy, the child's ORIGINAL captured policy}. This never widens beyond the child's original
+    // grant (satisfies "a resume can't widen the child's original policy"), AND additionally caps
+    // the resumed run at the CURRENT session policy if the session has TIGHTENED since spawn (e.g.
+    // the user switched to plan mode) — strictly safer than reusing rc.approvalPolicy verbatim,
+    // never wider. Same shallow-copy-only-when-it-narrows discipline as the fresh path's childMeta.
+    const childPolicyOnResume = restrictPolicy(meta.approvalPolicy, rc.approvalPolicy);
+    const childMeta = childPolicyOnResume !== meta.approvalPolicy ? { ...meta, approvalPolicy: childPolicyOnResume } : meta;
+
+    // D3 — flip the registry entry back to running with a FRESH abort controller (register() can't
+    // re-admit a known agentId). reopen() also resets notified so the resumed completion re-fires
+    // its reminder (bg path); the sync path re-marks it notified below.
+    const entryAbort = new AbortController();
+    this.cfg.bgAgents!.reopen(entry.agentId, entryAbort);
+
+    // D2 — re-emit thread_started so both client reducers RE-ADD the child (they prune all child
+    // items on the main thread's turn_completed, and dedupe thread_started by threadId → a no-op if
+    // still present, a correct re-add if pruned). parentThreadId is the RESUMING thread. The NEW
+    // prompt rides thread_started.prompt (what the clients render as the child's prompt), so the
+    // child user_message persisted below needs no separate broadcast for display.
+    this.emit(sessionId, {
+      type: "thread_started", sessionId, threadId: entry.threadId, parentThreadId,
+      agentType, prompt, description: rc.description,
+    });
+    // registerThread would PUSH a second thread.list entry for the same child on every resume — D2
+    // says "call registerThread", but a literal push double-lists the child; refine to flip the
+    // EXISTING entry back to running in place (register it only if somehow absent). thread_started's
+    // own by-threadId dedupe already covers the client-facing event stream.
+    const existingThread = this.threadsFor(sessionId).find((t) => t.threadId === entry.threadId);
+    if (existingThread) { existingThread.status = "running"; existingThread.stopReason = undefined; }
+    else this.registerThread(sessionId, { threadId: entry.threadId, parentThreadId, agentType, status: "running" });
+
+    // D1 — persist the NEW prompt as a child-scoped user_message BEFORE reconstructing input, so
+    // childHistoryInput picks it up as the LAST child event. Without this, resume #1 works but
+    // resume #2's reconstruction loses the between-assistants user turn (see childHistoryInput's
+    // KNOWN GAP note and this task's D1). The store's first_message index special-cases
+    // threadId==="main" only, so a child user_message appends without mis-indexing. runThread does
+    // NOT re-persist its input, so this event is written exactly once (pinned by an engine test).
+    this.emit(sessionId, { type: "user_message", sessionId, threadId: entry.threadId, text: prompt, clientName: "resume" });
+    // Reconstruct: opening prompt (the fresh spawn never persisted it) + the child's OWN stored
+    // history (now ending with the prompt just persisted).
+    const input: TurnInputItem[] = [
+      { type: "message", role: "user", content: rc.openingPrompt },
+      ...this.childHistoryInput(sessionId, entry.threadId),
+    ];
+
+    // D5 — replay the EXACT runThread args captured at spawn (fresh Sets from the arrayified
+    // snapshots), NOT re-derived: rc.depth (the child's own depth, gates its grandchild spawns),
+    // rc.instructions/cwd/roots/maxTurns, rc.model ?? the resuming turn's model. reasoningEffort is
+    // the CURRENT resuming turn's effort (inherited per-turn, not frozen at spawn). Both the sync
+    // and bg forks fold entryAbort.signal into the run signal, mirroring the fresh path.
+    const runResumed = (childSignal: AbortSignal) => this.runThread({
+      sessionId,
+      threadId: entry.threadId,
+      instructionsFull: rc.instructions,
+      input,
+      cwd: rc.cwd,
+      model: rc.model ?? model,
+      reasoningEffort,
+      meta: childMeta,
+      depth: rc.depth,
+      signal: AbortSignal.any([childSignal, entryAbort.signal]),
+      loaded: new Set(rc.loaded),
+      excludeTools: new Set(rc.excludeTools),
+      allowTools: rc.allowTools ? new Set(rc.allowTools) : undefined,
+      maxTurns: rc.maxTurns,
+      rootsOverride: rc.roots,
+    });
+
+    // D6 — same sync/bg fork the fresh path uses; `reentrant` keys off the RESUMING thread's depth
+    // (a depth>0 resumer already holds a SubagentManager slot), exactly like the fresh spawn.
+    if (runInBackground) {
+      void this.cfg.subagents!.run(async (childSignal) => runResumed(childSignal), { reentrant: depth > 0 })
+        .then((result) => {
+          const stopReason = result.ok ? result.value.stopReason : "error";
+          this.emit(sessionId, { type: "thread_completed", sessionId, threadId: entry.threadId, stopReason });
+          this.completeThread(sessionId, entry.threadId, stopReason);
+          this.cfg.bgAgents!.complete(entry.agentId, !result.ok
+            ? { ok: false, result: `subagent (${agentType}) ${result.error}` }
+            : result.value.stopReason === "error"
+              ? { ok: false, result: `subagent (${agentType}) failed: ${result.value.errorMessage ?? "provider error"}` }
+              : { ok: true, result: result.value.finalText || "the subagent finished without a final message" });
+        })
+        .catch((err) => {
+          // Defensive: SubagentManager.run() never throws; this guards a throw in the .then handler
+          // above so a detached resume never leaves an unhandled rejection.
+          const message = err instanceof Error ? err.message : String(err);
+          this.emit(sessionId, { type: "thread_completed", sessionId, threadId: entry.threadId, stopReason: "error" });
+          this.completeThread(sessionId, entry.threadId, "error");
+          this.cfg.bgAgents!.complete(entry.agentId, { ok: false, result: message });
+        })
+        .catch(() => { /* terminal net: a throw in the .catch above (persistent IO fault on the completion emit) has no caller to surface to on a detached run — swallow rather than emit an unhandled rejection */ });
+      return { output: JSON.stringify({ agentId: entry.threadId, status: "running" }), isError: false };
+    }
+
+    const result = await this.cfg.subagents!.run(async (childSignal) => runResumed(childSignal), { reentrant: depth > 0 });
+    const stopReason = result.ok ? result.value.stopReason : "error";
+    this.emit(sessionId, { type: "thread_completed", sessionId, threadId: entry.threadId, stopReason });
+    this.completeThread(sessionId, entry.threadId, stopReason);
+    const outcome: { output: string; isError: boolean } = !result.ok
+      ? { output: `subagent (${agentType}) ${result.error}`, isError: true }
+      : result.value.stopReason === "error"
+        ? { output: `subagent (${agentType}) failed: ${result.value.errorMessage ?? "provider error"}`, isError: true }
+        : { output: result.value.finalText || "the subagent finished without a final message", isError: false };
+    // { notified: true }: this sync resume's result reached the caller directly as its own
+    // tool_result this same turn, so the next turn's completion-reminder sweep must not re-surface
+    // it (same reasoning as the fresh sync path).
+    this.cfg.bgAgents!.complete(entry.agentId, { ok: !outcome.isError, result: outcome.output }, { notified: true });
+    return outcome;
   }
 
   /** Shared approval-request flow for the `ask`-policy path, the reviewer's escalation path, and

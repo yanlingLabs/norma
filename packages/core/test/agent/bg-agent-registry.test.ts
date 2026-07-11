@@ -211,10 +211,72 @@ describe("BackgroundAgentRegistry", () => {
       model: "fake-1",
       instructions: "you are a subagent",
       maxTurns: 10,
+      // 4h-ii-b Task 3 (D5): the fields resume (T3) captures at spawn so it re-runs the child
+      // with the exact same depth/tools/opening-prompt, never a re-derived guess.
+      openingPrompt: "review the auth module",
+      description: "review auth",
+      depth: 1,
+      loaded: ["ToolSearch"],
+      excludeTools: ["ask_user", "exit_plan_mode", "enter_plan_mode"],
+      allowTools: ["read", "grep"],
     };
     reg.register({ ...entry(), resume });
     expect(reg.get("a1")?.resume).toEqual(resume);
     expect(reg.list("s1")[0]?.resume).toEqual(resume);
+  });
+
+  // 4h-ii-b Task 3 (D3): reopen() re-admits an already-registered TERMINAL entry (register()
+  // rejects a known agentId, so resume can't use it to flip status). This is what lets a finished
+  // agent be resumed: flip status running, clear the stale result, reset notified so the resumed
+  // completion's reminder re-fires, and swap in the resume attempt's fresh AbortController.
+  test("reopen(terminal) → true: status running, result cleared, notified reset, abort replaced", () => {
+    const reg = new BackgroundAgentRegistry();
+    const firstAbort = new AbortController();
+    reg.register({ ...entry(), abort: firstAbort });
+    reg.complete("a1", { ok: true, result: "first run output" }, { notified: true });
+    expect(reg.get("a1")).toMatchObject({ status: "completed", result: "first run output", notified: true });
+
+    const resumeAbort = new AbortController();
+    const ok = reg.reopen("a1", resumeAbort);
+    expect(ok).toBe(true);
+    const e = reg.get("a1")!;
+    expect(e.status).toBe("running");
+    expect(e.result).toBeUndefined();
+    expect(e.notified).toBe(false);
+    expect(e.abort).toBe(resumeAbort);
+  });
+
+  test("reopen(unknown id) → false, no throw", () => {
+    const reg = new BackgroundAgentRegistry();
+    expect(reg.reopen("nope", new AbortController())).toBe(false);
+  });
+
+  test("reopen(already running) → false — a running agent is not resumable (the bridge guards this too)", () => {
+    const reg = new BackgroundAgentRegistry();
+    const firstAbort = new AbortController();
+    reg.register({ ...entry(), abort: firstAbort });
+    const ok = reg.reopen("a1", new AbortController());
+    expect(ok).toBe(false);
+    // untouched: still running, still holds its ORIGINAL abort controller
+    expect(reg.get("a1")?.status).toBe("running");
+    expect(reg.get("a1")?.abort).toBe(firstAbort);
+  });
+
+  test("reopen a stopped entry → true (stopped is terminal too)", () => {
+    const reg = new BackgroundAgentRegistry();
+    reg.register(entry());
+    reg.stop("a1");
+    expect(reg.get("a1")?.status).toBe("stopped");
+    expect(reg.reopen("a1", new AbortController())).toBe(true);
+    expect(reg.get("a1")?.status).toBe("running");
+  });
+
+  test("a reopened (now-running) entry is NOT surfaced by takeCompletedForSession", () => {
+    const reg = new BackgroundAgentRegistry();
+    reg.register(entry());
+    reg.complete("a1", { ok: true, result: "done" }); // unnotified terminal
+    reg.reopen("a1", new AbortController()); // flip back to running BEFORE the sweep
+    expect(reg.takeCompletedForSession("s1")).toEqual([]);
   });
 
   // 4h-ii-b Task 1: a SYNC spawn's completion is registered `notified` immediately (the caller

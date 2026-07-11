@@ -32,6 +32,19 @@ export interface ResumeContext {
   model?: string;
   instructions: string;
   maxTurns?: number;
+  // 4h-ii-b Task 3 (D5) — additive: the rest of what resume needs, CAPTURED at spawn (not
+  // re-derived at resume, which risks divergence — e.g. agents.resolve() re-run against a
+  // different cwd could pick a different local agent-def). `openingPrompt` is the child's ORIGINAL
+  // spawn prompt, which the fresh spawn never persisted as a child event (it went straight into
+  // runThread's in-memory input), so resume must prepend it by hand. `depth`/`loaded`/
+  // `excludeTools`/`allowTools` are the exact runThread args the original spawn computed, snapshotted
+  // to arrays here (Set → Array) so the ResumeContext stays a plain, structurally-clonable value.
+  openingPrompt: string;
+  description?: string;
+  depth: number;
+  loaded: string[];
+  excludeTools: string[];
+  allowTools?: string[];
 }
 
 export interface AgentEntry {
@@ -112,6 +125,31 @@ export class BackgroundAgentRegistry {
     e.status = outcome.ok ? "completed" : "failed";
     e.result = outcome.result;
     if (opts?.notified) e.notified = true;
+  }
+
+  /**
+   * 4h-ii-b Task 3 (D3): re-admits an already-registered TERMINAL entry so `resume` (engine.ts's
+   * spawn bridge) can re-run its child thread. `register()` REJECTS a known agentId (re-
+   * registration is a caller bug there), so resume needs this dedicated re-open path instead.
+   *
+   * If the entry exists AND is terminal (completed/failed/stopped): flips status → running, clears
+   * the stale `result`, resets `notified` to false (so the resumed run's OWN completion reminder
+   * re-fires — CC parity: a resumed agent that finishes again notifies again), and swaps in the
+   * resume attempt's fresh AbortController (`abort` is never reused across runs). Returns true.
+   *
+   * If missing, or already running, returns false and does nothing — both cases the bridge already
+   * guards (unknown → "no agent to resume"; running → "still running, use send_message"), so a
+   * false here is purely defensive. A reopened (now-running) entry is naturally excluded from
+   * `takeCompletedForSession` again (its status is no longer terminal).
+   */
+  reopen(agentId: string, abort: AbortController): boolean {
+    const e = this.agents.get(agentId);
+    if (!e || e.status === "running") return false;
+    e.status = "running";
+    e.result = undefined;
+    e.notified = false;
+    e.abort = abort;
+    return true;
   }
 
   /**
