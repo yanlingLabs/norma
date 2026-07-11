@@ -15,6 +15,25 @@
 
 export type AgentStatus = "running" | "completed" | "failed" | "stopped";
 
+/**
+ * Everything a future `resume` (4h-ii-b Task 3) needs to re-run this child thread EXCEPT its
+ * `input` (the resume message itself, supplied by the resume caller) and `signal` (freshly
+ * minted per resume attempt, never reused across runs). Captured by the spawn bridge
+ * (engine.ts) at spawn time — for BOTH the synchronous and `run_in_background` paths — from the
+ * exact values it already computed to start the child's own live run, so resume replays the
+ * SAME agentType/cwd/roots/policy/model/instructions/maxTurns the original spawn used, not a
+ * re-derived guess.
+ */
+export interface ResumeContext {
+  agentType?: string;
+  cwd: string;
+  roots?: string[];
+  approvalPolicy: "ask" | "auto" | "plan";
+  model?: string;
+  instructions: string;
+  maxTurns?: number;
+}
+
 export interface AgentEntry {
   agentId: string;
   sessionId: string;
@@ -25,6 +44,10 @@ export interface AgentEntry {
   startedAt: number;
   notified: boolean;
   abort: AbortController;
+  // Optional/additive (4h-ii-b Task 1): absent for any entry registered before this field
+  // existed (or by a caller that never builds a ResumeContext) — resume (T3) must treat a
+  // missing `resume` as "not resumable", never assume it's present.
+  resume?: ResumeContext;
 }
 
 export interface RegisterInput {
@@ -33,6 +56,7 @@ export interface RegisterInput {
   threadId: string;
   name?: string;
   abort: AbortController;
+  resume?: ResumeContext;
 }
 
 export type RegisterResult = { ok: true } | { ok: false; error: string };
@@ -68,16 +92,26 @@ export class BackgroundAgentRegistry {
       startedAt: Date.now(),
       notified: false,
       abort: e.abort,
+      resume: e.resume,
     });
     return { ok: true };
   }
 
-  /** running → completed|failed, stores the result. No-op if unknown or already terminal. */
-  complete(agentId: string, outcome: { ok: boolean; result: string }): void {
+  /** running → completed|failed, stores the result. No-op if unknown or already terminal.
+   *  `opts.notified` (4h-ii-b Task 1): set `true` for a SYNC spawn's own completion — the
+   *  synchronous caller already received this result directly as its tool_result, in the SAME
+   *  turn, so `takeCompletedForSession`'s later completion-reminder sweep (engine.ts's
+   *  `buildBgCompletionReminder`, built for `run_in_background`'s DETACHED completions) must
+   *  never re-surface it on a future turn — that would leak the child's raw result text into a
+   *  turn that never asked for it (Seam #1: a child's internal output must stay scoped to its own
+   *  turn). Omitted/false (the `run_in_background` path's own call site) is unchanged: a bg
+   *  completion starts unnotified so the sweep picks it up exactly once. */
+  complete(agentId: string, outcome: { ok: boolean; result: string }, opts?: { notified?: boolean }): void {
     const e = this.agents.get(agentId);
     if (!e || e.status !== "running") return;
     e.status = outcome.ok ? "completed" : "failed";
     e.result = outcome.result;
+    if (opts?.notified) e.notified = true;
   }
 
   /**

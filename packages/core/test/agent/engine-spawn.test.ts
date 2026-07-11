@@ -1169,6 +1169,12 @@ function setupIsolation(
   const agentsTrust = new TrustStore(join(agentsHome, "trust.json"));
   const agents = new AgentStore({ normaHome: agentsHome, trust: agentsTrust });
   const subagents = new SubagentManager({});
+  // 4h-ii-b Task 1: always wired (mirrors the top-level `setup()`'s own default) — no
+  // pre-existing isolation test here asserts on registry state, so wiring it doesn't change any
+  // of their observable behavior (a sync spawn's registry entry is a byte-identical no-op
+  // as far as the child's own execution goes: `entryAbort`'s signal never fires). Lets a NEW
+  // test assert isolation's worktree dir lands in the registry entry's `resume.roots`.
+  const bgAgents = new BackgroundAgentRegistry();
   const engine = new AgentEngine({
     store, hub, registry, broker,
     gate: new PermissionGate(),
@@ -1180,14 +1186,15 @@ function setupIsolation(
     agents,
     subagents,
     worktrees,
+    bgAgents,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: "auto" });
-  return { engine, store, hub, broker, sessionId, cwd, provider, dirs };
+  return { engine, store, hub, broker, sessionId, cwd, provider, dirs, bgAgents };
 }
 
 describe.if(isMac)("AgentEngine: spawn_agent isolation:\"worktree\" (4h-i Task 4)", () => {
   test("child writes a file under isolation:\"worktree\" → the file lands in the worktree dir, NOT the parent repo; the (dirty) worktree is left on disk (no auto-remove, no auto-merge)", async () => {
-    const { engine, store, sessionId, cwd } = setupIsolation([
+    const { engine, store, sessionId, cwd, bgAgents } = setupIsolation([
       [spawnCall("s1", "write a note", { isolation: "worktree" }), done("tool_calls")], // parent round 0: spawn, isolated
       [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: "note.txt", content: "isolated" }) }, done("tool_calls")], // child round 0
       text("wrote the note"), // child round 1: end turn
@@ -1226,6 +1233,13 @@ describe.if(isMac)("AgentEngine: spawn_agent isolation:\"worktree\" (4h-i Task 4
     // sanity: still a real git worktree, on its own norma/ branch
     const branchList = git(["branch", "--list", `norma/${names[0]}`], cwd);
     expect(branchList.stdout.trim().length).toBeGreaterThan(0);
+
+    // 4h-ii-b Task 1: the registry entry's captured resume context uses the ISOLATED worktree
+    // dir as BOTH cwd and roots (exactly what this child's own runThread call actually got as
+    // `cwd`/`rootsOverride` — see the bridge's `resumeCtx` construction) — not the parent repo.
+    const entry = bgAgents.list(sessionId).find((e) => e.threadId === (started as Extract<SessionEvent, { type: "thread_started" }>).threadId);
+    expect(entry?.resume?.cwd).toBe(wtDir);
+    expect(entry?.resume?.roots).toEqual([wtDir]);
   });
 
   test("a CLEAN isolated child (no changes) → the worktree is auto-removed after it returns — `git worktree list` shows only the original repo", async () => {
@@ -1457,6 +1471,29 @@ describe("AgentEngine: spawn_agent run_in_background (4h-ii-a)", () => {
     expect(mainTurnCompleted).toMatchObject({ stopReason: "end_turn" });
   });
 
+  test("4h-ii-b Task 1: resume context is captured on the bg entry at spawn — agentType/cwd/approvalPolicy/model/maxTurns/instructions match what the child actually ran with", async () => {
+    const { engine, store, sessionId, cwd, bgAgents } = setup([
+      [spawnCall("s1", "bg task", { run_in_background: true, model: "fake-1", max_turns: 7, agentType: "general-purpose" }), done("tool_calls")],
+      text("parent wrap-up"),
+    ]);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const started = events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>;
+    const entry = bgAgents.get(started.threadId);
+    expect(entry?.resume).toMatchObject({
+      agentType: "general-purpose",
+      cwd,
+      roots: undefined, // no isolation → the resumed child falls back to the session's live roots
+      approvalPolicy: "auto", // setup()'s default policy, no mode override
+      model: "fake-1",
+      maxTurns: 7,
+    });
+    // instructions carries the child's own agent-def base prompt (subagent framing), not the
+    // parent's own instructions — proof this is genuinely the CHILD's resolved instructionsFull.
+    expect(entry?.resume?.instructions).toContain("subagent");
+  });
+
   test("no run_in_background (default false/absent) → unchanged, fully-awaited synchronous behavior; parent's tool_result is the child's final text, not a running-JSON", async () => {
     const { engine, store, sessionId, bgAgents } = setup([
       [spawnCall("s1", "do X"), done("tool_calls")],
@@ -1471,9 +1508,15 @@ describe("AgentEngine: spawn_agent run_in_background (4h-ii-a)", () => {
     const toolResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
     expect(toolResult).toMatchObject({ isError: false, output: "child final report" });
 
-    // never touches the bg registry at all — the sync path is untouched by 4h-ii-a
+    // 4h-ii-b Task 1: a sync spawn now ALSO registers (and completes) in the bg registry — CC
+    // parity, so a finished sync-spawned agent is resumable too, not just a bg-spawned one — but
+    // it's registered `notified` (see BackgroundAgentRegistry.complete's own doc comment): the
+    // parent already got this result directly as the tool_result above, this same turn, so it
+    // must never ALSO surface via the next turn's completion-reminder sweep.
     const started = events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>;
-    expect(bgAgents.list(sessionId).find((e) => e.agentId === started.threadId)).toBeUndefined();
+    const entry = bgAgents.list(sessionId).find((e) => e.agentId === started.threadId);
+    expect(entry).toMatchObject({ status: "completed", result: "child final report", notified: true });
+    expect(entry?.resume).toMatchObject({ agentType: "general-purpose", approvalPolicy: "auto" });
   });
 
   test("run_in_background:true whose child provider ERRORS → registry.complete records isError-shaped failure text, thread_completed stopReason 'error'", async () => {

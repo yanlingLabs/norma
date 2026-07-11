@@ -192,4 +192,48 @@ describe("BackgroundAgentRegistry", () => {
     expect(reg.list("s1").map((e) => e.agentId)).toEqual(["a1"]);
     expect(reg.list("s2").map((e) => e.agentId)).toEqual(["a2"]);
   });
+
+  // 4h-ii-b Task 1: `resume` is additive/optional on both RegisterInput and AgentEntry — 4h-ii-a's
+  // register() calls (which never pass one) must still compile and behave exactly as before.
+  test("register: `resume` is optional — an entry registered without one carries resume:undefined", () => {
+    const reg = new BackgroundAgentRegistry();
+    reg.register(entry());
+    expect(reg.get("a1")?.resume).toBeUndefined();
+  });
+
+  test("register: `resume` (when passed) round-trips through get()/list() untouched", () => {
+    const reg = new BackgroundAgentRegistry();
+    const resume = {
+      agentType: "reviewer",
+      cwd: "/repo/child",
+      roots: ["/repo/child"],
+      approvalPolicy: "auto" as const,
+      model: "fake-1",
+      instructions: "you are a subagent",
+      maxTurns: 10,
+    };
+    reg.register({ ...entry(), resume });
+    expect(reg.get("a1")?.resume).toEqual(resume);
+    expect(reg.list("s1")[0]?.resume).toEqual(resume);
+  });
+
+  // 4h-ii-b Task 1: a SYNC spawn's completion is registered `notified` immediately (the caller
+  // already got this result directly as its own tool_result, same turn) — complete()'s new
+  // `opts.notified` param must actually suppress it from takeCompletedForSession's sweep, not
+  // just set the field cosmetically.
+  test("complete({notified:true}) → the entry is immediately notified, so takeCompletedForSession never returns it", () => {
+    const reg = new BackgroundAgentRegistry();
+    reg.register(entry());
+    reg.complete("a1", { ok: true, result: "done" }, { notified: true });
+    expect(reg.get("a1")).toMatchObject({ status: "completed", result: "done", notified: true });
+    expect(reg.takeCompletedForSession("s1")).toEqual([]);
+  });
+
+  test("complete without opts (default) is unchanged — entry starts unnotified, takeCompletedForSession still picks it up once", () => {
+    const reg = new BackgroundAgentRegistry();
+    reg.register(entry());
+    reg.complete("a1", { ok: true, result: "done" });
+    expect(reg.get("a1")?.notified).toBe(false);
+    expect(reg.takeCompletedForSession("s1").map((e) => e.agentId)).toEqual(["a1"]);
+  });
 });
