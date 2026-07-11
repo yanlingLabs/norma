@@ -231,4 +231,50 @@ describe("HookFacade.runFor", () => {
     expect(runner.calls.map((c) => c.spec.pluginId)).toEqual(["alpha", "beta"]);
     expect(results.length).toBe(2);
   });
+
+  // I1 (4f whole-branch review): a session interrupt must be able to cut through a running hook
+  // CHAIN — the engine has `signal` in scope at every hook site but never threaded it, so an
+  // aborted session kept firing subsequent hooks. runFor now takes an optional AbortSignal and, per
+  // design F-abort, checks `signal?.aborted` BEFORE STARTING each hook, returning the results so far.
+  test("aborted-before-call signal → zero hooks started (chain never begins)", async () => {
+    const registry = new HookRegistry();
+    registry.rebuild([
+      { id: "alpha", dir: "/plugins/alpha", hooks: [{ event: "pre-tool", command: "./a.sh" }] },
+      { id: "beta", dir: "/plugins/beta", hooks: [{ event: "pre-tool", command: "./b.sh" }] },
+    ]);
+    const runner = new FakeRunner([ok(), ok()]);
+    const facade = new HookFacade({ registry, runner: runner as unknown as HookRunner, hooksEnabled: () => true });
+
+    const controller = new AbortController();
+    controller.abort(); // already aborted before runFor is even entered
+    const results = await facade.runFor("pre-tool", {}, "sess-1", controller.signal);
+
+    expect(runner.calls.length).toBe(0); // not a single hook ran
+    expect(results).toEqual([]);
+  });
+
+  test("signal aborted mid-chain → the in-flight hook completes but NO further hooks start", async () => {
+    const registry = new HookRegistry();
+    registry.rebuild([
+      { id: "alpha", dir: "/plugins/alpha", hooks: [{ event: "post-tool", command: "./a.sh" }] },
+      { id: "beta", dir: "/plugins/beta", hooks: [{ event: "post-tool", command: "./b.sh" }] },
+      { id: "gamma", dir: "/plugins/gamma", hooks: [{ event: "post-tool", command: "./c.sh" }] },
+    ]);
+    const controller = new AbortController();
+    // Runner aborts the session while alpha is "running" — before beta's pre-hook check runs.
+    const runner = {
+      calls: [] as string[],
+      run(spec: HookSpec, _payload: HookEventPayload): Promise<HookResult> {
+        this.calls.push(spec.pluginId);
+        controller.abort();
+        return Promise.resolve(ok());
+      },
+    };
+    const facade = new HookFacade({ registry, runner: runner as unknown as HookRunner, hooksEnabled: () => true });
+
+    const results = await facade.runFor("post-tool", {}, "sess-1", controller.signal);
+
+    expect(runner.calls).toEqual(["alpha"]); // beta + gamma never started — the chain was cut
+    expect(results.map((r) => r.pluginId)).toEqual(["alpha"]); // alpha's result is still returned
+  });
 });

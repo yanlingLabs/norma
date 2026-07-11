@@ -80,13 +80,22 @@ export class HookFacade {
    * stops the loop (deny-only short-circuit per design F1); every other event always runs its full
    * list regardless of any individual hook's outcome (observe-only, per plan: "other events run
    * all").
+   *
+   * `signal` (4f whole-branch I1): the caller's session AbortSignal. Checked BEFORE STARTING each
+   * hook so a session interrupt can cut through a running hook CHAIN — an aborted signal stops the
+   * loop and returns the results gathered so far (an already-aborted signal starts zero hooks). The
+   * in-flight hook the abort races is NOT killed mid-run here (facade-level only, v1): it still
+   * completes, bounded by its own HookRunner timeout + readCapped deadline. Threading the signal
+   * into HookRunner.run to SIGKILL the child on abort is a deferred refinement — the chain-cut above
+   * is what the interrupt needs, and every hook is already time-bounded.
    */
-  async runFor(event: string, extra: Record<string, unknown>, sessionId: string): Promise<Array<{ pluginId: string; result: HookResult }>> {
+  async runFor(event: string, extra: Record<string, unknown>, sessionId: string, signal?: AbortSignal): Promise<Array<{ pluginId: string; result: HookResult }>> {
     const specs = this.deps.registry.hooksFor(event);
     if (specs.length === 0 || !this.deps.hooksEnabled()) return [];
 
     const results: Array<{ pluginId: string; result: HookResult }> = [];
     for (const spec of specs) {
+      if (signal?.aborted) break; // session interrupted — stop the chain, return what we have
       const payload: HookEventPayload = { event, sessionId, pluginId: spec.pluginId, ts: Date.now(), ...extra };
       const result = await this.deps.runner.run(spec, payload);
       results.push({ pluginId: spec.pluginId, result });

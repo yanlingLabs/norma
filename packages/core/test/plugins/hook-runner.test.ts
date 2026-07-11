@@ -208,4 +208,61 @@ describe("HookRunner.run", () => {
     },
     5000,
   );
+
+  // C1(l) regression (4f whole-branch review): a hook that backgrounds a process which INHERITS
+  // stdout (`sleep 5 & echo done`). `sh` writes "done" and EXITS — so proc.exited resolves ~instantly
+  // and proc.exitCode is 0 (this is the NORMAL-exit path, NOT the timeout path) — but the backgrounded
+  // grandchild keeps the pipe's write end open, so no EOF ever reaches our read. Pre-fix, the
+  // normal-exit path did `new Response(proc.stdout).text()`, which reads to EOF and therefore BLOCKS
+  // for the grandchild's whole lifetime (5s here); every engine hook site awaits run(), so the turn
+  // wedges and never clears runningTurns — unrecoverable without a daemon restart. Post-fix, readCapped
+  // races the read against a bounded deadline (the hook's own remaining budget, floored at 500ms) and
+  // returns the partial "done" it already captured. `sleep 5`, not `sleep 30`: the latter collides with
+  // tools-bash.test.ts's literal `pgrep -f 'sleep 30'` orphan guard. The 1500ms bun-test-level timeout
+  // (3rd arg) is the fail-fast RED guard — pre-fix this hangs ~5s to the grandchild's natural exit.
+  test(
+    "(l) C1: grandchild inheriting stdout holds the pipe open → readCapped returns partial promptly, never blocks to EOF",
+    async () => {
+      const runner = new HookRunner();
+      const start = Date.now();
+      const result = await runner.run(mkSpec({ command: "sleep 5 & echo done", timeoutMs: 300 }), mkPayload());
+      const elapsed = Date.now() - start;
+
+      expect(result.status).toBe("ok"); // sh exited 0 — classification is unchanged, uses proc.exitCode
+      expect(result.stdout).toContain("done"); // partial-ok: we captured what was written before the deadline
+      expect(elapsed).toBeLessThan(1500); // resolves at the ~500ms read deadline, nowhere near the 5s grandchild
+    },
+    1500,
+  );
+
+  // C1(m) regression (4f whole-branch review): the UNBOUNDED-memory facet, exercised by a grandchild
+  // that FLOODS the inherited stdout (`yes x & echo start`): sh exits instantly (proc.exited resolves,
+  // exitCode 0) but the orphaned `yes` writes forever with no EOF. Pre-fix, `new Response(proc.stdout)
+  // .text()` drains that unbounded stream into a single string — it never terminates, so run() BOTH
+  // hangs AND grows RSS without bound (measured ~+1.1GB within 4s → daemon OOM). Post-fix, readCapped
+  // reads at most STDOUT_CAP bytes then reader.cancel()s, which closes our read end so the orphan gets
+  // SIGPIPE and dies, and resolves in ~ms with a capped string. NB a *bounded* huge dump (e.g. 64MB
+  // `head -c … | tr`) does NOT reproduce this: Bun eagerly drains+buffers a finite producer's whole
+  // stdout into memory BEFORE proc.exited resolves, so pre-fix and post-fix show the same peak there —
+  // only an unbounded producer distinguishes them (see task-4-report.md). Asserts cap + prompt
+  // resolution (2500ms bun-test timeout = RED guard; pre-fix hangs) + a bounded RSS delta around run().
+  test(
+    "(m) C1: grandchild flooding stdout → readCapped caps output and bounds memory, never buffers unboundedly",
+    async () => {
+      const runner = new HookRunner();
+      const rssBefore = process.memoryUsage().rss;
+      const start = Date.now();
+      const result = await runner.run(mkSpec({ command: "yes x & echo start" }), mkPayload());
+      const elapsed = Date.now() - start;
+      const rssDelta = process.memoryUsage().rss - rssBefore;
+
+      expect(result.status).toBe("ok");
+      expect(result.stdout.length).toBe(8192); // capped, not the unbounded flood
+      expect(elapsed).toBeLessThan(1500); // resolves at the cap in ~ms, no hang
+      // Bounded memory: the fixed path adds only a few MB around run(); the pre-fix ~1GB buffering
+      // would blow past this wide ceiling (pre-fix never even reaches this assertion — it hangs first).
+      expect(rssDelta).toBeLessThan(150_000_000);
+    },
+    2500,
+  );
 });

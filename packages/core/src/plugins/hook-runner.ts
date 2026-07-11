@@ -44,8 +44,68 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const STDOUT_CAP = 8192;
 const STDERR_CAP = 1024;
 
+/**
+ * Bounded, deadline-guarded stream collector (4f whole-branch C1). Replaces
+ * `new Response(stream).text().slice(0, cap)` on the normal-exit path, which had two failure modes:
+ *   (a) UNBOUNDED HANG — `.text()` reads to EOF, but a hook that backgrounds a process inheriting
+ *       our stdout/stderr (`sleep 5 & …`, a daemon, …) keeps the pipe's write end open after `sh`
+ *       exits, so EOF never arrives and the read blocks for the grandchild's whole lifetime. `sh`
+ *       has already exited and the grandchild is reparented to launchd (we hold no pid), so killing
+ *       is not an option — the fix is to STOP READING, not to kill.
+ *   (b) UNBOUNDED MEMORY — `.text()` materializes the entire stream as one string before slicing;
+ *       an unbounded producer (`yes … & …`) grows RSS without limit → daemon OOM.
+ * This helper (1) accumulates at most `cap` bytes (decoded incrementally, TextDecoder streaming),
+ * then cancels the reader and returns; (2) races the whole read against `deadlineMs` — on deadline
+ * it cancels the reader and returns whatever was captured (partial-ok); (3) CATCHES every rejection
+ * path internally (cancel / abandoned read / stream error). It NEVER throws and ALWAYS resolves a
+ * string — an unhandled rejection here would reintroduce the daemon-crash class fixed in 04696ad.
+ * `reader.cancel()` closes our read end, which is also what lets an orphaned flooding grandchild die
+ * (it gets SIGPIPE on its next write). NB it cannot bound a *bounded* producer's peak RSS: Bun
+ * eagerly drains+buffers a finite child's full stdout into memory before `proc.exited` resolves, so
+ * that spike predates collection; this helper bounds the collected string (no second full-size copy)
+ * and is the only thing that saves an UNBOUNDED producer or a grandchild-held pipe.
+ */
+async function readCapped(stream: ReadableStream<Uint8Array> | null, cap: number, deadlineMs: number): Promise<string> {
+  if (!stream) return "";
+  const reader = stream.getReader();
+  let out = "";
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  // The read loop is its own task so the deadline can win the race WITHOUT awaiting a stuck read().
+  // Its body try/catches, so it resolves (never rejects) even on a stream error mid-read.
+  const readLoop = (async () => {
+    const decoder = new TextDecoder(); // UTF-8; {stream:true} keeps multibyte sequences intact across chunks
+    try {
+      while (out.length < cap) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) out += decoder.decode(value, { stream: true });
+      }
+    } catch {
+      /* stream errored mid-read — keep whatever we already decoded */
+    }
+  })();
+
+  const deadline = new Promise<void>((resolve) => { timer = setTimeout(resolve, deadlineMs); });
+  try {
+    await Promise.race([readLoop, deadline]);
+  } catch {
+    /* defensive — readLoop already swallows, but never let this throw */
+  }
+  if (timer !== undefined) clearTimeout(timer); // don't keep the event loop alive on the fast path
+
+  // Whether we hit the cap, hit EOF, or hit the deadline: cancel to release our read end. Do NOT
+  // await cancel() (on the grandchild-held path the underlying read is stuck; awaiting could re-hang)
+  // and swallow its rejection. readLoop may still be pending (its read() is stuck) — attach a catch so
+  // it can never surface as an unhandled rejection, and let it resolve on its own once cancel lands.
+  readLoop.catch(() => {});
+  void reader.cancel().catch(() => {});
+  return out.slice(0, cap);
+}
+
 export class HookRunner {
   async run(spec: HookSpec, payload: HookEventPayload): Promise<HookResult> {
+    const startTime = Date.now(); // for the stream-read deadline below (remaining timeout budget)
     let proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
     try {
       proc = Bun.spawn(["sh", "-c", spec.command], {
@@ -117,18 +177,20 @@ export class HookRunner {
       return { status: "timeout", stdout: "" };
     }
 
-    let stdout = "";
-    let stderr = "";
-    try {
-      stdout = (await new Response(proc.stdout).text()).slice(0, STDOUT_CAP);
-    } catch {
-      /* stream read failed — treat as empty, exit code still decides the outcome below */
-    }
-    try {
-      stderr = (await new Response(proc.stderr).text()).slice(0, STDERR_CAP);
-    } catch {
-      /* same as above */
-    }
+    // Normal-exit collection (C1). `proc` has already exited (the race resolved with timedOut=false)
+    // and proc.exitCode is set — so classification below is UNCHANGED. But the stdout/stderr streams
+    // can still block to EOF if the hook backgrounded a process inheriting them (see readCapped's
+    // doc). Deadline = the hook's OWN remaining timeout budget (floored at 500ms), so a normal fast
+    // hook — whose streams are already closed — completes instantly, while a grandchild-held or
+    // unbounded stream is abandoned after at most that budget with whatever was captured (partial-ok).
+    // stdout+stderr are read CONCURRENTLY so a blocked pair costs one deadline, not two. A lost or
+    // partial stderr on the blocked path just leaves `reason` undefined → "no reason given" downstream
+    // (acceptable). readCapped never throws, so no try/catch is needed here.
+    const readDeadline = Math.max(500, timeoutMs - (Date.now() - startTime));
+    const [stdout, stderr] = await Promise.all([
+      readCapped(proc.stdout, STDOUT_CAP, readDeadline),
+      readCapped(proc.stderr, STDERR_CAP, readDeadline),
+    ]);
 
     const exitCode = proc.exitCode;
     if (exitCode === 0) return { status: "ok", stdout };

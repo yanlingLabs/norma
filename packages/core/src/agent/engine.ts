@@ -175,7 +175,7 @@ export interface EngineConfig {
   // HookRunner + the hot `settings.hooks.enabled` read (plugins/hook-registry.ts's HookFacade).
   // Absent (every test/config predating Task 3) means no hook call site fires at all — this field
   // existing on the type does NOT by itself add any behavior.
-  hooks?: { runFor(event: string, extra: Record<string, unknown>, sessionId: string): Promise<Array<{ pluginId: string; result: HookResult }>> };
+  hooks?: { runFor(event: string, extra: Record<string, unknown>, sessionId: string, signal?: AbortSignal): Promise<Array<{ pluginId: string; result: HookResult }>> };
 }
 
 export class AgentEngine {
@@ -466,10 +466,13 @@ export class AgentEngine {
   }
 
   // ---- Plugin hooks (4f Task 3) ----------------------------------------------------------------
-  // Four hook points hang off `cfg.hooks` (the Task-2 facade). Reserved-key note (once): the
-  // per-event `extra` objects below NEVER carry `event`/`sessionId`/`pluginId`/`ts` — the facade
-  // owns those and spreads `extra` LAST over its own common fields, so a payload key can't shadow
-  // them. F1 (deny-only): only `pre-tool` can BLOCK, and only AFTER the gate has run (or, for the
+  // Four hook points hang off `cfg.hooks` (the Task-2 facade). Reserved-key note (once): the facade
+  // spreads `extra` LAST over its own `{event, sessionId, pluginId, ts}`, so `extra` actually WINS a
+  // key collision — the safety therefore does NOT come from spread order. It comes from the fact that
+  // every per-event `extra` object below is authored HERE with only fixed, non-reserved literal keys
+  // (toolName/argsJson/output/isError/threadId/cwd/stopReason/inputTokens/outputTokens) — none of
+  // them is `event`/`sessionId`/`pluginId`/`ts`, so nothing can shadow the facade's common fields.
+  // F1 (deny-only): only `pre-tool` can BLOCK, and only AFTER the gate has run (or, for the
   // read-only bridged tools, at their effect boundary) — a hook can restrict a call but never
   // widen/approve one. F2 (fail-open): `error`/`timeout`/non-blocked `ok` results are ignored so
   // the tool proceeds — that's just NOT treating them as `blocked`, no extra code.
@@ -491,9 +494,10 @@ export class AgentEngine {
     call: { name: string; argsJson: string; callId: string },
     outcome: { output: string; isError: boolean },
     blockedCallIds: Set<string>,
+    signal?: AbortSignal, // [4f I1] session interrupt cuts through the hook chain
   ): Promise<void> {
     if (blockedCallIds.has(call.callId)) return;
-    await this.cfg.hooks!.runFor("post-tool", { toolName: call.name, argsJson: call.argsJson, output: outcome.output, isError: outcome.isError, threadId }, sessionId);
+    await this.cfg.hooks!.runFor("post-tool", { toolName: call.name, argsJson: call.argsJson, output: outcome.output, isError: outcome.isError, threadId }, sessionId, signal);
   }
 
   /** turn-end: fired immediately after a MAIN-thread `turn_completed` emit (all terminal paths:
@@ -507,6 +511,14 @@ export class AgentEngine {
     usage: { inputTokens: number; outputTokens: number },
   ): Promise<void> {
     if (threadId !== MAIN_THREAD) return;
+    // [4f I1] DELIBERATELY passes NO AbortSignal — unlike session-start/pre-tool/post-tool. turn-end
+    // is the TERMINAL observation and must fire on ALL terminal paths, INCLUDING `aborted` (see this
+    // method's doc above). But `stopReason === "aborted"` happens precisely when the session signal
+    // fired (the provider only reports "aborted" once `signal` is aborted), so threading that signal
+    // into runFor's pre-hook `aborted` check would suppress turn-end on exactly the aborted path the
+    // design requires it to fire on. I1's interrupt-cuts-the-chain guarantee targets the ongoing work
+    // of a live turn (pre-tool gate chain, post-tool observation, session-start injection), not the
+    // turn's close-out — and turn-end hooks are already time-bounded by their own HookRunner budget.
     await this.cfg.hooks!.runFor("turn-end", { stopReason, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens }, sessionId);
   }
 
@@ -668,7 +680,7 @@ export class AgentEngine {
     // error/timeout results (F2 fail-open) and ok-with-empty-stdout inject nothing. extra: {cwd}.
     if (this.cfg.hooks && !this.hookSessionStarted.has(sessionId)) {
       this.hookSessionStarted.add(sessionId);
-      const results = await this.cfg.hooks.runFor("session-start", { cwd }, sessionId);
+      const results = await this.cfg.hooks.runFor("session-start", { cwd }, sessionId, signal); // [4f I1] interrupt cuts the chain
       for (const { result } of results) {
         if (result.status === "ok" && result.stdout.trim().length > 0) {
           const content = "<system-reminder>\n"
@@ -899,7 +911,7 @@ export class AgentEngine {
           // boundary IS the gate boundary. A BLOCK sets this call's spawnOutcomes entry to the block
           // tool_result and returns — no thread_started ever emits.
           if (this.cfg.hooks) {
-            const results = await this.cfg.hooks.runFor("pre-tool", { toolName: call.name, argsJson: call.argsJson, threadId }, sessionId);
+            const results = await this.cfg.hooks.runFor("pre-tool", { toolName: call.name, argsJson: call.argsJson, threadId }, sessionId, signal); // [4f I1] interrupt cuts the chain
             const blocked = results.find((r) => r.result.status === "blocked");
             if (blocked) { spawnOutcomes.set(call.callId, this.hookBlockOutcome(blocked)); hookBlockedCallIds.add(call.callId); return; }
           }
@@ -1446,7 +1458,7 @@ export class AgentEngine {
         // Site 2 — this is its one and only pre-tool fire. send_message is READ_ONLY (no gate), so
         // its effect boundary is the gate boundary. A BLOCK sets the outcome and skips the delivery.
         if (this.cfg.hooks) {
-          const results = await this.cfg.hooks.runFor("pre-tool", { toolName: call.name, argsJson: call.argsJson, threadId }, sessionId);
+          const results = await this.cfg.hooks.runFor("pre-tool", { toolName: call.name, argsJson: call.argsJson, threadId }, sessionId, signal); // [4f I1] interrupt cuts the chain
           const blocked = results.find((r) => r.result.status === "blocked");
           if (blocked) { sendMessageOutcomes.set(call.callId, this.hookBlockOutcome(blocked)); hookBlockedCallIds.add(call.callId); continue; }
         }
@@ -1497,7 +1509,7 @@ export class AgentEngine {
           input.push({ type: "tool_result", callId: call.callId, output: outcome.output, isError: outcome.isError });
           // [4f post-tool — bridged outcome] observe a spawn_agent/send_message call's result.
           // firePostTool SKIPS a pre-tool-blocked call (hookBlockedCallIds) — that call never ran.
-          if (this.cfg.hooks) await this.firePostTool(sessionId, threadId, call, outcome, hookBlockedCallIds);
+          if (this.cfg.hooks) await this.firePostTool(sessionId, threadId, call, outcome, hookBlockedCallIds, signal); // [4f I1] interrupt cuts the chain
           continue;
         }
         if (call.name === "spawn_agent" && opts.depth >= maxDepth) {
@@ -1551,7 +1563,7 @@ export class AgentEngine {
         // reaches the prompt. A `deny` (plan-mode) call still fires the hook; block-or-not is moot
         // there (the tool won't run either way), acceptable for a single site.
         if (this.cfg.hooks) {
-          const results = await this.cfg.hooks.runFor("pre-tool", { toolName: call.name, argsJson: call.argsJson, threadId }, sessionId);
+          const results = await this.cfg.hooks.runFor("pre-tool", { toolName: call.name, argsJson: call.argsJson, threadId }, sessionId, signal); // [4f I1] interrupt cuts the chain
           const blocked = results.find((r) => r.result.status === "blocked");
           if (blocked) {
             outcome = this.hookBlockOutcome(blocked);
@@ -1642,7 +1654,7 @@ export class AgentEngine {
         // [4f post-tool — normal outcome] observe the executed call's result (success or isError).
         // A pre-tool-blocked normal call `continue`d at Site 2 and never reached here, so it's
         // naturally skipped (hookBlockedCallIds guards it anyway, defense-in-depth).
-        if (this.cfg.hooks) await this.firePostTool(sessionId, threadId, call, outcome, hookBlockedCallIds);
+        if (this.cfg.hooks) await this.firePostTool(sessionId, threadId, call, outcome, hookBlockedCallIds, signal); // [4f I1] interrupt cuts the chain
 
         // A human explicitly denied this action → end the turn now and return control to the
         // user (Claude Code parity). The denied tool_result is already persisted above, so the
