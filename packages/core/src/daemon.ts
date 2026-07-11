@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { statSync } from "node:fs";
 import { bootstrapNormaDir, resolveNormaHome } from "./norma-dir";
 import { acquireLock, type Lock } from "./lock";
 import { TokenAuthority } from "./auth/tokens";
@@ -7,7 +8,7 @@ import { KeychainSecretStore, type SecretStore } from "./auth/secret-store";
 import { SessionStore } from "./sessions/store";
 import { SessionHub } from "./sessions/hub";
 import { startIpcServer, type IpcServer, type IpcServerOptions } from "./ipc/server";
-import { loadSettings, loadPermissionDirs } from "./settings";
+import { loadSettings, loadPermissionDirs, hooksEnabledFrom } from "./settings";
 import { createProvider } from "./providers/manager";
 import type { Provider } from "./providers/types";
 import { QuotaManager } from "./providers/quota";
@@ -48,9 +49,11 @@ import { ContextAssembler } from "./agent/context";
 import { SkillStore } from "./agent/skills";
 import { BackgroundTaskRegistry } from "./agent/bg-registry";
 import { sessionTmpDir } from "./agent/session-tmp";
-import { PluginStore, pluginMcpEligible, pluginSpawnEligible } from "./agent/plugins";
+import { PluginStore, pluginMcpEligible, pluginSpawnEligible, hookRegistryPlugins } from "./agent/plugins";
 import { PluginSupervisor } from "./plugins/supervisor";
 import { PluginContribRegistry } from "./plugins/contrib";
+import { HookRegistry, HookFacade } from "./plugins/hook-registry";
+import { HookRunner } from "./plugins/hook-runner";
 import { AuditLog } from "./peripheral/audit";
 import { PeripheralBroker, type PeripheralClass } from "./peripheral/broker";
 import { ProviderLink } from "./peripheral/provider-link";
@@ -63,6 +66,14 @@ export interface RunningDaemon {
   socketPath: string;
   tokens: { harness: string; admin: string };
   stop(): void;
+}
+
+/** Same mtime-or-zero helper providers/manager.ts's `liveModel` and ipc/server.ts's `livePlugins`
+ *  each already define locally — kept as a tiny module-private duplicate here too rather than
+ *  exported/shared, matching that existing precedent (no shared "settings hot-read" utility file
+ *  exists yet; each hot-read site owns its own cache). */
+function statMtimeOrZero(path: string): number {
+  try { return statSync(path).mtimeMs; } catch { return 0; } // missing file -> key 0
 }
 
 /** Builds the `policy(sessionId, cls)` dependency PeripheralBroker.lease() awaits (spec §A1:
@@ -163,6 +174,14 @@ export async function startDaemon(opts: {
   // ToolRegistry/PluginSupervisor) exists — a plugin process started outside the supervisor (e.g.
   // manually, for development) can still register contributions over a plain plugin-role hello.
   const pluginContrib = new PluginContribRegistry();
+  // Plugin hooks runtime (Phase 4f Task 2): the registry itself is built unconditionally, same
+  // precedent as `pluginContrib` above — it's cheap in-memory state, independent of whether an LLM
+  // provider is configured. Rebuilt below (once `allPlugins` exists) at boot, and again by
+  // ipc/server.ts's plugin.enable/disable/remove/setConsent handlers via the SAME instance (passed
+  // through startIpcServer's opts) — mirroring how `contributes.mcpServers` attaches at scan time,
+  // but ALSO hot-rebuilt on lifecycle changes (unlike MCP servers today), matching Tier-2's
+  // hotApplyStart/hotApplyStop precedent for "no restart needed" plugin changes.
+  const hookRegistry = new HookRegistry();
   const skillStore = new SkillStore({ normaHome, trust: trustStore, plugins: { disabled: settings?.plugins?.disabled ?? [] } });
   const assembler = new ContextAssembler({ normaHome, trust: trustStore, skills: skillStore });
   // Built unconditionally (needs only store, no provider) so the server's session.addDir /
@@ -243,6 +262,10 @@ export async function startDaemon(opts: {
   // `registry` const, which isn't in scope here) so it keeps behaving correctly either way — a safe
   // no-op via optional chaining while `sharedRegistry` is still null (no provider).
   const allPlugins = pluginStore.list();
+  // Boot-time hook-registry build (Phase 4f Task 2) — the SAME eligible-plugin projection
+  // (`hookRegistryPlugins`, agent/plugins.ts) ipc/server.ts's lifecycle RPCs use to rebuild this
+  // SAME `hookRegistry` instance hot, later, off a fresh `livePlugins()` read.
+  hookRegistry.rebuild(hookRegistryPlugins(allPlugins, normaHome));
   const pluginSupervisor = new PluginSupervisor({
     runDir: dirs.runDir,
     socketPath: dirs.socketPath,
@@ -387,6 +410,27 @@ export async function startDaemon(opts: {
     const titlesCfg = settings?.titles;
     const titler =
       titlesCfg?.enabled === false ? undefined : new SessionTitler({ provider: agentProvider, store, hub, model: titlesCfg?.model });
+    // Plugin hooks runtime (Phase 4f Task 2): the engine-facing `cfg.hooks` facade. `hookRegistry`
+    // is the SAME instance ipc/server.ts's plugin-lifecycle RPCs rebuild in place (passed through
+    // startIpcServer's opts below), so a `plugin.enable`/`disable` hot-apply is visible to the
+    // facade with no daemon restart. `hooksEnabledHot` mirrors providers/manager.ts's `liveModel`
+    // pattern (mtime-cached settings.json re-read per call, never throwing — falls back to the
+    // spec default of enabled) rather than closing over the boot-time `settings` snapshot above,
+    // so `hooks.enabled` toggles live too, exactly like the plan's "read like other hot settings".
+    let hooksEnabledCache: { key: number; value: boolean } | null = null;
+    const hooksEnabledHot = (): boolean => {
+      const key = statMtimeOrZero(dirs.settingsPath);
+      if (hooksEnabledCache && hooksEnabledCache.key === key) return hooksEnabledCache.value;
+      let value: boolean;
+      try {
+        value = hooksEnabledFrom(loadSettings(dirs.settingsPath));
+      } catch {
+        value = true; // never throw into a hook call — same fail-open-on-read-failure precedent as liveModel
+      }
+      hooksEnabledCache = { key, value };
+      return value;
+    };
+    const hookFacade = new HookFacade({ registry: hookRegistry, runner: new HookRunner(), hooksEnabled: hooksEnabledHot });
     engine = new AgentEngine({
       store, hub, registry, broker: approvalBroker,
       gate: new PermissionGate(),
@@ -417,6 +461,7 @@ export async function startDaemon(opts: {
         deferThreshold: settings?.toolSearch?.deferThreshold ?? Number(process.env.NORMA_TOOLSEARCH_THRESHOLD ?? 12),
         deferExternals: settings?.toolSearch?.deferExternals,
       },
+      hooks: hookFacade,
     });
   }
 
@@ -482,6 +527,11 @@ export async function startDaemon(opts: {
     registry: sharedRegistry ?? undefined,
     supervisor: pluginSupervisor,
     contrib: pluginContrib,
+    // Phase 4f Task 2: the SAME HookRegistry instance the engine's `cfg.hooks` facade (above,
+    // inside the agentProvider gate) reads from — lets plugin.enable/disable/remove/setConsent
+    // rebuild it hot (mirroring hotApplyStart/hotApplyStop's Tier-2 precedent), with no daemon
+    // restart, even on a no-provider daemon where the facade itself was never built.
+    hooks: hookRegistry,
     questions: questions ?? undefined,
     tasks: taskStore ?? undefined,
     plans: plans ?? undefined,

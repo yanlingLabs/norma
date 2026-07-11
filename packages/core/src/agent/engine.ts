@@ -20,6 +20,7 @@ import type { WorktreeManager } from "./worktree";
 import type { SubagentManager } from "./subagents";
 import type { AgentStore } from "./agents";
 import type { BackgroundAgentRegistry, ResumeContext } from "./bg-agent-registry";
+import type { HookResult } from "../plugins/hook-runner";
 
 /** Structural narrowing of BackgroundTaskRegistry (bg-registry.ts) to just what pinnedTools
  *  (below) needs — lets the engine (and tests) work with anything shaped like a per-session task
@@ -169,6 +170,12 @@ export interface EngineConfig {
   // auto-generated title. Fired fire-and-forget, only at the main thread's (depth 0) turn
   // completion, never on the error paths (an errored first turn has nothing worth titling).
   titler?: { maybeTitle(sessionId: string): Promise<void> };
+  // Plugin hooks runtime (Phase 4f Task 2 — TYPE ONLY here; Task 3 wires the 4 actual call sites:
+  // session-start/pre-tool(block)/post-tool/turn-end). daemon.ts builds this from a HookRegistry +
+  // HookRunner + the hot `settings.hooks.enabled` read (plugins/hook-registry.ts's HookFacade).
+  // Absent (every test/config predating Task 3) means no hook call site fires at all — this field
+  // existing on the type does NOT by itself add any behavior.
+  hooks?: { runFor(event: string, extra: Record<string, unknown>, sessionId: string): Promise<Array<{ pluginId: string; result: HookResult }>> };
 }
 
 export class AgentEngine {

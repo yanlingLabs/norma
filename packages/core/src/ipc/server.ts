@@ -33,10 +33,11 @@ import type { BackgroundTaskRegistry } from "../agent/bg-registry";
 import type { SkillStore } from "../agent/skills";
 import type { McpManager } from "../agent/mcp/manager";
 import { PluginStore, type PluginInfo } from "../agent/plugins";
-import { pluginSpawnEligible } from "../agent/plugins";
+import { pluginSpawnEligible, hookRegistryPlugins } from "../agent/plugins";
 import type { ToolRegistry } from "../agent/tools/registry";
 import type { PluginSupervisor, PluginConn, InvokeError, EligiblePlugin, SupervisorStatus } from "../plugins/supervisor";
 import type { PluginContribRegistry } from "../plugins/contrib";
+import type { HookRegistry } from "../plugins/hook-registry";
 import type { PeripheralBroker } from "../peripheral/broker";
 import type { ProviderLink } from "../peripheral/provider-link";
 import type { HardwareBroker } from "../peripheral/hardware";
@@ -101,6 +102,13 @@ export interface IpcServerOptions {
   registry?: ToolRegistry;
   supervisor?: PluginSupervisor;
   contrib?: PluginContribRegistry;
+  // Phase 4f Task 2: the SAME HookRegistry instance daemon.ts builds and wires into the engine's
+  // `cfg.hooks` facade — the plugin-lifecycle RPCs below (plugin.enable/disable/remove/setConsent)
+  // rebuild it hot, off `livePlugins()`'s fresh read, at every point they already call
+  // `invalidateLivePluginsCache()`. Optional: a server built without it (most existing tests) just
+  // skips the rebuild — same "typed no-op, never a crash" precedent as `registry`/`supervisor`
+  // being absent elsewhere in this file.
+  hooks?: HookRegistry;
   questions?: QuestionBroker; // in-flight ask_user questions; ask_user.respond
   tasks?: TaskStore;         // session task lists; task.list
   plans?: PlanBroker;        // in-flight exit_plan_mode plans; plan.respond
@@ -273,6 +281,16 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
    *  mtime key rather than instead of it. */
   function invalidateLivePluginsCache(): void {
     livePluginsCache = null;
+  }
+
+  /** Rebuilds `opts.hooks` (Phase 4f Task 2) off a FRESH `livePlugins()` read — called at every
+   *  point a plugin-lifecycle RPC below already calls `invalidateLivePluginsCache()`, so the two
+   *  never drift: whatever `livePlugins()` would now return, the hook registry reflects. A safe
+   *  no-op when `opts.hooks` or `opts.normaHome` is unset (most existing tests) — same "typed
+   *  no-op" precedent `hotApplyStart`/`hotApplyStop` already follow for a no-provider daemon. */
+  function rebuildHookRegistry(): void {
+    if (!opts.hooks || !opts.normaHome) return;
+    opts.hooks.rebuild(hookRegistryPlugins(livePlugins(), opts.normaHome));
   }
 
   /** A fresh, settings-current view of installed plugins — unlike `opts.plugins` (its
@@ -856,6 +874,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
           return { code: "invalid_source" }; // no manifest, invalid/traversal name, unreadable source, ...
         }
         invalidateLivePluginsCache(); // installFromDir just created a new plugins/<name> dir
+        rebuildHookRegistry(); // harmless no-op here (installs disabled+unconsented, never hook-eligible) — mirrors every other lifecycle site for consistency
         const info = livePlugins().find((pl) => pl.name === installed.name);
         return {
           ok: true,
@@ -882,6 +901,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
           : setPluginEnabled(loadSettings(settingsPath), p.name, true);
         saveSettings(settingsPath, settings);
         invalidateLivePluginsCache();
+        rebuildHookRegistry();
         const updated = livePlugins().find((pl) => pl.name === p.name) ?? info;
         return { ok: true, status: hotApplyStart(updated) };
       }
@@ -896,6 +916,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         // a disabled plugin must require consenting again, so strip its consent record here too.
         saveSettings(settingsPath, stripPluginConsents(setPluginEnabled(loadSettings(settingsPath), p.name, false), p.name));
         invalidateLivePluginsCache();
+        rebuildHookRegistry();
         hotApplyStop(p.name);
         return { ok: true };
       }
@@ -915,6 +936,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         // "removed" settings state while the directory is still on disk.
         saveSettings(settingsPath, settings);
         invalidateLivePluginsCache();
+        rebuildHookRegistry();
         return { ok: true };
       }
       case METHODS.pluginSetConsent: {
@@ -925,6 +947,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         const settingsPath = join(opts.normaHome, "settings.json");
         saveSettings(settingsPath, grantPluginConsents(loadSettings(settingsPath), p.name, p.classes, Date.now()));
         invalidateLivePluginsCache();
+        rebuildHookRegistry();
         return { ok: true };
       }
 

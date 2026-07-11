@@ -2,6 +2,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { execPayloadLines, loadManifest, requiredConsentClasses, type NormaManifest } from "./plugin-manifest";
+import type { HookRegistryPlugin } from "../plugins/hook-registry";
 
 export const PluginManifest = z.object({
   name: z.string().optional(), description: z.string().optional(),
@@ -27,6 +28,12 @@ export interface PluginInfo {
    *  norma-plugin.json a second time. undefined for legacy plugins and for manifest plugins with
    *  no mcpServers declared (hasManifestMcp false). */
   manifestServers?: NonNullable<NormaManifest["contributes"]>["mcpServers"];
+  /** norma-plugin.json's `contributes.hooks` verbatim (Phase 4f Task 2), filled from the SAME
+   *  single loadManifest call list() already makes — same precedent as manifestServers above.
+   *  undefined for legacy plugins and manifest plugins with no hooks declared. daemon.ts/
+   *  ipc/server.ts feed this straight into HookRegistry.rebuild() (dir/hooks per eligible plugin)
+   *  rather than re-parsing norma-plugin.json a second time. */
+  manifestHooks?: NonNullable<NormaManifest["contributes"]>["hooks"];
   /** Display data for the CLI consent block (Task 3, spec §1: "Consent text always shows the
    *  exec payload ... never just a summary."). execPayload = plugin-manifest.ts#execPayloadLines
    *  verbatim (one line per mcpServer/hook/entry). [] for legacy plugins or manifests with no
@@ -99,6 +106,7 @@ export class PluginStore {
           legacy: false,
           hasManifestMcp: Boolean(manifest.contributes?.mcpServers?.length),
           manifestServers: manifest.contributes?.mcpServers,
+          manifestHooks: manifest.contributes?.hooks,
           execPayload: execPayloadLines(manifest),
           tccPermissions: manifest.permissions?.tcc ?? [],
           hardwarePermissions: manifest.permissions?.hardware ?? [],
@@ -146,6 +154,32 @@ export function consentComplete(p: PluginInfo): boolean {
  */
 export function pluginMcpEligible(p: PluginInfo): boolean {
   return p.mcpEnabled && !p.disabled && (p.hasMcp || p.hasManifestMcp) && consentComplete(p);
+}
+
+/**
+ * The daemon's plugin-hooks eligibility filter (Phase 4f Task 2) — the SAME enabled/disabled/
+ * consent shape as `pluginMcpEligible` above (a plugin declaring `contributes.hooks` requires the
+ * "exec" consent class too, per plugin-manifest.ts#requiredConsentClasses, so `consentComplete`
+ * gates it identically), swapping the MCP-content check (`hasMcp || hasManifestMcp`) for "has at
+ * least one manifest hook declared". Legacy plugins have `manifestHooks` undefined, so this is
+ * always false for them — hooks are a manifest-only concept, unlike MCP eligibility which legacy
+ * plugins can satisfy via the old `.mcp.json` path.
+ */
+export function pluginHooksEligible(p: PluginInfo): boolean {
+  return p.mcpEnabled && !p.disabled && Boolean(p.manifestHooks?.length) && consentComplete(p);
+}
+
+/**
+ * Projects a plugin list into `HookRegistry.rebuild()`'s input shape — `pluginHooksEligible`
+ * filter + `{id, dir, hooks}` mapping in ONE place, shared by daemon.ts (boot-time scan) and
+ * ipc/server.ts (plugin.enable/disable/remove/setConsent hot-rebuild, mirroring how those RPCs
+ * already hot-apply Tier-2 spawn via `hotApplyStart`/`hotApplyStop`) so the two call sites can
+ * never drift out of sync on what counts as an eligible hook-contributing plugin.
+ */
+export function hookRegistryPlugins(plugins: PluginInfo[], normaHome: string): HookRegistryPlugin[] {
+  return plugins
+    .filter(pluginHooksEligible)
+    .map((p) => ({ id: p.name, dir: join(normaHome, "plugins", p.name), hooks: p.manifestHooks ?? [] }));
 }
 
 /**

@@ -97,8 +97,21 @@ export const Settings = z.object({
   webSearch: z.object({
     provider: z.literal("brave").optional(),
   }).optional(),
+  /** Plugin hooks runtime (Phase 4f, plan Global Constraints: "default true, read like other hot
+   *  settings"). `enabled: undefined` (block absent OR field absent) means ENABLED — see
+   *  `hooksEnabledFrom` below, the single place that decision is made. */
+  hooks: z.object({
+    enabled: z.boolean().optional(),
+  }).optional(),
 });
 export type Settings = z.infer<typeof Settings>;
+
+/** The one place `hooks.enabled`'s default-ON semantics live (4f Task 2): absent block, absent
+ *  field, or `enabled: true` all mean hooks run; only an explicit `false` turns them off. Kept as
+ *  a pure `Settings -> boolean` helper (not inlined at each call site) so both the daemon's hot
+ *  settings-reader (daemon.ts, re-reads settings.json per call, mtime-cached — same pattern as
+ *  providers/manager.ts's `liveModel`) and this file's own tests exercise the SAME decision. */
+export const hooksEnabledFrom = (s: Settings): boolean => s.hooks?.enabled !== false;
 
 // gpt-5.4 was the pre-deprecation default; fully deprecated per the 2026-07-10 user decision
 // (packages/core/src/providers/codex-config.ts) — a fresh v1→v2 migration must not persist a
