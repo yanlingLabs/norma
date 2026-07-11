@@ -52,6 +52,25 @@ describe("ResponsesSseParser", () => {
     });
   });
 
+  test("reasoning item WITHOUT encrypted_content yields nothing (gate on replayable state, history-parity minor)", () => {
+    // With reasoning effort UNSET (no include:["reasoning.encrypted_content"]), a backend may still
+    // emit a summary-only reasoning item that carries NO encrypted_content — capturing + replaying it
+    // would persist opaque state with nothing to restore. Capture ONLY the replayable ones.
+    const p = new ResponsesSseParser();
+    const chunk = new TextEncoder().encode(
+      'data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":"s"}]}}\n\n'
+    );
+    expect(p.push(chunk)).toEqual([]);
+  });
+
+  test("reasoning item with EMPTY encrypted_content also yields nothing (non-empty gate)", () => {
+    const p = new ResponsesSseParser();
+    const chunk = new TextEncoder().encode(
+      'data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","status":"completed","summary":[],"encrypted_content":""}}\n\n'
+    );
+    expect(p.push(chunk)).toEqual([]);
+  });
+
   test("unrecognized output_item.done item type still yields nothing (unchanged)", () => {
     const p = new ResponsesSseParser();
     const chunk = new TextEncoder().encode(

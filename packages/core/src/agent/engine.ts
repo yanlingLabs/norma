@@ -427,7 +427,7 @@ export class AgentEngine {
       const item = this.eventToInput(e);
       if (item) input.push(item);
     }
-    return input;
+    return this.normalizeReplayOrder(input);
   }
 
   /** The ONE event→TurnInputItem mapping for history reconstruction (main + child threads must
@@ -441,6 +441,47 @@ export class AgentEngine {
     // case gives BOTH historyInput (cross-turn) and childHistoryInput (subagent resume) the replay.
     if (e.type === "reasoning_item") return { type: "reasoning", itemJson: e.itemJson };
     return null;
+  }
+
+  /** Replay-order normalization (whole-branch C1): a main-thread steer() persists its user_message
+   *  at SEND time, which can land in seq between a tool_call and its tool_result (the live loop
+   *  only drains steers at the next round top, so the PROVIDER never saw that interleaving). Replay
+   *  must mirror what the provider actually received: any message items found between a
+   *  function_call and its matching tool_result are deferred to immediately after that tool_result,
+   *  preserving their relative order. Reasoning/tool items are never reordered.
+   *
+   *  Single pass with a per-open-pair buffer: on a function_call, subsequent `{type:"message"}`
+   *  items buffer until the matching tool_result (same callId) is emitted, then flush in order right
+   *  after it. Edge cases (never drop an item): sequential pairs (fc1,res1,fc2,res2) buffer
+   *  independently; a function_call opening while a prior pair is still unresolved flushes that
+   *  prior buffer first (degenerate — shouldn't exist post-compactor-clamp); a function_call whose
+   *  matching tool_result never appears flushes its buffered messages at the end. Reasoning items
+   *  and any non-matching tool_result between a pair pass through in place — only messages defer. */
+  private normalizeReplayOrder(input: TurnInputItem[]): TurnInputItem[] {
+    const out: TurnInputItem[] = [];
+    let openCallId: string | null = null; // the function_call whose matching tool_result we await
+    let buffer: TurnInputItem[] = []; // message items deferred while that pair is open
+    for (const item of input) {
+      if (item.type === "function_call") {
+        // A new pair opens. If a prior pair never resolved (degenerate), flush its buffered
+        // messages before this call so nothing is dropped or reordered ahead of it.
+        if (buffer.length > 0) { out.push(...buffer); buffer = []; }
+        openCallId = item.callId;
+        out.push(item);
+      } else if (item.type === "tool_result" && openCallId !== null && item.callId === openCallId) {
+        // Close the open pair: result right after its call, then the deferred messages flush right
+        // after the result (mirroring the live [fc, result, steer] order).
+        out.push(item);
+        if (buffer.length > 0) { out.push(...buffer); buffer = []; }
+        openCallId = null;
+      } else if (item.type === "message" && openCallId !== null) {
+        buffer.push(item); // a message between a call and its matching result — defer it
+      } else {
+        out.push(item); // reasoning / non-matching tool_result / message outside any pair — in place
+      }
+    }
+    if (buffer.length > 0) out.push(...buffer); // open pair with no matching result — never drop
+    return out;
   }
 
   /** Reconstructs a SPECIFIC child thread's own history from the store, in seq order — the
@@ -472,7 +513,10 @@ export class AgentEngine {
       const item = this.eventToInput(e);
       if (item) input.push(item);
     }
-    return input;
+    // whole-branch C1: child history is already structurally clean (send_message persists at the
+    // DRAIN, not at send), so this is a pure no-op today — applied here for uniformity and to guard
+    // any future child-scoped persist-at-send source (mirrors historyInput above).
+    return this.normalizeReplayOrder(input);
   }
 
   // Shared by every <system-reminder> builder below (taskListReminder, buildBgCompletionReminder):
@@ -1773,7 +1817,16 @@ export class AgentEngine {
     // right — only the last-event shape does. "Resume a capped agent for more turns" is a headline
     // use case, so reject it GRACEFULLY here rather than let a malformed provider input through.
     const priorHistory = this.childHistoryInput(sessionId, entry.threadId);
-    const lastPrior = priorHistory[priorHistory.length - 1];
+    // whole-branch #3: a cleanly-finished child whose FINAL round emitted a reasoning item then
+    // ended the turn with EMPTY assistant text (see runThread's `if (textBuf.length > 0)` — no
+    // assistant_message persisted) leaves a TRAILING reasoning item as its last reconstructed item.
+    // Reasoning is opaque, ORDER-TRANSPARENT state (it always PRECEDES the item it reasons for), so
+    // it must not count as the terminal shape: walk back past any trailing reasoning items to the
+    // last REAL item, then apply the assistant-turn check on THAT. A [tool_result, reasoning] tail
+    // (mid-tool + stray reasoning) still lands on the tool_result → correctly still rejected.
+    let lastIdx = priorHistory.length - 1;
+    while (lastIdx >= 0 && priorHistory[lastIdx]!.type === "reasoning") lastIdx--;
+    const lastPrior = priorHistory[lastIdx];
     if (!lastPrior || !(lastPrior.type === "message" && lastPrior.role === "assistant")) {
       return { output: `agent '${resumeArg}' didn't finish cleanly and can't be resumed`, isError: true };
     }

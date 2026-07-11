@@ -166,6 +166,78 @@ describe("engine historyInput replays tool_call/tool_result (CC parity, history-
     expect(serialized).not.toContain("child chatter");
     expect(serialized).not.toContain("cc1");
   });
+
+  // whole-branch C1: a main-thread steer() persists its user_message at SEND time (engine.ts
+  // steer()), which can land in seq BETWEEN an already-persisted tool_call and its later
+  // tool_result (the live loop only drains steers at the next round top, so the PROVIDER saw
+  // [fc, result, steer], never the [fc, steer, result] the raw store order would replay). Replay
+  // must mirror what the provider actually received — normalizeReplayOrder defers any message found
+  // inside a call/result pair to immediately after that tool_result.
+  test("(e) a steer persisted between a tool_call and its tool_result is deferred to AFTER the tool_result on replay (whole-branch C1)", async () => {
+    const provider = okProvider();
+    const { engine, store, sessionId } = setupEngine(provider);
+
+    store.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: "u1", clientName: "test" });
+    store.append(sessionId, { type: "assistant_message", sessionId, threadId: "main", text: "a1" });
+    store.append(sessionId, { type: "tool_call", sessionId, threadId: "main", callId: "c1", name: "read", argsJson: '{"path":"a.txt"}' });
+    // the interleaving: a steer landed mid-tool (while c1 was awaiting approval/execution).
+    store.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: "steer mid-tool", clientName: "steer" });
+    store.append(sessionId, { type: "tool_result", sessionId, threadId: "main", callId: "c1", output: "file contents", isError: false });
+    store.append(sessionId, { type: "assistant_message", sessionId, threadId: "main", text: "a2" });
+    store.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: "u2", clientName: "test" });
+
+    await engine.runTurn(sessionId);
+
+    const input = provider.requests[0]!.input;
+    // the steer is moved to immediately AFTER the tool_result — mirroring the live [fc, result, steer].
+    expect(input).toEqual([
+      M("user", "u1"),
+      M("assistant", "a1"),
+      FC("c1", "read", '{"path":"a.txt"}'),
+      TR("c1", "file contents", false),
+      M("user", "steer mid-tool"),
+      M("assistant", "a2"),
+      M("user", "u2"),
+    ]);
+    // pair-adjacency invariant: every function_call is immediately followed by its matching result.
+    for (let i = 0; i < input.length; i++) {
+      const it = input[i] as { type: string; callId?: string };
+      if (it.type === "function_call") {
+        const next = input[i + 1] as { type: string; callId?: string } | undefined;
+        expect(next?.type).toBe("tool_result");
+        expect(next?.callId).toBe(it.callId);
+      }
+    }
+  });
+
+  test("(f) two sequential call/result pairs, each with its own mid-tool steer — each steer defers only past its OWN pair (per-pair buffer scoping, whole-branch C1)", async () => {
+    const provider = okProvider();
+    const { engine, store, sessionId } = setupEngine(provider);
+
+    store.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: "u1", clientName: "test" });
+    store.append(sessionId, { type: "tool_call", sessionId, threadId: "main", callId: "c1", name: "read", argsJson: '{"path":"a"}' });
+    store.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: "steer during c1", clientName: "steer" });
+    store.append(sessionId, { type: "tool_result", sessionId, threadId: "main", callId: "c1", output: "ra", isError: false });
+    store.append(sessionId, { type: "tool_call", sessionId, threadId: "main", callId: "c2", name: "write", argsJson: '{"path":"b"}' });
+    store.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: "steer during c2", clientName: "steer" });
+    store.append(sessionId, { type: "tool_result", sessionId, threadId: "main", callId: "c2", output: "rb", isError: false });
+    store.append(sessionId, { type: "assistant_message", sessionId, threadId: "main", text: "a1" });
+    store.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: "u2", clientName: "test" });
+
+    await engine.runTurn(sessionId);
+
+    expect(provider.requests[0]!.input).toEqual([
+      M("user", "u1"),
+      FC("c1", "read", '{"path":"a"}'),
+      TR("c1", "ra", false),
+      M("user", "steer during c1"),
+      FC("c2", "write", '{"path":"b"}'),
+      TR("c2", "rb", false),
+      M("user", "steer during c2"),
+      M("assistant", "a1"),
+      M("user", "u2"),
+    ]);
+  });
 });
 
 // history-parity Task 3: the engine captures provider reasoning items, PERSISTS them at arrival
@@ -229,6 +301,30 @@ describe("engine reasoning-item capture/persist/replay in emission order (histor
       TRc1,
       REAS("EC2"),
       M("assistant", "done"),
+      M("user", "u2"),
+    ]);
+  });
+
+  test("normalization no-op: a reasoning-bearing turn with no interleaving replays reasoning before its call, pair adjacent", async () => {
+    // guards that the C1 adjacency normalization (below) never disturbs the emission-order reasoning
+    // prefix — reasoning precedes the function_call, and the function_call/tool_result pair stays put.
+    const provider = okProvider();
+    const { engine, store, sessionId } = setupEngine(provider);
+    store.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: "u1", clientName: "test" });
+    store.append(sessionId, { type: "reasoning_item", sessionId, threadId: "main", itemJson: recJson("EC1") });
+    store.append(sessionId, { type: "tool_call", sessionId, threadId: "main", callId: "c1", name: "read", argsJson: '{"path":"a.txt"}' });
+    store.append(sessionId, { type: "tool_result", sessionId, threadId: "main", callId: "c1", output: "file contents", isError: false });
+    store.append(sessionId, { type: "assistant_message", sessionId, threadId: "main", text: "a1" });
+    store.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: "u2", clientName: "test" });
+
+    await engine.runTurn(sessionId);
+
+    expect(provider.requests[0]!.input).toEqual([
+      M("user", "u1"),
+      REAS("EC1"),
+      FC("c1", "read", '{"path":"a.txt"}'),
+      TR("c1", "file contents", false),
+      M("assistant", "a1"),
       M("user", "u2"),
     ]);
   });
