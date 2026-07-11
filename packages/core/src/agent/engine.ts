@@ -367,6 +367,15 @@ export class AgentEngine {
     return input;
   }
 
+  // Shared by every <system-reminder> builder below (taskListReminder, buildBgCompletionReminder):
+  // reminder blocks interpolate model/tool-authored strings (task subjects, subagent result text)
+  // that may carry attacker-influenced content — newlines would inject fake reminder lines, and a
+  // literal </system-reminder> would close the block early, leaving durable ambient "system" text
+  // in-context on every later turn. Sanitize before embedding, always.
+  private sanitizeForReminder(s: string): string {
+    return s.replace(/\r?\n/g, " ").replace(/<\/?system-reminder>/gi, "[tag]");
+  }
+
   /** Per-turn task-list reminder (CC v2 parity): the model's own context carries task IDs
    *  nowhere else — `historyInput` above replays only user/assistant messages, never the
    *  task_updated events — so without this the model routinely loses track of ids and calls
@@ -388,12 +397,43 @@ export class AgentEngine {
     // in the reminder block: newlines would inject fake reminder lines, and a literal
     // </system-reminder> would close the block early, leaving durable ambient "system" text
     // in-context on every later turn.
-    const sanitize = (s: string) =>
-      s.replace(/\r?\n/g, " ").replace(/<\/?system-reminder>/gi, "[tag]");
-    const lines = tasks.map((t) => `#${t.id} [${t.status}] ${sanitize(t.subject)}`).join("\n");
+    const lines = tasks.map((t) => `#${t.id} [${t.status}] ${this.sanitizeForReminder(t.subject)}`).join("\n");
     const content = "<system-reminder>\nCurrent task list (update these by id — do NOT create a new task for work already listed):\n"
       + lines
       + "\nUse task_update with the task's id to change status; task_list shows full details."
+      + "\nThis reminder is invisible to the user — never mention it.\n</system-reminder>";
+    return { type: "message", role: "user", content };
+  }
+
+  /** Per-turn background-agent completion reminder (CC parity: Agent completion notices) — a
+   *  `run_in_background` child (4h-ii-a spawn_agent) finishes DETACHED, off the parent's own
+   *  turn, so nothing tells the model a bg agent it kicked off is done unless something injects
+   *  it. Mirrors `taskListReminder` above in every structural way (same "user" message wrapped in
+   *  an explicit <system-reminder> tag, same ASSEMBLED-INPUT-ONLY / never-persisted contract, same
+   *  call site in `turn()`) with ONE deliberate difference: this builder is NOT pure/idempotent.
+   *  `registry.takeCompletedForSession` marks every entry it returns `notified: true` as a
+   *  side effect — so this method must be called EXACTLY ONCE per turn, and only where its result
+   *  is actually used, never speculatively or twice. That side effect is what makes the
+   *  notification fire exactly once (the turn AFTER the agent finished): a second call this same
+   *  turn, or a call whose result is discarded, silently loses that agent's notification forever.
+   *  Returns undefined when there's nothing to remind about (no BackgroundAgentRegistry wired, or
+   *  no unnotified terminal entries) so `turn()` can skip appending entirely — byte-identical
+   *  turn input when no bg agent has finished. */
+  private buildBgCompletionReminder(sessionId: string): TurnInputItem | undefined {
+    if (!this.cfg.bgAgents) return undefined;
+    const finished = this.cfg.bgAgents.takeCompletedForSession(sessionId);
+    if (finished.length === 0) return undefined;
+    const lines = finished.map((e) => {
+      // `result` is only set by registry.complete() — a `stop()`-terminated entry never gets one,
+      // so this must tolerate undefined rather than assume every terminal entry has a result.
+      const resultHead = this.sanitizeForReminder((e.result ?? "").slice(0, 120));
+      return `- agent ${e.name ?? e.agentId} finished (${e.status}): ${resultHead}`;
+    }).join("\n");
+    const content = "<system-reminder>\nBackground agent"
+      + (finished.length > 1 ? "s" : "")
+      + " finished since your last turn:\n"
+      + lines
+      + "\nRead an agent's full output or resume it with spawn_agent {resume: <agentId>} (resume lands in 4h-ii-b) — for now use its result above."
       + "\nThis reminder is invisible to the user — never mention it.\n</system-reminder>";
     return { type: "message", role: "user", content };
   }
@@ -473,6 +513,13 @@ export class AgentEngine {
     // persisted event) and why it's a "user" message rather than a new TurnInputItem role.
     const taskReminder = this.taskListReminder(sessionId);
     if (taskReminder) input.push(taskReminder);
+    // Same call site/contract as taskReminder above (transient, appended once, never persisted)
+    // — this method's own doc comment covers why it must be called exactly once, right here,
+    // with its result used immediately. `turn()` is the MAIN-thread (depth 0) entry point only —
+    // subagent threads run through `runThread` directly via the spawn bridge, never through
+    // `turn()` — so this site is inherently main-thread-scoped without an extra depth check.
+    const bgReminder = this.buildBgCompletionReminder(sessionId);
+    if (bgReminder) input.push(bgReminder);
 
     await this.runThread({
       sessionId,
