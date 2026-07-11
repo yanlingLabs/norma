@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { OpenAICompatibleProvider, buildRequestBody } from "../../src/providers/openai-compatible";
+import { OpenAICompatibleProvider, buildRequestBody, mapInput } from "../../src/providers/openai-compatible";
 
 let server: ReturnType<typeof Bun.serve> | null = null;
 afterEach(() => { server?.stop(true); server = null; });
@@ -217,5 +217,19 @@ describe("buildRequestBody reasoningEffort", () => {
   test("reasoning.effort is present when reasoningEffort is set", () => {
     const body = buildRequestBody({ ...baseReq, reasoningEffort: "high" });
     expect(body.reasoning).toEqual({ effort: "high" });
+  });
+
+  test("include:[\"reasoning.encrypted_content\"] is requested whenever reasoning is configured", () => {
+    const body = buildRequestBody({ ...baseReq, reasoningEffort: "low" });
+    expect(body.reasoning).toEqual({ effort: "low" });
+    expect(body.include).toEqual(["reasoning.encrypted_content"]);
+  });
+});
+
+describe("mapInput reasoning passthrough", () => {
+  test("reasoning input items pass through itemJson verbatim (opaque, never inspected)", () => {
+    const itemJson = '{"type":"reasoning","summary":[],"encrypted_content":"X"}';
+    const out = mapInput([{ type: "reasoning", itemJson } as any]);
+    expect(out).toEqual([{ type: "reasoning", summary: [], encrypted_content: "X" }]);
   });
 });

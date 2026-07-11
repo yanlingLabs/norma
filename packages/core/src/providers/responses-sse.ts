@@ -43,6 +43,14 @@ export class ResponsesSseParser {
       case "response.output_text.delta":
         return [{ type: "text_delta", delta: String(data.delta ?? "") }];
       case "response.output_item.done":
+        if (data.item?.type === "reasoning") {
+          // Codex parity: capture the completed reasoning item; strip `id` (always cleared when
+          // store:false — codex client.rs prepare_response_items_for_request) and `status` (never
+          // echoed back; not modeled by codex either). encrypted_content is preserved VERBATIM —
+          // opaque sensitive state: never log itemJson (spec §B8).
+          const { id: _id, status: _status, ...item } = data.item;
+          return [{ type: "reasoning_item", itemJson: JSON.stringify(item) }];
+        }
         if (data.item?.type === "function_call") {
           this.sawToolCall = true;
           return [{

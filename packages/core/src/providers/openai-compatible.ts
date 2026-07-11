@@ -35,6 +35,7 @@ export function mapInput(items: TurnInputItem[]): unknown[] {
     if (i.type === "function_call") {
       return { type: "function_call", call_id: i.callId, name: i.name, arguments: i.argsJson };
     }
+    if (i.type === "reasoning") return JSON.parse(i.itemJson); // opaque passthrough — never inspected
     return { type: "function_call_output", call_id: i.callId, output: i.output };
   });
 }
@@ -65,7 +66,10 @@ export function buildRequestBody(req: TurnRequest): Record<string, unknown> {
     parallel_tool_calls: true,
     store: false,
     stream: true,
-    include: [],
+    // Codex parity: encrypted reasoning state is requested whenever reasoning is configured, so
+    // reasoning items are replayable on later store:false requests. Effort unset → [] (byte-identical
+    // pre-change shape, test-pinned).
+    include: req.reasoningEffort ? ["reasoning.encrypted_content"] : [],
     ...(req.reasoningEffort ? { reasoning: { effort: req.reasoningEffort } } : {}),
   };
 }

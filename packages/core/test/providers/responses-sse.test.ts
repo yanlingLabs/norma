@@ -37,6 +37,29 @@ describe("ResponsesSseParser", () => {
     expect(p.push(chunk)).toEqual([]);
   });
 
+  test("reasoning item on output_item.done → reasoning_item event (id/status stripped, encrypted_content verbatim)", () => {
+    const p = new ResponsesSseParser();
+    const chunk = new TextEncoder().encode(
+      'data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":"s"}],"encrypted_content":"OPAQUE"}}\n\n'
+    );
+    const events = p.push(chunk);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.type).toBe("reasoning_item");
+    expect(JSON.parse((events[0] as any).itemJson)).toEqual({
+      type: "reasoning",
+      summary: [{ type: "summary_text", text: "s" }],
+      encrypted_content: "OPAQUE",
+    });
+  });
+
+  test("unrecognized output_item.done item type still yields nothing (unchanged)", () => {
+    const p = new ResponsesSseParser();
+    const chunk = new TextEncoder().encode(
+      'data: {"type":"response.output_item.done","item":{"id":"ws_1","type":"web_search_call"}}\n\n'
+    );
+    expect(p.push(chunk)).toEqual([]);
+  });
+
   test("CRLF line endings are normalized (proxy compat)", () => {
     const p = new ResponsesSseParser();
     const chunk = new TextEncoder().encode(
