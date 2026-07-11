@@ -410,29 +410,39 @@ export class AgentEngine {
     for (const e of events) {
       if (e.seq <= uptoSeq) continue;
       if ("threadId" in e && e.threadId !== MAIN_THREAD) continue;
-      if (e.type === "user_message") input.push({ type: "message", role: "user", content: e.text });
-      else if (e.type === "assistant_message") input.push({ type: "message", role: "assistant", content: e.text });
-      // Prior turns' tool calls are summarized by their assistant_message; current-turn
-      // call/result items are threaded in-memory below.
+      // CC parity: prior turns' tool calls/results are replayed verbatim (via the shared
+      // eventToInput mapper below), not just summarized by their assistant_message — the model
+      // no longer "forgets" what its tools did across turns. A checkpoint's `uptoSeq` is always a
+      // MESSAGE seq (Compactor only ever folds up to a user/assistant boundary — see
+      // compactor.ts's isMessage filter), so a tool_call/tool_result pair can never be split by a
+      // checkpoint: either both are folded into the summary, or both survive as tail.
+      const item = this.eventToInput(e);
+      if (item) input.push(item);
     }
     return input;
   }
 
+  /** The ONE event→TurnInputItem mapping for history reconstruction (main + child threads must
+   *  stay in lockstep — both feed the provider). Returns null for events with no provider shape. */
+  private eventToInput(e: SessionEvent): TurnInputItem | null {
+    if (e.type === "user_message") return { type: "message", role: "user", content: e.text };
+    if (e.type === "assistant_message") return { type: "message", role: "assistant", content: e.text };
+    if (e.type === "tool_call") return { type: "function_call", callId: e.callId, name: e.name, argsJson: e.argsJson };
+    if (e.type === "tool_result") return { type: "tool_result", callId: e.callId, output: e.output, isError: e.isError };
+    return null;
+  }
+
   /** Reconstructs a SPECIFIC child thread's own history from the store, in seq order — the
-   *  foundation for `resume` (4h-ii-b Task 3). CRUCIAL DIFFERENCE from `historyInput` above:
-   *  historyInput replays only user/assistant MESSAGES (a main-thread turn's tool calls are
-   *  already summarized by the assistant's own text, so replaying tool_call/tool_result would
-   *  just duplicate context) — but a RESUMED child has no such summary to fall back on. Without
-   *  its own tool_call/tool_result pairs, a resumed child's replayed assistant_message text would
-   *  reference tool results (file contents, command output) the resumed model can no longer see,
-   *  and it has no way to re-run those tools mid-history. So this maps ALL FOUR event types,
-   *  reproducing the exact TurnInputItem shapes runThread's own dispatch loop pushes into `input`
-   *  live (see runThread's `input.push({type:"function_call",...})` / `input.push({type:
-   *  "tool_result",...})` calls above) — a resumed child's reconstructed history is
-   *  indistinguishable, shape-wise, from a child that never stopped.
-   *
-   *  No checkpoint/compaction handling (unlike historyInput): child threads are never compacted
-   *  today, so there is no per-child checkpoint event to fast-forward past.
+   *  foundation for `resume` (4h-ii-b Task 3). CRUCIAL DIFFERENCE from `historyInput` above is now
+   *  FILTERING, not mapping: both callers delegate to the same `eventToInput` mapper above, so a
+   *  main-thread turn's tool calls/results and a child's replay exactly the same shapes. The
+   *  difference is which events reach the mapper — historyInput fast-forwards past a checkpoint's
+   *  `uptoSeq` and keeps only the MAIN thread; this reconstructs ALL of one specific child
+   *  thread's events, unfiltered by any checkpoint (child threads are never compacted today, so
+   *  there is no per-child checkpoint event to fast-forward past). A resumed child needs its own
+   *  tool_call/tool_result pairs (unlike a main-thread turn, it has no assistant-text summary to
+   *  fall back on for what its tools did), so this reconstruction is indistinguishable, shape-wise,
+   *  from a child that never stopped.
    *
    *  KNOWN GAP (not fixed here — see this task's report): a child thread's ORIGINAL spawn prompt
    *  is never itself persisted as a `user_message` event scoped to that threadId — the spawn
@@ -448,10 +458,8 @@ export class AgentEngine {
     const input: TurnInputItem[] = [];
     for (const e of events) {
       if (!("threadId" in e) || e.threadId !== threadId) continue;
-      if (e.type === "user_message") input.push({ type: "message", role: "user", content: e.text });
-      else if (e.type === "assistant_message") input.push({ type: "message", role: "assistant", content: e.text });
-      else if (e.type === "tool_call") input.push({ type: "function_call", callId: e.callId, name: e.name, argsJson: e.argsJson });
-      else if (e.type === "tool_result") input.push({ type: "tool_result", callId: e.callId, output: e.output, isError: e.isError });
+      const item = this.eventToInput(e);
+      if (item) input.push(item);
     }
     return input;
   }
