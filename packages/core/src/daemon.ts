@@ -35,6 +35,7 @@ import { PlanBroker } from "./agent/plans";
 import { WorktreeManager } from "./agent/worktree";
 import { AgentStore } from "./agent/agents";
 import { SubagentManager } from "./agent/subagents";
+import { BackgroundAgentRegistry } from "./agent/bg-agent-registry";
 import { AgentEngine, SYSTEM_PROMPT } from "./agent/engine";
 import { BashReviewer } from "./agent/reviewer";
 import { SessionTitler } from "./agent/titles";
@@ -297,6 +298,12 @@ export async function startDaemon(opts: {
       plugins: { disabled: settings?.plugins?.disabled ?? [] },
     });
     const subagents = new SubagentManager({ maxConcurrent: settings?.subagents?.maxConcurrent });
+    // Async spawn (4h-ii-a): tracks DETACHED (`run_in_background:true`) child threads — see
+    // bg-agent-registry.ts's own doc comment for why this is separate from `bgRegistry` above
+    // (that one owns backgrounded bash processes; this one owns agent threads). Built
+    // unconditionally alongside `subagents` — both are required together for the spawn bridge's
+    // async branch to activate (engine.ts's EngineConfig.bgAgents doc comment).
+    const bgAgents = new BackgroundAgentRegistry();
     // `agentProvider` is already narrowed non-null here (we're inside `if (agentProvider)`), and
     // its `.provider` is the SAME provider instance the engine's spawn bridge calls .models() on
     // to validate a spawn_agent model override (4e gate F9) — so this list is exactly what the
@@ -382,6 +389,7 @@ export async function startDaemon(opts: {
       bgRegistry,
       agents,
       subagents,
+      bgAgents,
       // 4h-i Task 3: undefined (settings.subagents.maxDepth unset) → engine.ts's runThread
       // defaults it to 2 itself (`subagentMaxDepth ?? 2`) — mirrors the maxConcurrent line above,
       // which leans on SubagentManager's own internal default the same way.

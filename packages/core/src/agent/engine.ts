@@ -18,6 +18,7 @@ import { bashLooksSafe, type BashReviewer } from "./reviewer";
 import type { WorktreeManager } from "./worktree";
 import type { SubagentManager } from "./subagents";
 import type { AgentStore } from "./agents";
+import type { BackgroundAgentRegistry } from "./bg-agent-registry";
 
 /** Structural narrowing of BackgroundTaskRegistry (bg-registry.ts) to just what pinnedTools
  *  (below) needs — lets the engine (and tests) work with anything shaped like a per-session task
@@ -145,6 +146,14 @@ export interface EngineConfig {
   // the bridge to activate — see the `spawnCalls` filter in runThread's dispatch loop.
   subagents?: SubagentManager;
   agents?: AgentStore;
+  // Async spawn (4h-ii-a, CC parity: Agent.run_in_background): tracks DETACHED child threads —
+  // see bg-agent-registry.ts's own doc comment for why this is a separate registry from
+  // bgRegistry above (that one owns backgrounded bash processes; this one owns agent threads,
+  // whose live output already streams as ordinary thread events). Optional — a spawn call with
+  // `run_in_background:true` while this is unset fails as a typed error (see the bridge below)
+  // rather than silently falling back to the synchronous path, so a caller never gets a "running"
+  // tool_result for a detached child nothing is actually tracking.
+  bgAgents?: BackgroundAgentRegistry;
   // 4h-i Task 3 (CC parity: configurable nesting depth, settings.subagents.maxDepth): how many
   // levels of spawn_agent nesting are allowed, orthogonal to SubagentManager's maxConcurrent
   // (fan-out width) — this is depth, not count or concurrency. Undefined → defaults to 5
@@ -629,7 +638,7 @@ export class AgentEngine {
         : [];
       if (spawnCalls.length > 0) {
         await Promise.all(spawnCalls.map(async (call) => {
-          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown; max_turns?: unknown; mode?: unknown; isolation?: unknown } = {};
+          let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown; max_turns?: unknown; mode?: unknown; isolation?: unknown; run_in_background?: unknown } = {};
           try { parsed = JSON.parse(call.argsJson || "{}"); } catch { /* defensive: empty prompt below */ }
           const prompt = typeof parsed.prompt === "string" ? parsed.prompt : "";
           const agentType = typeof parsed.agentType === "string" ? parsed.agentType : undefined;
@@ -666,6 +675,11 @@ export class AgentEngine {
           // omitting the arg entirely (no isolation, child runs in the parent's own cwd — today's
           // unchanged behavior).
           const wantsWorktreeIsolation = parsed.isolation === "worktree";
+          // 4h-ii-a (CC parity: Agent.run_in_background) — same hand-parse-before-zod reasoning as
+          // isolation/mode/max_turns/model/description above: only the literal boolean `true` is
+          // recognized; anything else (wrong type, absent, false) → false, same as omitting the arg
+          // entirely (the synchronous, awaited path — today's unchanged behavior).
+          const runInBackground = parsed.run_in_background === true;
           // Child-scoped meta: a shallow copy ONLY when childPolicy actually narrows (differs from
           // the parent's) — never mutate the shared `meta` object itself (that object is the SAME
           // one `turn()`'s dispatch loop uses for the REST of the parent's turn; mutating
@@ -714,6 +728,19 @@ export class AgentEngine {
               });
               return; // no thread_started, no thread registry entry, no subagents.run slot
             }
+          }
+
+          // 4h-ii-a (CC parity: Agent.run_in_background) — a bg spawn needs somewhere to land its
+          // detached state; if the registry was never wired (daemon.ts) this fails as a typed
+          // error BEFORE thread_started/registerThread/subagents.run, same reason the checks above
+          // do — a caller must never get a `{agentId,status:"running"}` tool_result for a child
+          // nothing is actually tracking (no way to observe completion, no `stop()` target).
+          if (runInBackground && !this.cfg.bgAgents) {
+            spawnOutcomes.set(call.callId, {
+              output: `run_in_background is not available in this session`,
+              isError: true,
+            });
+            return; // no thread_started, no thread registry entry, no subagents.run slot
           }
 
           // 4h-i Task 4 (CC parity: Agent.isolation "worktree") — create the child's isolation
@@ -769,6 +796,112 @@ export class AgentEngine {
           const childDepth = opts.depth + 1;
           const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode"]);
           if (childDepth >= maxDepth) childExcludeTools.add("spawn_agent");
+          // 4h-ii-a (CC parity: Agent.run_in_background): the async/detached path — starts the
+          // child through the SAME SubagentManager slot (concurrency-limited) + depth cap as the
+          // synchronous path below, but does NOT await it. `entryAbort` is THIS bg entry's own
+          // controller (bg-agent-registry.ts's `stop()` fires it) — the child's own runThread
+          // signal is `AbortSignal.any([childSignal, entryAbort.signal])` so EITHER the
+          // SubagentManager's own per-run timeout (childSignal) OR a future stop() call
+          // (entryAbort) can abort it. This call's tool_result is set SYNCHRONOUSLY, right here,
+          // before any of the child's own work has run — Promise.all resolves as soon as this
+          // closure returns, without waiting on the detached chain below.
+          if (runInBackground) {
+            const entryAbort = new AbortController();
+            const registered = this.cfg.bgAgents!.register({
+              agentId: childId,
+              sessionId,
+              threadId: childId,
+              // `name` (4h-ii-b) is a follow-up arg — this task never passes one, so every bg
+              // entry is addressed by agentId (childId) only, same as thread.list today.
+              name: undefined,
+              abort: entryAbort,
+            });
+            if (!registered.ok) {
+              // Not reachable today (childId is a fresh randomUUID and name is always undefined
+              // here, so register() can only ever reject on a collision this task never produces)
+              // — handled defensively rather than assumed impossible, mirroring the guard style
+              // used throughout this bridge. thread_started already fired above, so this must
+              // still complete that thread entry rather than leaving a ghost "running" thread.
+              this.emit(sessionId, { type: "thread_completed", sessionId, threadId: childId, stopReason: "error" });
+              this.completeThread(sessionId, childId, "error");
+              spawnOutcomes.set(call.callId, { output: registered.error, isError: true });
+              return;
+            }
+            void this.cfg.subagents!.run(async (childSignal) => {
+              const childLoaded = new Set<string>();
+              const instructionsFull = this.buildInstructionsFull(def.instructions, childCwd, childLoaded, childPolicy, sessionId);
+              return this.runThread({
+                sessionId,
+                threadId: childId,
+                instructionsFull,
+                input: [{ type: "message", role: "user", content: prompt }], // FRESH — no parent history
+                cwd: childCwd,
+                model: effectiveOverride ?? opts.model,
+                // Subagents inherit the PARENT thread's resolved reasoning effort — no per-agent-def
+                // override, same as the synchronous path below.
+                reasoningEffort: opts.reasoningEffort,
+                meta: childMeta,
+                depth: childDepth,
+                // BOTH the SubagentManager's own per-run timeout (childSignal) AND a future
+                // registry.stop() (entryAbort.signal) must be able to abort this detached child —
+                // see this branch's own doc comment above. This is the ONLY functional difference
+                // (besides not awaiting) from the synchronous path's childFn just below.
+                signal: AbortSignal.any([childSignal, entryAbort.signal]),
+                loaded: childLoaded,
+                excludeTools: childExcludeTools,
+                allowTools: def.allowTools,
+                maxTurns,
+                rootsOverride: isolatedWorktree ? [isolatedWorktree.dir] : undefined,
+              });
+            }, { reentrant: opts.depth > 0 })
+              .then((result) => {
+                const stopReason = result.ok ? result.value.stopReason : "error";
+                this.emit(sessionId, { type: "thread_completed", sessionId, threadId: childId, stopReason });
+                this.completeThread(sessionId, childId, stopReason);
+                // Same outcome shape as the synchronous path's spawnOutcomes.set below (Defect 2,
+                // 4e gate F10) — a completed-but-errored child (result.ok, stopReason "error")
+                // reports as a failure, not a quiet success. This result is only READ later — by
+                // the completion reminder (a separate 4h-ii-a task, not built here) or a future
+                // resume/get — never by this already-returned tool_result.
+                this.cfg.bgAgents!.complete(childId, !result.ok
+                  ? { ok: false, result: `subagent (${agentType ?? "general-purpose"}) ${result.error}` }
+                  : result.value.stopReason === "error"
+                    ? { ok: false, result: `subagent (${agentType ?? "general-purpose"}) failed: ${result.value.errorMessage ?? "provider error"}` }
+                    : { ok: true, result: result.value.finalText || "the subagent finished without a final message" });
+              })
+              .catch((err) => {
+                // Defensive only — SubagentManager.run() itself never throws (see its own doc
+                // comment); this guards against a throw in the `.then` handler above (e.g. a
+                // registry bug) so a detached child NEVER leaves an unhandled rejection.
+                const message = err instanceof Error ? err.message : String(err);
+                this.emit(sessionId, { type: "thread_completed", sessionId, threadId: childId, stopReason: "error" });
+                this.completeThread(sessionId, childId, "error");
+                this.cfg.bgAgents!.complete(childId, { ok: false, result: message });
+              })
+              .finally(() => {
+                // 4h-i Task 4 teardown, mirrored for the detached path — see the synchronous
+                // path's own `finally` block below for the full rationale (clean-only removal,
+                // dirty worktrees left on disk for review).
+                if (isolatedWorktree) {
+                  try {
+                    const removed = this.cfg.worktrees!.removeDetached(isolatedWorktree.dir, opts.cwd, true);
+                    if (!removed) {
+                      console.error(`spawn_agent isolation:"worktree": left dirty worktree at ${isolatedWorktree.dir} (uncommitted changes) — not auto-removed`);
+                    }
+                  } catch (err) {
+                    console.error(`spawn_agent isolation:"worktree": teardown failed for ${isolatedWorktree.dir}: ${err instanceof Error ? err.message : String(err)}`);
+                  }
+                }
+              });
+            // NOTE: only {agentId, status} — never the AbortController/registry entry itself —
+            // ever reaches the model, via this tool_result JSON.
+            spawnOutcomes.set(call.callId, {
+              output: JSON.stringify({ agentId: childId, status: "running" }),
+              isError: false,
+            });
+            return; // Promise.all resolves without waiting on the detached chain above
+          }
+
           // Nested-spawn saturation fix (T3 review): `opts.depth` is THIS spawning thread's own
           // depth — >0 means it already holds a concurrency slot (it's itself a child), so this
           // run() call is a REENTRANT acquire. SubagentManager bounds a reentrant wait

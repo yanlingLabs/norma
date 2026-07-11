@@ -129,6 +129,25 @@ describe("BackgroundAgentRegistry", () => {
     expect(reg.stop("nope")).toBe(false);
   });
 
+  // T2 review (folded Minor): stop() then complete() must not resurrect a stopped entry back to
+  // running/completed — complete()'s own "no-op unless status === running" guard (see its doc
+  // comment) already covers this, but it was never pinned end-to-end for the stop→complete
+  // ordering specifically (only the reverse, complete→stop, was tested above).
+  test("stop() then complete(): the agent stays 'stopped' — complete() does not resurrect a stopped entry, and its result is never overwritten", () => {
+    const reg = new BackgroundAgentRegistry();
+    const e = entry();
+    reg.register(e);
+    expect(reg.stop("a1")).toBe(true);
+    expect(reg.get("a1")?.status).toBe("stopped");
+
+    // the detached child's own eventual resolution races in AFTER the stop — must be ignored
+    reg.complete("a1", { ok: true, result: "raced-in-after-stop" });
+
+    const after = reg.get("a1");
+    expect(after?.status).toBe("stopped");
+    expect(after?.result).toBeUndefined();
+  });
+
   test("takeCompletedForSession returns terminal-unnotified entries once; empty on second call", () => {
     const reg = new BackgroundAgentRegistry();
     reg.register(entry({ agentId: "a1" }));
