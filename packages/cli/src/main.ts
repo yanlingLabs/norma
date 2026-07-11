@@ -637,10 +637,15 @@ async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boole
     } else if (e.type === "thread_completed") {
       // Task 5: read finish stats from `subagents` BEFORE they're pruned — updateSubagents (run
       // earlier in this handler) only flips this entry to "done" here; the prune to [] happens
-      // later, on the MAIN thread's own turn_completed — so the item is still present.
+      // later, on the MAIN thread's own turn_completed — so the item is still present... for a
+      // SYNC child. A run_in_background child (4h-ii-a) finishes AFTER the main turn already
+      // pruned the list, so `item` is undefined and the label/stats are gone — fall back to the
+      // threadId so the finish line stays identifiable (`Agent "th_…" finished`) instead of
+      // `Agent ""`. Proper per-thread stats for bg agents are a Phase-3 TUI concern (its state
+      // model won't prune on main turn_completed).
       const item = subagents.find((s) => s.threadId === e.threadId);
       emit(process.stdout.isTTY
-        ? `${agentFinishLines(item?.label ?? "", item?.activeMs ?? 0, item?.toolCalls ?? 0).join("\n")}\n`
+        ? `${agentFinishLines(item?.label ?? e.threadId, item?.activeMs ?? 0, item?.toolCalls ?? 0).join("\n")}\n`
         : NONTTY_FINISH_LINE(e.stopReason));
       // §4 snap-back: if the just-finished subagent was the one being viewed, selection returns to
       // main (and a live focus highlight follows to the main row). The dim context line goes through
