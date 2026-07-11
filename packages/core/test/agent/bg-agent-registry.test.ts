@@ -298,4 +298,64 @@ describe("BackgroundAgentRegistry", () => {
     expect(reg.get("a1")?.notified).toBe(false);
     expect(reg.takeCompletedForSession("s1").map((e) => e.agentId)).toEqual(["a1"]);
   });
+
+  // 4h-ii-c: AgentStatus gains "timeout" — a bg spawn whose SubagentManager.run() rejected via
+  // its own clock (SubagentResult.timedOut:true) reports distinctly from a generic "failed", so
+  // a future client can render/handle "timed out" separately from "errored". "timeout" is
+  // TERMINAL like completed/failed/stopped: surfaced once by takeCompletedForSession, reopen()
+  // accepts it (a timed-out child may still be resumable — the 4h-ii-b shape guard decides that
+  // from its history), and stop() rejects it (not running).
+  describe("complete({timedOut:true}) → 'timeout' status (4h-ii-c)", () => {
+    test("complete(..., {timedOut:true}) → status 'timeout' (not 'failed'), result stored", () => {
+      const reg = new BackgroundAgentRegistry();
+      reg.register(entry());
+      reg.complete("a1", { ok: false, result: "timed out after 50s" }, { timedOut: true });
+      const e = reg.get("a1");
+      expect(e?.status).toBe("timeout");
+      expect(e?.result).toBe("timed out after 50s");
+    });
+
+    test("complete({timedOut:true, ok:true}) still becomes 'timeout' — timedOut wins over outcome.ok", () => {
+      const reg = new BackgroundAgentRegistry();
+      reg.register(entry());
+      reg.complete("a1", { ok: true, result: "irrelevant" }, { timedOut: true });
+      expect(reg.get("a1")?.status).toBe("timeout");
+    });
+
+    test("a 'timeout' entry is terminal: surfaced once by takeCompletedForSession, empty on the next call", () => {
+      const reg = new BackgroundAgentRegistry();
+      reg.register(entry());
+      reg.complete("a1", { ok: false, result: "timed out" }, { timedOut: true });
+      const first = reg.takeCompletedForSession("s1");
+      expect(first.map((e) => e.agentId)).toEqual(["a1"]);
+      expect(first[0]?.status).toBe("timeout");
+      expect(reg.takeCompletedForSession("s1")).toEqual([]);
+    });
+
+    test("reopen() accepts a 'timeout' entry — resumable, exactly like any other terminal status", () => {
+      const reg = new BackgroundAgentRegistry();
+      reg.register(entry());
+      reg.complete("a1", { ok: false, result: "timed out" }, { timedOut: true });
+      expect(reg.get("a1")?.status).toBe("timeout");
+      const ok = reg.reopen("a1", new AbortController());
+      expect(ok).toBe(true);
+      expect(reg.get("a1")?.status).toBe("running");
+    });
+
+    test("stop() rejects a 'timeout' entry — not running, returns false, status untouched", () => {
+      const reg = new BackgroundAgentRegistry();
+      reg.register(entry());
+      reg.complete("a1", { ok: false, result: "timed out" }, { timedOut: true });
+      expect(reg.stop("a1")).toBe(false);
+      expect(reg.get("a1")?.status).toBe("timeout");
+    });
+
+    test("complete({timedOut:true, notified:true}) — both opts apply together: status 'timeout' AND immediately notified", () => {
+      const reg = new BackgroundAgentRegistry();
+      reg.register(entry());
+      reg.complete("a1", { ok: false, result: "timed out" }, { timedOut: true, notified: true });
+      expect(reg.get("a1")).toMatchObject({ status: "timeout", notified: true });
+      expect(reg.takeCompletedForSession("s1")).toEqual([]);
+    });
+  });
 });

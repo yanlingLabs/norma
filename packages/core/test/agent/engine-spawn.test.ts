@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -106,7 +106,7 @@ export function setup(
   const sessionId = store.createSession("global", { cwd, approvalPolicy: opts.approvalPolicy ?? "auto" });
   const events: SessionEvent[] = [];
   hub.attach({ clientName: "test-observer", deliver: (e) => { events.push(e); return true; } }, sessionId, 0);
-  return { engine, store, hub, broker, sessionId, cwd, provider, dirs, events, registry, bgAgents };
+  return { engine, store, hub, broker, sessionId, cwd, provider, dirs, events, registry, bgAgents, subagents };
 }
 
 const done = (reason: "end_turn" | "tool_calls" | "aborted"): ProviderEvent => ({ type: "done", stopReason: reason });
@@ -1580,6 +1580,43 @@ describe("AgentEngine: spawn_agent run_in_background (4h-ii-a)", () => {
 
     // nothing was ever registered into the (unwired) registry either
     expect(bgAgents.list(sessionId)).toEqual([]);
+  });
+
+  // 4h-ii-c: a detached run_in_background child has no waiting parent to time out FOR — the
+  // 300s SubagentManager clock existed only as a safety net until a manual kill (task_stop,
+  // this same phase) existed. This spawn branch now passes `timeoutMs: null` for the detached
+  // call specifically — the sync path just below stays on the constructor default, unchanged.
+  test("run_in_background:true → subagents.run receives timeoutMs:null (untimed; task_stop is the only kill, not SubagentManager's own clock)", async () => {
+    const { engine, store, sessionId, subagents } = setup([
+      [spawnCall("s1", "bg task", { run_in_background: true }), done("tool_calls")],
+      text("parent wrap-up"),
+    ]);
+    const spy = spyOn(subagents!, "run");
+    try {
+      await engine.runTurn(sessionId);
+      expect(spy.mock.calls.length).toBeGreaterThan(0);
+      expect(spy.mock.calls[0]?.[1]).toMatchObject({ timeoutMs: null });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  // Contrast case: the SYNC path's own subagents.run call must NOT get a timeoutMs override —
+  // it stays on the constructor default (undefined opts.timeoutMs), unchanged from before this
+  // task.
+  test("no run_in_background (sync spawn) → subagents.run's opts carry NO timeoutMs override (constructor default applies, unchanged)", async () => {
+    const { engine, store, sessionId, subagents } = setup([
+      [spawnCall("s1", "do X"), done("tool_calls")],
+      text("child final report"),
+    ]);
+    const spy = spyOn(subagents!, "run");
+    try {
+      await engine.runTurn(sessionId);
+      expect(spy.mock.calls.length).toBeGreaterThan(0);
+      expect(spy.mock.calls[0]?.[1]).not.toHaveProperty("timeoutMs");
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

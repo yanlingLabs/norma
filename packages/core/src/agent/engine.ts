@@ -1055,11 +1055,12 @@ export class AgentEngine {
           // child through the SAME SubagentManager slot (concurrency-limited) + depth cap as the
           // synchronous path below, but does NOT await it. `entryAbort` is THIS bg entry's own
           // controller (bg-agent-registry.ts's `stop()` fires it) — the child's own runThread
-          // signal is `AbortSignal.any([childSignal, entryAbort.signal])` so EITHER the
-          // SubagentManager's own per-run timeout (childSignal) OR a future stop() call
-          // (entryAbort) can abort it. This call's tool_result is set SYNCHRONOUSLY, right here,
-          // before any of the child's own work has run — Promise.all resolves as soon as this
-          // closure returns, without waiting on the detached chain below.
+          // signal is `AbortSignal.any([childSignal, entryAbort.signal])`. 4h-ii-c: this call's own
+          // `subagents.run` now passes `timeoutMs: null` (below), so `childSignal` itself never
+          // aborts on a clock anymore — `entryAbort` (a future task_stop) is this detached child's
+          // ONLY kill mechanism. This call's tool_result is set SYNCHRONOUSLY, right here, before
+          // any of the child's own work has run — Promise.all resolves as soon as this closure
+          // returns, without waiting on the detached chain below.
           if (runInBackground) {
             const entryAbort = new AbortController();
             const registered = this.cfg.bgAgents!.register({
@@ -1098,10 +1099,9 @@ export class AgentEngine {
                 reasoningEffort: opts.reasoningEffort,
                 meta: childMeta,
                 depth: childDepth,
-                // BOTH the SubagentManager's own per-run timeout (childSignal) AND a future
-                // registry.stop() (entryAbort.signal) must be able to abort this detached child —
-                // see this branch's own doc comment above. This is the ONLY functional difference
-                // (besides not awaiting) from the synchronous path's childFn just below.
+                // registry.stop() (entryAbort.signal) is now the ONLY thing that can abort this
+                // detached child — see this branch's own doc comment above (4h-ii-c: childSignal
+                // itself never fires on a clock anymore, `timeoutMs: null` just below).
                 signal: AbortSignal.any([childSignal, entryAbort.signal]),
                 loaded: childLoaded,
                 excludeTools: childExcludeTools,
@@ -1109,7 +1109,17 @@ export class AgentEngine {
                 maxTurns,
                 rootsOverride: isolatedWorktree ? [isolatedWorktree.dir] : undefined,
               });
-            }, { reentrant: opts.depth > 0 })
+            }, {
+              reentrant: opts.depth > 0,
+              // 4h-ii-c: a detached `run_in_background` child has no waiting parent to time out
+              // FOR — the 4h-ii-a T3 review flagged the bg spawn's inherited SubagentManager
+              // timeout as something to "relax only once a manual kill exists" (a runaway
+              // detached child was previously bounded ONLY by this clock, with no way to kill it
+              // early). task_stop (this same phase) now IS that manual kill via `entryAbort`
+              // above, so this call runs UNTIMED: `timeoutMs: null` removes SubagentManager's own
+              // clock entirely, leaving entryAbort (task_stop) as the sole kill mechanism.
+              timeoutMs: null,
+            })
               .then((result) => {
                 const stopReason = result.ok ? result.value.stopReason : "error";
                 this.emit(sessionId, { type: "thread_completed", sessionId, threadId: childId, stopReason });
@@ -1123,7 +1133,11 @@ export class AgentEngine {
                   ? { ok: false, result: `subagent (${agentType ?? "general-purpose"}) ${result.error}` }
                   : result.value.stopReason === "error"
                     ? { ok: false, result: `subagent (${agentType ?? "general-purpose"}) failed: ${result.value.errorMessage ?? "provider error"}` }
-                    : { ok: true, result: result.value.finalText || "the subagent finished without a final message" });
+                    : { ok: true, result: result.value.finalText || "the subagent finished without a final message" },
+                  // 4h-ii-c: only reachable today if a future config re-adds a bg timeout (this
+                  // call itself now runs with `timeoutMs: null`, above) — wired now so a timed-out
+                  // detached child is never misreported as a generic "failed" once one exists.
+                  !result.ok && result.timedOut ? { timedOut: true } : undefined);
               })
               .catch((err) => {
                 // Defensive only — SubagentManager.run() itself never throws (see its own doc
@@ -1275,7 +1289,13 @@ export class AgentEngine {
             // completions) would re-surface it as a "background agent finished" reminder,
             // leaking the child's raw output into a turn that never asked for it (see
             // BackgroundAgentRegistry.complete's own doc comment).
-            if (registeredInBg) this.cfg.bgAgents!.complete(childId, { ok: !outcome.isError, result: outcome.output }, { notified: true });
+            // 4h-ii-c: this sync spawn's own `subagents.run` call above is UNCHANGED (no
+            // `timeoutMs` override — still the constructor default, 300s), but `timedOut` is
+            // threaded through here too for correctness/consistency with the bg path's own
+            // `.then` handler above, in case `result` ever IS a timeout (it still can be, since
+            // this path's run() call has no override).
+            if (registeredInBg) this.cfg.bgAgents!.complete(childId, { ok: !outcome.isError, result: outcome.output },
+              { notified: true, timedOut: !result.ok && result.timedOut });
           } finally {
             // 4h-i Task 4: teardown runs whether the child succeeded, errored, or timed out —
             // clean-only (mirrors exit_worktree's default guard AND CC's own isolation
