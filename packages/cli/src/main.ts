@@ -63,6 +63,18 @@ interface KeyListener {
   destroy(): void; // final teardown — detach, restore cooked mode, pause stdin
 }
 let activeKeyListener: KeyListener | null = null;
+// Set synchronously (then reset on the next microtask) by the pending-approval stdin reader (the
+// `process.stdin.on("data", …)` installed in run() when approvals are possible) for the exact "data"
+// dispatch of a chunk it consumes as a y/N answer. A concurrently-active readLine() — the idle
+// composer "› " read, or an ask_user answer read — shares that SAME "data" event, so without this it
+// would ALSO submit the chunk as input: a background-agent approval answered while the composer sits
+// idle both resolves the approval AND sends "y" as a chat message, starting a spurious turn (the
+// live-gate scout bug). LOAD-BEARING INVARIANT: that approval reader is installed once at startup, so
+// it is always EARLIER in stdin's listener array than any per-call readLine() onData; Node fires
+// "data" listeners in registration order, so the approval reader sets this flag before readLine()
+// checks it. Moving/reordering that registration (or making it per-turn) silently reintroduces the
+// double-consume with NO test failure — keep it installed before the composer loop.
+let approvalConsumedChunk = false;
 
 /** True for exactly the span of the chat composer's `readLine("› ")` call (final-review Finding 1).
  *  readLine() writes its prompt text directly to stdout, bypassing `emit()`'s tracking, so the
@@ -164,10 +176,18 @@ async function readLine(promptText: string): Promise<string | null> {
   const stdin = process.stdin;
   return new Promise((resolvePromise) => {
     const done = (v: string | null) => { cleanup(); resolvePromise(v); };
-    const onData = (d: Buffer) => done(String(d).trim());
+    const onData = (d: Buffer) => {
+      // A chunk the pending-approval reader consumed this same dispatch (its handler ran first and
+      // set the flag) is a y/N answer, NOT input for this read — skip it and keep listening (hence
+      // `.on`, not `.once`: a skipped chunk must re-arm) for the real next line. Every RESOLVE path
+      // still funnels through done()→cleanup()→stdin.off, so the `.on` listener is removed exactly
+      // once a real line lands — no leaked listener on the happy path (flag false → resolve once).
+      if (approvalConsumedChunk) return;
+      done(String(d).trim());
+    };
     const onEnd = () => done(null);
     function cleanup() { stdin.off("data", onData); stdin.off("end", onEnd); activeKeyListener?.resume(); }
-    stdin.once("data", onData);
+    stdin.on("data", onData);
     stdin.once("end", onEnd);
     stdin.resume();
   });
@@ -690,6 +710,12 @@ async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boole
   if (chat || !auto) {
     process.stdin.on("data", async (d) => {
       if (pending.length === 0) return;
+      // Claim this chunk for the approval BEFORE any concurrently-armed readLine() onData (which is
+      // later in the listener array) runs for the same "data" event, so it skips instead of also
+      // submitting the answer as input. Reset on the next microtask — after both synchronous "data"
+      // handlers for this chunk have run, and before the user's real next line can arrive.
+      approvalConsumedChunk = true;
+      queueMicrotask(() => { approvalConsumedChunk = false; });
       const yes = String(d).trim().toLowerCase() === "y";
       const callId = pending.shift();
       if (callId) await c.request(METHODS.approvalRespond, { sessionId, callId, approved: yes });
