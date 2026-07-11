@@ -67,11 +67,16 @@ export class HookRunner {
     }
 
     try {
-      proc.stdin.write(JSON.stringify(payload));
-      proc.stdin.end();
+      // Bun's FileSink write()/end() are typed `number | Promise<number>` — when the child has
+      // already exited (or exits mid-write) the write can fail asynchronously (EPIPE) rather than
+      // throwing synchronously. Awaiting here routes that failure into this catch instead of
+      // becoming an unhandled rejection, which would otherwise crash the whole daemon process.
+      await proc.stdin.write(JSON.stringify(payload));
+      await proc.stdin.end();
     } catch {
       // A process that exits immediately (e.g. `exit 1` before reading stdin) can make the write
-      // itself throw/reject — irrelevant to the exit-code outcome decided below, so swallow it.
+      // itself throw/reject (incl. EPIPE) — irrelevant to the exit-code outcome decided below, so
+      // swallow it; the child just won't see (all of) the payload.
     }
 
     const timeoutMs = spec.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -88,7 +93,12 @@ export class HookRunner {
 
     if (timedOut) {
       try {
-        proc.kill();
+        // SIGKILL, not the default SIGTERM: a hook can trivially install `trap '' TERM` (or simply
+        // ignore it) and a SIGTERM would then never actually stop it, leaving `await proc.exited`
+        // below blocked forever and defeating the timeout entirely. SIGKILL cannot be trapped or
+        // ignored. A timed-out hook gets no grace period — going straight to SIGKILL (rather than
+        // TERM-then-KILL escalation) keeps this simple, which is the right tradeoff for v1.
+        proc.kill("SIGKILL");
       } catch {
         /* already gone */
       }

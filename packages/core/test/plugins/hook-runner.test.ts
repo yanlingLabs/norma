@@ -119,4 +119,66 @@ describe("HookRunner.run", () => {
     expect(result.status).toBe("ok");
     expect(result.stdout).toBe("sess-42|plugin-x|turn-end");
   });
+
+  // C1 regression (4f T1 review): a child that exits before reading stdin (`exit 0`) combined with a
+  // large payload can make Bun's FileSink stdin `write()`/`end()` REJECT (EPIPE) instead of throwing
+  // synchronously. Pre-fix, that rejection was unhandled — Bun terminates the whole process on an
+  // unhandled rejection ("UNHANDLED REJECTION: EPIPE: broken pipe, send"), which would take the
+  // entire daemon down, not just this one hook run. Post-fix (awaiting the writes inside the
+  // try/catch), the rejection is caught like any other early-exit write failure and run() just
+  // resolves normally. The only meaningful assertion here is that this test (and the process running
+  // it) SURVIVES at all — if the fix regresses, this whole test file crashes rather than reporting a
+  // clean failure.
+  test("(i) C1: large payload + child that exits before reading stdin → no unhandled EPIPE rejection, run() resolves ok", async () => {
+    const runner = new HookRunner();
+    const bigPayload = mkPayload({ padding: "x".repeat(5_000_000) }); // multi-MB, reliably triggers EPIPE on write
+    const result = await runner.run(mkSpec({ command: "exit 0" }), bigPayload);
+    expect(result.status).toBe("ok");
+  });
+
+  // C2 regression (4f T1 review): the timeout path used to call `proc.kill()` (default SIGTERM), which
+  // a hook can trivially ignore (`trap '' TERM`). `await proc.exited` then blocks until the child exits
+  // on its own — for a genuinely hung/infinite-loop hook, that's forever, defeating the timeout and
+  // (downstream) hanging the pre-tool gate. Post-fix, the timeout path sends SIGKILL, which cannot be
+  // trapped. The explicit 3000ms bun-test-level timeout (3rd arg) is a fail-fast guard for the RED
+  // state: pre-fix this hook (SIGTERM-immune) makes run() hang for the sleep's full duration, and we
+  // want that to show up as a fast, unambiguous test failure rather than stalling the whole suite.
+  // NB: `sleep 2`, not `sleep 30` — `sh -c` forks `sleep` as a separate grandchild, so SIGKILLing the
+  // `sh` process (proc.pid) orphans it rather than killing it; it self-exits on its own shortly after
+  // (harmless), but `sleep 30` specifically collides with the literal `pgrep -f 'sleep 30'` orphan
+  // check in test/agent/tools-bash.test.ts, so a longer-but-distinct duration avoids cross-file flakes.
+  test(
+    "(j) C2: SIGTERM-ignoring hook (trap '' TERM; sleep 2) + timeoutMs ~100 → timeout resolves promptly via SIGKILL, child is dead",
+    async () => {
+      const runner = new HookRunner();
+      const dir = tmpDir();
+      const pidFile = join(dir, "pid");
+      const start = Date.now();
+      const result = await runner.run(
+        mkSpec({ cwd: dir, command: `trap '' TERM; echo $$ > "${pidFile}"; sleep 2`, timeoutMs: 100 }),
+        mkPayload(),
+      );
+      const elapsed = Date.now() - start;
+
+      expect(result.status).toBe("timeout");
+      // Budget well under 1s: proves SIGKILL won, not the ignored SIGTERM + eventual natural exit.
+      expect(elapsed).toBeLessThan(1000);
+
+      // Poll (bounded, short interval) that the spawned shell's own pid is no longer alive — proves
+      // the timeout path actually killed the SIGTERM-immune process rather than merely giving up on it.
+      const pid = Number(readFileSync(pidFile, "utf8").trim());
+      let alive = true;
+      for (let i = 0; i < 25; i++) {
+        try {
+          process.kill(pid, 0);
+        } catch {
+          alive = false;
+          break;
+        }
+        await sleep(20);
+      }
+      expect(alive).toBe(false);
+    },
+    3000,
+  );
 });
