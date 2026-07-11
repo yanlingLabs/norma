@@ -437,6 +437,9 @@ export class AgentEngine {
     if (e.type === "assistant_message") return { type: "message", role: "assistant", content: e.text };
     if (e.type === "tool_call") return { type: "function_call", callId: e.callId, name: e.name, argsJson: e.argsJson };
     if (e.type === "tool_result") return { type: "tool_result", callId: e.callId, output: e.output, isError: e.isError };
+    // history-parity Task 3: opaque reasoning items replay verbatim (CC/Codex parity). This ONE
+    // case gives BOTH historyInput (cross-turn) and childHistoryInput (subagent resume) the replay.
+    if (e.type === "reasoning_item") return { type: "reasoning", itemJson: e.itemJson };
     return null;
   }
 
@@ -818,6 +821,11 @@ export class AgentEngine {
 
       let textBuf = "";
       const calls: Extract<ProviderEvent, { type: "tool_call" }>[] = [];
+      // history-parity Task 3: this round's opaque reasoning items, in provider emission order.
+      // Prefixed ahead of the round's message/function_calls below, then cleared (must not leak
+      // into the next round of the same turn). Empty when the provider emits none → the round's
+      // input assembly is byte-identical to the pre-change behavior.
+      const roundReasoning: string[] = [];
       let stop: "end_turn" | "tool_calls" | "aborted" | null = null;
 
       // Pins recomputed EVERY round (unlike buildInstructionsFull's once-per-thread read above) —
@@ -847,6 +855,12 @@ export class AgentEngine {
           if (ev.delta.length > 0) this.cfg.hub.broadcastTransient(sessionId, { type: "assistant_delta", sessionId, threadId, delta: ev.delta });
         }
         else if (ev.type === "tool_call") calls.push(ev);
+        else if (ev.type === "reasoning_item") {
+          roundReasoning.push(ev.itemJson);
+          // Persist AT ARRIVAL so seq order = provider emission order (the replay-order invariant,
+          // spec §B4/§B6). itemJson is sensitive-opaque: this append is its only sink — never log it.
+          this.emit(sessionId, { type: "reasoning_item", sessionId, threadId, itemJson: ev.itemJson });
+        }
         else if (ev.type === "usage") { usage.inputTokens += ev.inputTokens; usage.outputTokens += ev.outputTokens; }
         else if (ev.type === "done") stop = ev.stopReason;
         else if (ev.type === "error") {
@@ -862,6 +876,15 @@ export class AgentEngine {
           return { finalText: lastText, stopReason: "error", errorMessage: ev.message };
         }
       }
+
+      // Emission-order replay (spec §B4): reasoning items precede the round's message/function_calls.
+      // Simplification, documented: all of a round's reasoning items are prefixed as a block in
+      // arrival order (the Responses API emits reasoning before the items it reasons for — codex
+      // report §13.1; a hypothetical mid-batch reasoning item would be hoisted to the block, never
+      // dropped/reordered relative to other reasoning items). Empty roundReasoning → no-op, so the
+      // no-reasoning path (every non-reasoning provider) is byte-identical to before.
+      for (const r of roundReasoning) input.push({ type: "reasoning", itemJson: r });
+      roundReasoning.length = 0;
 
       if (textBuf.length > 0) {
         this.emit(sessionId, { type: "assistant_message", sessionId, threadId, text: textBuf });

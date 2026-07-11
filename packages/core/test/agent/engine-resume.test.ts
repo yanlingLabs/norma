@@ -146,6 +146,50 @@ describe("AgentEngine: spawn_agent resume (4h-ii-b Task 3)", () => {
     expect(new Set(allChildStarts.map((e) => (e as Extract<SessionEvent, { type: "thread_started" }>).threadId)).size).toBe(1);
   });
 
+  // history-parity Task 3 (test d): a child whose stored history includes a reasoning_item — emitted
+  // during its first run, BEFORE its closing assistant message — resumes cleanly. The
+  // clean-termination guard (which only inspects the LAST reconstructed item) still sees an
+  // assistant message as last (reasoning precedes it, per Codex emission order), so the resume is
+  // NOT rejected; and childHistoryInput replays the reasoning item VERBATIM into the resumed run's
+  // input, in emission order, ahead of the child's own assistant reply.
+  test("(d) a resumed child replays its reasoning_item; the clean-termination guard still sees last-item = assistant", async () => {
+    const recJson = (ec: string) => JSON.stringify({ type: "reasoning", summary: [], encrypted_content: ec });
+    const RI = (ec: string): ProviderEvent => ({ type: "reasoning_item", itemJson: recJson(ec) });
+    const REAS = (ec: string) => ({ type: "reasoning" as const, itemJson: recJson(ec) });
+    const { engine, store, sessionId, provider, bgAgents } = setup([
+      [spawnNamed("s1", "do the task", "worker"), done("tool_calls")],               // turn 1: spawn
+      [RI("EC1"), { type: "text_delta", delta: "child-out-1" }, done("end_turn")],   // child run 1: reasoning THEN reply
+      text("parent turn1"),                                                          // main continuation
+      [resumeCall("r1", "worker", "now do Y"), done("tool_calls")],                  // turn 2: resume
+      text("child-out-2"),                                                           // resumed child run
+      text("parent turn2"),                                                          // main continuation
+    ]);
+    await engine.runTurn(sessionId); // turn 1: spawn "worker" (child emits a reasoning item, then finishes)
+    await engine.runTurn(sessionId); // turn 2: resume "worker" — must PASS the clean-termination guard
+
+    const fp = provider as FakeProvider;
+    // the RESUMED child's own provider request, found by content (opening + new prompt) — never by
+    // index. Its EXISTENCE proves the guard passed (a rejected resume never re-runs the child).
+    const resumed = fp.requests.find((r) => isChildRun(r.input, "do the task") && lastUserOf(r.input) === "now do Y");
+    expect(resumed).toBeDefined();
+    // the reasoning item replays verbatim, in emission order, ahead of the child's own reply.
+    expect(resumed!.input).toEqual([
+      M("user", "do the task"),      // opening prompt, prepended
+      REAS("EC1"),                   // the child's reasoning item, replayed from the store
+      M("assistant", "child-out-1"), // the child's OWN prior reply
+      M("user", "now do Y"),         // the new instruction
+    ]);
+
+    // in the child's stored history the reasoning item precedes the assistant message that closed
+    // run 1 — exactly the emission-order shape the clean-termination guard reconstructs at resume
+    // time ([reasoning, assistant], last = assistant), which is why the resume above was accepted.
+    const worker = bgAgents.get("worker", sessionId)!;
+    const childEvents = store.read(sessionId).filter((e) => "threadId" in e && e.threadId === worker.threadId);
+    const firstReasoningSeq = childEvents.find((e) => e.type === "reasoning_item")!.seq;
+    const firstAssistantSeq = childEvents.find((e) => e.type === "assistant_message")!.seq;
+    expect(firstReasoningSeq).toBeLessThan(firstAssistantSeq);
+  });
+
   // D1 MANDATORY: the two-resume alternation. The naive resume (input = [...childHistoryInput,
   // newPrompt] without persisting each prompt) passes the single-resume test above but CORRUPTS
   // the second resume — childHistoryInput would then rebuild [assistant1, assistant2] with NO user

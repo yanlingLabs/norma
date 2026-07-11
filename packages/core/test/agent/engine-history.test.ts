@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import type { SessionEvent } from "@norma/protocol";
+import type { ProviderEvent } from "../../src/providers/types";
 import { FakeProvider } from "../../src/agent/fake-provider";
 import { setupEngine } from "./engine-steer.test";
 
@@ -11,6 +13,13 @@ import { setupEngine } from "./engine-steer.test";
 const M = (role: "user" | "assistant", content: string) => ({ type: "message" as const, role, content });
 const FC = (callId: string, name: string, argsJson: string) => ({ type: "function_call" as const, callId, name, argsJson });
 const TR = (callId: string, output: string, isError: boolean) => ({ type: "tool_result" as const, callId, output, isError });
+
+// history-parity Task 3 helpers: an opaque provider reasoning item (encrypted_content) as the
+// provider yields it, and the TurnInputItem it replays into on later requests.
+const done = (reason: "end_turn" | "tool_calls"): ProviderEvent => ({ type: "done", stopReason: reason });
+const recJson = (ec: string) => JSON.stringify({ type: "reasoning", summary: [], encrypted_content: ec });
+const RI = (ec: string): ProviderEvent => ({ type: "reasoning_item", itemJson: recJson(ec) });
+const REAS = (ec: string) => ({ type: "reasoning" as const, itemJson: recJson(ec) });
 
 // A one-round provider script: enough to drive a single engine.runTurn() call and capture the
 // request it sent — the SAME pattern engine-compaction.test.ts uses to inspect historyInput's
@@ -156,5 +165,98 @@ describe("engine historyInput replays tool_call/tool_result (CC parity, history-
     expect(serialized).not.toContain("child tool output");
     expect(serialized).not.toContain("child chatter");
     expect(serialized).not.toContain("cc1");
+  });
+});
+
+// history-parity Task 3: the engine captures provider reasoning items, PERSISTS them at arrival
+// (so their store seq = provider emission order), PREFIXES the round's reasoning ahead of that
+// round's message/function_calls in-turn, and replays them cross-turn via the shared eventToInput
+// mapper. itemJson is SENSITIVE opaque state — the persist is its only sink.
+describe("engine reasoning-item capture/persist/replay in emission order (history-parity Task 3)", () => {
+  test("(b) reasoning items persist at arrival in emission order, prefix within-round, and replay cross-turn", async () => {
+    const writeArgs = JSON.stringify({ path: "out.txt", content: "hi" });
+    const provider = new FakeProvider([
+      // turn 1, round 0: reasoning THEN a tool call
+      [RI("EC1"), { type: "tool_call", callId: "c1", name: "write", argsJson: writeArgs }, done("tool_calls")],
+      // turn 1, round 1: reasoning THEN the final assistant text
+      [RI("EC2"), { type: "text_delta", delta: "done" }, done("end_turn")],
+      // turn 2, round 0: end immediately — captures the cross-turn historyInput replay
+      [{ type: "text_delta", delta: "ok" }, done("end_turn")],
+    ]);
+    const { engine, store, sessionId } = setupEngine(provider);
+
+    store.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: "u1", clientName: "test" });
+    await engine.runTurn(sessionId); // turn 1 (round 0: reasoning + tool call; round 1: reasoning + final text)
+    store.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: "u2", clientName: "test" });
+    await engine.runTurn(sessionId); // turn 2 (captures the cross-turn replay in provider.requests[2])
+
+    // write's exact tool_result text isn't load-bearing here — pull it verbatim from the store.
+    const events = store.read(sessionId);
+    const trEvent = events.find((e) => e.type === "tool_result" && e.callId === "c1") as Extract<SessionEvent, { type: "tool_result" }>;
+    const TRc1 = TR("c1", trEvent.output, trEvent.isError);
+
+    // (i) round 2's REQUEST input: round 0's reasoning precedes its function_call; nothing reordered.
+    // (round 1's OWN reasoning EC2 is collected DURING this stream and appended only afterwards, so
+    // it is not part of the request that opened round 2.)
+    expect(provider.requests[1]!.input).toEqual([
+      M("user", "u1"),
+      REAS("EC1"),
+      FC("c1", "write", writeArgs),
+      TRc1,
+    ]);
+
+    // (ii) the store holds exactly two reasoning_item events, in emission order, with seqs BETWEEN
+    // the surrounding events (EC1 after u1 and before its tool_call; EC2 after the tool_result and
+    // before the closing assistant_message).
+    const reasoning = events.filter((e) => e.type === "reasoning_item") as Extract<SessionEvent, { type: "reasoning_item" }>[];
+    expect(reasoning.map((e) => e.itemJson)).toEqual([recJson("EC1"), recJson("EC2")]);
+    const seqOf = (pred: (e: SessionEvent) => boolean) => events.find(pred)!.seq;
+    const u1seq = seqOf((e) => e.type === "user_message" && e.text === "u1");
+    const tcSeq = seqOf((e) => e.type === "tool_call" && e.callId === "c1");
+    const trSeq = seqOf((e) => e.type === "tool_result" && e.callId === "c1");
+    const asstSeq = seqOf((e) => e.type === "assistant_message" && e.text === "done");
+    expect(u1seq).toBeLessThan(reasoning[0]!.seq);
+    expect(reasoning[0]!.seq).toBeLessThan(tcSeq);
+    expect(trSeq).toBeLessThan(reasoning[1]!.seq);
+    expect(reasoning[1]!.seq).toBeLessThan(asstSeq);
+
+    // (iii) turn 2's input replays the whole prior turn cross-turn via historyInput — both reasoning
+    // items in emission order, verbatim.
+    expect(provider.requests[2]!.input).toEqual([
+      M("user", "u1"),
+      REAS("EC1"),
+      FC("c1", "write", writeArgs),
+      TRc1,
+      REAS("EC2"),
+      M("assistant", "done"),
+      M("user", "u2"),
+    ]);
+  });
+
+  test("(c) a checkpoint covering the reasoning-bearing turn folds the reasoning items away — none survive in the built input", async () => {
+    const provider = okProvider();
+    const { engine, store, sessionId } = setupEngine(provider);
+
+    store.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: "u1", clientName: "test" });
+    store.append(sessionId, { type: "reasoning_item", sessionId, threadId: "main", itemJson: recJson("EC1") });
+    store.append(sessionId, { type: "tool_call", sessionId, threadId: "main", callId: "c1", name: "read", argsJson: '{"path":"a.txt"}' });
+    store.append(sessionId, { type: "tool_result", sessionId, threadId: "main", callId: "c1", output: "file contents", isError: false });
+    store.append(sessionId, { type: "reasoning_item", sessionId, threadId: "main", itemJson: recJson("EC2") });
+    const a1 = store.append(sessionId, { type: "assistant_message", sessionId, threadId: "main", text: "a1" });
+    // checkpoint folds the WHOLE reasoning-bearing turn (uptoSeq = a1's seq, always a MESSAGE seq).
+    store.append(sessionId, { type: "checkpoint", sessionId, threadId: "main", summary: "SUMMARY_TOKEN", uptoSeq: a1.seq });
+    store.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: "u2", clientName: "test" });
+
+    await engine.runTurn(sessionId);
+
+    expect(provider.requests[0]!.input).toEqual([
+      { type: "message", role: "user", content: "[Summary of earlier conversation]\nSUMMARY_TOKEN" },
+      M("user", "u2"),
+    ]);
+    // no opaque reasoning state (or any reasoning item) leaked past the fold.
+    const serialized = JSON.stringify(provider.requests[0]!.input);
+    expect(serialized).not.toContain("EC1");
+    expect(serialized).not.toContain("EC2");
+    expect(serialized).not.toContain("reasoning");
   });
 });
