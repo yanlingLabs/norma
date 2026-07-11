@@ -174,6 +174,14 @@ export interface EngineConfig {
 export class AgentEngine {
   private runningTurns = new Set<string>();
   private steerQueue = new Map<string, string[]>();
+  // 4h-ii-b Task 4 (CC SendMessage): per-CHILD-THREAD steer queue, keyed by threadId (globally
+  // unique th_<uuid>) — SEPARATE from the sessionId-keyed `steerQueue` above, which stays
+  // MAIN-thread-only and untouched. A send_message to a RUNNING child pushes here (sendToThread);
+  // the child's runThread drains its own thread's queue at each round boundary (round-top drain),
+  // exactly mirroring how the main loop drains steerQueue. Deleted when a child thread's runThread
+  // reaches any terminal return (see cleanupThreadSteer in runThread) so an undrained message can't
+  // leak into a later resume of the SAME threadId.
+  private threadSteerQueue = new Map<string, string[]>();
   private aborters = new Map<string, AbortController>();
   // loadedSkills is SESSION-scoped (sticky across turns) — NOT cleared per turn, unlike
   // steerQueue/aborters below (which ARE deleted in runTurn's finally, being per-turn). A skill
@@ -270,6 +278,24 @@ export class AgentEngine {
     // start a turn; the user_message is already in history
     void this.runTurn(sessionId).catch((e) => console.error("steer turn failed:", e));
     return { injected: false };
+  }
+
+  /**
+   * 4h-ii-b Task 4 (CC SendMessage): deliver `text` to a RUNNING child thread. The child receives
+   * it at its next step. Two effects, both scoped to the child (never the parent/main):
+   *  - persist a child-scoped `user_message` for the record (same pattern as the resume path's
+   *    persist) — verified not to leak into the parent: both client reducers no-op a child-threadId
+   *    user_message, and historyInput (the MAIN thread's input builder) drops every non-main event;
+   *  - push `text` into this child thread's own steer queue (keyed by threadId), which the child's
+   *    runThread drains at its next round boundary (the round-top drain), exactly like the main
+   *    loop drains steerQueue. This is the running-target half of the send_message bridge (SM4);
+   *    the finished-target half reuses resumeThread instead.
+   */
+  sendToThread(sessionId: string, threadId: string, text: string): void {
+    this.emit(sessionId, { type: "user_message", sessionId, threadId, text, clientName: "send_message" });
+    const q = this.threadSteerQueue.get(threadId) ?? [];
+    q.push(text);
+    this.threadSteerQueue.set(threadId, q);
   }
 
   private emit(sessionId: string, event: NewSessionEvent): SessionEvent {
@@ -634,6 +660,13 @@ export class AgentEngine {
     // EngineConfig.subagentMaxDepth's doc comment. Computed once so the spawn-gather filter below
     // and the belt-and-braces reject agree on the exact same number.
     const maxDepth = this.cfg.subagentMaxDepth ?? 5;
+    // 4h-ii-b Task 4 (SM3): delete THIS child thread's steer queue when its runThread terminates,
+    // so a send_message that landed but wasn't drained before the child finished can't resurface
+    // when the SAME threadId is later resumed (resume reuses the threadId; its round-top drain
+    // would otherwise pick up the stale entry). Called before EVERY terminal return below (the four
+    // returns: error, end_turn/aborted, deniedByHuman, cap). NO-OP for MAIN — the main thread never
+    // populates threadSteerQueue, so this leaves the byte-identical main path unchanged.
+    const cleanupThreadSteer = () => { if (threadId !== MAIN_THREAD) this.threadSteerQueue.delete(threadId); };
 
     this.emit(sessionId, { type: "turn_started", sessionId, threadId });
 
@@ -641,6 +674,13 @@ export class AgentEngine {
       if (threadId === MAIN_THREAD) {
         const steers = this.steerQueue.get(sessionId);
         if (steers && steers.length) { for (const t of steers) input.push({ type: "message", role: "user", content: t }); steers.length = 0; }
+      } else {
+        // 4h-ii-b Task 4 (SM2): CHILD threads drain their OWN per-thread steer queue here — a
+        // SEPARATE parallel branch to the MAIN branch above (which is untouched). A send_message to
+        // this running child (sendToThread) queued into threadSteerQueue[threadId]; drain it into
+        // this round's input exactly like the main loop drains steerQueue.
+        const msgs = this.threadSteerQueue.get(threadId);
+        if (msgs && msgs.length) { for (const t of msgs) input.push({ type: "message", role: "user", content: t }); msgs.length = 0; }
       }
 
       let textBuf = "";
@@ -684,6 +724,7 @@ export class AgentEngine {
           // just emitted are invisible to the parent model, which only sees the child's return
           // value). Main-thread callers (turn(), which just `await`s runThread without touching
           // the return value) are unaffected — see the grep note in the 4e-fix3 report.
+          cleanupThreadSteer();
           return { finalText: lastText, stopReason: "error", errorMessage: ev.message };
         }
       }
@@ -695,13 +736,17 @@ export class AgentEngine {
       }
 
       if (stop !== "tool_calls" || calls.length === 0) {
-        if (threadId === MAIN_THREAD) {
-          const pending = this.steerQueue.get(sessionId);
-          // A steer landed as we finished → drain at next iteration top, keep going. But an
-          // interrupt must win: an aborted turn ends now with turn_completed(aborted) even if a
-          // steer is queued (it stays queued for the next runTurn, e.g. via steer()'s own restart).
-          if (stop !== "aborted" && pending && pending.length) { continue; }
-        }
+        // A steer/message landed as we finished → drain at next iteration top, keep going. But an
+        // interrupt must win: an aborted turn ends now with turn_completed(aborted) even if one is
+        // queued (it stays queued for the next runTurn, e.g. via steer()'s own restart). 4h-ii-b
+        // Task 4 (SM3): GENERALIZED from MAIN-only to also continue a CHILD when a send_message
+        // landed as it finished (else a message sent while the child is on its final round would be
+        // silently dropped) — `pending` reads the MAIN steerQueue for the main thread and this
+        // child's threadSteerQueue for a child. For the MAIN thread this is byte-identical to the
+        // prior `if (threadId === MAIN_THREAD) { const pending = steerQueue.get(sessionId); ... }`.
+        const pending = threadId === MAIN_THREAD ? this.steerQueue.get(sessionId) : this.threadSteerQueue.get(threadId);
+        if (stop !== "aborted" && pending && pending.length) { continue; }
+        cleanupThreadSteer();
         this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: stop === "aborted" ? "aborted" : "end_turn", ...usage });
         if (opts.depth === 0 && this.cfg.titler) void this.cfg.titler.maybeTitle(sessionId);
         return { finalText: lastText, stopReason: stop === "aborted" ? "aborted" : "end_turn" };
@@ -724,6 +769,15 @@ export class AgentEngine {
       const spawnCalls = this.cfg.subagents && this.cfg.agents && opts.depth < maxDepth
         ? calls.filter((c) => c.name === "spawn_agent")
         : [];
+      // 4h-ii-b Task 4 (SM1 + SM6, CC SendMessage): message a subagent by agentId/name. DEPTH-0
+      // ONLY — only the main thread orchestrates in v1 (no agent-to-agent messaging), belt-and-
+      // braces with send_message's unconditional exclusion from every child's tool set below.
+      // Precomputed here (like spawnOutcomes) and consumed by the per-call dispatch loop below as a
+      // send_message call's tool_result, so it never falls through to executeCall. Processed in a
+      // simple `for` loop (not Promise.all): a running-target delivery is sync (sendToThread), a
+      // finished-target resume is async (awaited), and there's no benefit to parallelizing them.
+      const sendMessageOutcomes = new Map<string, { output: string; isError: boolean }>();
+      const sendMessageCalls = opts.depth === 0 ? calls.filter((c) => c.name === "send_message") : [];
       if (spawnCalls.length > 0) {
         await Promise.all(spawnCalls.map(async (call) => {
           let parsed: { prompt?: unknown; agentType?: unknown; model?: unknown; description?: unknown; max_turns?: unknown; mode?: unknown; isolation?: unknown; run_in_background?: unknown; name?: unknown; resume?: unknown } = {};
@@ -934,8 +988,13 @@ export class AgentEngine {
           // one more level (recursing into this SAME bridge, via its own runThread call, with the
           // gate-1 spawnCalls filter above reading ITS OWN opts.depth). ask_user/exit_plan_mode/
           // enter_plan_mode stay excluded from every child regardless of depth (unchanged).
+          // 4h-ii-b Task 4 (SM6): send_message is excluded from EVERY child UNCONDITIONALLY (not
+          // depth-conditional like spawn_agent) — v1 has no agent-to-agent messaging; only the main
+          // thread orchestrates. Belt-and-braces with the bridge's own `opts.depth === 0` gate on
+          // sendMessageCalls above. Captured into resumeCtx.excludeTools below, so a resumed child
+          // stays excluded too.
           const childDepth = opts.depth + 1;
-          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode"]);
+          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode", "send_message"]);
           if (childDepth >= maxDepth) childExcludeTools.add("spawn_agent");
           // 4h-ii-b Task 1: instructionsFull is computed ONCE here — hoisted out of the bg and
           // sync closures below, which used to each build their own copy independently — so it
@@ -1218,14 +1277,59 @@ export class AgentEngine {
         }));
       }
 
+      // 4h-ii-b Task 4 (SM1/SM4): the send_message bridge. Each depth-0 send_message call resolves
+      // its `to` (agentId/name) in this session's bg-agent registry and routes: a RUNNING target
+      // gets the message queued into its thread steer queue (sendToThread); a TERMINAL target is
+      // resumed in the BACKGROUND (resumeThread with runInBackground:true — send_message never
+      // blocks the parent, and this reuses ALL of T3's guards: clean-termination, removed-worktree,
+      // policy no-widen). The precomputed {output,isError} becomes the call's tool_result in the
+      // dispatch loop below (read via `preOutcome`), so a send_message call never reaches
+      // executeCall. `to`/`message` are hand-parsed from argsJson (string-only) BEFORE any zod
+      // would run — same defensive shape as the spawn bridge — so a malformed call is a typed error.
+      for (const call of sendMessageCalls) {
+        let smParsed: { to?: unknown; message?: unknown } = {};
+        try { smParsed = JSON.parse(call.argsJson || "{}"); } catch { /* defensive: typed error below */ }
+        const to = typeof smParsed.to === "string" && smParsed.to.length > 0 ? smParsed.to : undefined;
+        const message = typeof smParsed.message === "string" && smParsed.message.length > 0 ? smParsed.message : undefined;
+        if (!to) { sendMessageOutcomes.set(call.callId, { output: "invalid arguments for send_message: to", isError: true }); continue; }
+        if (!message) { sendMessageOutcomes.set(call.callId, { output: "invalid arguments for send_message: message", isError: true }); continue; }
+        // No registry wired (daemon.ts never built bgAgents) → nothing to address, mirroring the
+        // spawn bridge's own `run_in_background && !bgAgents` guard.
+        if (!this.cfg.bgAgents) { sendMessageOutcomes.set(call.callId, { output: "send_message is not available in this session", isError: true }); continue; }
+        const target = this.cfg.bgAgents.get(to, sessionId);
+        if (!target) { sendMessageOutcomes.set(call.callId, { output: `no agent '${to}' to message`, isError: true }); continue; }
+        if (target.status === "running") {
+          this.sendToThread(sessionId, target.threadId, message);
+          sendMessageOutcomes.set(call.callId, { output: `message delivered to '${to}'`, isError: false });
+          continue;
+        }
+        // terminal (completed/failed/stopped) → resume it in the background. Its {output,isError}
+        // (a bg resume returns {agentId,status:"running"} immediately, or a T3 guard's typed error)
+        // becomes this send_message call's tool_result.
+        sendMessageOutcomes.set(call.callId, await this.resumeThread({
+          sessionId,
+          resumeArg: to,
+          prompt: message,
+          runInBackground: true,
+          meta,
+          model: opts.model,
+          reasoningEffort: opts.reasoningEffort,
+          depth: opts.depth,
+          parentThreadId: threadId,
+        }));
+      }
+
       for (const call of calls) {
         this.emit(sessionId, { type: "tool_call", sessionId, threadId, callId: call.callId, name: call.name, argsJson: call.argsJson });
         input.push({ type: "function_call", callId: call.callId, name: call.name, argsJson: call.argsJson });
 
         let outcome: { output: string; isError: boolean; deniedByHuman?: boolean };
-        const spawnOutcome = spawnOutcomes.get(call.callId);
-        if (spawnOutcome) {
-          outcome = spawnOutcome;
+        // A precomputed outcome from the spawn OR send_message bridge above becomes this call's
+        // tool_result verbatim (both are computed BEFORE this loop so N spawns/messages in one
+        // assistant message don't serialize the dispatch), so it never falls through to executeCall.
+        const preOutcome = spawnOutcomes.get(call.callId) ?? sendMessageOutcomes.get(call.callId);
+        if (preOutcome) {
+          outcome = preOutcome;
           this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
           input.push({ type: "tool_result", callId: call.callId, output: outcome.output, isError: outcome.isError });
           continue;
@@ -1353,6 +1457,7 @@ export class AgentEngine {
         // user then says. Any later calls in this same batch were never emitted/pushed (the
         // loop pushes function_call + tool_result one at a time), so nothing is left dangling.
         if (outcome.deniedByHuman) {
+          cleanupThreadSteer();
           this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "end_turn", ...usage });
           if (opts.depth === 0 && this.cfg.titler) void this.cfg.titler.maybeTitle(sessionId);
           return { finalText: lastText, stopReason: "end_turn" };
@@ -1361,6 +1466,7 @@ export class AgentEngine {
     }
 
     const capMessage = `tool-iteration cap (${effectiveMaxIterations}) reached`;
+    cleanupThreadSteer();
     this.emit(sessionId, { type: "agent_error", sessionId, threadId, message: capMessage });
     this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "error", ...usage });
     return { finalText: lastText, stopReason: "error", errorMessage: capMessage };
@@ -1436,6 +1542,15 @@ export class AgentEngine {
     }
 
     const agentType = rc.agentType ?? "general-purpose";
+
+    // 4h-ii-b Task 4 (SM3, defensive): start the resumed run with a CLEAN thread steer queue. A
+    // send_message to the prior (now-terminal) instance is stale on resume — and there is a narrow
+    // window where one can be orphaned into this queue: runThread's own cleanupThreadSteer runs at
+    // its terminal return BEFORE the detached completion handler flips bgAgents status to terminal,
+    // so a delivery in that gap sees "running" and lands here AFTER cleanup. Deleting the key here,
+    // before input reconstruction / the round-0 top-drain, guarantees such a message can't be
+    // drained into the resumed run (it would otherwise surface as a spurious extra user turn).
+    this.threadSteerQueue.delete(entry.threadId);
 
     // D4 — POLICY ON RESUME (restrict-only, no widen): the MORE RESTRICTIVE of {current session
     // policy, the child's ORIGINAL captured policy}. This never widens beyond the child's original

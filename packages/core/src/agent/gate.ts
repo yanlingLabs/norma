@@ -27,7 +27,14 @@ export type SessionApprovalPolicy = "ask" | "auto" | "plan";
 // "plan" (no fs/process mutation) — it must be allowed under EVERY policy, including "plan" itself
 // (calling it while already in plan mode is a no-op the engine bridge turns into a typed error,
 // not a gate denial), so the model can always request the restrictive mode.
-const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent"]);
+// send_message is read-only too (4h-ii-b Task 4): allowed in ALL modes, including plan — like
+// spawn_agent it's orchestration (directing an already-launched child), not a mutation itself; the
+// child's own mutating tool calls still get gated by the child's policy. In practice the engine's
+// send_message bridge intercepts a depth-0 call and sets its tool_result BEFORE the gate is
+// consulted, so this classification only backstops a stray depth>0 call (send_message is excluded
+// from child tool sets, so this can only fire if a provider ignores that) — allow it to return the
+// bridge/placeholder path cleanly rather than hang on an approval prompt.
+const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message"]);
 const MUTATING = new Set(["write", "edit", "bash", "bash_kill", "notebook_edit", "enter_worktree", "exit_worktree"]);
 const SELF_GATING = new Set(["request_directory"]);
 // web_fetch (4g Task 5, T6 adds web_search here) is Norma's ONLY network-capable tool — it does NOT
