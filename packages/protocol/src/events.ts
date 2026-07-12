@@ -155,6 +155,12 @@ export const ThreadCompletedEvent = ThreadBase.extend({
   type: z.literal("thread_completed"), stopReason: z.enum(["end_turn", "aborted", "error"]),
 });
 
+/** Background-agent completion notice (CC parity: <task-notification>), persisted and replayed as a
+ *  user-role message so the model learns a detached agent finished without a user keystroke.
+ *  Clients render nothing for it (thread_completed carries the visible finish line). Do NOT add a
+ *  generator fixture: Swift round-trips it as unknownEvent (reasoning_item precedent). */
+export const TaskNotificationEvent = ThreadBase.extend({ type: z.literal("task_notification"), content: z.string().min(1) });
+
 export const SessionTitledEvent = ThreadBase.extend({
   type: z.literal("session_titled"), title: z.string().min(1),
 });
@@ -288,6 +294,7 @@ export const SessionEvent = z.discriminatedUnion("type", [
   WorktreeExitedEvent,
   ThreadStartedEvent,
   ThreadCompletedEvent,
+  TaskNotificationEvent,
   SessionTitledEvent,
   LeaseGrantedEvent,
   LeaseLostEvent,

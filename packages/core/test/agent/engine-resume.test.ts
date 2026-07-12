@@ -382,7 +382,9 @@ describe("AgentEngine: spawn_agent resume (4h-ii-b Task 3)", () => {
       await new Promise((r) => setTimeout(r, 5));
     }
     // the detached resumed run re-completed the entry, and (unlike a sync resume) left it UN-notified
-    // so the next turn's completion reminder can surface it (CC parity)
+    // — claimable by a completion-notice mechanism (bg-retrigger Task 1's takeForNotification;
+    // NOTE: the detached-RESUME settle path does not yet call notifyBgCompletion — see that task's
+    // report — so nothing claims this entry today)
     expect(bgAgents.get("worker", sessionId)).toMatchObject({ status: "completed", notified: false });
   });
 

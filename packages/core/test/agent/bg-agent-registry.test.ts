@@ -148,32 +148,33 @@ describe("BackgroundAgentRegistry", () => {
     expect(after?.result).toBeUndefined();
   });
 
-  test("takeCompletedForSession returns terminal-unnotified entries once; empty on second call", () => {
+  // bg-retrigger Task 1: takeCompletedForSession retired (its only caller,
+  // buildBgCompletionReminder, is gone — see engine.ts) in favor of takeForNotification, a
+  // single-agentId, single-consumer claim used by notifyBgCompletion to persist a task_notification
+  // event exactly once per completion.
+  test("takeForNotification returns a terminal-unnotified entry once; undefined on the second call", () => {
     const reg = new BackgroundAgentRegistry();
     reg.register(entry({ agentId: "a1" }));
-    reg.register(entry({ agentId: "a2" }));
     reg.complete("a1", { ok: true, result: "r1" });
-    reg.complete("a2", { ok: false, result: "r2" });
 
-    const first = reg.takeCompletedForSession("s1");
-    expect(first.map((e) => e.agentId).sort()).toEqual(["a1", "a2"]);
-    expect(first.every((e) => e.notified)).toBe(true);
+    const first = reg.takeForNotification("a1");
+    expect(first?.agentId).toBe("a1");
+    expect(first?.notified).toBe(true);
 
-    const second = reg.takeCompletedForSession("s1");
-    expect(second).toEqual([]);
+    expect(reg.takeForNotification("a1")).toBeUndefined();
   });
 
-  test("a still-running agent is not returned by takeCompletedForSession", () => {
+  test("a still-running agent is not returned by takeForNotification (undefined)", () => {
     const reg = new BackgroundAgentRegistry();
     reg.register(entry({ agentId: "a1" }));
-    reg.register(entry({ agentId: "a2" }));
-    reg.complete("a1", { ok: true, result: "r1" });
-    // a2 stays running
+    expect(reg.takeForNotification("a1")).toBeUndefined();
+    expect(reg.get("a1")?.status).toBe("running");
+    expect(reg.get("a1")?.notified).toBe(false);
+  });
 
-    const taken = reg.takeCompletedForSession("s1");
-    expect(taken.map((e) => e.agentId)).toEqual(["a1"]);
-    expect(reg.get("a2")?.status).toBe("running");
-    expect(reg.get("a2")?.notified).toBe(false);
+  test("takeForNotification returns undefined for an unknown agentId", () => {
+    const reg = new BackgroundAgentRegistry();
+    expect(reg.takeForNotification("ghost")).toBeUndefined();
   });
 
   test("list returns entries in registration order, running and terminal alike", () => {
@@ -271,38 +272,38 @@ describe("BackgroundAgentRegistry", () => {
     expect(reg.get("a1")?.status).toBe("running");
   });
 
-  test("a reopened (now-running) entry is NOT surfaced by takeCompletedForSession", () => {
+  test("a reopened (now-running) entry is NOT surfaced by takeForNotification (undefined)", () => {
     const reg = new BackgroundAgentRegistry();
     reg.register(entry());
     reg.complete("a1", { ok: true, result: "done" }); // unnotified terminal
-    reg.reopen("a1", new AbortController()); // flip back to running BEFORE the sweep
-    expect(reg.takeCompletedForSession("s1")).toEqual([]);
+    reg.reopen("a1", new AbortController()); // flip back to running BEFORE the claim
+    expect(reg.takeForNotification("a1")).toBeUndefined();
   });
 
   // 4h-ii-b Task 1: a SYNC spawn's completion is registered `notified` immediately (the caller
-  // already got this result directly as its own tool_result, same turn) — complete()'s new
-  // `opts.notified` param must actually suppress it from takeCompletedForSession's sweep, not
+  // already got this result directly as its own tool_result, same turn) — complete()'s
+  // `opts.notified` param must actually suppress it from takeForNotification's claim, not
   // just set the field cosmetically.
-  test("complete({notified:true}) → the entry is immediately notified, so takeCompletedForSession never returns it", () => {
+  test("complete({notified:true}) → the entry is immediately notified, so takeForNotification returns undefined", () => {
     const reg = new BackgroundAgentRegistry();
     reg.register(entry());
     reg.complete("a1", { ok: true, result: "done" }, { notified: true });
     expect(reg.get("a1")).toMatchObject({ status: "completed", result: "done", notified: true });
-    expect(reg.takeCompletedForSession("s1")).toEqual([]);
+    expect(reg.takeForNotification("a1")).toBeUndefined();
   });
 
-  test("complete without opts (default) is unchanged — entry starts unnotified, takeCompletedForSession still picks it up once", () => {
+  test("complete without opts (default) is unchanged — entry starts unnotified, takeForNotification still picks it up once", () => {
     const reg = new BackgroundAgentRegistry();
     reg.register(entry());
     reg.complete("a1", { ok: true, result: "done" });
     expect(reg.get("a1")?.notified).toBe(false);
-    expect(reg.takeCompletedForSession("s1").map((e) => e.agentId)).toEqual(["a1"]);
+    expect(reg.takeForNotification("a1")?.agentId).toBe("a1");
   });
 
   // 4h-ii-c: AgentStatus gains "timeout" — a bg spawn whose SubagentManager.run() rejected via
   // its own clock (SubagentResult.timedOut:true) reports distinctly from a generic "failed", so
   // a future client can render/handle "timed out" separately from "errored". "timeout" is
-  // TERMINAL like completed/failed/stopped: surfaced once by takeCompletedForSession, reopen()
+  // TERMINAL like completed/failed/stopped: surfaced once by takeForNotification, reopen()
   // accepts it (a timed-out child may still be resumable — the 4h-ii-b shape guard decides that
   // from its history), and stop() rejects it (not running).
   describe("complete({timedOut:true}) → 'timeout' status (4h-ii-c)", () => {
@@ -322,14 +323,14 @@ describe("BackgroundAgentRegistry", () => {
       expect(reg.get("a1")?.status).toBe("timeout");
     });
 
-    test("a 'timeout' entry is terminal: surfaced once by takeCompletedForSession, empty on the next call", () => {
+    test("a 'timeout' entry is terminal: surfaced once by takeForNotification, undefined on the next call", () => {
       const reg = new BackgroundAgentRegistry();
       reg.register(entry());
       reg.complete("a1", { ok: false, result: "timed out" }, { timedOut: true });
-      const first = reg.takeCompletedForSession("s1");
-      expect(first.map((e) => e.agentId)).toEqual(["a1"]);
-      expect(first[0]?.status).toBe("timeout");
-      expect(reg.takeCompletedForSession("s1")).toEqual([]);
+      const first = reg.takeForNotification("a1");
+      expect(first?.agentId).toBe("a1");
+      expect(first?.status).toBe("timeout");
+      expect(reg.takeForNotification("a1")).toBeUndefined();
     });
 
     test("reopen() accepts a 'timeout' entry — resumable, exactly like any other terminal status", () => {
@@ -355,7 +356,7 @@ describe("BackgroundAgentRegistry", () => {
       reg.register(entry());
       reg.complete("a1", { ok: false, result: "timed out" }, { timedOut: true, notified: true });
       expect(reg.get("a1")).toMatchObject({ status: "timeout", notified: true });
-      expect(reg.takeCompletedForSession("s1")).toEqual([]);
+      expect(reg.takeForNotification("a1")).toBeUndefined();
     });
   });
 });
