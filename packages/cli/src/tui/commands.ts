@@ -13,6 +13,7 @@ import {
 import type { Settings } from "@norma/core";
 import { parseModelArgs, validateEffort, validateModelSlug } from "../model-cli";
 import { formatElapsed, formatTokens } from "../task-display";
+import { formatRoutineLine } from "../routines-cli";
 import type { NormaClient } from "../client";
 
 export interface CommandCtx {
@@ -209,6 +210,16 @@ async function runBg(ctx: CommandCtx, argText: string): Promise<void> {
   ctx.appendNote(usage);
 }
 
+/** Phase 5 routines T4: list-only in v1 (design doc §5 — create/delete/enable/disable stay
+ *  CLI/tool-only). Mirrors main.ts `case "routines"`'s default (no-subcommand → list) branch:
+ *  `client.routinesList()`, one line per routine via `formatRoutineLine` (routines-cli.ts) — the
+ *  exact plain content the CLI's colored list wraps AQUA/DIM around. */
+async function runRoutines(ctx: CommandCtx): Promise<void> {
+  const { routines } = await ctx.client.routinesList();
+  if (routines.length === 0) { ctx.appendNote("(no routines)"); return; }
+  ctx.appendNote(routines.map((r) => formatRoutineLine(r)).join("\n"));
+}
+
 // ---- registry -------------------------------------------------------------------------------
 
 export const COMMANDS: SlashCommand[] = [
@@ -223,6 +234,7 @@ export const COMMANDS: SlashCommand[] = [
   { name: "skills", description: "List installed skills", run: (ctx) => runSkills(ctx) },
   { name: "mcp", description: "List configured MCP servers", run: (ctx) => runMcp(ctx) },
   { name: "bg", args: "[list|peek|kill] [taskId]", description: "List/peek/kill background tasks", run: (ctx, argText) => runBg(ctx, argText) },
+  { name: "routines", description: "List scheduled routines", run: (ctx) => runRoutines(ctx) },
 ];
 
 // ---- parse / filter / dispatch ---------------------------------------------------------------

@@ -14,6 +14,7 @@ import {
   COMMANDS, filterCommands, helpText, parseSlashInput, runCommand,
   type CommandCtx,
 } from "../../src/tui/commands";
+import { formatRoutineLine } from "../../src/routines-cli";
 import type { NormaClient } from "../../src/client";
 
 // ---- fake client (mirrors test/tui/app.test.tsx's fakeClient — recorded calls, canned results) ----
@@ -343,6 +344,46 @@ describe("runners — mirror main.ts's routes", () => {
     await runCommand(ctx, "/bg bogus");
     expect(calls).toEqual([]);
     expect(notes[0]).toContain("usage:");
+  });
+
+  // Phase 5 routines T4: /routines is list-only (design doc §5 — create/delete/enable/disable
+  // stay CLI/tool-only in v1). Mirrors main.ts `case "routines"`'s default (list) branch:
+  // client.routinesList(), one line per routine via formatRoutineLine (routines-cli.ts).
+  test("/routines — one line per routine, via formatRoutineLine", async () => {
+    const routine = {
+      id: "r_1", spec: "every 30m", prompt: "check the inbox", policy: "auto" as const,
+      cwd: "/work", enabled: true, lastRunAt: null, nextRunAt: Date.UTC(2026, 6, 13), createdAt: 0,
+      lastResult: null, deferAttempts: 0,
+    };
+    const { client, calls } = makeClient({ routinesList: () => ({ routines: [routine] }) });
+    const { ctx, notes } = makeCtx(client);
+    await runCommand(ctx, "/routines");
+    expect(calls).toEqual([{ method: "routinesList", args: [] }]);
+    expect(notes).toEqual([formatRoutineLine(routine)]);
+  });
+
+  test("/routines — empty list note", async () => {
+    const { client } = makeClient({ routinesList: () => ({ routines: [] }) });
+    const { ctx, notes } = makeCtx(client);
+    await runCommand(ctx, "/routines");
+    expect(notes).toEqual(["(no routines)"]);
+  });
+
+  test("/routines — multiple routines join with newlines, in list order", async () => {
+    const r1 = {
+      id: "r_1", spec: "every 30m", prompt: "check the inbox", policy: "auto" as const,
+      cwd: "/work", enabled: true, lastRunAt: null, nextRunAt: Date.UTC(2026, 6, 13), createdAt: 0,
+      lastResult: null, deferAttempts: 0,
+    };
+    const r2 = {
+      id: "r_2", spec: "0 9 * * 1-5", prompt: "morning standup summary", policy: "plan" as const,
+      cwd: "/work", enabled: false, lastRunAt: null, nextRunAt: Date.UTC(2026, 6, 14), createdAt: 0,
+      lastResult: null, deferAttempts: 0,
+    };
+    const { client } = makeClient({ routinesList: () => ({ routines: [r1, r2] }) });
+    const { ctx, notes } = makeCtx(client);
+    await runCommand(ctx, "/routines");
+    expect(notes).toEqual([[formatRoutineLine(r1), formatRoutineLine(r2)].join("\n")]);
   });
 });
 

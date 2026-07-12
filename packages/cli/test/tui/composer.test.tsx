@@ -854,12 +854,14 @@ describe("Composer — slash-command completion menu (Phase 3d T2)", () => {
 
     stdin.write("\x1b[B"); // down -> skills
     await wait();
-    stdin.write("\x1b[B"); // down again -> bounded, stays on skills (only 3 matches)
+    stdin.write("\x1b[B"); // down -> routines (phase 5 T4: fuzzy-matches "s" — 4th/last of the "/s" set)
     await wait();
-    let skillsLineIdx = stripAnsi(lastFrame() ?? "").split("\n").findIndex((l) => l.includes("/skills"));
-    expect((lastFrame() ?? "").split("\n")[skillsLineIdx]).toContain("\x1b[7m");
+    stdin.write("\x1b[B"); // down again -> bounded, stays on routines (only 4 matches)
+    await wait();
+    let routinesLineIdx = stripAnsi(lastFrame() ?? "").split("\n").findIndex((l) => l.includes("/routines"));
+    expect((lastFrame() ?? "").split("\n")[routinesLineIdx]).toContain("\x1b[7m");
 
-    stdin.write("\x1b[A"); // up -> back to sessions — never touched history (buffer still "/s")
+    stdin.write("\x1b[A"); // up -> back to skills — never touched history (buffer still "/s")
     await wait();
     expect(stripAnsi(lastFrame() ?? "")).toContain("/s");
   });
@@ -1094,9 +1096,9 @@ describe("Composer — slash-command completion menu (Phase 3d T2)", () => {
     await wait();
     expect(seen.at(0)).toBe(0); // mount, no slash mode
 
-    stdin.write("/s"); // matches exactly 3 (status, sessions, skills)
+    stdin.write("/s"); // matches exactly 4 (status, sessions, skills, routines — routines fuzzy-matches "s")
     await wait();
-    expect(seen.at(-1)).toBe(3);
+    expect(seen.at(-1)).toBe(4);
 
     stdin.write("\x1b"); // esc-dismiss — no InputState change, but the row count must still drop
     await wait();
