@@ -27,6 +27,7 @@
 
 import type { Task } from "@norma/protocol";
 import { updateSubagents, type CliSubagent } from "../subagent-state";
+import { subagentTokens } from "../subagent-display";
 import { upsertTask } from "../task-block";
 import { formatElapsed, type TaskRow } from "../task-display";
 
@@ -180,12 +181,27 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
       // reassignment. Never pruned to [] regardless of arrival order relative to the main turn's
       // own turn_completed (that guard lives in the `turn_completed` case above), so `row` is never
       // undefined here — this reducer's whole point.
+      //
+      // Wording (phase 3b Task 6, matching CC's AgentTool/UI.tsx completion summary per
+      // cc-ui-study-transcript.md §4): ONE line, `Agent "{label}": Done ({toolCalls} tool use(s)[ ·
+      // {tokens} tokens] · {elapsed})` — no second `⎿` line (the old two-line "finished ·
+      // elapsed\n⎿ Ran N tool calls" wording folds the tool count into the parens instead).
+      // `subagentTokens` (subagent-display.ts, READ-only) already renders its own "↑X ↓Y" arrows,
+      // so its output is embedded verbatim as the tokens segment with " tokens" appended — same
+      // "arrows + literal word tokens" convention transcript.tsx's turn-summary block already uses.
+      // It returns "" when NOTHING is known yet (no child turn_completed ever landed before this
+      // thread_completed — the exact case both 3a bug-fix fixtures below hit), in which case the
+      // whole tokens segment is omitted rather than leaving a dangling "· ·".
       const withDone = feedAgents(s, e);
       const row = withDone.agents.find((a) => a.threadId === e.threadId);
       const label = row?.label ?? str(e.threadId);
-      const lines = [`Agent "${label}" finished · ${formatElapsed(row?.activeMs ?? 0)}`];
-      if ((row?.toolCalls ?? 0) > 0) lines.push(`⎿ Ran ${row!.toolCalls} tool calls`);
-      return { ...withDone, committed: [...withDone.committed, { kind: "note", text: lines.join("\n") }] };
+      const toolCalls = row?.toolCalls ?? 0;
+      const tokens = subagentTokens(row?.inputTokens, row?.outputTokens ?? 0, row?.liveOutputChars ?? 0);
+      const parts = [`${toolCalls} tool use${toolCalls === 1 ? "" : "s"}`];
+      if (tokens) parts.push(`${tokens} tokens`);
+      parts.push(formatElapsed(row?.activeMs ?? 0));
+      const text = `Agent "${label}": Done (${parts.join(" · ")})`;
+      return { ...withDone, committed: [...withDone.committed, { kind: "note", text }] };
     }
 
     case "task_updated":

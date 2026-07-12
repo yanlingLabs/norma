@@ -174,24 +174,64 @@ describe("CommittedTranscript — collapsed read/search groups (phase 3b T4)", (
   });
 });
 
-describe("AgentList (b)", () => {
-  test("a DONE agent row shows its persisted label/stats, not empty/0s", () => {
-    const row: AgentRow = {
-      threadId: "th_1",
+describe("AgentList — tree rows (phase 3b Task 6, c)", () => {
+  function agent(overrides: Partial<AgentRow>): AgentRow {
+    return {
+      threadId: "th_x",
       agentType: "general-purpose",
       label: "scout",
-      status: "done",
-      outputTokens: 120,
+      status: "working",
+      outputTokens: 0,
       liveOutputChars: 0,
-      activeMs: 9000,
-      toolCalls: 3,
+      activeMs: 0,
+      toolCalls: 0,
+      ...overrides,
     };
+  }
+
+  test("a single agent renders as the LAST row: '└─ ' head + bold agentType + (label) + tool-use count", () => {
+    const row = agent({ threadId: "th_1", agentType: "general-purpose", label: "scout", status: "working", toolCalls: 3 });
     const { lastFrame } = render(<AgentList agents={[row]} nowMs={999_999} />);
     const frame = lastFrame() ?? "";
-    expect(frame).toContain("scout");
-    expect(frame).toContain("9s");
-    expect(frame).toContain("3 tools");
-    expect(frame).not.toContain("0s");
+    expect(frame).toContain("└─");
+    expect(frame).not.toContain("├─");
+    expect(frame).toContain("general-purpose");
+    expect(frame).toContain("(scout)");
+    expect(frame).toContain("3 tool uses");
+  });
+
+  test("a DONE agent's continuation row reads 'Done'", () => {
+    const row = agent({ status: "done", toolCalls: 1 });
+    const { lastFrame } = render(<AgentList agents={[row]} nowMs={0} />);
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("⎿");
+    expect(frame).toContain("Done");
+  });
+
+  test("a working agent with no recorded activity yet shows 'Working…' on the continuation row", () => {
+    const row = agent({ status: "working" });
+    const { lastFrame } = render(<AgentList agents={[row]} nowMs={0} />);
+    expect(lastFrame() ?? "").toContain("Working…");
+  });
+
+  test("a working agent WITH a recorded activity shows that activity string, not 'Working…'", () => {
+    const row = agent({ status: "working", activity: "reading src/app.ts" });
+    const { lastFrame } = render(<AgentList agents={[row]} nowMs={0} />);
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("reading src/app.ts");
+    expect(frame).not.toContain("Working…");
+  });
+
+  test("two agents: first row is '├─ ' with a '│  ⎿' continuation, last row is '└─ ' with a '   ⎿' continuation", () => {
+    const first = agent({ threadId: "th_1", label: "first agent", status: "working" });
+    const last = agent({ threadId: "th_2", label: "second agent", status: "done" });
+    const { lastFrame } = render(<AgentList agents={[first, last]} nowMs={0} />);
+    const frame = lastFrame() ?? "";
+    const lines = frame.split("\n");
+    expect(lines.some((l) => l.includes("├─") && l.includes("first agent"))).toBe(true);
+    expect(lines.some((l) => l.includes("└─") && l.includes("second agent"))).toBe(true);
+    expect(lines.some((l) => l.includes("│") && l.includes("⎿"))).toBe(true);
+    expect(lines.some((l) => l.includes("   ⎿") && !l.includes("│"))).toBe(true);
   });
 
   test("hidden when there are no agents", () => {
@@ -219,23 +259,56 @@ describe("StatusLine (c)", () => {
   });
 });
 
-describe("TaskList (d)", () => {
+describe("TaskList — CC task rows (phase 3b Task 6, a+b)", () => {
   test("hidden when empty", () => {
     const { lastFrame } = render(<TaskList tasks={[]} nowMs={0} />);
     expect((lastFrame() ?? "").trim()).toBe("");
   });
 
-  test("two tasks: both glyphs+subjects render", () => {
+  test("done task: ✔ glyph + strikethrough subject", () => {
+    const tasks: TaskRow[] = [{ id: "1", subject: "Ship feature", status: "completed" }];
+    const { lastFrame } = render(<TaskList tasks={tasks} nowMs={0} />);
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("✔");
+    expect(frame).toContain("Ship feature");
+    expect(frame).toContain("[9m"); // strikethrough SGR code
+  });
+
+  test("in-progress task: filled square glyph + BOLD subject", () => {
+    const tasks: TaskRow[] = [{ id: "1", subject: "Write tests", status: "in_progress" }];
+    const { lastFrame } = render(<TaskList tasks={tasks} nowMs={0} />);
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("◼");
+    expect(frame).toContain("Write tests");
+    expect(frame).toContain("[1m"); // bold SGR code
+  });
+
+  test("pending task: plain square glyph, no bold/strikethrough", () => {
+    const tasks: TaskRow[] = [{ id: "1", subject: "Later task", status: "pending" }];
+    const { lastFrame } = render(<TaskList tasks={tasks} nowMs={0} />);
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("◻");
+    expect(frame).toContain("Later task");
+    expect(frame).not.toContain("[1m");
+    expect(frame).not.toContain("[9m");
+  });
+
+  test("counts header line + overflow: a 4th completed task collapses behind a dim overflow line", () => {
     const tasks: TaskRow[] = [
-      { id: "1", subject: "Write tests", status: "in_progress" },
-      { id: "2", subject: "Ship feature", status: "pending" },
+      { id: "1", subject: "done1", status: "completed" },
+      { id: "2", subject: "done2", status: "completed" },
+      { id: "3", subject: "done3", status: "completed" },
+      { id: "4", subject: "done4", status: "completed" },
+      { id: "5", subject: "in progress task", status: "in_progress" },
     ];
     const { lastFrame } = render(<TaskList tasks={tasks} nowMs={0} />);
     const frame = lastFrame() ?? "";
-    expect(frame).toContain("■");
-    expect(frame).toContain("Write tests");
-    expect(frame).toContain("☐");
-    expect(frame).toContain("Ship feature");
+    expect(frame).toContain("5 tasks (4 done, 1 in progress, 0 open)");
+    expect(frame).toContain("done1");
+    expect(frame).toContain("done2");
+    expect(frame).toContain("done3");
+    expect(frame).not.toContain("done4"); // 4th completed collapsed away by collapseCompleted
+    expect(frame).toContain("+1"); // dim overflow line surfaces the hidden count
   });
 });
 

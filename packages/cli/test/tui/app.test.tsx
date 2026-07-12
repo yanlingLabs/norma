@@ -88,9 +88,9 @@ describe("App (integration)", () => {
     await wait();
 
     const frame = lastFrame() ?? "";
-    expect(frame).toContain('Agent "scout" finished'); // real label, not ""
+    expect(frame).toContain('Agent "scout": Done'); // real label, not ""  (phase 3b Task 6 wording)
     expect(frame).toContain("9s"); // banked span (10000-1000), not 0s
-    expect(frame).toContain("Agent(scout)"); // roster row survived the main turn_completed (not pruned)
+    expect(frame).toContain("(scout)"); // roster tree row survived the main turn_completed (not pruned)
     expect(frame).toContain("all wrapped up"); // the following main message rendered
     expect(frame).toContain("❯"); // composer still present, never overwritten
   });
