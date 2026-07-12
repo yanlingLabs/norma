@@ -180,6 +180,11 @@ export interface EngineConfig {
 
 export class AgentEngine {
   private runningTurns = new Set<string>();
+  // bg-retrigger Task 2: sessionIds with a detached-agent completion that landed WHILE a turn was
+  // already running for that session — notifyBgCompletion sets this instead of starting a
+  // reentrant turn; runTurn's finally drains it (starts exactly one follow-up turn) once the
+  // in-flight turn settles, UNLESS that turn ended via interrupt() (see runTurn's finally).
+  private retriggerPending = new Set<string>();
   private steerQueue = new Map<string, string[]>();
   // 4h-ii-b Task 4 (CC SendMessage): per-CHILD-THREAD steer queue, keyed by threadId (globally
   // unique th_<uuid>) — SEPARATE from the sessionId-keyed `steerQueue` above, which stays
@@ -263,6 +268,13 @@ export class AgentEngine {
       this.runningTurns.delete(sessionId);
       this.aborters.delete(sessionId);
       this.steerQueue.delete(sessionId);
+      if (this.retriggerPending.delete(sessionId) && !ac.signal.aborted) {
+        // A detached agent finished mid-turn; its task_notification is already persisted. Drain it
+        // now (CC parity: between-turns queue drain) so the model reacts without a user message.
+        // An esc-aborted turn deliberately drops the drain — don't fight the user's interrupt; the
+        // persisted event reaches the model on their next send.
+        void this.runTurn(sessionId).catch((err) => console.error("bg-notification drain failed:", err));
+      }
     }
   }
 
@@ -647,6 +659,13 @@ export class AgentEngine {
     const result = e.result ? `\n<result>${clean(e.result)}</result>` : "";
     const content = `<task-notification>\n<task-id>${e.agentId}</task-id>\n<status>${e.status}</status>\n<summary>${summary}</summary>${result}\n</task-notification>`;
     this.cfg.hub.append(sessionId, { type: "task_notification", sessionId, threadId: MAIN_THREAD, content });
+    // bg-retrigger Task 2 (CC parity: background-agent wake): if a turn is already running for
+    // this session, defer — runTurn's finally drains it once that turn settles (between-turns
+    // queue drain). Otherwise the session is idle right now, so start a fresh turn immediately;
+    // the event above is already in history, so that turn's own replay carries it to the model.
+    if (this.isRunning(sessionId)) { this.retriggerPending.add(sessionId); return; }
+    // steer()'s idle idiom: the event is already in history; a fresh turn replays it.
+    void this.runTurn(sessionId).catch((err) => console.error("bg-notification turn failed:", err));
   }
 
   // Computed ONCE per turn by turn() (same one-per-turn rule as `instructions` itself) — a
