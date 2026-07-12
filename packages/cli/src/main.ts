@@ -224,6 +224,16 @@ async function revokePluginTokenViaDaemon(pluginId: string): Promise<void> {
 export const INIT_PROMPT =
   "Survey this project to understand it: read the README, the package manifest (package.json/pyproject/Cargo.toml/etc.), and skim the directory structure and a few key source files. Then write a concise NORMA.md at the project root capturing: what this project is, how to build/test/run it, and the key conventions a new contributor should follow. If a NORMA.md already exists, read it and UPDATE it rather than clobbering. Keep it tight and factual.";
 
+// T5 — the dim "how to resume" hint printed after the Ink TUI exits (every Ink chat exit, not just a
+// resumed one — mirrors CC's own "you can resume this conversation" chrome). Pure + exported so
+// mount.test.ts can assert the EXIT-SEQUENCE ORDERING (mouse-off → unmount → leave escape → this
+// hint) through an injected sink, without spinning up a real Ink instance or importing this whole
+// module's `import.meta.main`-gated CLI dispatch. Uses the same raw DIM/RESET escapes (task-block.ts)
+// this file already writes with elsewhere, rather than a fresh Chalk instance, for one convention.
+export function formatResumeHint(sessionId: string): string {
+  return `${DIM}\nResume this session with:\n  norma resume ${sessionId}\n${RESET}`;
+}
+
 // Turn-watching runner (2e-iii-b Task 6 — refactored from the former `runHeadlessAgent`). Wires
 // the client, the pinned-block/event machinery, the raw control-key listener, and the stall
 // watchdog ONCE, then either runs a SINGLE turn and exits (chat:false — `-p`, `resume id text`,
@@ -284,6 +294,12 @@ async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boole
   let policyInFlight = false; // in-flight guard — one setPolicy RPC at a time (repeat shift+tab ignored until it settles)
   const pending: string[] = []; // callIds awaiting a y/n on stdin, oldest first
   let sessionId = ""; // set below, before send() — turn_completed can only fire after that
+  // T5 resume replay: set ONLY on the Ink `norma resume <id>` route (see the `existingSessionId`
+  // branch below) — the seq `<App>`'s replay is expected to reach before it clears its "Resuming
+  // conversation…" line. Left `undefined` on every other route (fresh session, legacy/
+  // NORMA_LEGACY_CLI chat resume, non-TTY, resumeOneShot) — mountTui/`<App>` treat that exactly like
+  // today (no resuming line, ever).
+  let resumeTargetSeq: number | undefined;
   const wd: WatchdogState = { turnRunning: false, toolsInFlight: 0, approvalsPending: 0, lastEventAt: Date.now() };
   let wdTimer: ReturnType<typeof setInterval> | undefined; // one session-long stall poll; cleared on teardown
   let exiting = false; // guard to ensure a single exit path wins (stall watchdog vs endHeadlessTurn vs ctrl+C)
@@ -701,9 +717,17 @@ async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boole
     const info = (await c.listSessions()).sessions.find((r: any) => r.sessionId === existingSessionId);
     if (!info) { console.error(`no such session: ${existingSessionId}`); c.close(); process.exit(1); }
     console.log(`${DIM}↻ resuming ${existingSessionId} — ${info.scope}, ${info.lastSeq} events${RESET}`);
-    // Attach from the tip (info.lastSeq), not seq 0: attaching from 0 would replay every
-    // historical turn_completed event on this session, tripping endHeadlessTurn immediately.
-    await c.attach(sessionId, info.lastSeq);
+    // Attach from the tip (info.lastSeq) on every route EXCEPT the Ink resume route: attaching from
+    // 0 there replays the whole session so `<App>` can render the full transcript back (T5), with a
+    // "Resuming conversation…" line shown until the replay catches up to `resumeTargetSeq` (the seq
+    // this very attach() call returns — the daemon's current tip, regardless of the fromSeq it was
+    // asked to replay from). Every other route (legacy/NORMA_LEGACY_CLI chat resume, non-TTY,
+    // resumeOneShot) keeps attaching from the tip — attaching from 0 there would replay every
+    // historical turn_completed event on this session, tripping endHeadlessTurn immediately
+    // (unchanged concern from before this task; inkMode is false on all of those routes anyway).
+    const attachFromSeq = inkMode ? 0 : info.lastSeq;
+    const attachedLastSeq = await c.attach(sessionId, attachFromSeq);
+    if (inkMode) resumeTargetSeq = attachedLastSeq;
   } else {
     const created = await c.createSession("global", { cwd, approvalPolicy: auto ? "auto" : plan ? "plan" : "ask" });
     sessionId = created.sessionId;
@@ -737,7 +761,14 @@ async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boole
     try {
       model = loadSettings(join(resolveNormaHome(), "settings.json")).provider.model;
     } catch { /* keep fallback */ }
-    await mountTui({ client: c, bridge: bridge!, sessionId, cwd, initialPolicy: policy, version, model }).waitUntilExit();
+    await mountTui({
+      client: c, bridge: bridge!, sessionId, cwd, initialPolicy: policy, version, model,
+      ...(resumeTargetSeq !== undefined ? { resumeTargetSeq } : {}),
+    }).waitUntilExit();
+    // T5: printed AFTER waitUntilExit resolves — mountTui's own teardown has already written the
+    // LEAVE escape by then (mount.ts's HARD CONSTRAINT 3 ordering), so this lands in the NORMAL
+    // buffer, never the alt screen.
+    process.stdout.write(formatResumeHint(sessionId));
     clearInterval(spinnerTimer);
     keyListener.destroy();
     c.close();

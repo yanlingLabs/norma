@@ -1,24 +1,26 @@
-/** Task 7 integration tests — <App> (the CC-layout Ink TUI) + mountTui's non-TTY guard.
+/** Phase 3c Task 4 — <App>, the fullscreen alt-screen shell.
  *
- *  <App> is driven exactly the way main.ts drives it in production: a real makeEventBridge() whose
- *  events the test pushes, and a FAKE client that only records the callback args (App calls no
- *  client method on its own — only in response to composer/card/key input). ink-testing-library
- *  renders in debug mode, so lastFrame() carries the FULL accumulated <Static> transcript plus the
- *  live dynamic region — a committed block added several renders ago still shows in the final frame.
+ *  <App> is driven the way main.ts drives it in production: a real makeEventBridge() whose events
+ *  the test pushes, and a FAKE client that only records callback args (App issues no RPC on its own,
+ *  only in response to composer/card/key input). ink-testing-library renders in debug mode, so
+ *  lastFrame() is the WHOLE frame — a root pinned to `height = rows - 1` (24-1 = 23 lines in the
+ *  non-TTY test env, where process.stdout.rows is undefined → the App's 24 fallback).
  *
- *  Phase 3b Task 7 re-skins the layout: the welcome banner is the first Static line; StatusLine is
- *  gone (Spinner + Footer own the turn chrome); ctrl+t toggles the task view; ctrl+o opens the
- *  alt-screen pager (its own coverage lives in pager.test.tsx). */
+ *  The transcript is a JS-windowed line log now (no Ink <Static>): the flattened committed lines are
+ *  sliced to the viewport height and rendered one <Text> per visible line, above a PINNED bottom bar
+ *  (active-turn tail · tasks · spinner · composer|card · agents · footer). Scroll keys / wheel move
+ *  the window; "stick" auto-follows the tail until the user scrolls away. */
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { cleanup, render } from "ink-testing-library";
-import { App } from "../../src/tui/app";
-import { mountTui } from "../../src/tui/mount";
+import { App, bottomBarRows } from "../../src/tui/app";
 import { makeEventBridge } from "../../src/tui/event-bridge";
+import type { AgentRow } from "../../src/tui/state";
+import type { TaskRow } from "../../src/task-display";
 
-// useInput / effects wire on the tick after render() returns (same caveat the other tui tests
-// document) — a short wait after render and after each push keeps assertions deterministic.
-const wait = (ms = 20) => new Promise((r) => setTimeout(r, ms));
+// useInput / effects wire on the tick after render() returns — a short wait after render and after
+// each push/keystroke keeps assertions deterministic.
+const wait = (ms = 25) => new Promise((r) => setTimeout(r, ms));
 
 afterEach(cleanup);
 
@@ -45,11 +47,21 @@ const ev = (o: Record<string, unknown>) => o as any;
 
 const baseProps = { sessionId: "s1", cwd: "/tmp", initialPolicy: "ask" as const, version: "0.0.1", model: "gpt-5-codex" };
 
-describe("App (integration)", () => {
+// The composer's real inverse-video cursor (`<Text inverse>`) — a unique fingerprint of "the
+// composer is rendered" (nothing else in the TUI uses `inverse`).
+const COMPOSER_CURSOR = "\x1b[7m";
+const FOOTER_HINT = "shift+tab to cycle modes";
+
+// SGR mouse wheel-up report (mode 1006). Ink strips the leading ESC before useInput, but the App's
+// emitter patch sees the raw chunk (ESC intact) — so mouse input is swallowed before the composer.
+const WHEEL_UP = "\x1b[<64;10;5M";
+
+const count = (haystack: string, needle: string) => haystack.split(needle).length - 1;
+
+describe("App (fullscreen shell)", () => {
   test("(a) a full mini-turn (buffered before subscribe) commits the assistant text + returns to an idle composer", async () => {
     const bridge = makeEventBridge();
-    // Push the whole turn BEFORE App renders/subscribes → exercises the bridge's pre-subscribe
-    // buffer (the attach-replay path): none of these may be lost.
+    // Push the whole turn BEFORE App renders/subscribes → exercises the bridge's pre-subscribe buffer.
     bridge.push(ev({ type: "user_message", threadId: "main", text: "hello" }));
     bridge.push(ev({ type: "turn_started", threadId: "main" }));
     bridge.push(ev({ type: "assistant_delta", threadId: "main", delta: "hi " }));
@@ -62,9 +74,9 @@ describe("App (integration)", () => {
     await wait();
 
     const frame = lastFrame() ?? "";
-    expect(frame).toContain("hi there friend"); // committed assistant block flushed from the buffer
+    expect(frame).toContain("hi there friend"); // committed assistant block, windowed into view
     expect(frame).toContain("❯ hello"); // committed user block (⏺/❯ grammar)
-    expect(frame).toContain("▌"); // idle composer prompt (its block cursor) present
+    expect(frame).toContain(COMPOSER_CURSOR); // idle composer prompt present
     expect(client.calls).toEqual([]); // App issued no RPCs on its own
   });
 
@@ -74,10 +86,6 @@ describe("App (integration)", () => {
     const { lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
     await wait();
 
-    // A run_in_background child that opens a timed span, finishes, THEN the main turn completes and
-    // a further main message lands. The old CLI pruned the subagent list on the main turn_completed,
-    // so a child finishing after it rendered `Agent "" · 0s`. The reducer never prunes on the main
-    // turn, so the child's real label + banked elapsed survive.
     bridge.push(ev({ type: "thread_started", threadId: "th_1", agentType: "general-purpose", description: "scout", ts: 500 }));
     bridge.push(ev({ type: "turn_started", threadId: "th_1", ts: 1000 }));
     bridge.push(ev({ type: "thread_completed", threadId: "th_1", ts: 10000, stopReason: "end_turn" }));
@@ -90,10 +98,10 @@ describe("App (integration)", () => {
     expect(frame).toContain("9s"); // banked span (10000-1000), not 0s
     expect(frame).toContain("(scout)"); // roster tree row survived the main turn_completed (not pruned)
     expect(frame).toContain("all wrapped up"); // the following main message rendered
-    expect(frame).toContain("▌"); // composer still present, never overwritten
+    expect(frame).toContain(COMPOSER_CURSOR); // composer still present, never overwritten
   });
 
-  test("(c) a bg_task_output chunk lands in the committed transcript and the composer stays present after it", async () => {
+  test("(c) a bg_task_output chunk lands in the transcript and the composer stays present after it", async () => {
     const bridge = makeEventBridge();
     const client = fakeClient();
     const { lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
@@ -103,8 +111,8 @@ describe("App (integration)", () => {
     await wait();
 
     const frame = lastFrame() ?? "";
-    expect(frame).toContain("BUILD-LOG-XYZ"); // committed to Static (scrollback), not the live region
-    expect(frame).toContain("▌"); // composer still rendered below it (invisible-prompt invariant)
+    expect(frame).toContain("BUILD-LOG-XYZ"); // committed to the transcript line log
+    expect(frame).toContain(COMPOSER_CURSOR); // composer still rendered below it (invisible-prompt invariant)
   });
 
   test("(d) welcome banner is the first line: bold Norma + version, then model · cwd", async () => {
@@ -119,24 +127,40 @@ describe("App (integration)", () => {
     expect(frame).toContain("gpt-5-codex · /work/proj");
   });
 
-  test("(e) ctrl+t toggles the task view (hidden by default, visible after the toggle)", async () => {
+  test("(e) empty session: frame is exactly rows-1 lines, welcome at the top, composer + footer pinned at the bottom", async () => {
+    const bridge = makeEventBridge();
+    const { lastFrame } = render(<App client={fakeClient()} bridge={bridge} {...baseProps} />);
+    await wait();
+    const lines = (lastFrame() ?? "").split("\n");
+
+    expect(lines).toHaveLength(23); // rows-1 (HARD CONSTRAINT 1: outputHeight < stdout.rows)
+    expect(lines[0]).toContain("Norma"); // welcome header rides the top of the log
+    expect(lines.at(-1)).toContain(FOOTER_HINT); // footer is the very last row
+
+    // The composer sits at the frame BOTTOM (pushed down by the flexGrow transcript region), not
+    // directly under the welcome.
+    const cursorLine = lines.findIndex((l) => l.includes(COMPOSER_CURSOR));
+    expect(cursorLine).toBeGreaterThanOrEqual(lines.length - 4);
+  });
+
+  test("(f) tasks auto-appear on task_updated (default visible) and ctrl+t toggles them", async () => {
     const bridge = makeEventBridge();
     const { stdin, lastFrame } = render(<App client={fakeClient()} bridge={bridge} {...baseProps} />);
     await wait();
     bridge.push(ev({ type: "task_updated", task: { id: "t1", subject: "ship the feature", status: "pending" } }));
     await wait();
-    expect(lastFrame() ?? "").not.toContain("ship the feature"); // tasks hidden by default
+    expect(lastFrame() ?? "").toContain("ship the feature"); // visible by DEFAULT (CC default)
 
-    stdin.write("\x14"); // ctrl+t
-    await wait();
-    expect(lastFrame() ?? "").toContain("ship the feature"); // now visible
-
-    stdin.write("\x14"); // ctrl+t again -> hidden
+    stdin.write("\x14"); // ctrl+t -> hide
     await wait();
     expect(lastFrame() ?? "").not.toContain("ship the feature");
+
+    stdin.write("\x14"); // ctrl+t -> show again
+    await wait();
+    expect(lastFrame() ?? "").toContain("ship the feature");
   });
 
-  test("(f) Footer shows the plan-mode indicator when initialPolicy is plan", async () => {
+  test("(g) Footer shows the plan-mode indicator when initialPolicy is plan", async () => {
     const bridge = makeEventBridge();
     const { lastFrame } = render(
       <App client={fakeClient()} bridge={bridge} sessionId="s" cwd="/tmp" initialPolicy="plan" version="0.0.1" model="m" />,
@@ -144,53 +168,445 @@ describe("App (integration)", () => {
     await wait();
     expect(lastFrame() ?? "").toContain("⏸ plan mode on");
   });
+
+  test("(h) long transcript sticks to the tail: newest lines visible, oldest scrolled off, bottom bar intact", async () => {
+    const bridge = makeEventBridge();
+    for (let i = 0; i < 40; i++) bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: `NOTE-${i}` }));
+    const { lastFrame } = render(<App client={fakeClient()} bridge={bridge} {...baseProps} />);
+    await wait();
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("NOTE-39"); // tail follows growth (stick)
+    expect(frame).not.toContain("NOTE-0"); // oldest scrolled off the top
+    expect((frame).split("\n")).toHaveLength(23); // still exactly rows-1
+    expect(frame).toContain(COMPOSER_CURSOR); // bottom bar still pinned
+  });
+
+  test("(i) scroll keys: PgUp unsticks (a new block does NOT move the view); PgDn back to the end re-sticks (follows)", async () => {
+    const bridge = makeEventBridge();
+    for (let i = 0; i < 40; i++) bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: `NOTE-${i}` }));
+    const { stdin, lastFrame } = render(<App client={fakeClient()} bridge={bridge} {...baseProps} />);
+    await wait();
+
+    stdin.write("\x1b[5~"); // PgUp -> unstick
+    await wait();
+    bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: "UNSTUCK-MARKER" }));
+    await wait();
+    expect(lastFrame() ?? "").not.toContain("UNSTUCK-MARKER"); // unstuck: view held, new block not followed
+
+    for (let k = 0; k < 6; k++) { stdin.write("\x1b[6~"); await wait(8); } // PgDn to the end -> re-stick
+    bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: "RESTICK-MARKER" }));
+    await wait();
+    expect(lastFrame() ?? "").toContain("RESTICK-MARKER"); // re-stuck: tail follows again
+  });
+
+  test("(j) ctrl+o toggles verbose: a capped tool output expands in place (full lines, no '+N lines' hint)", async () => {
+    const bridge = makeEventBridge();
+    const out = Array.from({ length: 14 }, (_, i) => `oline${i}`).join("\n");
+    bridge.push(ev({ type: "tool_call", threadId: "main", name: "bash", argsJson: "{}" }));
+    bridge.push(ev({ type: "tool_result", threadId: "main", output: out }));
+    const { stdin, lastFrame } = render(<App client={fakeClient()} bridge={bridge} {...baseProps} />);
+    await wait();
+
+    let frame = lastFrame() ?? "";
+    expect(frame).toContain("… +4 lines (ctrl+o to expand)"); // non-verbose: capped at 10
+    expect(frame).not.toContain("oline13");
+
+    stdin.write("\x0f"); // ctrl+o -> verbose
+    await wait();
+    frame = lastFrame() ?? "";
+    expect(frame).toContain("oline13"); // full output now shown in place
+    expect(frame).not.toContain("+4 lines"); // no truncation hint in verbose
+  });
+
+  test("(k) wheel scroll: the SGR report scrolls the transcript (unsticks) and never reaches the composer buffer", async () => {
+    const bridge = makeEventBridge();
+    for (let i = 0; i < 40; i++) bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: `W-${i}` }));
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+
+    stdin.write(WHEEL_UP); // wheel up -> scroll up + unstick
+    await wait();
+    const frame = lastFrame() ?? "";
+    expect(count(frame, "64;10;5")).toBe(0); // the raw mouse bytes never landed anywhere (not the composer)
+
+    // The composer buffer is empty (mouse was swallowed): Enter submits nothing.
+    stdin.write("\r");
+    await wait();
+    expect(client.calls).toEqual([]);
+
+    // The wheel actually scrolled: it unstuck the view, so a new block is no longer auto-followed.
+    bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: "WHEEL-UNSTUCK" }));
+    await wait();
+    expect(lastFrame() ?? "").not.toContain("WHEEL-UNSTUCK");
+  });
+
+  test("(l) resize: the frame re-renders to the new terminal height", async () => {
+    const prev = (process.stdout as unknown as { rows?: number }).rows;
+    const { lastFrame } = render(<App client={fakeClient()} bridge={makeEventBridge()} {...baseProps} />);
+    try {
+      await wait();
+      expect((lastFrame() ?? "").split("\n")).toHaveLength(23); // rows=24 fallback -> 23
+
+      (process.stdout as unknown as { rows?: number }).rows = 30;
+      process.stdout.emit("resize");
+      await wait();
+      expect((lastFrame() ?? "").split("\n")).toHaveLength(29); // rows=30 -> 29
+    } finally {
+      (process.stdout as unknown as { rows?: number }).rows = prev;
+    }
+  });
 });
 
-describe("mountTui (non-TTY guard)", () => {
-  const mountOpts = () => ({
-    client: fakeClient(),
-    bridge: makeEventBridge(),
-    sessionId: "s",
-    cwd: "/tmp",
-    initialPolicy: "ask" as const,
-    version: "0.0.1",
-    model: "m",
+describe("App — double ctrl+C/ctrl+D exit flow (Phase 3c Task 5)", () => {
+  test("(m) first ctrl+C interrupts a running turn AND arms the footer hint; second press within the window exits", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const exits: number[] = [];
+    const { stdin, lastFrame } = render(
+      <App client={client} bridge={bridge} {...baseProps} onExitRequest={() => exits.push(1)} />,
+    );
+    await wait();
+    bridge.push(ev({ type: "turn_started", threadId: "main" }));
+    await wait();
+
+    stdin.write("\x03"); // first ctrl+C
+    await wait();
+    expect(client.calls.map((c) => c.method)).toContain("interrupt");
+    expect(lastFrame() ?? "").toContain("Press Ctrl-C again to exit");
+    expect(exits).toEqual([]);
+
+    stdin.write("\x03"); // second ctrl+C, well within the 800ms window in real time
+    await wait();
+    expect(exits).toEqual([1]);
   });
 
-  test("(g) does NOT render Ink when stdout is not a TTY and returns a resolved no-op handle", async () => {
-    const prev = process.stdout.isTTY;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (process.stdout as any).isTTY = false;
-    try {
-      let renders = 0;
-      const handle = mountTui(mountOpts(), () => {
-        renders += 1;
-        return { waitUntilExit: () => new Promise<void>(() => {}) };
-      });
-      expect(renders).toBe(0);
-      let resolved = false;
-      await Promise.race([handle.waitUntilExit().then(() => { resolved = true; }), wait(30)]);
-      expect(resolved).toBe(true); // resolved immediately → nothing is blocking on a live Ink instance
-    } finally {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (process.stdout as any).isTTY = prev;
-    }
+  test("(n) first ctrl+C while IDLE does not interrupt (nothing running) but still arms the window", async () => {
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={makeEventBridge()} {...baseProps} />);
+    await wait();
+    stdin.write("\x03");
+    await wait();
+    expect(client.calls).toEqual([]); // idle — onInterrupt's own turnRunning guard no-ops
+    expect(lastFrame() ?? "").toContain("Press Ctrl-C again to exit");
   });
 
-  test("(g2) DOES render (once) when stdout IS a TTY", () => {
-    const prev = process.stdout.isTTY;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (process.stdout as any).isTTY = true;
-    try {
-      let renders = 0;
-      mountTui(mountOpts(), () => {
-        renders += 1;
-        return { waitUntilExit: () => new Promise<void>(() => {}) };
-      });
-      expect(renders).toBe(1);
-    } finally {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (process.stdout as any).isTTY = prev;
-    }
+  test("(o) window expiry re-arms instead of exiting (driven off the App's injected `now`, never Date.now)", async () => {
+    let clock = 1_000_000;
+    const now = () => clock;
+    const exits: number[] = [];
+    const { stdin, lastFrame } = render(
+      <App client={fakeClient()} bridge={makeEventBridge()} {...baseProps} now={now} onExitRequest={() => exits.push(1)} />,
+    );
+    await wait();
+
+    stdin.write("\x03"); // arm
+    await wait();
+    expect(lastFrame() ?? "").toContain("Press Ctrl-C again to exit");
+
+    clock += 900; // past the 800ms exit window
+    await wait(150); // let the ~100ms tick pick up the new clock value
+    stdin.write("\x03"); // treated as a FRESH first press — re-arms, does not exit
+    await wait();
+
+    expect(exits).toEqual([]);
+    expect(lastFrame() ?? "").toContain("Press Ctrl-C again to exit"); // re-armed, not cleared
+  });
+
+  test("(p) ctrl+C exits even while a pending approval card owns input (the T4 review regression)", async () => {
+    const bridge = makeEventBridge();
+    const exits: number[] = [];
+    const { stdin, lastFrame } = render(
+      <App client={fakeClient()} bridge={bridge} {...baseProps} onExitRequest={() => exits.push(1)} />,
+    );
+    await wait();
+    bridge.push(ev({ type: "approval_requested", callId: "c1", toolName: "bash", summary: "rm -rf /" }));
+    await wait();
+    expect(lastFrame() ?? "").toContain("approve bash?"); // the card really did take over
+
+    stdin.write("\x03");
+    await wait();
+    stdin.write("\x03");
+    await wait();
+    expect(exits).toEqual([1]);
+  });
+
+  test("(q) ctrl+D on an empty composer drives the identical arm/exit flow", async () => {
+    const exits: number[] = [];
+    const { stdin } = render(
+      <App client={fakeClient()} bridge={makeEventBridge()} {...baseProps} onExitRequest={() => exits.push(1)} />,
+    );
+    await wait();
+    stdin.write("\x04"); // arm
+    await wait();
+    stdin.write("\x04"); // exit
+    await wait();
+    expect(exits).toEqual([1]);
+  });
+
+  test("(r) ctrl+D with composer text does NOT arm the exit flow (never steals from typing)", async () => {
+    const exits: number[] = [];
+    const { stdin, lastFrame } = render(
+      <App client={fakeClient()} bridge={makeEventBridge()} {...baseProps} onExitRequest={() => exits.push(1)} />,
+    );
+    await wait();
+    stdin.write("hello");
+    await wait();
+    stdin.write("\x04");
+    await wait();
+    stdin.write("\x04");
+    await wait();
+    expect(exits).toEqual([]);
+    expect(lastFrame() ?? "").not.toContain("again to exit"); // not armed under EITHER key's hint
+    expect(lastFrame() ?? "").toContain("hello"); // buffer untouched
+  });
+
+  test("(q2) ctrl+D arming names its OWN key in the footer hint (3c whole-branch review item 3)", async () => {
+    const { stdin, lastFrame } = render(<App client={fakeClient()} bridge={makeEventBridge()} {...baseProps} />);
+    await wait();
+    stdin.write("\x04"); // arm via ctrl+D (empty composer)
+    await wait();
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("Press Ctrl-D again to exit");
+    expect(frame).not.toContain("Press Ctrl-C again to exit");
+  });
+
+  test("(v) ctrl+D's first press does NOT scroll the transcript (3c whole-branch review item 1 — the scroll hook ceded ctrl+d)", async () => {
+    const bridge = makeEventBridge();
+    for (let i = 0; i < 40; i++) bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: `SCROLL-${i}` }));
+    const { stdin, lastFrame } = render(<App client={fakeClient()} bridge={bridge} {...baseProps} />);
+    await wait();
+
+    // Scroll UP first so a half-page-DOWN (the removed scroll binding) would visibly move the window.
+    stdin.write("\x1b[5~"); // PgUp
+    await wait();
+    stdin.write("\x1b[5~"); // PgUp again — well away from the bottom
+    await wait();
+    const before = (lastFrame() ?? "").split("\n");
+
+    stdin.write("\x04"); // ctrl+D (empty composer) — must ONLY arm exit, never scroll
+    await wait();
+    const after = (lastFrame() ?? "").split("\n");
+
+    expect(after[0]).toBe(before[0]!); // viewport top line unmoved — no half-page-down fired
+    expect(after.join("\n")).toContain("Press Ctrl-D again to exit"); // ... but the exit window armed
+    // The frames are identical EXCEPT the armed footer line (the very last row).
+    const diffs = before.map((line, i) => (line === after[i] ? null : i)).filter((i) => i !== null);
+    expect(diffs).toEqual([before.length - 1]);
+  });
+
+  test("(w) running + empty composer: the first ctrl+D interrupts EXACTLY once (only the exit hook's armOrExit — no scroll-path double-fire)", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    bridge.push(ev({ type: "turn_started", threadId: "main" }));
+    await wait();
+
+    stdin.write("\x04"); // first ctrl+D while running
+    await wait();
+    expect(client.calls.filter((c) => c.method === "interrupt")).toHaveLength(1);
+    expect(lastFrame() ?? "").toContain("Press Ctrl-D again to exit");
+  });
+
+  test("(x) a DIFFERENT eligible key inside the window re-arms under that key instead of exiting", async () => {
+    const exits: number[] = [];
+    const { stdin, lastFrame } = render(
+      <App client={fakeClient()} bridge={makeEventBridge()} {...baseProps} onExitRequest={() => exits.push(1)} />,
+    );
+    await wait();
+    stdin.write("\x03"); // arm via ctrl+C
+    await wait();
+    expect(lastFrame() ?? "").toContain("Press Ctrl-C again to exit");
+
+    stdin.write("\x04"); // ctrl+D inside the window — re-arms as ctrl-d, does NOT exit
+    await wait();
+    expect(exits).toEqual([]);
+    expect(lastFrame() ?? "").toContain("Press Ctrl-D again to exit");
+
+    stdin.write("\x04"); // matching second press — exits
+    await wait();
+    expect(exits).toEqual([1]);
+  });
+});
+
+describe("App — Home/End transcript jumps on an empty composer (3c whole-branch review item 2, spec §5)", () => {
+  test("(y) Home on empty scrolls to the top (welcome/oldest visible, unstuck); End re-sticks to the bottom", async () => {
+    const bridge = makeEventBridge();
+    for (let i = 0; i < 40; i++) bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: `HE-${i}` }));
+    const { stdin, lastFrame } = render(<App client={fakeClient()} bridge={bridge} {...baseProps} />);
+    await wait();
+    expect(lastFrame() ?? "").toContain("HE-39"); // starts stuck to the bottom
+
+    stdin.write("\x1b[H"); // Home, empty composer -> transcript top
+    await wait();
+    const frame = lastFrame() ?? "";
+    expect(frame.split("\n")[0]).toContain("Norma"); // the welcome header — the very first log line
+    expect(frame).toContain("HE-1"); // oldest transcript lines in view
+    expect(frame).not.toContain("HE-39");
+
+    bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: "HE-NEW" }));
+    await wait();
+    expect(lastFrame() ?? "").not.toContain("HE-NEW"); // the top jump UNSTUCK the view — growth not followed
+
+    stdin.write("\x1b[F"); // End, empty composer -> back to (and stuck to) the bottom
+    await wait();
+    expect(lastFrame() ?? "").toContain("HE-NEW");
+    bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: "HE-STICKY" }));
+    await wait();
+    expect(lastFrame() ?? "").toContain("HE-STICKY"); // re-stuck: tail follows again
+  });
+
+  test("(z) Home/End with TEXT keep their cursor semantics and never scroll the transcript", async () => {
+    const bridge = makeEventBridge();
+    for (let i = 0; i < 40; i++) bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: `TX-${i}` }));
+    const { stdin, lastFrame } = render(<App client={fakeClient()} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("abc");
+    await wait();
+
+    stdin.write("\x1b[H"); // Home with text -> cursor to 0, NO scroll
+    await wait();
+    let frame = lastFrame() ?? "";
+    expect(frame).toContain("\x1b[7ma\x1b[27m"); // inverse cursor sits ON "a" (cursor really moved to 0)
+    expect(frame).toContain("TX-39"); // still at the bottom — did not jump to the top
+    expect(frame.split("\n")[0]).not.toContain("Norma"); // top of the log NOT in view
+
+    stdin.write("\x1b[F"); // End with text -> cursor back to the end, still no scroll
+    await wait();
+    stdin.write("d");
+    await wait();
+    frame = lastFrame() ?? "";
+    expect(frame).toContain("abcd"); // insert landed at the END — End restored the cursor
+    expect(frame).toContain("TX-39"); // view still at the bottom
+  });
+});
+
+describe("App — resume replay (Phase 3c Task 5)", () => {
+  test("(s) resumeTargetSeq: 'Resuming conversation…' shows from mount, survives mid-replay, clears once the target seq is processed — full transcript present, task_notification invisible, composer stuck at the bottom", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    // Mount FIRST (mirrors main.ts: `attach(sessionId, 0)` resolves with the daemon's tip BEFORE
+    // mountTui/<App> render), THEN push the historical log through the bridge's LIVE subscribe path
+    // (not the pre-subscribe buffer test (a) exercises) — matching how the daemon's replay actually
+    // arrives relative to the App mounting.
+    const { lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} resumeTargetSeq={5} />);
+    await wait();
+    expect(lastFrame() ?? "").toContain("Resuming conversation…"); // shown immediately, before any event
+
+    bridge.push(ev({ type: "user_message", threadId: "main", text: "hello again", seq: 1 }));
+    await wait();
+    expect(lastFrame() ?? "").toContain("Resuming conversation…"); // still mid-replay
+
+    bridge.push(ev({ type: "turn_started", threadId: "main", seq: 2 }));
+    bridge.push(ev({ type: "assistant_message", threadId: "main", text: "hi back", seq: 3 }));
+    bridge.push(ev({ type: "task_notification", threadId: "main", content: "bg agent finished", seq: 4 }));
+    bridge.push(ev({ type: "turn_completed", threadId: "main", inputTokens: 3, outputTokens: 2, seq: 5 }));
+    await wait();
+
+    const frame = lastFrame() ?? "";
+    expect(frame).not.toContain("Resuming conversation…"); // replay reached resumeTargetSeq -> cleared
+    expect(frame).toContain("❯ hello again"); // full transcript present
+    expect(frame).toContain("hi back");
+    expect(frame).not.toContain("bg agent finished"); // task_notification: reducer no-op, invisible
+    expect(frame).toContain(COMPOSER_CURSOR); // composer back — viewport starts stuck to the bottom
+    expect(client.calls).toEqual([]); // App issued no RPCs on its own during replay
+  });
+
+  test("(t) resumeTargetSeq: 0 (a resumed session with no prior events) never shows the resuming line", async () => {
+    const { lastFrame } = render(<App client={fakeClient()} bridge={makeEventBridge()} {...baseProps} resumeTargetSeq={0} />);
+    await wait();
+    expect(lastFrame() ?? "").not.toContain("Resuming conversation…");
+  });
+
+  test("(u) non-resume (default opts, no resumeTargetSeq): the resuming line never appears, even across a full turn", async () => {
+    const bridge = makeEventBridge();
+    const { lastFrame } = render(<App client={fakeClient()} bridge={bridge} {...baseProps} />);
+    await wait();
+    bridge.push(ev({ type: "user_message", threadId: "main", text: "hi", seq: 1 }));
+    bridge.push(ev({ type: "turn_completed", threadId: "main", inputTokens: 1, outputTokens: 1, seq: 2 }));
+    await wait();
+    expect(lastFrame() ?? "").not.toContain("Resuming conversation…");
+    expect(lastFrame() ?? "").toContain(COMPOSER_CURSOR);
+  });
+});
+
+describe("bottomBarRows (pinned-bar line-count model)", () => {
+  const task = (subject: string, status: TaskRow["status"]): TaskRow => ({ id: subject, subject, status });
+  const agent = (threadId: string): AgentRow => ({
+    threadId, agentType: "general-purpose", label: "a", status: "working",
+    outputTokens: 0, liveOutputChars: 0, activeMs: 0, toolCalls: 0,
+  });
+
+  // Common fields every call needs post-T5 (columns/composerText/composerCursor/resuming) — 80
+  // columns and an empty idle composer are wide/short enough that `composerRows` always comes out to
+  // its old flat "3" (2 border rows + 1 unwrapped content row), so every pre-T5 expectation below is
+  // unchanged; only the NEW "small columns" describe block below exercises actual wrapping.
+  type Base = Parameters<typeof bottomBarRows>[0];
+  const base = (overrides: Partial<Base>): Base => ({
+    tasksVisible: true, tasks: [], agents: [], running: false, pending: null, activeTurnRows: 0,
+    columns: 80, composerText: "", composerCursor: 0, resuming: false,
+    ...overrides,
+  });
+
+  test("empty: composer (3) + footer (1) = 4", () => {
+    expect(bottomBarRows(base({}))).toBe(4);
+  });
+
+  test("spinner adds 1 while a turn runs", () => {
+    expect(bottomBarRows(base({ running: true }))).toBe(5);
+  });
+
+  test("tasks add the count header + one row per task while visible; nothing when hidden", () => {
+    const tasks = [task("a", "in_progress"), task("b", "pending")];
+    expect(bottomBarRows(base({ tasks }))).toBe(4 + (1 + 2));
+    expect(bottomBarRows(base({ tasks, tasksVisible: false }))).toBe(4);
+  });
+
+  test("each live agent adds two rows (head + continuation)", () => {
+    expect(bottomBarRows(base({ agents: [agent("x"), agent("y")] }))).toBe(4 + 4);
+  });
+
+  test("active-turn tail rows and a pending card both count; the card replaces the composer's 3", () => {
+    expect(bottomBarRows(base({ activeTurnRows: 5 }))).toBe(9); // 5 + composer 3 + footer 1
+    const withCard = bottomBarRows(base({
+      pending: { kind: "approval", callId: "c", toolName: "bash", summary: "x" },
+    }));
+    expect(withCard).toBe(1 + 1); // approval card (1) + footer (1), NOT the composer's 3
+  });
+
+  test("resuming adds 1 line", () => {
+    expect(bottomBarRows(base({ resuming: true }))).toBe(5);
+  });
+
+  describe("composer wrap-awareness (T5 hard requirement — narrow columns)", () => {
+    test("content longer than columns adds extra composer rows", () => {
+      // Content = "❯ " (2) + 9 chars + a placeholder cursor cell (cursor at the end) = 12 visible
+      // chars; at columns=10 that hard-wraps to ceil(12/10) = 2 rows, so the composer box grows from
+      // 3 rows (2 border + 1 content) to 4 (2 border + 2 content).
+      const text = "a".repeat(9);
+      expect(bottomBarRows(base({ columns: 10, composerText: text, composerCursor: text.length })))
+        .toBe(4 + 1); // composer(4) + footer(1); tasks/spinner/agents all 0
+    });
+
+    test("cursor AT the end costs one extra visible cell vs. cursor mid-text (same text)", () => {
+      // Same 8-char text either way; visible length is 2("❯ ")+8+1(placeholder)=11 at the end vs.
+      // 2+8+0=10 mid-text (the "at" character is already counted within the 8) — crossing the
+      // columns=10 wrap boundary in exactly one of the two cases.
+      const text = "a".repeat(8);
+      const atEnd = bottomBarRows(base({ columns: 10, composerText: text, composerCursor: text.length }));
+      const midText = bottomBarRows(base({ columns: 10, composerText: text, composerCursor: 4 }));
+      expect(atEnd).toBe(4 + 1); // 11 visible chars -> 2 wrapped rows -> composer 4
+      expect(midText).toBe(3 + 1); // 10 visible chars -> 1 wrapped row -> composer 3 (unchanged)
+    });
+
+    test("a pending card ignores composerText/composerCursor entirely (no wrap accounting needed)", () => {
+      const huge = "x".repeat(500);
+      const rows = bottomBarRows(base({
+        columns: 10, composerText: huge, composerCursor: huge.length,
+        pending: { kind: "approval", callId: "c", toolName: "bash", summary: "x" },
+      }));
+      expect(rows).toBe(1 + 1); // approval card (1) + footer (1) — the composer's wrap math never runs
+    });
   });
 });

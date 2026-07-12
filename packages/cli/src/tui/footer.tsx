@@ -1,11 +1,18 @@
-/** `<Footer>` (Phase 3b Task 5) — the CC-shaped single dim hint line beneath the composer: an
- *  approval-policy mode indicator (plan/auto, colored per `theme.planMode`/`theme.autoAccept`),
- *  an `esc to interrupt` hint while a turn runs, and an agents pill (`N agent(s) · ctrl+t`) when
- *  any subagents are live — segments joined with `" · "`. When none of those render, a fallback
- *  `shift+tab to cycle modes` hint keeps the line non-empty (cc-ui-study-chrome.md §1's
- *  `PromptInputFooterLeftSide` empty-state hint, adapted).
+/** `<Footer>` (Phase 3b Task 5; Phase 3c Task 5 — exit-armed override) — the CC-shaped single dim
+ *  hint line beneath the composer: an approval-policy mode indicator (plan/auto, colored per
+ *  `theme.planMode`/`theme.autoAccept`), an `esc to interrupt` hint while a turn runs, and an
+ *  agents pill (`N agent(s) · ctrl+t`) when any subagents are live — segments joined with `" · "`.
+ *  When none of those render, a fallback `shift+tab to cycle modes` hint keeps the line non-empty
+ *  (cc-ui-study-chrome.md §1's `PromptInputFooterLeftSide` empty-state hint, adapted).
  *
- *  Pure — no client, no timers; `policy`/`running`/`agents` are all caller-supplied snapshots. */
+ *  T5: while the double-ctrl+C/ctrl+D exit window is armed (`exitArmed` carries WHICH key armed it —
+ *  whole-branch review item 3), this REPLACES the whole line with the exact key-specific dim hint
+ *  ("Press Ctrl-C again to exit" / "Press Ctrl-D again to exit", reference behavior) — no other
+ *  segment renders alongside it, so the line reads unambiguously as "press again to exit" rather
+ *  than getting lost among mode/agents chrome.
+ *
+ *  Pure — no client, no timers; `policy`/`running`/`agents`/`exitArmed` are all caller-supplied
+ *  snapshots. */
 
 import React from "react";
 import { Text } from "ink";
@@ -13,13 +20,25 @@ import type { ApprovalPolicy } from "@norma/protocol";
 import { theme } from "./theme";
 import type { AgentRow } from "./state";
 
+/** Which key armed the T5 double-press exit window — declared here (the component that renders the
+ *  distinction) and imported by app.tsx (the component that tracks it). */
+export type ExitKey = "ctrl-c" | "ctrl-d";
+
 export interface FooterProps {
   policy: ApprovalPolicy;
   running: boolean;
   agents: AgentRow[];
+  /** T5 double-ctrl+C/ctrl+D exit flow: the key that armed the ~800ms window on its FIRST press;
+   *  `undefined` when not armed. Optional so every pre-T5 call site (and non-Ink test) stays
+   *  byte-identical. */
+  exitArmed?: ExitKey;
 }
 
-export function Footer({ policy, running, agents }: FooterProps) {
+export function Footer({ policy, running, agents, exitArmed }: FooterProps) {
+  if (exitArmed) {
+    return <Text dimColor>{exitArmed === "ctrl-d" ? "Press Ctrl-D again to exit" : "Press Ctrl-C again to exit"}</Text>;
+  }
+
   const segments: React.ReactNode[] = [];
 
   if (policy === "plan") {

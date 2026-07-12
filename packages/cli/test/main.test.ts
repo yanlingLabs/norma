@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { routeCliInvocation, type CliRoute } from "../src/main";
+import { formatResumeHint, routeCliInvocation, type CliRoute } from "../src/main";
 
 // Pure arg-routing table test (final-review Findings 3+4). `routeCliInvocation` is the ONLY piece
 // of the bare/--auto/--plan/-p/resume dispatch that's cheaply unit-testable without a real
@@ -89,5 +89,18 @@ describe("routeCliInvocation — resume (Finding 3)", () => {
       kind: "chat",
       existingSessionId: "sess1",
     });
+  });
+});
+
+describe("formatResumeHint (Phase 3c Task 5 — the dim post-exit resume hint)", () => {
+  test("exact text (dim-wrapped), including the session id", () => {
+    const DIM = "\x1b[2m";
+    const RESET = "\x1b[0m";
+    expect(formatResumeHint("s_abc123")).toBe(`${DIM}\nResume this session with:\n  norma resume s_abc123\n${RESET}`);
+  });
+
+  test("no trailing newline is added beyond the one already in the spec string (process.stdout.write, not console.log)", () => {
+    const hint = formatResumeHint("x");
+    expect(hint.endsWith("\n\x1b[0m")).toBe(true); // ends with the required "\n" then the RESET code — no EXTRA "\n"
   });
 });
