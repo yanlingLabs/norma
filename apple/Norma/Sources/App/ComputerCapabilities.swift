@@ -111,7 +111,12 @@ func parseComputerPayload(cls: String, payloadJson: String) -> Result<ComputerOp
         guard let keys = raw.keys, !keys.isEmpty else { return .failure(ComputerError(message: "key needs a chord")) }
         return .success(.key(keys: keys))
     case ("input-drive", "scroll"):
-        return .success(.scroll(target: resolveTarget(raw.target), dx: Int(raw.dx ?? 0), dy: Int(raw.dy ?? 0)))
+        // Clamp BEFORE Int conversion: `Int(_: Double)` is a TRAPPING conversion, and dx/dy are
+        // model-controlled doubles (core's zod schema is a bare z.number()) — an absurd value like
+        // 1e40 must become a bounded scroll, not a fatalError on the main actor. ±100_000 px is far
+        // beyond any real scroll intent and safely inside Int32 for the CGEvent wheel fields.
+        let clamp = { (v: Double) -> Int in Int(min(max(v, -100_000), 100_000)) }
+        return .success(.scroll(target: resolveTarget(raw.target), dx: clamp(raw.dx ?? 0), dy: clamp(raw.dy ?? 0)))
     default:
         return .failure(ComputerError(message: "op '\(raw.op)' is not valid for class '\(cls)'"))
     }
@@ -227,8 +232,16 @@ protocol ComputerCapabilities: AnyObject {
 /// CGEvents).
 @MainActor
 final class LiveComputerCapabilities: ComputerCapabilities {
-    /// Max AX elements returned by a snapshot (bounds the walk + the text size).
+    /// Max AX elements returned by a snapshot (bounds the text size).
     private let maxElements = 200
+    /// Max nodes VISITED by the BFS, independent of how many match — each visit is a synchronous AX
+    /// IPC round-trip on the main actor, and a huge Chromium/Electron tree with few interesting
+    /// roles would otherwise freeze the UI for seconds while `elements.count` never reaches its cap.
+    private let maxVisitedNodes = 5_000
+    /// Monotonic element-id counter — NEVER reset (see snapshotAX): stale ids from an older
+    /// snapshot must miss the cache and produce the typed refresh error, not silently resolve to a
+    /// different element that now occupies the same ordinal.
+    private var nextElementId = 0
     /// Roles worth surfacing to the model (interactive + a few structural anchors).
     private let interestingRoles: Set<String> = [
         "AXButton", "AXLink", "AXMenuButton", "AXPopUpButton", "AXCheckBox", "AXRadioButton",
@@ -247,21 +260,36 @@ final class LiveComputerCapabilities: ComputerCapabilities {
         case .axSnapshot:
             return .text(try snapshotAX())
         case .click(let target, let button, let clicks):
+            try requireInputTrust()
             return .detail(try click(target: target, button: button, clicks: clicks))
         case .move(let target):
+            try requireInputTrust()
             let p = try point(for: target)
             postMouse(type: .mouseMoved, at: p, button: .left)
             return .detail("moved to (\(Int(p.x)),\(Int(p.y)))")
         case .type(let text):
+            try requireInputTrust()
             try typeText(text)
             return .detail("typed \(text.count) character(s)")
         case .key(let keys):
+            try requireInputTrust()
             try pressChord(keys)
             return .detail("pressed \(keys)")
         case .scroll(let target, let dx, let dy):
+            try requireInputTrust()
             if let target { _ = CGWarpMouseCursorPosition(try point(for: target)) }
             postScroll(dx: dx, dy: dy)
             return .detail("scrolled dx=\(dx) dy=\(dy)")
+        }
+    }
+
+    /// EVERY input-drive op must be gated on Accessibility trust — without it macOS silently
+    /// discards posted CGEvents, so an unguarded path would report "clicked (x,y)" for a click
+    /// that never happened and send the CU loop into confident hallucination. One guard for all
+    /// five input ops (click/move/type/key/scroll), same actionable message everywhere.
+    private func requireInputTrust() throws {
+        guard AXIsProcessTrusted() else {
+            throw ComputerError(message: "accessibility permission not granted — grant Norma in System Settings › Privacy & Security › Accessibility, then retry")
         }
     }
 
@@ -276,7 +304,12 @@ final class LiveComputerCapabilities: ComputerCapabilities {
         // one-shot SCScreenshotManager (macOS 14+). A point-resolution capture of the main display
         // is plenty for grounding and keeps the base64 well under the NDJSON line cap.
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        guard let display = content.displays.first else {
+        // Pick the MAIN display explicitly — SCShareableContent.displays order is undocumented, and
+        // `first` on a multi-display Mac could capture a secondary screen while ax_snapshot
+        // describes the frontmost window elsewhere (visual grounding breaks). Main-display fallback
+        // to `first` keeps single-display Macs working even if the id lookup ever misses.
+        let mainID = CGMainDisplayID()
+        guard let display = content.displays.first(where: { $0.displayID == mainID }) ?? content.displays.first else {
             throw ComputerError(message: "no display available to capture")
         }
         let filter = SCContentFilter(display: display, excludingWindows: [])
@@ -339,11 +372,15 @@ final class LiveComputerCapabilities: ComputerCapabilities {
         var elements: [CUAXElement] = []
         var queue = roots
         var head = 0
-        var nextId = 0
-        while head < queue.count, elements.count < maxElements {
+        var visited = 0
+        while head < queue.count, elements.count < maxElements, visited < maxVisitedNodes {
             let el = queue[head]; head += 1
+            visited += 1
             if let role = copyString(el, kAXRoleAttribute as String), interestingRoles.contains(role), let frame = copyFrame(el) {
-                let id = nextId; nextId += 1
+                // MONOTONIC ids across snapshots (never reused): a model holding an id from an
+                // OLDER snapshot must get the typed "unknown — run ax_snapshot again" error, not a
+                // silent click on whatever element happens to occupy that ordinal in the NEW cache.
+                let id = nextElementId; nextElementId += 1
                 elementCache[id] = el
                 elements.append(CUAXElement(
                     id: id, role: role,
@@ -438,8 +475,12 @@ final class LiveComputerCapabilities: ComputerCapabilities {
         up.post(tap: .cghidEventTap)
     }
 
+    /// Sign convention (pinned in the core tool's schema): positive dy scrolls DOWN the page
+    /// (web-style deltaY), positive dx scrolls content right. CGEvent's wheel axes are the
+    /// OPPOSITE (positive wheel1 scrolls up, positive wheel2 scrolls left), so both are negated
+    /// here. dx/dy are pre-clamped to ±100_000 by parseComputerPayload, safely inside Int32.
     private func postScroll(dx: Int, dy: Int) {
-        guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: Int32(dy), wheel2: Int32(dx), wheel3: 0) else { return }
+        guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: Int32(clamping: -dy), wheel2: Int32(clamping: -dx), wheel3: 0) else { return }
         event.post(tap: .cghidEventTap)
     }
 }

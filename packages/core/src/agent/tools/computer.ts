@@ -59,8 +59,8 @@ const RAW_PARAMETERS = {
     double: { type: "boolean", description: "Double-click when true." },
     text: { type: "string", description: "Text to type (action=type)." },
     keys: { type: "string", description: "Key or chord to press, e.g. \"cmd+s\" (action=key)." },
-    dx: { type: "number", description: "Horizontal scroll delta (action=scroll)." },
-    dy: { type: "number", description: "Vertical scroll delta (action=scroll)." },
+    dx: { type: "number", description: "Horizontal scroll delta in pixels (action=scroll); positive scrolls content right." },
+    dy: { type: "number", description: "Vertical scroll delta in pixels (action=scroll); positive scrolls DOWN the page (web-style), negative scrolls up." },
   },
 };
 
@@ -105,7 +105,12 @@ function buildPayload(a: ComputerArgsT, screenshotMaxDim?: number): Record<strin
 /** Shape the model-facing result string from a successful capability call. */
 function formatResult(a: ComputerArgsT, resultJson: string, attachImage?: (u: string) => void): string {
   let parsed: Record<string, unknown> = {};
-  try { parsed = JSON.parse(resultJson || "{}"); } catch { /* provider returned non-JSON — fall through */ }
+  try {
+    const p: unknown = JSON.parse(resultJson || "{}");
+    // JSON.parse("null")/primitives succeed — only accept an object so the field reads below
+    // never TypeError on a degenerate provider payload.
+    if (p !== null && typeof p === "object") parsed = p as Record<string, unknown>;
+  } catch { /* provider returned non-JSON — fall through */ }
 
   if (a.action === "ax_snapshot") {
     return typeof parsed.text === "string" ? parsed.text : resultJson;
@@ -115,8 +120,14 @@ function formatResult(a: ComputerArgsT, resultJson: string, attachImage?: (u: st
     if (dataUrl && attachImage) attachImage(dataUrl);
     const w = parsed.width, h = parsed.height, sw = parsed.scaledWidth, sh = parsed.scaledHeight;
     const dims = typeof w === "number" && typeof h === "number" ? `${w}×${h}` : "screen";
-    const scaled = typeof sw === "number" && typeof sh === "number" && (sw !== w || sh !== h) ? `, sent to you at ${sw}×${sh}` : "";
-    return dataUrl ? `Screenshot captured (${dims}${scaled}). The image is provided to you above.` : `Screenshot captured (${dims}).`;
+    const wasScaled = typeof w === "number" && typeof sw === "number" && typeof sh === "number" && (sw !== w || sh !== h);
+    // COORDINATE-SPACE NOTE (systematic-misclick guard): click/move/scroll x,y are SCREEN
+    // coordinates (the ax_snapshot space). When the image was downscaled, a position read off the
+    // image must be multiplied back up or every click lands short — tell the model the factor.
+    const scaleNote = wasScaled
+      ? ` The image was downscaled to ${sw}×${sh}; click x,y are SCREEN coordinates — multiply positions read off the image by ${((w as number) / (sw as number)).toFixed(3)}, or better, target ax_snapshot element ids.`
+      : "";
+    return dataUrl ? `Screenshot captured (screen is ${dims}). The image follows this result as the next message.${scaleNote}` : `Screenshot captured (${dims}).`;
   }
   // input actions: prefer a provider-supplied detail, else a generic confirmation.
   if (typeof parsed.detail === "string") return parsed.detail;

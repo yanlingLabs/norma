@@ -44,10 +44,10 @@ function manualScheduler() {
   return { scheduler, tick: () => fns.forEach((f) => f()) };
 }
 
-function makeService(broker: FakeBroker, nowMs = 0) {
+function makeService(broker: FakeBroker, nowMs = 0, maxIdleMs = 60_000) {
   const { scheduler, tick } = manualScheduler();
   let now = nowMs;
-  const svc = new ComputerUseService({ broker, heartbeatMs: 5_000, now: () => now, scheduler });
+  const svc = new ComputerUseService({ broker, heartbeatMs: 5_000, maxIdleMs, now: () => now, scheduler });
   return { svc, tick, setNow: (n: number) => { now = n; } };
 }
 
@@ -165,14 +165,73 @@ describe("ComputerUseService", () => {
     expect(broker.leaseCalls.length).toBe(2);
   });
 
-  test("a near-expiry cached lease is re-acquired on the next act", async () => {
+  test("a near-expiry cached lease is RENEWED on the next act — never lease()d again (self-deny trap)", async () => {
+    // The broker's lease() is holder-blind: a second lease() while our own lease still holds the
+    // class returns lease_held BY OUR OWN SESSION. The skew window must renew, not re-lease.
     const broker = new FakeBroker();
     broker.expiresAt = 10_000;
     const { svc, setNow } = makeService(broker, 0);
     await svc.act("s1", "screenshot", "{}");
     setNow(9_500); // within EXPIRY_SKEW_MS (1000) of expiresAt=10000
+    const r = await svc.act("s1", "screenshot", "{}");
+    expect(r.ok).toBe(true);
+    expect(broker.leaseCalls.length).toBe(1); // no second lease()
+    expect(broker.renewCalls.length).toBe(1); // renewed instead
+  });
+
+  test("a near-expiry lease whose renew FAILS is dropped and freshly re-leased", async () => {
+    const broker = new FakeBroker();
+    broker.expiresAt = 10_000;
+    const { svc, setNow } = makeService(broker, 0);
     await svc.act("s1", "screenshot", "{}");
-    expect(broker.leaseCalls.length).toBe(2);
+    setNow(10_500); // past expiry — the broker refuses the renew
+    broker.renewResult = { code: "expired" };
+    broker.expiresAt = 100_000;
+    const r = await svc.act("s1", "screenshot", "{}");
+    expect(r.ok).toBe(true);
+    expect(broker.leaseCalls.length).toBe(2); // fresh lease after the failed renew
+  });
+
+  test("concurrent first-acquisitions of the same class share ONE broker.lease() call", async () => {
+    const broker = new FakeBroker();
+    const { svc } = makeService(broker);
+    const [a, b] = await Promise.all([
+      svc.act("s1", "input-drive", "{}"),
+      svc.act("s1", "input-drive", "{}"),
+    ]);
+    expect(a.ok).toBe(true);
+    expect(b.ok).toBe(true);
+    expect(broker.leaseCalls.length).toBe(1); // memoized in-flight acquisition
+    expect(broker.callCalls.length).toBe(2);
+  });
+
+  test("idle backstop: a heartbeat tick past maxIdleMs releases everything (no eternal renewal)", async () => {
+    const broker = new FakeBroker();
+    const { svc, tick, setNow } = makeService(broker, 0, 60_000);
+    await svc.act("s1", "screenshot", "{}");
+    setNow(30_000);
+    tick(); // idle 30s < 60s → renews
+    expect(broker.renewCalls.length).toBe(1);
+    expect(broker.releaseCalls.length).toBe(0);
+    setNow(61_000);
+    tick(); // idle 61s ≥ 60s → releases instead of renewing forever
+    expect(broker.releaseCalls.length).toBe(1);
+    expect(svc.holdsAny("s1")).toBe(false);
+    // and the timer is stopped — further ticks do nothing
+    tick();
+    expect(broker.renewCalls.length).toBe(1);
+  });
+
+  test("an act() resets the idle clock", async () => {
+    const broker = new FakeBroker();
+    const { svc, tick, setNow } = makeService(broker, 0, 60_000);
+    await svc.act("s1", "screenshot", "{}");
+    setNow(50_000);
+    await svc.act("s1", "screenshot", "{}"); // activity at t=50s
+    setNow(100_000); // 50s since last act — under the 60s idle cap
+    tick();
+    expect(broker.releaseCalls.length).toBe(0); // renewed, not released
+    expect(svc.holdsAny("s1")).toBe(true);
   });
 
   test("releaseSession releases every held lease and clears state", async () => {

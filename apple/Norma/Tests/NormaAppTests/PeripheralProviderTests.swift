@@ -442,6 +442,15 @@ final class ComputerCapabilitiesPureTests: XCTestCase {
         XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"scroll","dy":-120}"#).get(), .scroll(target: nil, dx: 0, dy: -120))
     }
 
+    func testScrollDeltasAreClampedNotTrapped() {
+        // Int(_: Double) is a trapping conversion — a model-controlled absurd delta must clamp,
+        // never fatalError the app.
+        XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"scroll","dy":1e40}"#).get(),
+                       .scroll(target: nil, dx: 0, dy: 100_000))
+        XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"scroll","dx":-1e40,"dy":50}"#).get(),
+                       .scroll(target: nil, dx: -100_000, dy: 50))
+    }
+
     func testParsePayloadRejectsMismatchAndMissingFields() {
         // op valid for a DIFFERENT class
         if case .success = parseComputerPayload(cls: "screenshot", payloadJson: #"{"op":"click"}"#) { XCTFail("class/op mismatch should fail") }
