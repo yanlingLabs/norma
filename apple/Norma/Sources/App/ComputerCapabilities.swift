@@ -26,24 +26,44 @@ enum CUTarget: Equatable {
 }
 
 /// A parsed computer-use operation (the wire `payloadJson`'s `op` + fields), validated against the
-/// lease class it arrived on. Pure — no CoreGraphics/AX types.
+/// lease class it arrived on. Pure — no CoreGraphics/AX types (CGEventFlags is a plain OptionSet).
 enum ComputerOp: Equatable {
     case screenshot(maxDim: Int?)
+    /// Region capture at full detail (the dense-UI/Retina path) — x,y = origin, width,height =
+    /// size, all in screen points. maxDim still caps the OUTPUT so a huge region can't blow the
+    /// payload; a typical zoom region is untouched by it.
+    case zoom(x: Double, y: Double, width: Double, height: Double, maxDim: Int?)
     case axSnapshot
-    case click(target: CUTarget, button: String, clicks: Int)
+    case click(target: CUTarget, button: String, clicks: Int, modifiers: CGEventFlags)
     case move(target: CUTarget)
+    /// Press at `from`, glide, release at `to` — sliders, drag-and-drop, text selection.
+    case drag(from: CUTarget, to: CUTarget, modifiers: CGEventFlags)
     case type(text: String)
     case key(keys: String)
     case scroll(target: CUTarget?, dx: Int, dy: Int)
 }
 
-/// A captured screenshot ready to ship to the model (a `data:` URL + source/scaled dims).
+/// A captured screenshot ready to ship to the model (a `data:` URL + source/scaled dims). For a
+/// zoom capture, `originX/originY` carry the region's screen origin so the core tool can tell the
+/// model how to map image positions back to screen coordinates; nil for a full-screen capture.
 struct CUScreenshot: Equatable {
     let dataUrl: String
     let width: Int
     let height: Int
     let scaledWidth: Int
     let scaledHeight: Int
+    let originX: Int?
+    let originY: Int?
+
+    init(dataUrl: String, width: Int, height: Int, scaledWidth: Int, scaledHeight: Int, originX: Int? = nil, originY: Int? = nil) {
+        self.dataUrl = dataUrl
+        self.width = width
+        self.height = height
+        self.scaledWidth = scaledWidth
+        self.scaledHeight = scaledHeight
+        self.originX = originX
+        self.originY = originY
+    }
 }
 
 /// The result of performing one op — encoded into the `peripheral.respond` resultJson by the
@@ -70,12 +90,19 @@ private struct RawPayload: Decodable {
     let op: String
     let maxDim: Int?
     let target: RawTarget?
+    let from: RawTarget?
+    let to: RawTarget?
     let button: String?
     let clicks: Int?
+    let modifiers: [String]?
     let text: String?
     let keys: String?
     let dx: Double?
     let dy: Double?
+    let x: Double?
+    let y: Double?
+    let width: Double?
+    let height: Double?
 }
 
 private func resolveTarget(_ raw: RawTarget?) -> CUTarget? {
@@ -85,10 +112,50 @@ private func resolveTarget(_ raw: RawTarget?) -> CUTarget? {
     return nil
 }
 
+/// Safe Double→Int for scroll deltas AND every DISPLAY/error-string coordinate conversion.
+/// `Int(_: Double)` TRAPS (fatalError) on NaN/±Inf and on magnitudes outside Int64 — and EVERY
+/// coordinate/delta here is model-controlled (core's zod schema is a bare z.number()), so a value
+/// like `to_x: 1e40` reaching a bare `Int(x)` would crash the whole peripheral provider. Clamp to
+/// ±100_000 (beyond any real screen coordinate or scroll intent, safely inside Int32) and map NaN
+/// to 0. The ACTUAL CGEvent uses CGFloat (never traps); this guards only the Int() sites — scroll
+/// wheel fields, click/move/drag detail strings, and the zoom out-of-bounds error message. Pure +
+/// unit-tested.
+func cuSafeInt(_ v: Double) -> Int {
+    if v.isNaN { return 0 }
+    return Int(min(max(v, -100_000), 100_000))
+}
+
+/// The one modifier-token → CGEventFlags map, shared by `parseChord` (chord strings like "cmd+s")
+/// and `cuModifierFlags` (the click/drag `modifiers` array). Pure.
+func cuModifierFlag(for token: String) -> CGEventFlags? {
+    switch token {
+    case "cmd", "command", "⌘": return .maskCommand
+    case "shift", "⇧": return .maskShift
+    case "ctrl", "control", "⌃": return .maskControl
+    case "opt", "option", "alt", "⌥": return .maskAlternate
+    case "fn": return .maskSecondaryFn
+    default: return nil
+    }
+}
+
+/// Fold a `modifiers` array (["shift","cmd"]) into CGEventFlags; nil on any unknown token so a
+/// typo'd modifier is a typed error, not a silently-unmodified click. Pure + unit-tested.
+func cuModifierFlags(from tokens: [String]?) -> CGEventFlags? {
+    var flags: CGEventFlags = []
+    for token in tokens ?? [] {
+        guard let f = cuModifierFlag(for: token.lowercased()) else { return nil }
+        flags.insert(f)
+    }
+    return flags
+}
+
+private let cuValidButtons: Set<String> = ["left", "right", "middle"]
+
 /// Parse `payloadJson` and validate its `op` belongs to the lease `class` it arrived on
-/// (screenshot→screenshot, ax-read→ax_snapshot, input-drive→click/move/type/key/scroll). Returns a
-/// typed `ComputerError` on any malformed/mismatched payload — the provider forwards its `message`
-/// as the call's `error`. Pure + fully unit-tested.
+/// (screenshot→screenshot/zoom, ax-read→ax_snapshot, input-drive→click/move/drag/type/key/scroll).
+/// Returns a typed `ComputerError` on any malformed/mismatched payload — the provider forwards its
+/// `message` as the call's `error`. Pure + fully unit-tested. (`wait` never reaches the provider —
+/// core handles it locally with no peripheral call.)
 func parseComputerPayload(cls: String, payloadJson: String) -> Result<ComputerOp, ComputerError> {
     guard let raw = try? JSONDecoder().decode(RawPayload.self, from: Data(payloadJson.utf8)) else {
         return .failure(ComputerError(message: "invalid computer payload"))
@@ -96,14 +163,29 @@ func parseComputerPayload(cls: String, payloadJson: String) -> Result<ComputerOp
     switch (cls, raw.op) {
     case ("screenshot", "screenshot"):
         return .success(.screenshot(maxDim: raw.maxDim))
+    case ("screenshot", "zoom"):
+        guard let x = raw.x, let y = raw.y, let w = raw.width, let h = raw.height, w > 0, h > 0 else {
+            return .failure(ComputerError(message: "zoom needs a region: x, y (origin) and positive width, height"))
+        }
+        return .success(.zoom(x: x, y: y, width: w, height: h, maxDim: raw.maxDim))
     case ("ax-read", "ax_snapshot"):
         return .success(.axSnapshot)
     case ("input-drive", "click"):
         guard let t = resolveTarget(raw.target) else { return .failure(ComputerError(message: "click needs a target (element_id or x,y)")) }
-        return .success(.click(target: t, button: raw.button ?? "left", clicks: max(1, raw.clicks ?? 1)))
+        let button = raw.button ?? "left"
+        guard cuValidButtons.contains(button) else { return .failure(ComputerError(message: "unknown mouse button '\(button)'")) }
+        guard let mods = cuModifierFlags(from: raw.modifiers) else { return .failure(ComputerError(message: "unknown modifier in \(raw.modifiers ?? [])")) }
+        // clicks clamped to 1...3 (single/double/triple) — defensive against a provider ignoring
+        // the core schema's own 1-3 bound.
+        return .success(.click(target: t, button: button, clicks: min(max(1, raw.clicks ?? 1), 3), modifiers: mods))
     case ("input-drive", "move"):
         guard let t = resolveTarget(raw.target) else { return .failure(ComputerError(message: "move needs a target (element_id or x,y)")) }
         return .success(.move(target: t))
+    case ("input-drive", "drag"):
+        guard let from = resolveTarget(raw.from) else { return .failure(ComputerError(message: "drag needs a `from` target (element_id or x,y)")) }
+        guard let to = resolveTarget(raw.to) else { return .failure(ComputerError(message: "drag needs a `to` target (element_id or x,y)")) }
+        guard let mods = cuModifierFlags(from: raw.modifiers) else { return .failure(ComputerError(message: "unknown modifier in \(raw.modifiers ?? [])")) }
+        return .success(.drag(from: from, to: to, modifiers: mods))
     case ("input-drive", "type"):
         guard let text = raw.text else { return .failure(ComputerError(message: "type needs text")) }
         return .success(.type(text: text))
@@ -111,12 +193,10 @@ func parseComputerPayload(cls: String, payloadJson: String) -> Result<ComputerOp
         guard let keys = raw.keys, !keys.isEmpty else { return .failure(ComputerError(message: "key needs a chord")) }
         return .success(.key(keys: keys))
     case ("input-drive", "scroll"):
-        // Clamp BEFORE Int conversion: `Int(_: Double)` is a TRAPPING conversion, and dx/dy are
-        // model-controlled doubles (core's zod schema is a bare z.number()) — an absurd value like
-        // 1e40 must become a bounded scroll, not a fatalError on the main actor. ±100_000 px is far
-        // beyond any real scroll intent and safely inside Int32 for the CGEvent wheel fields.
-        let clamp = { (v: Double) -> Int in Int(min(max(v, -100_000), 100_000)) }
-        return .success(.scroll(target: resolveTarget(raw.target), dx: clamp(raw.dx ?? 0), dy: clamp(raw.dy ?? 0)))
+        // cuSafeInt clamps BEFORE the trapping Int conversion — dx/dy are model-controlled doubles
+        // (core's zod schema is a bare z.number()), so 1e40/Inf/NaN must become a bounded scroll,
+        // not a fatalError on the main actor. See cuSafeInt's doc comment.
+        return .success(.scroll(target: resolveTarget(raw.target), dx: cuSafeInt(raw.dx ?? 0), dy: cuSafeInt(raw.dy ?? 0)))
     default:
         return .failure(ComputerError(message: "op '\(raw.op)' is not valid for class '\(cls)'"))
     }
@@ -167,19 +247,17 @@ struct CUChord: Equatable {
 
 /// Parse a chord like "cmd+shift+4" / "return" / "a" into modifier flags + a virtual keycode. Pure
 /// + unit-tested (no CGEvent posting — just the mapping). Returns nil for an unknown key token.
+/// Modifier tokens share `cuModifierFlag` with the click/drag `modifiers` array — one map, both
+/// surfaces.
 func parseChord(_ chord: String) -> CUChord? {
     let tokens = chord.lowercased().split(separator: "+").map { String($0).trimmingCharacters(in: .whitespaces) }
     guard !tokens.isEmpty else { return nil }
     var flags: CGEventFlags = []
     var keyCode: CGKeyCode?
     for token in tokens {
-        switch token {
-        case "cmd", "command", "⌘": flags.insert(.maskCommand)
-        case "shift", "⇧": flags.insert(.maskShift)
-        case "ctrl", "control", "⌃": flags.insert(.maskControl)
-        case "opt", "option", "alt", "⌥": flags.insert(.maskAlternate)
-        case "fn": flags.insert(.maskSecondaryFn)
-        default:
+        if let flag = cuModifierFlag(for: token) {
+            flags.insert(flag)
+        } else {
             guard let code = cuKeyCode(for: token) else { return nil }
             keyCode = code
         }
@@ -257,16 +335,21 @@ final class LiveComputerCapabilities: ComputerCapabilities {
         switch op {
         case .screenshot(let maxDim):
             return .screenshot(try await captureScreen(maxDim: maxDim ?? cuDefaultScreenshotMaxDim))
+        case .zoom(let x, let y, let width, let height, let maxDim):
+            return .screenshot(try await captureRegion(x: x, y: y, width: width, height: height, maxDim: maxDim ?? cuDefaultScreenshotMaxDim))
         case .axSnapshot:
             return .text(try snapshotAX())
-        case .click(let target, let button, let clicks):
+        case .click(let target, let button, let clicks, let modifiers):
             try requireInputTrust()
-            return .detail(try click(target: target, button: button, clicks: clicks))
+            return .detail(try click(target: target, button: button, clicks: clicks, modifiers: modifiers))
         case .move(let target):
             try requireInputTrust()
             let p = try point(for: target)
             postMouse(type: .mouseMoved, at: p, button: .left)
-            return .detail("moved to (\(Int(p.x)),\(Int(p.y)))")
+            return .detail("moved to (\(cuSafeInt(p.x)),\(cuSafeInt(p.y)))")
+        case .drag(let from, let to, let modifiers):
+            try requireInputTrust()
+            return .detail(try await drag(from: from, to: to, modifiers: modifiers))
         case .type(let text):
             try requireInputTrust()
             try typeText(text)
@@ -286,23 +369,24 @@ final class LiveComputerCapabilities: ComputerCapabilities {
     /// EVERY input-drive op must be gated on Accessibility trust — without it macOS silently
     /// discards posted CGEvents, so an unguarded path would report "clicked (x,y)" for a click
     /// that never happened and send the CU loop into confident hallucination. One guard for all
-    /// five input ops (click/move/type/key/scroll), same actionable message everywhere.
+    /// six input ops (click/move/drag/type/key/scroll), same actionable message everywhere.
     private func requireInputTrust() throws {
         guard AXIsProcessTrusted() else {
             throw ComputerError(message: "accessibility permission not granted — grant Norma in System Settings › Privacy & Security › Accessibility, then retry")
         }
     }
 
-    // MARK: screenshot
+    // MARK: screenshot / zoom
 
-    private func captureScreen(maxDim: Int) async throws -> CUScreenshot {
+    /// One-shot point-resolution capture of the main display — shared by full-screen `screenshot`
+    /// and region `zoom`. CGDisplayCreateImage is unavailable in the current SDK — capture via
+    /// ScreenCaptureKit's SCScreenshotManager (macOS 14+). Point resolution keeps image pixels ==
+    /// screen points (the ax_snapshot/CGEvent coordinate space) and bounds the base64 payload.
+    private func captureMainDisplayImage() async throws -> CGImage {
         guard CGPreflightScreenCaptureAccess() else {
             _ = CGRequestScreenCaptureAccess() // triggers the system prompt for next time
             throw ComputerError(message: "screen recording permission not granted — grant Norma in System Settings › Privacy & Security › Screen Recording, then retry")
         }
-        // CGDisplayCreateImage is unavailable in the current SDK — capture via ScreenCaptureKit's
-        // one-shot SCScreenshotManager (macOS 14+). A point-resolution capture of the main display
-        // is plenty for grounding and keeps the base64 well under the NDJSON line cap.
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         // Pick the MAIN display explicitly — SCShareableContent.displays order is undocumented, and
         // `first` on a multi-display Mac could capture a secondary screen while ax_snapshot
@@ -316,19 +400,45 @@ final class LiveComputerCapabilities: ComputerCapabilities {
         let config = SCStreamConfiguration()
         config.width = display.width
         config.height = display.height
-        let image: CGImage
         do {
-            image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
         } catch {
             throw ComputerError(message: "screen capture failed (\(error.localizedDescription)) — is screen recording permission granted?")
         }
+    }
+
+    private func encodeShot(_ image: CGImage, maxDim: Int, originX: Int? = nil, originY: Int? = nil) throws -> CUScreenshot {
         let srcW = image.width, srcH = image.height
         let (dstW, dstH) = cuDownscaledSize(width: srcW, height: srcH, maxDim: maxDim)
         guard let png = pngData(from: image, width: dstW, height: dstH) else {
             throw ComputerError(message: "screenshot encode failed")
         }
         let dataUrl = "data:image/png;base64,\(png.base64EncodedString())"
-        return CUScreenshot(dataUrl: dataUrl, width: srcW, height: srcH, scaledWidth: dstW, scaledHeight: dstH)
+        return CUScreenshot(dataUrl: dataUrl, width: srcW, height: srcH, scaledWidth: dstW, scaledHeight: dstH, originX: originX, originY: originY)
+    }
+
+    private func captureScreen(maxDim: Int) async throws -> CUScreenshot {
+        try encodeShot(try await captureMainDisplayImage(), maxDim: maxDim)
+    }
+
+    /// Zoom: crop the point-resolution capture to the requested region (screen points, top-left
+    /// origin — the same space ax_snapshot coordinates live in), clamped to the display bounds.
+    /// The region is usually well under maxDim, so the model sees it at FULL detail — the
+    /// dense-UI/Retina grounding path without raising the global downscale cap.
+    private func captureRegion(x: Double, y: Double, width: Double, height: Double, maxDim: Int) async throws -> CUScreenshot {
+        let image = try await captureMainDisplayImage()
+        let bounds = CGRect(x: 0, y: 0, width: CGFloat(image.width), height: CGFloat(image.height))
+        let requested = CGRect(x: x, y: y, width: width, height: height)
+        let region = requested.intersection(bounds).integral
+        guard !region.isNull, region.width >= 1, region.height >= 1 else {
+            throw ComputerError(message: "zoom region (\(cuSafeInt(x)),\(cuSafeInt(y)) \(cuSafeInt(width))×\(cuSafeInt(height))) is outside the screen (\(image.width)×\(image.height))")
+        }
+        guard let cropped = image.cropping(to: region) else {
+            throw ComputerError(message: "zoom crop failed")
+        }
+        // region is the intersection with display bounds (finite, in-range) so Int() here is
+        // already safe — routed through cuSafeInt anyway for one uniform coordinate→Int path.
+        return try encodeShot(cropped, maxDim: maxDim, originX: cuSafeInt(region.origin.x), originY: cuSafeInt(region.origin.y))
     }
 
     private func pngData(from image: CGImage, width: Int, height: Int) -> Data? {
@@ -426,26 +536,57 @@ final class LiveComputerCapabilities: ComputerCapabilities {
         }
     }
 
-    private func click(target: CUTarget, button: String, clicks: Int) throws -> String {
-        // AX-PRIMARY: for an element target, try the native press action first (targets the element,
-        // not a pixel). Fall back to a synthesized click at the element's center on any failure.
-        if case .element(let id) = target, let el = elementCache[id], clicks == 1, button == "left" {
+    /// Button-name → (CGMouseButton, down/up/drag event types). "middle" rides CGMouseButton.center
+    /// with the .otherMouse* event family (that is how macOS models any non-left/right button).
+    private func buttonEvents(_ button: String) -> (button: CGMouseButton, down: CGEventType, up: CGEventType, dragged: CGEventType) {
+        switch button {
+        case "right": return (.right, .rightMouseDown, .rightMouseUp, .rightMouseDragged)
+        case "middle": return (.center, .otherMouseDown, .otherMouseUp, .otherMouseDragged)
+        default: return (.left, .leftMouseDown, .leftMouseUp, .leftMouseDragged)
+        }
+    }
+
+    private func click(target: CUTarget, button: String, clicks: Int, modifiers: CGEventFlags) throws -> String {
+        // AX-PRIMARY: for a PLAIN element click (single, left, unmodified), try the native press
+        // action first (targets the element, not a pixel). Modified/multi/other-button clicks fall
+        // through to synthesis — AXPress cannot express them.
+        if case .element(let id) = target, let el = elementCache[id], clicks == 1, button == "left", modifiers.isEmpty {
             if AXUIElementPerformAction(el, kAXPressAction as CFString) == .success { return "pressed element #\(id)" }
         }
         let p = try point(for: target)
-        let cgButton: CGMouseButton = button == "right" ? .right : .left
-        let down: CGEventType = cgButton == .right ? .rightMouseDown : .leftMouseDown
-        let up: CGEventType = cgButton == .right ? .rightMouseUp : .leftMouseUp
+        let ev = buttonEvents(button)
         for i in 1...max(1, clicks) {
-            postMouse(type: down, at: p, button: cgButton, clickCount: i)
-            postMouse(type: up, at: p, button: cgButton, clickCount: i)
+            postMouse(type: ev.down, at: p, button: ev.button, clickCount: i, flags: modifiers)
+            postMouse(type: ev.up, at: p, button: ev.button, clickCount: i, flags: modifiers)
         }
-        return "clicked (\(Int(p.x)),\(Int(p.y)))"
+        let mods = modifiers.isEmpty ? "" : " (modified)"
+        return "clicked (\(cuSafeInt(p.x)),\(cuSafeInt(p.y)))\(mods)"
     }
 
-    private func postMouse(type: CGEventType, at point: CGPoint, button: CGMouseButton, clickCount: Int = 1) {
+    /// Drag: press at `from`, glide through interpolated dragged events (apps ignore a teleporting
+    /// drag — they need intermediate positions + real time), release at `to`. Modifier flags ride
+    /// every event of the sequence (shift-drag constrains axes, cmd-drag in some apps).
+    private func drag(from: CUTarget, to: CUTarget, modifiers: CGEventFlags) async throws -> String {
+        let a = try point(for: from)
+        let b = try point(for: to)
+        let ev = buttonEvents("left")
+        let steps = 12
+        postMouse(type: .mouseMoved, at: a, button: ev.button, flags: modifiers)
+        postMouse(type: ev.down, at: a, button: ev.button, flags: modifiers)
+        for i in 1...steps {
+            let t = Double(i) / Double(steps)
+            let p = CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)
+            postMouse(type: ev.dragged, at: p, button: ev.button, flags: modifiers)
+            try? await Task.sleep(nanoseconds: 15_000_000) // ~15ms per step ≈ 180ms total glide
+        }
+        postMouse(type: ev.up, at: b, button: ev.button, flags: modifiers)
+        return "dragged (\(cuSafeInt(a.x)),\(cuSafeInt(a.y))) → (\(cuSafeInt(b.x)),\(cuSafeInt(b.y)))"
+    }
+
+    private func postMouse(type: CGEventType, at point: CGPoint, button: CGMouseButton, clickCount: Int = 1, flags: CGEventFlags = []) {
         guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: button) else { return }
         if clickCount > 1 { event.setIntegerValueField(.mouseEventClickState, value: Int64(clickCount)) }
+        if !flags.isEmpty { event.flags = flags }
         event.post(tap: .cghidEventTap)
     }
 
@@ -491,13 +632,20 @@ func encodeCUResult(_ result: CUResult) -> String? {
     let value: JSONValue
     switch result {
     case .screenshot(let s):
-        value = .object([
+        var fields: [String: JSONValue] = [
             "dataUrl": .string(s.dataUrl),
             "width": .number(Double(s.width)),
             "height": .number(Double(s.height)),
             "scaledWidth": .number(Double(s.scaledWidth)),
             "scaledHeight": .number(Double(s.scaledHeight)),
-        ])
+        ]
+        // Zoom region origin (screen points) — the core tool relays this to the model so image
+        // positions can be mapped back to screen coordinates. Absent for full-screen captures.
+        if let ox = s.originX, let oy = s.originY {
+            fields["originX"] = .number(Double(ox))
+            fields["originY"] = .number(Double(oy))
+        }
+        value = .object(fields)
     case .text(let t):
         value = .object(["text": .string(t)])
     case .detail(let d):
