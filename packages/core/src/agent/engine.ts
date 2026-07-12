@@ -180,6 +180,11 @@ export interface EngineConfig {
 
 export class AgentEngine {
   private runningTurns = new Set<string>();
+  // bg-retrigger Task 2: sessionIds with a detached-agent completion that landed WHILE a turn was
+  // already running for that session — notifyBgCompletion sets this instead of starting a
+  // reentrant turn; runTurn's finally drains it (starts exactly one follow-up turn) once the
+  // in-flight turn settles, UNLESS that turn ended via interrupt() (see runTurn's finally).
+  private retriggerPending = new Set<string>();
   private steerQueue = new Map<string, string[]>();
   // 4h-ii-b Task 4 (CC SendMessage): per-CHILD-THREAD steer queue, keyed by threadId (globally
   // unique th_<uuid>) — SEPARATE from the sessionId-keyed `steerQueue` above, which stays
@@ -263,6 +268,13 @@ export class AgentEngine {
       this.runningTurns.delete(sessionId);
       this.aborters.delete(sessionId);
       this.steerQueue.delete(sessionId);
+      if (this.retriggerPending.delete(sessionId) && !ac.signal.aborted) {
+        // A detached agent finished mid-turn; its task_notification is already persisted. Drain it
+        // now (CC parity: between-turns queue drain) so the model reacts without a user message.
+        // An esc-aborted turn deliberately drops the drain — don't fight the user's interrupt; the
+        // persisted event reaches the model on their next send.
+        void this.runTurn(sessionId).catch((err) => console.error("bg-notification drain failed:", err));
+      }
     }
   }
 
@@ -440,6 +452,10 @@ export class AgentEngine {
     // history-parity Task 3: opaque reasoning items replay verbatim (CC/Codex parity). This ONE
     // case gives BOTH historyInput (cross-turn) and childHistoryInput (subagent resume) the replay.
     if (e.type === "reasoning_item") return { type: "reasoning", itemJson: e.itemJson };
+    // bg-retrigger Task 1: a persisted bg-agent completion notice (engine.ts's `notifyBgCompletion`)
+    // replays as a plain user-role message — same shape as `user_message` above — so the model
+    // learns a detached agent finished without a user keystroke (CC parity).
+    if (e.type === "task_notification") return { type: "message", role: "user", content: e.content };
     return null;
   }
 
@@ -519,11 +535,13 @@ export class AgentEngine {
     return this.normalizeReplayOrder(input);
   }
 
-  // Shared by every <system-reminder> builder below (taskListReminder, buildBgCompletionReminder):
-  // reminder blocks interpolate model/tool-authored strings (task subjects, subagent result text)
-  // that may carry attacker-influenced content — newlines would inject fake reminder lines, and a
-  // literal </system-reminder> would close the block early, leaving durable ambient "system" text
-  // in-context on every later turn. Sanitize before embedding, always.
+  // Shared by every <system-reminder> builder below (taskListReminder) AND by notifyBgCompletion's
+  // persisted <task-notification>: both interpolate model/tool-authored strings (task subjects,
+  // subagent name/result text) that may carry attacker-influenced content — newlines would inject
+  // fake reminder/notification lines, and a literal closing tag would close the block early,
+  // leaving durable ambient text in-context on every later turn (a persisted task_notification is
+  // replayed on EVERY future turn, same durability concern as a reminder). Sanitize before
+  // embedding, always.
   private sanitizeForReminder(s: string): string {
     return s.replace(/\r?\n/g, " ").replace(/<\/?system-reminder>/gi, "[tag]");
   }
@@ -614,39 +632,40 @@ export class AgentEngine {
     return { type: "message", role: "user", content };
   }
 
-  /** Per-turn background-agent completion reminder (CC parity: Agent completion notices) — a
-   *  `run_in_background` child (4h-ii-a spawn_agent) finishes DETACHED, off the parent's own
-   *  turn, so nothing tells the model a bg agent it kicked off is done unless something injects
-   *  it. Mirrors `taskListReminder` above in every structural way (same "user" message wrapped in
-   *  an explicit <system-reminder> tag, same ASSEMBLED-INPUT-ONLY / never-persisted contract, same
-   *  call site in `turn()`) with ONE deliberate difference: this builder is NOT pure/idempotent.
-   *  `registry.takeCompletedForSession` marks every entry it returns `notified: true` as a
-   *  side effect — so this method must be called EXACTLY ONCE per turn, and only where its result
-   *  is actually used, never speculatively or twice. That side effect is what makes the
-   *  notification fire exactly once (the turn AFTER the agent finished): a second call this same
-   *  turn, or a call whose result is discarded, silently loses that agent's notification forever.
-   *  Returns undefined when there's nothing to remind about (no BackgroundAgentRegistry wired, or
-   *  no unnotified terminal entries) so `turn()` can skip appending entirely — byte-identical
-   *  turn input when no bg agent has finished. */
-  private buildBgCompletionReminder(sessionId: string): TurnInputItem | undefined {
-    if (!this.cfg.bgAgents) return undefined;
-    const finished = this.cfg.bgAgents.takeCompletedForSession(sessionId);
-    if (finished.length === 0) return undefined;
-    const lines = finished.map((e) => {
-      // `result` is only set by registry.complete() — a `stop()`-terminated entry never gets one,
-      // so this must tolerate undefined rather than assume every terminal entry has a result.
-      const resultHead = this.sanitizeForReminder((e.result ?? "").slice(0, 120));
-      // sanitize the label too: agentId is a safe th_+uuid today, but `name` becomes model-supplied
-      // in 4h-ii-b — route it through sanitizeForReminder now so it can never inject a fake block.
-      return `- agent ${this.sanitizeForReminder(e.name ?? e.agentId)} finished (${e.status}): ${resultHead}`;
-    }).join("\n");
-    const content = "<system-reminder>\nBackground agent"
-      + (finished.length > 1 ? "s" : "")
-      + " finished since your last turn:\n"
-      + lines
-      + "\nRead an agent's full output or resume it with spawn_agent {resume: <agentId>} (resume lands in 4h-ii-b) — for now use its result above."
-      + "\nThis reminder is invisible to the user — never mention it.\n</system-reminder>";
-    return { type: "message", role: "user", content };
+  /** Persists a detached child's completion as a task_notification history event (CC parity — the
+   *  <task-notification> block LocalAgentTask builds; see the bg-retrigger spec). Exactly-once via
+   *  registry.takeForNotification (single-consumer claim: a sync spawn's completion is registered
+   *  notified:true and can never be claimed; task_stop marks its own target notified in-turn).
+   *  Replaces the retired per-turn <system-reminder> sweep (buildBgCompletionReminder): the notice
+   *  is now a durable main-thread event, replayed user-role by eventToInput on every later turn.
+   *  Task 2 adds the wake (idle turn / between-turns drain) here. */
+  private notifyBgCompletion(sessionId: string, agentId: string): void {
+    const e = this.cfg.bgAgents?.takeForNotification(agentId);
+    if (!e) return;
+    // sanitize BOTH interpolations: `name` is model-supplied, `result` is subagent-authored — see
+    // sanitizeForReminder's doc comment above (a persisted event replays on every later turn, so
+    // injected structure would be durable). `result` is only set by registry.complete() — a
+    // stop()-terminated entry never gets one, so the <result> line is omitted entirely then.
+    // LOCAL hardening on top of sanitizeForReminder (which is shared with the <system-reminder>
+    // builders and deliberately untouched): entity-escape a literal closing task-notification tag
+    // (any casing/inner whitespace) so a hostile result can't close THIS block early — the real
+    // closing tag below must stay the only one.
+    const clean = (s: string) => this.sanitizeForReminder(s).replace(/<\/\s*task-notification\s*>/gi, "&lt;/task-notification&gt;");
+    const label = clean(e.name ?? e.agentId);
+    const summary = e.status === "completed" ? `Agent "${label}" completed`
+      : e.status === "failed" ? `Agent "${label}" failed`
+      : e.status === "timeout" ? `Agent "${label}" timed out`
+      : `Agent "${label}" was stopped`;
+    const result = e.result ? `\n<result>${clean(e.result)}</result>` : "";
+    const content = `<task-notification>\n<task-id>${e.agentId}</task-id>\n<status>${e.status}</status>\n<summary>${summary}</summary>${result}\n</task-notification>`;
+    this.cfg.hub.append(sessionId, { type: "task_notification", sessionId, threadId: MAIN_THREAD, content });
+    // bg-retrigger Task 2 (CC parity: background-agent wake): if a turn is already running for
+    // this session, defer — runTurn's finally drains it once that turn settles (between-turns
+    // queue drain). Otherwise the session is idle right now, so start a fresh turn immediately;
+    // the event above is already in history, so that turn's own replay carries it to the model.
+    if (this.isRunning(sessionId)) { this.retriggerPending.add(sessionId); return; }
+    // steer()'s idle idiom: the event is already in history; a fresh turn replays it.
+    void this.runTurn(sessionId).catch((err) => console.error("bg-notification turn failed:", err));
   }
 
   // Computed ONCE per turn by turn() (same one-per-turn rule as `instructions` itself) — a
@@ -724,13 +743,10 @@ export class AgentEngine {
     // persisted event) and why it's a "user" message rather than a new TurnInputItem role.
     const taskReminder = this.taskListReminder(sessionId);
     if (taskReminder) input.push(taskReminder);
-    // Same call site/contract as taskReminder above (transient, appended once, never persisted)
-    // — this method's own doc comment covers why it must be called exactly once, right here,
-    // with its result used immediately. `turn()` is the MAIN-thread (depth 0) entry point only —
-    // subagent threads run through `runThread` directly via the spawn bridge, never through
-    // `turn()` — so this site is inherently main-thread-scoped without an extra depth check.
-    const bgReminder = this.buildBgCompletionReminder(sessionId);
-    if (bgReminder) input.push(bgReminder);
+    // NOTE (bg-retrigger Task 1): the old per-turn bg-completion reminder call site lived here
+    // (buildBgCompletionReminder) — retired. A detached child's completion is now PERSISTED as a
+    // task_notification event at settle time (notifyBgCompletion, called from the detached
+    // chain's .then/.catch) and replays via historyInput's eventToInput above like any message.
 
     // [4f session-start] Fire the session-start hook ONCE per sessionId per daemon process, at the
     // MAIN thread's turn start, BEFORE the first provider round (runThread) below — CC SessionStart
@@ -739,7 +755,7 @@ export class AgentEngine {
     // result with NON-EMPTY stdout becomes ONE <system-reminder> "user" message appended to THIS
     // turn's input — same assembled-input-only / never-persisted contract and same
     // sanitizeForReminder pass (newlines→spaces + literal </system-reminder>→[tag]) as
-    // taskListReminder/buildBgCompletionReminder, so hook stdout can't inject a fake reminder block.
+    // taskListReminder, so hook stdout can't inject a fake reminder block.
     // error/timeout results (F2 fail-open) and ok-with-empty-stdout inject nothing. extra: {cwd}.
     if (this.cfg.hooks && !this.hookSessionStarted.has(sessionId)) {
       this.hookSessionStarted.add(sessionId);
@@ -1335,8 +1351,8 @@ export class AgentEngine {
                 // Same outcome shape as the synchronous path's spawnOutcomes.set below (Defect 2,
                 // 4e gate F10) — a completed-but-errored child (result.ok, stopReason "error")
                 // reports as a failure, not a quiet success. This result is only READ later — by
-                // the completion reminder (a separate 4h-ii-a task, not built here) or a future
-                // resume/get — never by this already-returned tool_result.
+                // notifyBgCompletion just below (persisted <result>) or a future resume/get —
+                // never by this already-returned tool_result.
                 this.cfg.bgAgents!.complete(childId, !result.ok
                   ? { ok: false, result: `subagent (${agentType ?? "general-purpose"}) ${result.error}` }
                   : result.value.stopReason === "error"
@@ -1346,6 +1362,10 @@ export class AgentEngine {
                   // call itself now runs with `timeoutMs: null`, above) — wired now so a timed-out
                   // detached child is never misreported as a generic "failed" once one exists.
                   !result.ok && result.timedOut ? { timedOut: true } : undefined);
+                // bg-retrigger Task 1: LAST — after complete() above, so the claim sees the
+                // terminal status/result, and after the thread_completed emit (event order:
+                // completion first, notification second).
+                this.notifyBgCompletion(sessionId, childId);
               })
               .catch((err) => {
                 // Defensive only — SubagentManager.run() itself never throws (see its own doc
@@ -1355,6 +1375,10 @@ export class AgentEngine {
                 this.emit(sessionId, { type: "thread_completed", sessionId, threadId: childId, stopReason: "error" });
                 this.completeThread(sessionId, childId, "error");
                 this.cfg.bgAgents!.complete(childId, { ok: false, result: message });
+                // bg-retrigger Task 1: LAST, mirroring the .then above — takeForNotification's
+                // single-consumer claim makes a double persist impossible even if the .then
+                // already notified before throwing.
+                this.notifyBgCompletion(sessionId, childId);
               })
               .finally(() => {
                 // 4h-i Task 4 teardown, mirrored for the detached path — see the synchronous
@@ -1492,10 +1516,10 @@ export class AgentEngine {
                 : { output: result.value.finalText || "the subagent finished without a final message", isError: false };
             spawnOutcomes.set(call.callId, outcome);
             // { notified: true } — this sync child's result already reached the parent directly
-            // as this SAME call's tool_result, this SAME turn; without this the next turn's
-            // buildBgCompletionReminder sweep (built for run_in_background's DETACHED
-            // completions) would re-surface it as a "background agent finished" reminder,
-            // leaking the child's raw output into a turn that never asked for it (see
+            // as this SAME call's tool_result, this SAME turn; without this a later
+            // takeForNotification claim (notifyBgCompletion, built for run_in_background's
+            // DETACHED completions) could persist it as a task_notification too, leaking the
+            // child's raw output into a turn that never asked for it (see
             // BackgroundAgentRegistry.complete's own doc comment).
             // 4h-ii-c: this sync spawn's own `subagents.run` call above is UNCHANGED (no
             // `timeoutMs` override — still the constructor default, 300s), but `timedOut` is
@@ -1949,6 +1973,10 @@ export class AgentEngine {
             // `timeoutMs: null` above) — wired now, same as the fresh bg spawn's `.then`, so a
             // timed-out resumed child is never misreported as generic "failed".
             !result.ok && result.timedOut ? { timedOut: true } : undefined);
+          // bg-retrigger T1 (concern fix): LAST, exactly like the fresh detached spawn's `.then` —
+          // a detached RESUME completion is as invisible to the parent as a fresh bg spawn's, and
+          // reopen() reset `notified`, so the resumed run's OWN completion notifies again (CC parity).
+          this.notifyBgCompletion(sessionId, entry.agentId);
         })
         .catch((err) => {
           // Defensive: SubagentManager.run() never throws; this guards a throw in the .then handler
@@ -1957,6 +1985,9 @@ export class AgentEngine {
           this.emit(sessionId, { type: "thread_completed", sessionId, threadId: entry.threadId, stopReason: "error" });
           this.completeThread(sessionId, entry.threadId, "error");
           this.cfg.bgAgents!.complete(entry.agentId, { ok: false, result: message });
+          // bg-retrigger T1 (concern fix): LAST, mirroring the `.then` above — the single-consumer
+          // claim makes a double persist impossible even if the .then already notified before throwing.
+          this.notifyBgCompletion(sessionId, entry.agentId);
         })
         .catch(() => { /* terminal net: a throw in the .catch above (persistent IO fault on the completion emit) has no caller to surface to on a detached run — swallow rather than emit an unhandled rejection */ });
       return { output: JSON.stringify({ agentId: entry.threadId, status: "running" }), isError: false };
@@ -1972,7 +2003,7 @@ export class AgentEngine {
         ? { output: `subagent (${agentType}) failed: ${result.value.errorMessage ?? "provider error"}`, isError: true }
         : { output: result.value.finalText || "the subagent finished without a final message", isError: false };
     // { notified: true }: this sync resume's result reached the caller directly as its own
-    // tool_result this same turn, so the next turn's completion-reminder sweep must not re-surface
+    // tool_result this same turn, so a later takeForNotification claim must never re-surface
     // it (same reasoning as the fresh sync path). `timedOut` (4h-ii-c): the sync resume's run()
     // call above is still on the constructor-default clock (no override), so a timeout IS
     // reachable here — mirror the fresh sync path's threading so it reports "timeout", not "failed".

@@ -16,7 +16,7 @@
 // 4h-ii-c: "timeout" — a bg spawn whose SubagentManager.run() call rejected via its own clock
 // (SubagentResult.timedOut:true) reports distinctly from a generic "failed", so a client can
 // render/handle "timed out" separately from "errored". TERMINAL like completed/failed/stopped:
-// takeCompletedForSession surfaces it (unnotified), reopen() accepts it, stop() rejects it — see
+// takeForNotification surfaces it (unnotified), reopen() accepts it, stop() rejects it — see
 // each method's own doc comment; none needed a code change for the new status, since all three
 // already key off "running" vs. "not running" rather than an enumerated terminal set.
 export type AgentStatus = "running" | "completed" | "failed" | "stopped" | "timeout";
@@ -119,12 +119,12 @@ export class BackgroundAgentRegistry {
   /** running → completed|failed|timeout, stores the result. No-op if unknown or already terminal.
    *  `opts.notified` (4h-ii-b Task 1): set `true` for a SYNC spawn's own completion — the
    *  synchronous caller already received this result directly as its tool_result, in the SAME
-   *  turn, so `takeCompletedForSession`'s later completion-reminder sweep (engine.ts's
-   *  `buildBgCompletionReminder`, built for `run_in_background`'s DETACHED completions) must
+   *  turn, so `takeForNotification`'s later claim (bg-retrigger Task 1: engine.ts's
+   *  `notifyBgCompletion`, built for `run_in_background`'s DETACHED completions) must
    *  never re-surface it on a future turn — that would leak the child's raw result text into a
    *  turn that never asked for it (Seam #1: a child's internal output must stay scoped to its own
    *  turn). Omitted/false (the `run_in_background` path's own call site) is unchanged: a bg
-   *  completion starts unnotified so the sweep picks it up exactly once.
+   *  completion starts unnotified so the claim picks it up exactly once.
    *  `opts.timedOut` (4h-ii-c): set `true` when this completion is reporting a
    *  SubagentResult.timedOut:true (the child's own SubagentManager.run() call hit its clock) —
    *  status becomes `"timeout"` instead of the outcome.ok-derived completed/failed, so a timed-
@@ -143,14 +143,14 @@ export class BackgroundAgentRegistry {
    * registration is a caller bug there), so resume needs this dedicated re-open path instead.
    *
    * If the entry exists AND is terminal (completed/failed/stopped/timeout): flips status → running, clears
-   * the stale `result`, resets `notified` to false (so the resumed run's OWN completion reminder
+   * the stale `result`, resets `notified` to false (so the resumed run's OWN completion notice
    * re-fires — CC parity: a resumed agent that finishes again notifies again), and swaps in the
    * resume attempt's fresh AbortController (`abort` is never reused across runs). Returns true.
    *
    * If missing, or already running, returns false and does nothing — both cases the bridge already
    * guards (unknown → "no agent to resume"; running → "still running, use send_message"), so a
    * false here is purely defensive. A reopened (now-running) entry is naturally excluded from
-   * `takeCompletedForSession` again (its status is no longer terminal).
+   * `takeForNotification` again (its status is no longer terminal).
    */
   reopen(agentId: string, abort: AbortController): boolean {
     const e = this.agents.get(agentId);
@@ -197,20 +197,15 @@ export class BackgroundAgentRegistry {
     return [...this.agents.values()].filter((e) => e.sessionId === sessionId);
   }
 
-  /**
-   * Returns terminal (completed/failed/stopped) entries for `sessionId` that
-   * haven't been notified yet, marking each `notified: true` as it's
-   * returned. Idempotent: entries already notified are skipped, so a second
-   * call with no new completions in between returns [].
-   */
-  takeCompletedForSession(sessionId: string): AgentEntry[] {
-    const taken: AgentEntry[] = [];
-    for (const e of this.agents.values()) {
-      if (e.sessionId !== sessionId || e.status === "running" || e.notified) continue;
-      e.notified = true;
-      taken.push(e);
-    }
-    return taken;
+  /** Claims a terminal, not-yet-notified entry for completion-notice persistence: marks it
+   *  notified:true and returns it. Unknown id, still running, or already notified → undefined.
+   *  Single-consumer — at most one caller ever receives a given entry, which is what makes the
+   *  persisted notification exactly-once. */
+  takeForNotification(agentId: string): AgentEntry | undefined {
+    const e = this.agents.get(agentId);
+    if (!e || e.status === "running" || e.notified) return undefined;
+    e.notified = true;
+    return e;
   }
 
   private findByName(sessionId: string, name: string): AgentEntry | undefined {

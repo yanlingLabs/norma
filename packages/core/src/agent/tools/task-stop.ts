@@ -18,10 +18,11 @@ import type { BackgroundTaskRegistry } from "../bg-registry";
  *
  * `entry.notified = true` (mirrors the sync-spawn `complete(..., {notified:true})` reasoning in
  * bg-agent-registry.ts): the CALLER of task_stop receives this tool_result directly, in the SAME
- * turn — the next-turn completion-reminder sweep (`takeCompletedForSession`, built for
- * `run_in_background`'s DETACHED completions) must never re-surface an agent the caller just
- * stopped itself. Set directly on the live entry object (register()'d/returned by the SAME Map) —
- * no new BackgroundAgentRegistry method needed; the entry is a live reference, not a copy.
+ * turn — the detached chain's own eventual settle-time claim (`takeForNotification`, engine.ts's
+ * `notifyBgCompletion`, built for `run_in_background`'s DETACHED completions) must never persist a
+ * task_notification for an agent the caller just stopped itself. Set directly on the live entry
+ * object (register()'d/returned by the SAME Map) — no new BackgroundAgentRegistry method needed;
+ * the entry is a live reference, not a copy.
  */
 export function registerTaskStopTool(
   r: ToolRegistry,

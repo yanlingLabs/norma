@@ -368,6 +368,21 @@ describe("SessionEvent discriminated union", () => {
     expect(parsed.type).toBe("reasoning_item" as SessionEvent["type"]);
     expect(SessionEvent.safeParse({ ...base, threadId: "main", type: "reasoning_item", itemJson: "" }).success).toBe(false);
   });
+
+  // bg-retrigger Task 1 (CC parity): background-agent completion notice — persisted (engine.ts's
+  // notifyBgCompletion) and replayed as a user-role history message so the model learns a detached
+  // agent finished without a user keystroke. Same no-generator-fixture precedent as reasoning_item
+  // above (see this variant's own doc comment in events.ts).
+  test("task_notification round-trips; the union accepts it; empty content rejected", () => {
+    const e = {
+      ...base, threadId: "main", type: "task_notification",
+      content: "<task-notification>\n<task-id>th_1</task-id>\n<status>completed</status>\n<summary>Agent \"th_1\" completed</summary>\n<result>done</result>\n</task-notification>",
+    } as const;
+    const parsed = SessionEvent.parse(e);
+    expect(parsed).toEqual(e);
+    expect(parsed.type).toBe("task_notification" as SessionEvent["type"]);
+    expect(SessionEvent.safeParse({ ...base, threadId: "main", type: "task_notification", content: "" }).success).toBe(false);
+  });
 });
 
 describe("hello method schemas", () => {

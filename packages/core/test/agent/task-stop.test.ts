@@ -195,8 +195,9 @@ describe("AgentEngine: task_stop E2E (4h-ii-c Task 2)", () => {
   // own — it only ends when its combined AbortSignal fires), task_stop it from the main thread,
   // and verify the full lifecycle: tool_result, registry status, thread_completed(aborted), the
   // status STAYING "stopped" after the detached chain's late complete() (already-guaranteed
-  // no-op), and the NEXT turn's completion reminder omitting it (notified was set).
-  test("(a) task_stop aborts a parked bg child; status stays 'stopped' after settling; next-turn reminder omits it", async () => {
+  // no-op), and NO task_notification ever persisted for it (bg-retrigger Task 1: task_stop set
+  // notified in-turn, so the settle-time takeForNotification claim returns undefined).
+  test("(a) task_stop aborts a parked bg child; status stays 'stopped' after settling; no task_notification is persisted", async () => {
     class ParkedChildProvider implements Provider {
       readonly id = "fake";
       readonly requests: TurnRequest[] = [];
@@ -281,13 +282,18 @@ describe("AgentEngine: task_stop E2E (4h-ii-c Task 2)", () => {
     expect(bgAgents.get("worker", sessionId)?.status).toBe("stopped");
     expect(bgAgents.get("worker", sessionId)?.result).toBeUndefined(); // stop() never sets a result; complete() no-op left it unset
 
-    // Next turn: the completion reminder must NOT mention this agent (notified was set by task_stop).
+    // bg-retrigger Task 1: the detached chain's settle-time notifyBgCompletion must NOT have
+    // persisted a task_notification for this agent — task_stop set notified in-turn (the caller
+    // got the stop's tool_result directly), so takeForNotification's claim returned undefined.
+    expect(afterSettle.some((e) => e.type === "task_notification")).toBe(false);
+
+    // Next turn: nothing about this agent rides the input either (no persisted event to replay).
     const baseline = provider.requests.length;
     await engine.runTurn(sessionId); // turn 2
     const turn2Requests = provider.requests.slice(baseline);
-    const reminder = turn2Requests.find((r) =>
-      r.input.some((it) => "content" in it && typeof it.content === "string" && it.content.includes("finished (")));
-    expect(reminder).toBeUndefined();
+    const notified = turn2Requests.find((r) =>
+      r.input.some((it) => "content" in it && typeof it.content === "string" && it.content.includes("<task-notification>")));
+    expect(notified).toBeUndefined();
   });
 
   // PIN coverage: daemon.ts registers task_stop `deferred: true` (mirrors bash_kill) — in
