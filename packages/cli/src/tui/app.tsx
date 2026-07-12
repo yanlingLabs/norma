@@ -25,17 +25,25 @@
  *  `isActive: !state.pending` hook made ctrl+C dead the instant a pending card took over input, and
  *  Ink's own `exitOnCtrlC` is off — see mount.ts — so the app was UNQUITTABLE until the card was
  *  answered):
- *    1. The scroll/toggle hook (active while `!state.pending`, unchanged from 3b): PgUp/PgDn scroll
- *       ±(viewH-1), ctrl+u/ctrl+d ±⌈viewH/2⌉, ctrl+o toggles `verbose`, ctrl+t toggles `tasksVisible`.
- *       It no longer touches ctrl+C at all (moved to #2 below — never duplicated, so the two hooks
- *       never both react to the same keystroke).
+ *    1. The scroll/toggle hook (active while `!state.pending`): PgUp/PgDn scroll ±(viewH-1), ctrl+u
+ *       scrolls UP ⌈viewH/2⌉, ctrl+o toggles `verbose`, ctrl+t toggles `tasksVisible`. It touches
+ *       NEITHER ctrl+C NOR ctrl+D (both owned wholesale by #2 below — never duplicated, so the two
+ *       hooks never both act on the same keystroke; the whole-branch review caught the original
+ *       ctrl+d half-page-down binding double-firing with the exit flow — scroll AND arm on one
+ *       press — so ctrl+d was ceded to the exit hook entirely. Half-page-DOWN is covered by PgDn;
+ *       ctrl+u keeps half-page-up. Spec §5 amended to match).
  *    2. The EXIT hook (Task 5, `isActive: true` UNCONDITIONALLY): double-press ctrl+C (800ms window,
  *       timed off the ticking `nowMs`, never `Date.now`) — first press arms + (if a turn is running)
- *       ALSO interrupts; second press within the window calls `onExitRequest`; window expiry re-arms
- *       cleanly on the next press. ctrl+D drives the identical arm/exit flow, but ONLY when the
- *       composer is empty or unmounted (a pending card owns input) — a non-empty buffer leaves it
- *       inert for this purpose (the scroll hook's own pre-existing ctrl+d binding is untouched
- *       either way). While armed, the footer shows the exact "press again to exit" hint (below).
+ *       ALSO interrupts; second press of the SAME key within the window calls `onExitRequest` (a
+ *       DIFFERENT eligible key inside the window re-arms under that key instead of exiting); window
+ *       expiry re-arms cleanly on the next press. ctrl+D drives the identical arm/exit flow, but
+ *       ONLY when the composer is empty or unmounted (a pending card owns input) — a non-empty
+ *       buffer leaves ctrl+D fully inert (nothing else binds it anymore). While armed, the footer
+ *       shows the exact key-specific "Press Ctrl-C|Ctrl-D again to exit" hint (below).
+ *  Home/End when the composer is EMPTY jump the transcript to its top/bottom (spec §5) — routed
+ *  through the composer's T3 raw side-channel (the single consumer of those byte sequences), which
+ *  calls back into this App's `scrollToTop`/`scrollToBottom` viewport updates instead of running its
+ *  cursor ops; with text in the buffer they keep their cursor semantics and never scroll.
  *  Mouse SGR reports (wheel + any button/motion) are intercepted at the shared stdin input emitter
  *  and swallowed BEFORE any `useInput` consumer (either hook here, the composer's, or a pending
  *  card's) sees them — wheel scrolls ±3, every other mouse report is dropped (so no mouse bytes ever
@@ -60,13 +68,13 @@ import wrapAnsi from "wrap-ansi";
 import { METHODS, type ApprovalPolicy, type SessionEvent } from "@norma/protocol";
 import { initialState, reduce, type AgentRow, type PendingCard, type TuiState } from "./state";
 import { activeTurnLines, makeFlattenCache } from "./flatten-blocks";
-import { scrollBy, scrollToBottom, viewportSlice, type ViewportState } from "./viewport";
+import { scrollBy, scrollToBottom, scrollToTop, viewportSlice, type ViewportState } from "./viewport";
 import { collapseCompleted, sortTasksForDisplay, type TaskRow } from "../task-display";
 import { renderWithCursor, type InputState } from "./input-model";
 import { Spinner } from "./spinner";
 import { TaskList } from "./task-list";
 import { AgentList } from "./agent-list";
-import { Footer } from "./footer";
+import { Footer, type ExitKey } from "./footer";
 import { Composer } from "./composer";
 import { PendingCards, type AnswerPayload } from "./pending-cards";
 import { parseMouseInput } from "./alt-screen";
@@ -230,8 +238,12 @@ export function App({
   const onComposerStateChange = useCallback((s: InputState) => setComposerState(s), []);
 
   // T5 double-press ctrl+C/ctrl+D exit-armed state (see the file-top doc comment's KEY ROUTING #2).
-  const [exitArmedAt, setExitArmedAt] = useState<number | null>(null);
-  const exitArmed = exitArmedAt !== null && nowMs - exitArmedAt <= EXIT_WINDOW_MS;
+  // Carries WHICH key armed it (whole-branch review item 3) so the footer hint names the right key;
+  // `exitArmedKey` is `undefined` once the window lapses (the stored press simply ages out against
+  // the ticking `nowMs` — no timer to cancel).
+  const [exitArmed, setExitArmed] = useState<{ atMs: number; key: ExitKey } | null>(null);
+  const exitArmedKey: ExitKey | undefined =
+    exitArmed !== null && nowMs - exitArmed.atMs <= EXIT_WINDOW_MS ? exitArmed.key : undefined;
 
   // T5 resume replay: true from mount until an event with `seq >= resumeTargetSeq` is processed (see
   // the file-top doc comment's RESUME REPLAY section). `resumeTargetSeq` is a constant for the
@@ -251,6 +263,14 @@ export function App({
 
   // Scroll state for the windowed transcript (viewport.ts). Starts stuck to the bottom (auto-follow).
   const [vp, setVp] = useState<ViewportState>(() => scrollToBottom());
+
+  // Whole-branch review item 2 (spec §5, previously dead): Home/End with an EMPTY composer jump the
+  // transcript to its top/bottom. The composer's T3 raw side-channel is the single consumer of those
+  // byte sequences, so it calls back through these instead of its cursor ops when its text is empty
+  // (see composer.tsx). `scrollToTop` unsticks (nothing below the top to follow); `scrollToBottom`
+  // re-sticks so the tail auto-follows again.
+  const onComposerScrollTop = useCallback(() => setVp((cur) => scrollToTop(cur)), []);
+  const onComposerScrollBottom = useCallback(() => setVp(() => scrollToBottom()), []);
 
   // Subscribe to the bridge; flush its pre-subscribe (attach-replay) backlog then forward live. T5:
   // also clears `resuming` once the replay reaches `resumeTargetSeq` — every `SessionEvent` carries a
@@ -377,25 +397,27 @@ export function App({
       if (key.pageUp) { setVp((cur) => scrollBy(cur, -(vh - 1), len, vh)); return; }
       if (key.pageDown) { setVp((cur) => scrollBy(cur, vh - 1, len, vh)); return; }
       if (key.ctrl && input === "u") { setVp((cur) => scrollBy(cur, -Math.ceil(vh / 2), len, vh)); return; }
-      if (key.ctrl && input === "d") { setVp((cur) => scrollBy(cur, Math.ceil(vh / 2), len, vh)); return; }
       if (key.ctrl && input === "o") { setVerbose((v) => !v); return; }
       if (key.ctrl && input === "t") { setTasksVisible((v) => !v); return; }
-      // ctrl+C is deliberately NOT handled here — see the dedicated always-active exit hook below
-      // (T5). Two active hooks both acting on the same keystroke would double-fire it.
+      // ctrl+C AND ctrl+D are deliberately NOT handled here — both belong solely to the dedicated
+      // always-active exit hook below (T5 + whole-branch review item 1: the original ctrl+d
+      // half-page-down binding here double-fired with the exit flow — one press scrolled AND armed
+      // exit / interrupted a running turn twice over. Half-page-down is PgDn now; spec §5 amended).
     },
     { isActive: !state.pending },
   );
 
-  // First press: arm the exit window (+ interrupt, if a turn is running). Second press within the
-  // window: fire onExitRequest. Window expiry: the next press is treated as a fresh first press.
-  const armOrExit = (): void => {
-    if (exitArmed) {
-      setExitArmedAt(null);
+  // First press: arm the exit window under `key` (+ interrupt, if a turn is running). Second press
+  // of the SAME key within the window: fire onExitRequest. A different eligible key within the
+  // window (or any press after expiry) re-arms under that key instead of exiting.
+  const armOrExit = (pressKey: ExitKey): void => {
+    if (exitArmedKey === pressKey) {
+      setExitArmed(null);
       onExitRequest?.();
       return;
     }
     onInterrupt(); // no-op while idle — the turnRunning guard already lives inside onInterrupt
-    setExitArmedAt(nowMs);
+    setExitArmed({ atMs: nowMs, key: pressKey });
   };
 
   // ALWAYS-ACTIVE exit hook (Task 5 hard requirement): a SEPARATE `useInput` from the scroll/toggle
@@ -403,18 +425,16 @@ export function App({
   // card owns input (the bug this fixes: the scroll/toggle hook goes `isActive: false` the instant a
   // card appears, Ink's own `exitOnCtrlC` is off — mount.ts — and neither PendingCards' nor
   // Composer's own `useInput` ever act on ctrl+C/ctrl+D, so the app was previously unquittable until
-  // the card was answered). Only ctrl+C and ctrl+D are handled here; every other key falls through
-  // untouched — this is genuinely additive, not a replacement for the hook above (which still owns
-  // scrolling/verbose/tasks-toggle, including its own pre-existing, unrelated ctrl+d binding).
+  // the card was answered). Only ctrl+C and ctrl+D are handled here — and NOWHERE else (the scroll
+  // hook ceded ctrl+d entirely; see its comment) — every other key falls through untouched.
   useInput(
     (input, key) => {
-      if (key.ctrl && input === "c") { armOrExit(); return; }
+      if (key.ctrl && input === "c") { armOrExit("ctrl-c"); return; }
       if (key.ctrl && input === "d") {
-        // Only when the composer is empty or unmounted (a pending card owns input) — never steals
-        // ctrl+D from a non-empty buffer; the scroll/toggle hook's own ctrl+d scroll binding above
-        // is unaffected either way (this hook returning early here just means THIS hook does nothing).
+        // Only when the composer is empty or unmounted (a pending card owns input) — a non-empty
+        // buffer leaves ctrl+D fully inert (no other hook binds it anymore).
         const composerEligible = state.pending !== null || composerState.text.length === 0;
-        if (composerEligible) armOrExit();
+        if (composerEligible) armOrExit("ctrl-d");
       }
     },
     { isActive: true },
@@ -454,10 +474,12 @@ export function App({
             nowMs={nowMs}
             sessionId={sessionId}
             onStateChange={onComposerStateChange}
+            onScrollTop={onComposerScrollTop}
+            onScrollBottom={onComposerScrollBottom}
           />
         )}
         {state.agents.length > 0 ? <AgentList agents={state.agents} nowMs={nowMs} /> : null}
-        <Footer policy={policy} running={state.turnRunning} agents={state.agents} exitArmed={exitArmed} />
+        <Footer policy={policy} running={state.turnRunning} agents={state.agents} exitArmed={exitArmedKey} />
       </Box>
     </Box>
   );

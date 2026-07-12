@@ -568,4 +568,66 @@ describe("Composer", () => {
     await wait();
     expect(seen.at(-1)).toEqual({ text: "", cursor: 0 }); // cleared after submit
   });
+
+  test("(p) Home/End on EMPTY text route to onScrollTop/onScrollBottom instead of the cursor ops (3c review item 2)", async () => {
+    let tops = 0;
+    let bottoms = 0;
+    const { stdin } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        onScrollTop={() => { tops += 1; }}
+        onScrollBottom={() => { bottoms += 1; }}
+      />,
+    );
+    await wait();
+    stdin.write("\x1b[H"); // Home on empty -> scroll callback, not the (no-op) cursor op
+    await wait();
+    stdin.write("\x1b[4~"); // End (vt220 variant) on empty -> scroll callback too
+    await wait();
+
+    expect(tops).toBe(1);
+    expect(bottoms).toBe(1);
+  });
+
+  test("(p2) Home/End with TEXT keep cursor semantics and NEVER fire the scroll callbacks", async () => {
+    let scrolls = 0;
+    const submitted: string[] = [];
+    const { stdin } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={(text) => submitted.push(text)}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        onScrollTop={() => { scrolls += 1; }}
+        onScrollBottom={() => { scrolls += 1; }}
+      />,
+    );
+    await wait();
+    stdin.write("bc");
+    await wait();
+    stdin.write("\x1b[H"); // Home with text -> cursor to 0 (NOT a scroll)
+    await wait();
+    stdin.write("a");
+    await wait();
+    stdin.write("\x1b[F"); // End with text -> cursor to end (NOT a scroll)
+    await wait();
+    stdin.write("d");
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    expect(scrolls).toBe(0);
+    expect(submitted).toEqual(["abcd"]); // both edits landed at the cursor edges — ops still work
+  });
 });

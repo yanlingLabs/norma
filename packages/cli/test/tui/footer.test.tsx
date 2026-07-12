@@ -61,15 +61,22 @@ describe("Footer (e, f, g)", () => {
     expect(lastFrame() ?? "").not.toContain("shift+tab to cycle modes");
   });
 
-  test("(T5) exitArmed replaces the whole line with the exact dim hint, even when other segments would apply", () => {
+  test("(T5) exitArmed replaces the whole line with the exact key-specific dim hint, even when other segments would apply", () => {
     const { lastFrame } = render(
-      <Footer policy="plan" running agents={[agent("a")]} exitArmed />,
+      <Footer policy="plan" running agents={[agent("a")]} exitArmed="ctrl-c" />,
     );
     const frame = lastFrame() ?? "";
     expect(frame).toContain("Press Ctrl-C again to exit");
     expect(frame).not.toContain("plan mode on");
     expect(frame).not.toContain("esc to interrupt");
     expect(frame).not.toContain("agent");
+  });
+
+  test("(T5) exitArmed names the arming key: ctrl-d renders the Ctrl-D hint (3c whole-branch review item 3)", () => {
+    const { lastFrame } = render(<Footer policy="ask" running={false} agents={[]} exitArmed="ctrl-d" />);
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("Press Ctrl-D again to exit");
+    expect(frame).not.toContain("Ctrl-C");
   });
 
   test("segments render in order (mode, interrupt, agents) when all three apply", () => {

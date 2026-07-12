@@ -36,7 +36,7 @@
  *  codes INSIDE the root string (see the render comment below for why an Ink layout bug forces
  *  that shape). */
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Box, Text, useInput, useStdin } from "ink";
@@ -110,6 +110,15 @@ export interface ComposerProps {
    *  is about to lay out, on the SAME render pass, and (b) decide ctrl+D exit-eligibility ("only
    *  when the composer is empty"). Optional so every existing call site is unaffected. */
   onStateChange?: (state: InputState) => void;
+  /** 3c whole-branch review item 2 (spec §5): Home/End pressed while the text is EMPTY call these
+   *  (App wires them to transcript scroll-to-top / scroll-to-bottom) INSTEAD of the cursor ops the
+   *  raw side-channel otherwise runs — the side-channel is the single consumer of those byte
+   *  sequences, so routing here (not a second listener) keeps one owner per key. With any text in
+   *  the buffer, Home/End keep their cursor semantics and these never fire. Optional: when omitted
+   *  (legacy call sites/tests), empty-text Home/End fall through to the cursor ops as before
+   *  (harmless no-ops on empty text). */
+  onScrollTop?: () => void;
+  onScrollBottom?: () => void;
 }
 
 export function Composer({
@@ -125,6 +134,8 @@ export function Composer({
   historyPath,
   onHint,
   onStateChange,
+  onScrollTop,
+  onScrollBottom,
 }: ComposerProps) {
   // `policy` stays a prop (callers/tests still pass it; `<Footer>`, a sibling, is the one that
   // renders it) — this component no longer renders it directly, matching `task-list.tsx`'s
@@ -143,20 +154,37 @@ export function Composer({
   const [historyEntries] = useState(() => loadHistory(effectiveHistoryPath, sessionId));
   const historyNav = useMemo(() => makeHistoryNav(historyEntries), [historyEntries]);
 
+  // Whole-branch review item 2: the raw side-channel handler below runs from a closure created when
+  // its effect last wired (its deps deliberately exclude `state`), so it reads text-emptiness at
+  // EVENT time through a render-updated ref — the same event-time-read pattern app.tsx uses for its
+  // viewport refs — rather than a stale closure snapshot.
+  const textEmptyRef = useRef(state.text.length === 0);
+  textEmptyRef.current = state.text.length === 0;
+
   // T3 raw side-channel (see the file-top doc comment) — Home/End/Backspace/Forward-Delete only.
+  // Home/End route to the App's transcript scroll callbacks when the text is EMPTY (spec §5; see the
+  // onScrollTop/onScrollBottom prop doc), and to their cursor ops otherwise.
   const { internal_eventEmitter } = useStdin();
   useEffect(() => {
     if (disabled || !internal_eventEmitter) return;
     const onRawInput = (chunk: Buffer | string) => {
       const seq = typeof chunk === "string" ? chunk : chunk.toString();
-      if (HOME_SEQS.has(seq)) { setState(home); return; }
-      if (END_SEQS.has(seq)) { setState(end); return; }
+      if (HOME_SEQS.has(seq)) {
+        if (textEmptyRef.current && onScrollTop) { onScrollTop(); return; }
+        setState(home);
+        return;
+      }
+      if (END_SEQS.has(seq)) {
+        if (textEmptyRef.current && onScrollBottom) { onScrollBottom(); return; }
+        setState(end);
+        return;
+      }
       if (BACKSPACE_SEQS.has(seq)) { setState(backspace); return; }
       if (DELETE_SEQS.has(seq)) { setState(del); return; }
     };
     internal_eventEmitter.on("input", onRawInput);
     return () => { internal_eventEmitter.off("input", onRawInput); };
-  }, [disabled, internal_eventEmitter]);
+  }, [disabled, internal_eventEmitter, onScrollTop, onScrollBottom]);
 
   useInput(
     (input, key) => {

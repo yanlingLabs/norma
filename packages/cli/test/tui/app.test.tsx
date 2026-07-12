@@ -357,8 +357,128 @@ describe("App — double ctrl+C/ctrl+D exit flow (Phase 3c Task 5)", () => {
     stdin.write("\x04");
     await wait();
     expect(exits).toEqual([]);
-    expect(lastFrame() ?? "").not.toContain("Press Ctrl-C again to exit");
+    expect(lastFrame() ?? "").not.toContain("again to exit"); // not armed under EITHER key's hint
     expect(lastFrame() ?? "").toContain("hello"); // buffer untouched
+  });
+
+  test("(q2) ctrl+D arming names its OWN key in the footer hint (3c whole-branch review item 3)", async () => {
+    const { stdin, lastFrame } = render(<App client={fakeClient()} bridge={makeEventBridge()} {...baseProps} />);
+    await wait();
+    stdin.write("\x04"); // arm via ctrl+D (empty composer)
+    await wait();
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("Press Ctrl-D again to exit");
+    expect(frame).not.toContain("Press Ctrl-C again to exit");
+  });
+
+  test("(v) ctrl+D's first press does NOT scroll the transcript (3c whole-branch review item 1 — the scroll hook ceded ctrl+d)", async () => {
+    const bridge = makeEventBridge();
+    for (let i = 0; i < 40; i++) bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: `SCROLL-${i}` }));
+    const { stdin, lastFrame } = render(<App client={fakeClient()} bridge={bridge} {...baseProps} />);
+    await wait();
+
+    // Scroll UP first so a half-page-DOWN (the removed scroll binding) would visibly move the window.
+    stdin.write("\x1b[5~"); // PgUp
+    await wait();
+    stdin.write("\x1b[5~"); // PgUp again — well away from the bottom
+    await wait();
+    const before = (lastFrame() ?? "").split("\n");
+
+    stdin.write("\x04"); // ctrl+D (empty composer) — must ONLY arm exit, never scroll
+    await wait();
+    const after = (lastFrame() ?? "").split("\n");
+
+    expect(after[0]).toBe(before[0]!); // viewport top line unmoved — no half-page-down fired
+    expect(after.join("\n")).toContain("Press Ctrl-D again to exit"); // ... but the exit window armed
+    // The frames are identical EXCEPT the armed footer line (the very last row).
+    const diffs = before.map((line, i) => (line === after[i] ? null : i)).filter((i) => i !== null);
+    expect(diffs).toEqual([before.length - 1]);
+  });
+
+  test("(w) running + empty composer: the first ctrl+D interrupts EXACTLY once (only the exit hook's armOrExit — no scroll-path double-fire)", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    bridge.push(ev({ type: "turn_started", threadId: "main" }));
+    await wait();
+
+    stdin.write("\x04"); // first ctrl+D while running
+    await wait();
+    expect(client.calls.filter((c) => c.method === "interrupt")).toHaveLength(1);
+    expect(lastFrame() ?? "").toContain("Press Ctrl-D again to exit");
+  });
+
+  test("(x) a DIFFERENT eligible key inside the window re-arms under that key instead of exiting", async () => {
+    const exits: number[] = [];
+    const { stdin, lastFrame } = render(
+      <App client={fakeClient()} bridge={makeEventBridge()} {...baseProps} onExitRequest={() => exits.push(1)} />,
+    );
+    await wait();
+    stdin.write("\x03"); // arm via ctrl+C
+    await wait();
+    expect(lastFrame() ?? "").toContain("Press Ctrl-C again to exit");
+
+    stdin.write("\x04"); // ctrl+D inside the window — re-arms as ctrl-d, does NOT exit
+    await wait();
+    expect(exits).toEqual([]);
+    expect(lastFrame() ?? "").toContain("Press Ctrl-D again to exit");
+
+    stdin.write("\x04"); // matching second press — exits
+    await wait();
+    expect(exits).toEqual([1]);
+  });
+});
+
+describe("App — Home/End transcript jumps on an empty composer (3c whole-branch review item 2, spec §5)", () => {
+  test("(y) Home on empty scrolls to the top (welcome/oldest visible, unstuck); End re-sticks to the bottom", async () => {
+    const bridge = makeEventBridge();
+    for (let i = 0; i < 40; i++) bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: `HE-${i}` }));
+    const { stdin, lastFrame } = render(<App client={fakeClient()} bridge={bridge} {...baseProps} />);
+    await wait();
+    expect(lastFrame() ?? "").toContain("HE-39"); // starts stuck to the bottom
+
+    stdin.write("\x1b[H"); // Home, empty composer -> transcript top
+    await wait();
+    const frame = lastFrame() ?? "";
+    expect(frame.split("\n")[0]).toContain("Norma"); // the welcome header — the very first log line
+    expect(frame).toContain("HE-1"); // oldest transcript lines in view
+    expect(frame).not.toContain("HE-39");
+
+    bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: "HE-NEW" }));
+    await wait();
+    expect(lastFrame() ?? "").not.toContain("HE-NEW"); // the top jump UNSTUCK the view — growth not followed
+
+    stdin.write("\x1b[F"); // End, empty composer -> back to (and stuck to) the bottom
+    await wait();
+    expect(lastFrame() ?? "").toContain("HE-NEW");
+    bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: "HE-STICKY" }));
+    await wait();
+    expect(lastFrame() ?? "").toContain("HE-STICKY"); // re-stuck: tail follows again
+  });
+
+  test("(z) Home/End with TEXT keep their cursor semantics and never scroll the transcript", async () => {
+    const bridge = makeEventBridge();
+    for (let i = 0; i < 40; i++) bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: `TX-${i}` }));
+    const { stdin, lastFrame } = render(<App client={fakeClient()} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("abc");
+    await wait();
+
+    stdin.write("\x1b[H"); // Home with text -> cursor to 0, NO scroll
+    await wait();
+    let frame = lastFrame() ?? "";
+    expect(frame).toContain("\x1b[7ma\x1b[27m"); // inverse cursor sits ON "a" (cursor really moved to 0)
+    expect(frame).toContain("TX-39"); // still at the bottom — did not jump to the top
+    expect(frame.split("\n")[0]).not.toContain("Norma"); // top of the log NOT in view
+
+    stdin.write("\x1b[F"); // End with text -> cursor back to the end, still no scroll
+    await wait();
+    stdin.write("d");
+    await wait();
+    frame = lastFrame() ?? "";
+    expect(frame).toContain("abcd"); // insert landed at the END — End restored the cursor
+    expect(frame).toContain("TX-39"); // view still at the bottom
   });
 });
 

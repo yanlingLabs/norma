@@ -5,9 +5,11 @@
  *  When none of those render, a fallback `shift+tab to cycle modes` hint keeps the line non-empty
  *  (cc-ui-study-chrome.md §1's `PromptInputFooterLeftSide` empty-state hint, adapted).
  *
- *  T5: while the double-ctrl+C/ctrl+D exit window is armed (`exitArmed`), this REPLACES the whole
- *  line with the exact dim hint text — no other segment renders alongside it, so the line reads
- *  unambiguously as "press again to exit" rather than getting lost among mode/agents chrome.
+ *  T5: while the double-ctrl+C/ctrl+D exit window is armed (`exitArmed` carries WHICH key armed it —
+ *  whole-branch review item 3), this REPLACES the whole line with the exact key-specific dim hint
+ *  ("Press Ctrl-C again to exit" / "Press Ctrl-D again to exit", reference behavior) — no other
+ *  segment renders alongside it, so the line reads unambiguously as "press again to exit" rather
+ *  than getting lost among mode/agents chrome.
  *
  *  Pure — no client, no timers; `policy`/`running`/`agents`/`exitArmed` are all caller-supplied
  *  snapshots. */
@@ -18,18 +20,23 @@ import type { ApprovalPolicy } from "@norma/protocol";
 import { theme } from "./theme";
 import type { AgentRow } from "./state";
 
+/** Which key armed the T5 double-press exit window — declared here (the component that renders the
+ *  distinction) and imported by app.tsx (the component that tracks it). */
+export type ExitKey = "ctrl-c" | "ctrl-d";
+
 export interface FooterProps {
   policy: ApprovalPolicy;
   running: boolean;
   agents: AgentRow[];
-  /** T5 double-ctrl+C/ctrl+D exit flow: true for the ~800ms window after the FIRST press. Optional/
-   *  defaults to false so every pre-T5 call site (and non-Ink test) stays byte-identical. */
-  exitArmed?: boolean;
+  /** T5 double-ctrl+C/ctrl+D exit flow: the key that armed the ~800ms window on its FIRST press;
+   *  `undefined` when not armed. Optional so every pre-T5 call site (and non-Ink test) stays
+   *  byte-identical. */
+  exitArmed?: ExitKey;
 }
 
 export function Footer({ policy, running, agents, exitArmed }: FooterProps) {
   if (exitArmed) {
-    return <Text dimColor>Press Ctrl-C again to exit</Text>;
+    return <Text dimColor>{exitArmed === "ctrl-d" ? "Press Ctrl-D again to exit" : "Press Ctrl-C again to exit"}</Text>;
   }
 
   const segments: React.ReactNode[] = [];
