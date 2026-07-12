@@ -29,16 +29,18 @@
  *  four cases anyway (nothing in the ordinary path reacts to them).
  *
  *  Phase 3b T5 render note (cc-ui-study-chrome.md §1) still holds: an "open" prompt (bare top+bottom
- *  rounded rules, no side walls), dimmed while a turn runs. T3 replaces the old trailing
- *  block-cursor glyph with a real cursor position: `❯ ` + `before` + inverse(`at` or a space) +
- *  `after`, per `renderWithCursor` (see `input-model.ts`) — all as ONE root `<Text>` (see the render
- *  comment below for why: an Ink layout bug forces that shape, and dimming moved from JUST the `❯ `
- *  glyph to the whole line as a side effect). */
+ *  rounded rules, no side walls), a `❯ ` prompt glyph dimmed while a turn runs (glyph ONLY — the
+ *  user's typed text never dims). T3 replaces the old trailing block-cursor glyph with a real
+ *  cursor position: `❯ ` + `before` + inverse(`at` or a space) + `after`, per `renderWithCursor`
+ *  (see `input-model.ts`) — all as ONE root `<Text>`, with the glyph's dim expressed as raw ANSI
+ *  codes INSIDE the root string (see the render comment below for why an Ink layout bug forces
+ *  that shape). */
 
 import React, { useEffect, useMemo, useState } from "react";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Box, Text, useInput, useStdin } from "ink";
+import { Chalk } from "chalk";
 import type { ApprovalPolicy } from "@norma/protocol";
 import { footerKeyAction } from "../keys";
 import type { FooterSelection } from "../task-block";
@@ -72,6 +74,11 @@ const HOME_SEQS = new Set(["\x1b[H", "\x1bOH", "\x1b[1~", "\x1b[7~"]);
 const END_SEQS = new Set(["\x1b[F", "\x1bOF", "\x1b[4~", "\x1b[8~"]);
 const BACKSPACE_SEQS = new Set(["\x7f", "\b", "\x1b\x7f", "\x1b\b"]);
 const DELETE_SEQS = new Set(["\x1b[3~", "\x1b[3^", "\x1b[3$"]);
+
+// Fixed-level truecolor Chalk instance — same convention (and reason) as flatten-blocks.ts /
+// markdown.ts: the ambient default export downgrades to level 0 under a non-TTY (tests), which
+// would silently strip the dim codes the render below bakes into its string.
+const ansi = new Chalk({ level: 3 });
 
 function defaultHistoryPath(): string {
   return join(homedir(), ".norma", "history.jsonl");
@@ -238,11 +245,14 @@ export function Composer({
        *  the FIRST render where MORE THAN ONE Text descendant has independent style/content
        *  (reproduced in isolation: 2 sibling Texts, or 1 root + 2 nested children, both glitch —
        *  garbled/truncated text, sometimes bleeding into the border row; 1 root + 1 nested child
-       *  never does). The composer used to dim ONLY the "❯ " glyph while a turn ran; this instead
-       *  dims the WHOLE line (glyph + typed text + cursor) — an adaptation forced by that bug, not
-       *  a design change anyone asked for, and no test asserts the old narrower-dim behavior. */}
-      <Text dimColor={running}>
-        {`❯ ${before}`}
+       *  never does). To keep the reference behavior — ONLY the "❯ " glyph dims while a turn runs,
+       *  never the user's typed text — the glyph's dim is baked into the root STRING as raw ANSI
+       *  codes (`ansi.dim`, the module-level Chalk instance) instead of a styled <Text> child that
+       *  would re-trigger the bug. Ink measures text width ANSI-aware (string-width), so the baked
+       *  codes don't skew layout; verified clean on the bug's trigger case (first content frame
+       *  after empty) in composer.test.tsx (n). */}
+      <Text>
+        {`${running ? ansi.dim("❯ ") : "❯ "}${before}`}
         <Text inverse>{at || " "}</Text>
         {after}
       </Text>

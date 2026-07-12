@@ -135,6 +135,23 @@ describe("input-model", () => {
     });
   });
 
+  describe("non-ASCII basics (single-code-unit BMP chars — see input-model.ts's documented grapheme limitation)", () => {
+    test("insert/backspace round-trip on accented text", () => {
+      const typed = insert(s("", 0), "café");
+      expect(typed).toEqual({ text: "café", cursor: 4 });
+      expect(backspace(typed)).toEqual({ text: "caf", cursor: 3 }); // é is one code unit — removed whole
+    });
+    test("cursor ops treat an accented char as one position", () => {
+      const state = s("café", 4);
+      expect(left(state)).toEqual({ text: "café", cursor: 3 }); // now sitting on "é"
+      expect(renderWithCursor(left(state))).toEqual({ before: "caf", at: "é", after: "" });
+      expect(del(left(state))).toEqual({ text: "caf", cursor: 3 });
+    });
+    test("wordLeft over non-ASCII words", () => {
+      expect(wordLeft(s("crème brûlée", 12))).toEqual({ text: "crème brûlée", cursor: 6 });
+    });
+  });
+
   describe("renderWithCursor", () => {
     test("splits before/at/after around a mid-text cursor", () => {
       expect(renderWithCursor(s("abc", 1))).toEqual({ before: "a", at: "b", after: "c" });

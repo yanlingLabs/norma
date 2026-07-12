@@ -238,6 +238,64 @@ describe("Composer", () => {
     expect(submitted).toEqual(["abc"]);
   });
 
+  test("(h2) real Forward-Delete (ESC [3~) deletes the char AT the cursor", async () => {
+    const submitted: string[] = [];
+    const { stdin } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={(text) => submitted.push(text)}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+      />,
+    );
+    await wait();
+    stdin.write("abc");
+    await wait();
+    stdin.write("\x1b[H"); // Home — cursor to 0, sitting on "a"
+    await wait();
+    stdin.write("\x1b[3~"); // Forward-Delete — removes "a", cursor stays put
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    expect(submitted).toEqual(["bc"]);
+  });
+
+  test("(h3) ctrl+arrow word-jumps: edits land at both word boundaries end-to-end", async () => {
+    const submitted: string[] = [];
+    const { stdin } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={(text) => submitted.push(text)}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+      />,
+    );
+    await wait();
+    stdin.write("foo bar");
+    await wait();
+    stdin.write("\x1b[1;5D"); // ctrl+left — word-left, cursor to the start of "bar" (index 4)
+    await wait();
+    stdin.write("X");
+    await wait();
+    stdin.write("\x1b[1;5C"); // ctrl+right — word-right, cursor past "Xbar" (end of text)
+    await wait();
+    stdin.write("!");
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    expect(submitted).toEqual(["foo Xbar!"]);
+  });
+
   test("(i) Home/End/ctrl+a/ctrl+e move the cursor to the edges", async () => {
     const submitted: string[] = [];
     const { stdin } = render(
@@ -260,6 +318,41 @@ describe("Composer", () => {
     stdin.write("a");
     await wait();
     stdin.write("\x05"); // ctrl+e — End
+    await wait();
+    stdin.write("d");
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    expect(submitted).toEqual(["abcd"]);
+  });
+
+  test("(i2) raw End sequences (ESC [F xterm, ESC [4~ vt220) move the cursor to the end", async () => {
+    const submitted: string[] = [];
+    const { stdin } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={(text) => submitted.push(text)}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+      />,
+    );
+    await wait();
+    stdin.write("ab");
+    await wait();
+    stdin.write("\x1b[H"); // Home — cursor to 0
+    await wait();
+    stdin.write("\x1b[F"); // End (xterm) — cursor to end
+    await wait();
+    stdin.write("c");
+    await wait();
+    stdin.write("\x01"); // ctrl+a — Home again
+    await wait();
+    stdin.write("\x1b[4~"); // End (vt220) — cursor to end again
     await wait();
     stdin.write("d");
     await wait();
@@ -419,5 +512,33 @@ describe("Composer", () => {
 
     expect(hints).toEqual(["Esc again to clear", "Esc again to clear"]);
     expect(stripAnsi(lastFrame() ?? "")).toContain("still here");
+  });
+
+  test("(n) running: only the prompt glyph dims — buffer text carries no dim code, and the FIRST content frame after empty is well-formed", async () => {
+    const { stdin, lastFrame } = render(
+      <Composer
+        running
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+      />,
+    );
+    await wait();
+    stdin.write("a"); // ONE char, asserted immediately — the Ink layout bug's trigger case is the
+    await wait(); //     first content-growing render after empty (see composer.tsx render comment)
+
+    const frame = lastFrame() ?? "";
+    // Glyph dimmed, dim CLOSED before the buffer text, then the un-dimmed "a" and the inverse
+    // cursor — the exact byte layout, so a whole-line dim (or a dim leak into the buffer) fails.
+    expect(frame).toContain("\x1b[2m❯ \x1b[22ma\x1b[7m");
+    // Well-formed frame: the prompt line is intact between the two border rules (the bug's failure
+    // mode garbles the text across the border rows).
+    const lines = (frame ?? "").split("\n").map(stripAnsi);
+    expect(lines).toHaveLength(3);
+    expect(lines[1]).toBe("❯ a ");
   });
 });
