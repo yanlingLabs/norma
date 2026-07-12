@@ -1,11 +1,16 @@
-/** `<Footer>` (Phase 3b Task 5) — the CC-shaped single dim hint line beneath the composer: an
- *  approval-policy mode indicator (plan/auto, colored per `theme.planMode`/`theme.autoAccept`),
- *  an `esc to interrupt` hint while a turn runs, and an agents pill (`N agent(s) · ctrl+t`) when
- *  any subagents are live — segments joined with `" · "`. When none of those render, a fallback
- *  `shift+tab to cycle modes` hint keeps the line non-empty (cc-ui-study-chrome.md §1's
- *  `PromptInputFooterLeftSide` empty-state hint, adapted).
+/** `<Footer>` (Phase 3b Task 5; Phase 3c Task 5 — exit-armed override) — the CC-shaped single dim
+ *  hint line beneath the composer: an approval-policy mode indicator (plan/auto, colored per
+ *  `theme.planMode`/`theme.autoAccept`), an `esc to interrupt` hint while a turn runs, and an
+ *  agents pill (`N agent(s) · ctrl+t`) when any subagents are live — segments joined with `" · "`.
+ *  When none of those render, a fallback `shift+tab to cycle modes` hint keeps the line non-empty
+ *  (cc-ui-study-chrome.md §1's `PromptInputFooterLeftSide` empty-state hint, adapted).
  *
- *  Pure — no client, no timers; `policy`/`running`/`agents` are all caller-supplied snapshots. */
+ *  T5: while the double-ctrl+C/ctrl+D exit window is armed (`exitArmed`), this REPLACES the whole
+ *  line with the exact dim hint text — no other segment renders alongside it, so the line reads
+ *  unambiguously as "press again to exit" rather than getting lost among mode/agents chrome.
+ *
+ *  Pure — no client, no timers; `policy`/`running`/`agents`/`exitArmed` are all caller-supplied
+ *  snapshots. */
 
 import React from "react";
 import { Text } from "ink";
@@ -17,9 +22,16 @@ export interface FooterProps {
   policy: ApprovalPolicy;
   running: boolean;
   agents: AgentRow[];
+  /** T5 double-ctrl+C/ctrl+D exit flow: true for the ~800ms window after the FIRST press. Optional/
+   *  defaults to false so every pre-T5 call site (and non-Ink test) stays byte-identical. */
+  exitArmed?: boolean;
 }
 
-export function Footer({ policy, running, agents }: FooterProps) {
+export function Footer({ policy, running, agents, exitArmed }: FooterProps) {
+  if (exitArmed) {
+    return <Text dimColor>Press Ctrl-C again to exit</Text>;
+  }
+
   const segments: React.ReactNode[] = [];
 
   if (policy === "plan") {

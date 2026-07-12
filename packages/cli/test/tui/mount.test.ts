@@ -12,6 +12,7 @@
 import { describe, expect, test } from "bun:test";
 import { mountTui, type RenderInstance } from "../../src/tui/mount";
 import { makeEventBridge } from "../../src/tui/event-bridge";
+import { formatResumeHint } from "../../src/main";
 
 const ENTER = "\x1b[?1049h\x1b[2J\x1b[H";
 const MOUSE_ON = "\x1b[?1000h\x1b[?1006h";
@@ -148,6 +149,84 @@ describe("mountTui — alt-screen escape order (HARD CONSTRAINT 3)", () => {
       await handle.waitUntilExit();
       expect(unmounts).toBe(1);
       expect(order).toEqual(["ENTER", "MOUSE_ON", "MOUSE_OFF", "LEAVE"]);
+    } finally {
+      (process.stdout as unknown as { isTTY: boolean }).isTTY = prev;
+    }
+  });
+});
+
+describe("mountTui — resumeTargetSeq passthrough (Phase 3c Task 5)", () => {
+  test("passed straight through to <App> when set on opts", () => {
+    const prev = process.stdout.isTTY;
+    (process.stdout as unknown as { isTTY: boolean }).isTTY = true;
+    try {
+      let opts: unknown;
+      mountTui(
+        { ...mountOpts(), resumeTargetSeq: 42 },
+        (node) => { opts = node.props; return { unmount() {}, waitUntilExit: () => new Promise<void>(() => {}) }; },
+        () => {},
+      );
+      expect((opts as { resumeTargetSeq?: number }).resumeTargetSeq).toBe(42);
+    } finally {
+      (process.stdout as unknown as { isTTY: boolean }).isTTY = prev;
+    }
+  });
+
+  test("(d) non-resume: omitted on opts -> undefined on <App> (today's behavior, unchanged)", () => {
+    const prev = process.stdout.isTTY;
+    (process.stdout as unknown as { isTTY: boolean }).isTTY = true;
+    try {
+      let opts: unknown;
+      mountTui(
+        mountOpts(),
+        (node) => { opts = node.props; return { unmount() {}, waitUntilExit: () => new Promise<void>(() => {}) }; },
+        () => {},
+      );
+      expect((opts as { resumeTargetSeq?: number }).resumeTargetSeq).toBeUndefined();
+    } finally {
+      (process.stdout as unknown as { isTTY: boolean }).isTTY = prev;
+    }
+  });
+});
+
+// Phase 3c Task 5 — main.ts's post-exit seam: AFTER `await mountTui(...).waitUntilExit()` resolves,
+// main.ts writes `formatResumeHint(sessionId)` through the SAME stdout sink. mountTui's own
+// `waitUntilExit` writes the LEAVE escape as its OWN last step (HARD CONSTRAINT 3) before resolving
+// — so as long as main.ts's hint-write happens after the `await` (which it does — see main.ts's
+// ink-mode branch), the hint is STRUCTURALLY guaranteed to land after LEAVE. This replicates that
+// exact call order (mountTui(...).waitUntilExit() THEN write the hint) through the injected sink, no
+// real Ink instance or terminal involved — "unit-test the mount/main seam with an injected
+// sink+printer" per the task brief, `formatResumeHint` standing in as the "printer".
+describe("mount/main seam — resume hint prints after the LEAVE escape (Phase 3c Task 5)", () => {
+  test("hint text lands in the sink strictly after LEAVE, with the exact session id", async () => {
+    const prev = process.stdout.isTTY;
+    (process.stdout as unknown as { isTTY: boolean }).isTTY = true;
+    try {
+      const order: string[] = [];
+      let resolveExit!: () => void;
+      const exitP = new Promise<void>((r) => { resolveExit = r; });
+      let capturedOnExit: (() => void) | undefined;
+      const handle = mountTui(
+        mountOpts(),
+        (node) => {
+          capturedOnExit = (node.props as { onExitRequest?: () => void }).onExitRequest;
+          return {
+            unmount: () => { order.push("unmount"); },
+            waitUntilExit: () => { order.push("waitUntilExit"); return exitP; },
+          };
+        },
+        (s) => order.push(escName(s)),
+      );
+
+      capturedOnExit!();
+      resolveExit();
+      await handle.waitUntilExit(); // by now LEAVE has already been written (mount.ts's own last step)
+      order.push(formatResumeHint("s1")); // main.ts's post-await step, through the SAME sink
+
+      expect(order[order.length - 2]).toBe("LEAVE"); // the hint is the VERY NEXT thing after LEAVE
+      const hint = order.at(-1)!;
+      expect(hint).toContain("Resume this session with:");
+      expect(hint).toContain("norma resume s1");
     } finally {
       (process.stdout as unknown as { isTTY: boolean }).isTTY = prev;
     }

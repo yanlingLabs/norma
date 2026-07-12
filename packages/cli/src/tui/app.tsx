@@ -21,25 +21,48 @@
  *      [AgentList]                  — the subagent tree, only while any agent is live.
  *      Footer                       — policy/interrupt/agents hint line.
  *
- *  KEY ROUTING (App-level `useInput`, active while `!state.pending`): PgUp/PgDn scroll ±(viewH-1),
- *  ctrl+u/ctrl+d ±⌈viewH/2⌉, ctrl+o toggles `verbose`, ctrl+t toggles `tasksVisible`, ctrl+C requests
- *  exit (TODO(T5): a temporary single-press quit until T5 wires the double-press flow). Mouse SGR
- *  reports (wheel + any button/motion) are intercepted at the shared stdin input emitter and swallowed
- *  BEFORE any `useInput` consumer (this App's or the composer's) sees them — wheel scrolls ±3, every
- *  other mouse report is dropped (so no mouse bytes ever land in the composer buffer).
+ *  KEY ROUTING — TWO `useInput` hooks, deliberately split (Phase 3c Task 5 review finding: a single
+ *  `isActive: !state.pending` hook made ctrl+C dead the instant a pending card took over input, and
+ *  Ink's own `exitOnCtrlC` is off — see mount.ts — so the app was UNQUITTABLE until the card was
+ *  answered):
+ *    1. The scroll/toggle hook (active while `!state.pending`, unchanged from 3b): PgUp/PgDn scroll
+ *       ±(viewH-1), ctrl+u/ctrl+d ±⌈viewH/2⌉, ctrl+o toggles `verbose`, ctrl+t toggles `tasksVisible`.
+ *       It no longer touches ctrl+C at all (moved to #2 below — never duplicated, so the two hooks
+ *       never both react to the same keystroke).
+ *    2. The EXIT hook (Task 5, `isActive: true` UNCONDITIONALLY): double-press ctrl+C (800ms window,
+ *       timed off the ticking `nowMs`, never `Date.now`) — first press arms + (if a turn is running)
+ *       ALSO interrupts; second press within the window calls `onExitRequest`; window expiry re-arms
+ *       cleanly on the next press. ctrl+D drives the identical arm/exit flow, but ONLY when the
+ *       composer is empty or unmounted (a pending card owns input) — a non-empty buffer leaves it
+ *       inert for this purpose (the scroll hook's own pre-existing ctrl+d binding is untouched
+ *       either way). While armed, the footer shows the exact "press again to exit" hint (below).
+ *  Mouse SGR reports (wheel + any button/motion) are intercepted at the shared stdin input emitter
+ *  and swallowed BEFORE any `useInput` consumer (either hook here, the composer's, or a pending
+ *  card's) sees them — wheel scrolls ±3, every other mouse report is dropped (so no mouse bytes ever
+ *  land in the composer buffer). Neither that emitter patch nor the composer's own T3 raw side-
+ *  channel ever matches \x03/\x04, so neither interferes with the exit hook.
+ *
+ *  RESUME REPLAY (Task 5): `resumeTargetSeq` (mount.ts ← main.ts, set only on the `norma resume <id>`
+ *  Ink route, which attaches from seq 0 instead of the tip) drives a `resuming` flag — true from
+ *  mount until an event with `seq >= resumeTargetSeq` is processed (or never true at all if the prop
+ *  is omitted or 0), rendering a dim "Resuming conversation…" line above the composer/card meanwhile.
+ *  Every other event type's handling is unaffected — `task_notification` in particular already
+ *  reduces to a no-op (state.ts's `default` case), so it replays invisibly like today.
  *
  *  Clock discipline unchanged from 3a: the reducer is fed an INJECTED clock (`now()` at event time);
  *  a ~100ms `setInterval` ticks `nowMs` in state for live chrome; `reduce` itself never calls
  *  Date.now. Policy cycle keeps the one-RPC-in-flight guard; idle-Esc stays inert. */
 
-import React, { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { Box, Text, useInput, useStdin } from "ink";
 import { Chalk } from "chalk";
+import wrapAnsi from "wrap-ansi";
 import { METHODS, type ApprovalPolicy, type SessionEvent } from "@norma/protocol";
 import { initialState, reduce, type AgentRow, type PendingCard, type TuiState } from "./state";
 import { activeTurnLines, makeFlattenCache } from "./flatten-blocks";
 import { scrollBy, scrollToBottom, viewportSlice, type ViewportState } from "./viewport";
 import { collapseCompleted, sortTasksForDisplay, type TaskRow } from "../task-display";
+import { renderWithCursor, type InputState } from "./input-model";
 import { Spinner } from "./spinner";
 import { TaskList } from "./task-list";
 import { AgentList } from "./agent-list";
@@ -75,14 +98,22 @@ export interface AppProps {
   version: string;
   model: string;
   /** Injectable clock (tests). Defaults to Date.now — the ONLY place Date.now enters; passed to
-   *  `reduce` strictly as the injected `nowMs`, keeping the reducer pure. */
+   *  `reduce` strictly as the injected `nowMs`, keeping the reducer pure. Also times the T5
+   *  double-press exit window (never `Date.now` directly). */
   now?: () => number;
-  /** Exit request (mount.ts wires it to the alt-screen teardown). TODO(T5): a single ctrl+C press
-   *  calls this today; T5 replaces it with the double-press quit flow + resume hint. */
+  /** Exit request (mount.ts wires it to the alt-screen teardown) — the double-press ctrl+C/ctrl+D
+   *  flow (Task 5) calls this on the SECOND press within the window. */
   onExitRequest?: () => void;
+  /** Set ONLY on the Ink `norma resume <id>` route (main.ts attaches from seq 0 there instead of the
+   *  tip, replaying the whole session) — the seq the replay is expected to reach. Drives the
+   *  "Resuming conversation…" line: shown from mount until an event with `seq >= resumeTargetSeq` is
+   *  processed, or never shown at all if this is `undefined` (a fresh session — today's behavior,
+   *  byte-identical) or `0` (a resumed session with no prior events — nothing to wait for). */
+  resumeTargetSeq?: number;
 }
 
 const POLICY_ORDER: ApprovalPolicy[] = ["ask", "auto", "plan"];
+const EXIT_WINDOW_MS = 800; // T5 double-press ctrl+C/ctrl+D window, timed off the App's ticking `nowMs`
 
 const readRows = (): number => (typeof process.stdout.rows === "number" ? process.stdout.rows : 24);
 const readCols = (): number => (typeof process.stdout.columns === "number" ? process.stdout.columns : 80);
@@ -120,12 +151,32 @@ function pendingCardRows(pending: PendingCard): number {
   return 3 + options * 2 + 1; // header/question + per-option lines + prompt
 }
 
+/** Rendered line count of the IDLE composer's bordered box: the top/bottom border rules (2) + the
+ *  content line's WRAP-AWARE row count (Phase 3c Task 5 review fix — the flat `3` this replaced
+ *  assumed the content line never wraps, undercounting `bottomBarRows` the moment typed text +
+ *  prompt/cursor overflowed `columns`, which risks the exact Yoga shrink-distortion the module doc
+ *  above warns about). Builds the SAME string composer.tsx's real render assembles (`"❯ " + before +
+ *  cursor-cell + after`, `renderWithCursor`'s cursor-cell placeholder space included) and hard-wraps
+ *  it at `columns` via `wrap-ansi` — the identical wrapping primitive `flatten-blocks.ts` already
+ *  uses elsewhere in this app, so this count and Ink's own Yoga-measured wrap agree. The dim/inverse
+ *  ANSI codes the real render bakes in are omitted here on purpose: `wrap-ansi` measures ANSI-aware
+ *  (via `string-width`), so they don't change the wrap point either way — only the plain text needs
+ *  to be reconstructed for an accurate row count. */
+function composerRows(text: string, cursor: number, columns: number): number {
+  const { before, at, after } = renderWithCursor({ text, cursor });
+  const content = `❯ ${before}${at || " "}${after}`;
+  const contentRows = wrapAnsi(content, Math.max(1, columns), { hard: true, trim: false }).split("\n").length;
+  return 2 + Math.max(1, contentRows);
+}
+
 /** The pinned bottom bar's rendered line count — subtracted from `rows-1` to size the transcript
  *  viewport. Deliberately a JS line-count model (HARD CONSTRAINT 2: the frame height must be
  *  computed, never guessed via Yoga). Slight OVER-estimates are safe (they only leave blank space in
  *  the flexGrow viewport); the risk is UNDER-estimating so the viewport overflows its flex share and
- *  Yoga shrink-distorts — so the fixed pieces (composer 3 for its bordered box, footer 1) and the
- *  per-row task/agent counts are chosen to match the components' natural (unwrapped) heights. */
+ *  Yoga shrink-distorts — so the fixed pieces (footer 1, the T5 "Resuming conversation…" line 1 while
+ *  active) and the per-row task/agent counts are chosen to match the components' natural (unwrapped)
+ *  heights; the composer alone is wrap-aware (`composerRows` above, T5's hard-requirement fix) —
+ *  task subjects/footer stay best-effort single-line estimates, per that same review. */
 export function bottomBarRows(input: {
   tasksVisible: boolean;
   tasks: TaskRow[];
@@ -133,18 +184,31 @@ export function bottomBarRows(input: {
   running: boolean;
   pending: PendingCard | null;
   activeTurnRows: number;
+  /** Terminal width — feeds the composer's wrap-aware row count (or is simply unused when a card
+   *  replaces the composer). */
+  columns: number;
+  /** The idle composer's CURRENT text/cursor (App mirrors these off `Composer`'s `onStateChange`) —
+   *  irrelevant (and safely ignored) whenever `pending` is set, since a card replaces the composer. */
+  composerText: string;
+  composerCursor: number;
+  /** T5: the "Resuming conversation…" line renders (and counts) while true. */
+  resuming: boolean;
 }): number {
-  const { tasksVisible, tasks, agents, running, pending, activeTurnRows } = input;
+  const { tasksVisible, tasks, agents, running, pending, activeTurnRows, columns, composerText, composerCursor, resuming } = input;
   let n = activeTurnRows; // in-flight active turn (already tail-capped at ⌈rows/3⌉)
   if (tasks.length > 0 && tasksVisible) n += taskListRows(tasks);
   if (running) n += 1; // Spinner
-  n += pending ? pendingCardRows(pending) : 3; // Composer is a 3-row bordered box
+  if (resuming) n += 1; // "Resuming conversation…"
+  n += pending ? pendingCardRows(pending) : composerRows(composerText, composerCursor, columns);
   if (agents.length > 0) n += agents.length * 2; // each agent: head row + continuation row
   n += 1; // Footer
   return n;
 }
 
-export function App({ client, bridge, sessionId, cwd, initialPolicy, version, model, now = Date.now, onExitRequest }: AppProps) {
+export function App({
+  client, bridge, sessionId, cwd, initialPolicy, version, model,
+  now = Date.now, onExitRequest, resumeTargetSeq,
+}: AppProps) {
   const [state, dispatch] = useReducer(
     (s: TuiState, e: SessionEvent) => reduce(s, e, now()),
     undefined,
@@ -156,6 +220,24 @@ export function App({ client, bridge, sessionId, cwd, initialPolicy, version, mo
   const [tasksVisible, setTasksVisible] = useState(true); // CC default: the task view is shown
   const [verbose, setVerbose] = useState(false); // ctrl+o expands tool outputs / disables grouping
   const [highlight, setHighlight] = useState<Highlighter | undefined>(undefined);
+
+  // T5: mirrors the idle composer's OWN InputState (see composer.tsx's `onStateChange` doc comment)
+  // — feeds `bottomBarRows`' wrap-aware composer height and the exit hook's ctrl+D eligibility check.
+  // A real `useState` (not a ref): `bottomBarRows` must recompute on the SAME render Ink is about to
+  // lay the composer out on, or the JS height model could transiently under-count a just-typed
+  // wrapped line (the exact Yoga shrink-distortion risk this task's hard requirement fixes).
+  const [composerState, setComposerState] = useState<InputState>({ text: "", cursor: 0 });
+  const onComposerStateChange = useCallback((s: InputState) => setComposerState(s), []);
+
+  // T5 double-press ctrl+C/ctrl+D exit-armed state (see the file-top doc comment's KEY ROUTING #2).
+  const [exitArmedAt, setExitArmedAt] = useState<number | null>(null);
+  const exitArmed = exitArmedAt !== null && nowMs - exitArmedAt <= EXIT_WINDOW_MS;
+
+  // T5 resume replay: true from mount until an event with `seq >= resumeTargetSeq` is processed (see
+  // the file-top doc comment's RESUME REPLAY section). `resumeTargetSeq` is a constant for the
+  // mount's whole lifetime (main.ts sets it once, before rendering), so this lazy initializer only
+  // ever runs against its true starting value.
+  const [resuming, setResuming] = useState<boolean>(() => resumeTargetSeq !== undefined && resumeTargetSeq > 0);
 
   // Terminal geometry, live off process.stdout (+ a resize listener). Ink lays the root out at an
   // explicit height=rows-1, and the transcript/active-turn are pre-wrapped at `columns`.
@@ -170,8 +252,14 @@ export function App({ client, bridge, sessionId, cwd, initialPolicy, version, mo
   // Scroll state for the windowed transcript (viewport.ts). Starts stuck to the bottom (auto-follow).
   const [vp, setVp] = useState<ViewportState>(() => scrollToBottom());
 
-  // Subscribe to the bridge; flush its pre-subscribe (attach-replay) backlog then forward live.
-  useEffect(() => bridge.subscribe(dispatch), [bridge]);
+  // Subscribe to the bridge; flush its pre-subscribe (attach-replay) backlog then forward live. T5:
+  // also clears `resuming` once the replay reaches `resumeTargetSeq` — every `SessionEvent` carries a
+  // `seq` (protocol/events.ts's `Base`), so this needs no per-type special-casing (a `task_notification`
+  // still reduces to a no-op in state.ts, replaying invisibly, but its `seq` still counts here).
+  useEffect(() => bridge.subscribe((e) => {
+    dispatch(e);
+    if (resumeTargetSeq !== undefined && e.seq >= resumeTargetSeq) setResuming(false);
+  }), [bridge, resumeTargetSeq]);
 
   // Ticking clock so elapsed/spinner chrome advances between real events (legacy 120ms tick twin).
   useEffect(() => {
@@ -204,6 +292,7 @@ export function App({ client, bridge, sessionId, cwd, initialPolicy, version, mo
   const barRows = bottomBarRows({
     tasksVisible, tasks: state.tasks, agents: state.agents,
     running: state.turnRunning, pending: state.pending, activeTurnRows: atVisible.length,
+    columns, composerText: composerState.text, composerCursor: composerState.cursor, resuming,
   });
   const viewH = Math.max(1, (rows - 1) - barRows);
 
@@ -291,9 +380,44 @@ export function App({ client, bridge, sessionId, cwd, initialPolicy, version, mo
       if (key.ctrl && input === "d") { setVp((cur) => scrollBy(cur, Math.ceil(vh / 2), len, vh)); return; }
       if (key.ctrl && input === "o") { setVerbose((v) => !v); return; }
       if (key.ctrl && input === "t") { setTasksVisible((v) => !v); return; }
-      if (key.ctrl && input === "c") { onExitRequest?.(); return; } // TODO(T5): temporary single-press quit
+      // ctrl+C is deliberately NOT handled here — see the dedicated always-active exit hook below
+      // (T5). Two active hooks both acting on the same keystroke would double-fire it.
     },
     { isActive: !state.pending },
+  );
+
+  // First press: arm the exit window (+ interrupt, if a turn is running). Second press within the
+  // window: fire onExitRequest. Window expiry: the next press is treated as a fresh first press.
+  const armOrExit = (): void => {
+    if (exitArmed) {
+      setExitArmedAt(null);
+      onExitRequest?.();
+      return;
+    }
+    onInterrupt(); // no-op while idle — the turnRunning guard already lives inside onInterrupt
+    setExitArmedAt(nowMs);
+  };
+
+  // ALWAYS-ACTIVE exit hook (Task 5 hard requirement): a SEPARATE `useInput` from the scroll/toggle
+  // hook above, `isActive: true` UNCONDITIONALLY — so ctrl+C/ctrl+D can quit even while a pending
+  // card owns input (the bug this fixes: the scroll/toggle hook goes `isActive: false` the instant a
+  // card appears, Ink's own `exitOnCtrlC` is off — mount.ts — and neither PendingCards' nor
+  // Composer's own `useInput` ever act on ctrl+C/ctrl+D, so the app was previously unquittable until
+  // the card was answered). Only ctrl+C and ctrl+D are handled here; every other key falls through
+  // untouched — this is genuinely additive, not a replacement for the hook above (which still owns
+  // scrolling/verbose/tasks-toggle, including its own pre-existing, unrelated ctrl+d binding).
+  useInput(
+    (input, key) => {
+      if (key.ctrl && input === "c") { armOrExit(); return; }
+      if (key.ctrl && input === "d") {
+        // Only when the composer is empty or unmounted (a pending card owns input) — never steals
+        // ctrl+D from a non-empty buffer; the scroll/toggle hook's own ctrl+d scroll binding above
+        // is unaffected either way (this hook returning early here just means THIS hook does nothing).
+        const composerEligible = state.pending !== null || composerState.text.length === 0;
+        if (composerEligible) armOrExit();
+      }
+    },
+    { isActive: true },
   );
 
   return (
@@ -315,6 +439,7 @@ export function App({ client, bridge, sessionId, cwd, initialPolicy, version, mo
           outTokens={state.outTokens}
           tasks={state.tasks}
         />
+        {resuming ? <Text dimColor>Resuming conversation…</Text> : null}
         {state.pending ? (
           <PendingCards pending={state.pending} onApprove={onApprove} onAnswer={onAnswer} onPlan={onPlan} />
         ) : (
@@ -328,10 +453,11 @@ export function App({ client, bridge, sessionId, cwd, initialPolicy, version, mo
             onCyclePolicy={onCyclePolicy}
             nowMs={nowMs}
             sessionId={sessionId}
+            onStateChange={onComposerStateChange}
           />
         )}
         {state.agents.length > 0 ? <AgentList agents={state.agents} nowMs={nowMs} /> : null}
-        <Footer policy={policy} running={state.turnRunning} agents={state.agents} />
+        <Footer policy={policy} running={state.turnRunning} agents={state.agents} exitArmed={exitArmed} />
       </Box>
     </Box>
   );

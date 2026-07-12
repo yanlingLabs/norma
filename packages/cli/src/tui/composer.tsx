@@ -104,6 +104,12 @@ export interface ComposerProps {
   /** Fires on the FIRST esc press against non-empty text ("Esc again to clear"); a later task wires
    *  this into the footer's hint line. Optional so existing call sites need no changes. */
   onHint?: (hint: string) => void;
+  /** T5: fires on mount and every text/cursor edit, mirroring the internal `InputState` up to the
+   *  parent — NOT a controlled-component wire (the parent never feeds a value back in). App.tsx
+   *  uses this to (a) compute `bottomBarRows`' wrap-aware composer height from the SAME state Ink
+   *  is about to lay out, on the SAME render pass, and (b) decide ctrl+D exit-eligibility ("only
+   *  when the composer is empty"). Optional so every existing call site is unaffected. */
+  onStateChange?: (state: InputState) => void;
 }
 
 export function Composer({
@@ -118,6 +124,7 @@ export function Composer({
   sessionId = "",
   historyPath,
   onHint,
+  onStateChange,
 }: ComposerProps) {
   // `policy` stays a prop (callers/tests still pass it; `<Footer>`, a sibling, is the one that
   // renders it) — this component no longer renders it directly, matching `task-list.tsx`'s
@@ -126,6 +133,9 @@ export function Composer({
   const [state, setState] = useState<InputState>({ text: "", cursor: 0 });
   const [lastEscMs, setLastEscMs] = useState<number | null>(null);
   const effectiveHistoryPath = historyPath ?? defaultHistoryPath();
+
+  // T5: mirror state up to the parent on mount + every edit (see the prop doc comment above).
+  useEffect(() => { onStateChange?.(state); }, [state, onStateChange]);
 
   // Load prompt history once per mount (the App never remounts a live composer, so "once" here
   // really does mean "for this composer's whole lifetime") — a lazy useState initializer, not an

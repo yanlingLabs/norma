@@ -11,9 +11,15 @@
  *    enterAltScreen → enableMouseTracking → render(<App>) …  (interactive)
  *    … on exit request: disableMouseTracking → instance.unmount() → await waitUntilExit() → leaveAltScreen
  *  The App is rendered onto a BSU/ESU synchronized-update stdout proxy (`makeSyncStdout`) with
- *  `exitOnCtrlC: false` — the App itself owns quitting now (TODO(T5): a temporary single ctrl+C press
- *  calls `onExitRequest`, wired below to the teardown; T5 replaces it with the double-press flow and
- *  prints the resume hint in main.ts). */
+ *  `exitOnCtrlC: false` — the App itself owns quitting (Task 5's double-ctrl+C/ctrl+D flow calls
+ *  `onExitRequest`, wired below to the teardown; main.ts prints the dim "resume this session with…"
+ *  hint itself, AFTER `waitUntilExit()` resolves — i.e. after `leaveAltScreen` above has already run,
+ *  landing the hint in the NORMAL buffer, never the alt screen).
+ *
+ *  RESUME REPLAY (Task 5): `resumeTargetSeq` is a passthrough — main.ts sets it (to the seq its own
+ *  `attach(sessionId, 0)` call returned) ONLY on the `norma resume <id>` Ink route; every other route
+ *  (fresh session, legacy/NORMA_LEGACY_CLI chat resume, non-TTY) leaves it `undefined`, and `<App>`'s
+ *  behavior with `undefined` is exactly today's (see app.tsx's RESUME REPLAY doc comment). */
 
 import React from "react";
 import { render as inkRender } from "ink";
@@ -31,6 +37,8 @@ export interface MountOpts {
   initialPolicy: ApprovalPolicy;
   version: string; // CLI version — welcome banner (packages/cli/package.json)
   model: string; // resolved provider model — welcome banner (settings.provider.model)
+  /** Task 5 resume replay — see the module doc comment. Passed straight through to `<App>`. */
+  resumeTargetSeq?: number;
 }
 
 export interface TuiHandle {
@@ -76,6 +84,7 @@ export function mountTui(
       version: opts.version,
       model: opts.model,
       onExitRequest,
+      resumeTargetSeq: opts.resumeTargetSeq,
     }),
     { stdout: makeSyncStdout(process.stdout), exitOnCtrlC: false },
   );

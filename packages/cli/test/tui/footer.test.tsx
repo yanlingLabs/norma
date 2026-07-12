@@ -61,6 +61,17 @@ describe("Footer (e, f, g)", () => {
     expect(lastFrame() ?? "").not.toContain("shift+tab to cycle modes");
   });
 
+  test("(T5) exitArmed replaces the whole line with the exact dim hint, even when other segments would apply", () => {
+    const { lastFrame } = render(
+      <Footer policy="plan" running agents={[agent("a")]} exitArmed />,
+    );
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("Press Ctrl-C again to exit");
+    expect(frame).not.toContain("plan mode on");
+    expect(frame).not.toContain("esc to interrupt");
+    expect(frame).not.toContain("agent");
+  });
+
   test("segments render in order (mode, interrupt, agents) when all three apply", () => {
     // Individual segments are wrapped in their own colored <Text>, so ANSI reset/set codes can sit
     // between them in the raw frame — assert relative ORDER via indexOf rather than one contiguous

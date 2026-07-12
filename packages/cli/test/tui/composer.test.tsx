@@ -541,4 +541,31 @@ describe("Composer", () => {
     expect(lines).toHaveLength(3);
     expect(lines[1]).toBe("❯ a ");
   });
+
+  test("(o) onStateChange mirrors state on mount and on every edit (T5 — App's layout/exit-eligibility seam)", async () => {
+    const seen: { text: string; cursor: number }[] = [];
+    const { stdin } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        onStateChange={(s) => seen.push({ ...s })}
+      />,
+    );
+    await wait();
+    expect(seen.at(0)).toEqual({ text: "", cursor: 0 }); // fired on mount
+
+    stdin.write("hi");
+    await wait();
+    expect(seen.at(-1)).toEqual({ text: "hi", cursor: 2 });
+
+    stdin.write("\r");
+    await wait();
+    expect(seen.at(-1)).toEqual({ text: "", cursor: 0 }); // cleared after submit
+  });
 });
