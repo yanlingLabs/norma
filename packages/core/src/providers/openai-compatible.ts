@@ -36,6 +36,16 @@ export function mapInput(items: TurnInputItem[]): unknown[] {
       return { type: "function_call", call_id: i.callId, name: i.name, arguments: i.argsJson };
     }
     if (i.type === "reasoning") return JSON.parse(i.itemJson); // opaque passthrough — never inspected
+    // Computer-use image (Phase 5 CU): a user message carrying an input_image. This is the ONLY
+    // image shape the CU spike verified against the Codex backend — a structured user message with
+    // `input_image` + `image_url` as a plain data-URL string (NOT the chat-completions
+    // `{image_url:{url}}` object form). The optional `alt` rides as a leading input_text part.
+    if (i.type === "image") {
+      const content: unknown[] = [];
+      if (i.alt) content.push({ type: "input_text", text: i.alt });
+      content.push({ type: "input_image", image_url: i.imageUrl });
+      return { type: "message", role: "user", content };
+    }
     return { type: "function_call_output", call_id: i.callId, output: i.output };
   });
 }
