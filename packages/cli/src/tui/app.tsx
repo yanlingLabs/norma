@@ -1,46 +1,52 @@
-/** `<App>` (Phase 3a Task 6; re-laid-out Phase 3b Task 7) — the assembled Ink TUI. It folds the
- *  client's event stream (via the `EventBridge`) through the pure `reduce` reducer into one
- *  `TuiState`, renders the Claude-Code transcript grammar + turn chrome, and wires the
- *  composer/card callbacks back to the client (send/steer/interrupt/setPolicy/approval/ask/plan).
+/** `<App>` (Phase 3a Task 6; Phase 3c Task 4 — rebuilt as CC's FULLSCREEN alt-screen shell). It
+ *  folds the client's event stream (via the `EventBridge`) through the pure `reduce` reducer into
+ *  one `TuiState`, renders a JS-WINDOWED transcript above a PINNED bottom bar (composer + turn
+ *  chrome), and wires the composer/card callbacks back to the client
+ *  (send/steer/interrupt/setPolicy/approval/ask/plan).
  *
- *  CC LAYOUT (Task 7), top to bottom:
- *    <CommittedTranscript>  — the <Static> scrollback. Its FIRST item is the welcome banner (passed
- *                             as `header`), so the banner lands once at the top and never re-emits.
- *                             ALWAYS MOUNTED (never remounted / never conditionally unmounted) so the
- *                             Static flush pointer survives a pager toggle (HARD CONSTRAINT 2).
- *    then, when the pager is CLOSED:
- *      <ActiveTurn>         — streaming assistant text + in-flight tool lines (nowMs → blinking dot).
- *      <Spinner>            — animated in-progress indicator (verbs/elapsed/tokens).
- *      [<TaskList>]         — shown only while `tasksVisible` (ctrl+t toggles it).
- *      <PendingCards|Composer> — the card takes over input when `state.pending` is set.
- *      [<AgentList>]        — the subagent tree rows, only while any agent is live.
- *      <Footer>             — policy/interrupt/agents hint line.
- *    when the pager is OPEN (ctrl+o): the <Pager> renders in place of that whole block, as a SIBLING
- *      of the still-mounted <CommittedTranscript>, on the terminal's alternate screen buffer.
+ *  FULLSCREEN LAYOUT (Task 4), inside a root `<Box flexDirection="column" height={rows-1}>` (HARD
+ *  CONSTRAINT 1: an explicit numeric height keeps Ink's `outputHeight < stdout.rows` unconditionally,
+ *  so Ink never emits the scrollback-erasing clearTerminal):
+ *    <Box flexGrow={1}>            — the transcript viewport: EXACTLY the visible lines of the flattened
+ *                                    line log (welcome header ++ `makeFlattenCache().lines(committed)`),
+ *                                    sliced by `viewport.ts` to `viewH` = (rows-1) − bottomBarRows, ONE
+ *                                    <Text> per line (HARD CONSTRAINT 2: JS-window everything; never
+ *                                    lean on Yoga overflow). `flexGrow` pushes the bar to the bottom
+ *                                    when the log is shorter than the viewport.
+ *    <Box flexShrink={0}>          — the pinned bottom bar, top-to-bottom:
+ *      activeTurn (tail-sliced)     — the in-flight streaming turn, JS tail-capped at ⌈rows/3⌉ lines.
+ *      [TaskList]                   — when tasks exist AND `tasksVisible` (DEFAULT TRUE; ctrl+t toggles).
+ *      Spinner                      — animated in-progress indicator (only while a turn runs).
+ *      PendingCards | Composer      — a card takes over input when `state.pending` is set.
+ *      [AgentList]                  — the subagent tree, only while any agent is live.
+ *      Footer                       — policy/interrupt/agents hint line.
  *
- *  KEY ROUTING: a single App-level `useInput` (active while `!state.pending`) owns ctrl+o (pager
- *  toggle), ctrl+t (task view toggle), and — WHILE THE PAGER IS OPEN — the pager's ↑/↓ · PgUp/PgDn ·
- *  esc navigation, swallowing everything else. The composer is `disabled` (its listener detached)
- *  whenever a card or the pager owns input, so exactly one live consumer sees each keystroke.
+ *  KEY ROUTING (App-level `useInput`, active while `!state.pending`): PgUp/PgDn scroll ±(viewH-1),
+ *  ctrl+u/ctrl+d ±⌈viewH/2⌉, ctrl+o toggles `verbose`, ctrl+t toggles `tasksVisible`, ctrl+C requests
+ *  exit (TODO(T5): a temporary single-press quit until T5 wires the double-press flow). Mouse SGR
+ *  reports (wheel + any button/motion) are intercepted at the shared stdin input emitter and swallowed
+ *  BEFORE any `useInput` consumer (this App's or the composer's) sees them — wheel scrolls ±3, every
+ *  other mouse report is dropped (so no mouse bytes ever land in the composer buffer).
  *
  *  Clock discipline unchanged from 3a: the reducer is fed an INJECTED clock (`now()` at event time);
  *  a ~100ms `setInterval` ticks `nowMs` in state for live chrome; `reduce` itself never calls
  *  Date.now. Policy cycle keeps the one-RPC-in-flight guard; idle-Esc stays inert. */
 
-import React, { useEffect, useReducer, useRef, useState } from "react";
-import { Box, Text, useInput } from "ink";
+import React, { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { Box, Text, useInput, useStdin } from "ink";
+import { Chalk } from "chalk";
 import { METHODS, type ApprovalPolicy, type SessionEvent } from "@norma/protocol";
-import { initialState, reduce, type TuiState } from "./state";
-import { CommittedTranscript, settledCount } from "./transcript";
-import { ActiveTurn } from "./active-turn";
+import { initialState, reduce, type AgentRow, type PendingCard, type TuiState } from "./state";
+import { activeTurnLines, makeFlattenCache } from "./flatten-blocks";
+import { scrollBy, scrollToBottom, viewportSlice, type ViewportState } from "./viewport";
+import { collapseCompleted, sortTasksForDisplay, type TaskRow } from "../task-display";
 import { Spinner } from "./spinner";
 import { TaskList } from "./task-list";
 import { AgentList } from "./agent-list";
 import { Footer } from "./footer";
 import { Composer } from "./composer";
 import { PendingCards, type AnswerPayload } from "./pending-cards";
-import { Pager, pagerLines, pagerWindowRows } from "./pager";
-import { enterAltScreen, leaveAltScreen } from "./alt-screen";
+import { parseMouseInput } from "./alt-screen";
 import { theme } from "./theme";
 import { loadSafeHighlighter } from "./highlight-guard";
 import type { Highlighter } from "./markdown";
@@ -68,32 +74,77 @@ export interface AppProps {
   /** Welcome-banner data (main.ts threads these through mountTui). */
   version: string;
   model: string;
-  /** Injectable clock (tests). Defaults to Date.now — this is the ONLY place Date.now enters; it is
-   *  passed to `reduce` strictly as the injected `nowMs`, keeping the reducer pure. */
+  /** Injectable clock (tests). Defaults to Date.now — the ONLY place Date.now enters; passed to
+   *  `reduce` strictly as the injected `nowMs`, keeping the reducer pure. */
   now?: () => number;
-  /** Injectable raw-stdout writer for the alt-screen enter/leave escapes (tests inject a sink so no
-   *  real escape bytes reach the test terminal). Production writes straight to `process.stdout`. */
-  write?: (s: string) => void;
+  /** Exit request (mount.ts wires it to the alt-screen teardown). TODO(T5): a single ctrl+C press
+   *  calls this today; T5 replaces it with the double-press quit flow + resume hint. */
+  onExitRequest?: () => void;
 }
 
 const POLICY_ORDER: ApprovalPolicy[] = ["ask", "auto", "plan"];
 
-/** The welcome banner: bold-accent `Norma` + dim version, then a dim `model · cwd` line. Rendered as
- *  the FIRST <Static> item (via CommittedTranscript's `header`) so it paints once at the top. */
-function Welcome({ version, model, cwd }: { version: string; model: string; cwd: string }) {
-  return (
-    <Box flexDirection="column">
-      <Text>
-        <Text bold color={theme.accent}>Norma</Text>
-        <Text dimColor>{` v${version}`}</Text>
-      </Text>
-      <Text dimColor>{`${model} · ${cwd}`}</Text>
-    </Box>
-  );
+const readRows = (): number => (typeof process.stdout.rows === "number" ? process.stdout.rows : 24);
+const readCols = (): number => (typeof process.stdout.columns === "number" ? process.stdout.columns : 80);
+
+/** The welcome header — the FIRST lines of the transcript line log (prepended once; they scroll off
+ *  the top as the transcript grows, exactly like any other scrollback line). Bold-accent `Norma` +
+ *  dim version, then a dim `model · cwd` line, then a blank spacer. A fixed-level Chalk instance
+ *  (same reason as flatten-blocks.ts / markdown.ts: the ambient default downgrades to level 0 under
+ *  a non-TTY and would strip these codes). */
+function welcomeLines(version: string, model: string, cwd: string): string[] {
+  const ansi = new Chalk({ level: 3 });
+  return [
+    `${ansi.hex(theme.accent).bold("Norma")}${ansi.dim(` v${version}`)}`,
+    ansi.dim(`${model} · ${cwd}`),
+    "",
+  ];
 }
 
-export function App({ client, bridge, sessionId, cwd, initialPolicy, version, model, now = Date.now, write }: AppProps) {
-  const writeOut = write ?? ((s: string) => { process.stdout.write(s); });
+/** Rendered line count of `<TaskList>` for `tasks`: the count header (1) + the collapsed display
+ *  rows + one overflow line when older completed rows were folded away. Logical-row model (assumes
+ *  each row fits one terminal line) — mirrors `task-list.tsx`'s own structure. */
+function taskListRows(tasks: TaskRow[]): number {
+  const { rows, collapsedCompletedCount } = collapseCompleted(sortTasksForDisplay(tasks));
+  return 1 + rows.length + (collapsedCompletedCount > 0 ? 1 : 0);
+}
+
+/** Rendered line count of a pending card. Approval is one line; plan/question are best-effort
+ *  logical-row estimates (the transcript is only a background surface while a card owns input, so a
+ *  slight miscount here just adds/removes blank rows above the card, never breaks its own layout). */
+function pendingCardRows(pending: PendingCard): number {
+  if (pending.kind === "approval") return 1;
+  if (pending.kind === "plan") return 5 + pending.plan.split("\n").length; // header + plan + 3-line menu + choose line
+  const q = (pending.questions as { options?: unknown[] }[])[0];
+  const options = Array.isArray(q?.options) ? q!.options!.length : 0;
+  return 3 + options * 2 + 1; // header/question + per-option lines + prompt
+}
+
+/** The pinned bottom bar's rendered line count — subtracted from `rows-1` to size the transcript
+ *  viewport. Deliberately a JS line-count model (HARD CONSTRAINT 2: the frame height must be
+ *  computed, never guessed via Yoga). Slight OVER-estimates are safe (they only leave blank space in
+ *  the flexGrow viewport); the risk is UNDER-estimating so the viewport overflows its flex share and
+ *  Yoga shrink-distorts — so the fixed pieces (composer 3 for its bordered box, footer 1) and the
+ *  per-row task/agent counts are chosen to match the components' natural (unwrapped) heights. */
+export function bottomBarRows(input: {
+  tasksVisible: boolean;
+  tasks: TaskRow[];
+  agents: AgentRow[];
+  running: boolean;
+  pending: PendingCard | null;
+  activeTurnRows: number;
+}): number {
+  const { tasksVisible, tasks, agents, running, pending, activeTurnRows } = input;
+  let n = activeTurnRows; // in-flight active turn (already tail-capped at ⌈rows/3⌉)
+  if (tasks.length > 0 && tasksVisible) n += taskListRows(tasks);
+  if (running) n += 1; // Spinner
+  n += pending ? pendingCardRows(pending) : 3; // Composer is a 3-row bordered box
+  if (agents.length > 0) n += agents.length * 2; // each agent: head row + continuation row
+  n += 1; // Footer
+  return n;
+}
+
+export function App({ client, bridge, sessionId, cwd, initialPolicy, version, model, now = Date.now, onExitRequest }: AppProps) {
   const [state, dispatch] = useReducer(
     (s: TuiState, e: SessionEvent) => reduce(s, e, now()),
     undefined,
@@ -102,20 +153,22 @@ export function App({ client, bridge, sessionId, cwd, initialPolicy, version, mo
   const [nowMs, setNowMs] = useState(() => now());
   const [policy, setPolicy] = useState<ApprovalPolicy>(initialPolicy);
   const policyInFlight = useRef(false);
-  const [tasksVisible, setTasksVisible] = useState(false);
+  const [tasksVisible, setTasksVisible] = useState(true); // CC default: the task view is shown
+  const [verbose, setVerbose] = useState(false); // ctrl+o expands tool outputs / disables grouping
   const [highlight, setHighlight] = useState<Highlighter | undefined>(undefined);
 
-  // ctrl+o pager state. `pagerRows` is the terminal height captured at OPEN time (fallback 24) — the
-  // pager reserves rows off it so its total painted height stays strictly under it (see pager.tsx).
-  // `staticCap` (fix B, whole-branch review) freezes <Static>'s item feed while the pager holds the
-  // alternate screen buffer: items flushed there would be discarded by `\x1b[?1049l` on close while
-  // Static's flush index still advanced — permanently missing from scrollback. Captured at open
-  // (= the settled count Static has already painted), lifted in the SAME state update as every
-  // close path so the held items flush into the restored normal buffer.
-  const [pagerOpen, setPagerOpen] = useState(false);
-  const [pagerOffset, setPagerOffset] = useState(0);
-  const [pagerRows, setPagerRows] = useState(24);
-  const [staticCap, setStaticCap] = useState<number | null>(null);
+  // Terminal geometry, live off process.stdout (+ a resize listener). Ink lays the root out at an
+  // explicit height=rows-1, and the transcript/active-turn are pre-wrapped at `columns`.
+  const [rows, setRows] = useState(readRows);
+  const [columns, setColumns] = useState(readCols);
+  useEffect(() => {
+    const onResize = () => { setRows(readRows()); setColumns(readCols()); };
+    process.stdout.on("resize", onResize);
+    return () => { process.stdout.off("resize", onResize); };
+  }, []);
+
+  // Scroll state for the windowed transcript (viewport.ts). Starts stuck to the bottom (auto-follow).
+  const [vp, setVp] = useState<ViewportState>(() => scrollToBottom());
 
   // Subscribe to the bridge; flush its pre-subscribe (attach-replay) backlog then forward live.
   useEffect(() => bridge.subscribe(dispatch), [bridge]);
@@ -126,30 +179,75 @@ export function App({ client, bridge, sessionId, cwd, initialPolicy, version, mo
     return () => clearInterval(id);
   }, [now]);
 
-  // Load the code-fence syntax highlighter once (best-effort, stderr-suppressed — HARD CONSTRAINT 4)
-  // and thread it into the committed transcript's markdown render. Async: until it resolves, code
-  // fences render as plain text (identical to pre-load), then newly-committed blocks get highlighted.
+  // Load the code-fence syntax highlighter once (best-effort, stderr-suppressed — HARD CONSTRAINT 4).
   useEffect(() => {
     let live = true;
     void loadSafeHighlighter().then((hl) => { if (live) setHighlight(() => hl); });
     return () => { live = false; };
   }, []);
 
-  // Fix A (whole-branch review): a pending card arriving while the pager is open would soft-lock the
-  // session — this component's useInput goes inactive (isActive: !pending) and <PendingCards> only
-  // mounts on the non-pager branch, leaving an un-closeable pager over an invisible card (and a
-  // Ctrl+C exit would strand the terminal on the alternate buffer, never writing leaveAltScreen).
-  // Auto-close instead: leave the alt screen and drop the pager + Static freeze-cap in one batched
-  // update; the card then mounts normally with its own input. The leave escape is written
-  // synchronously here and React repaints after the effect, so the escape still precedes the
-  // restored (card-bearing) frame — HARD CONSTRAINT 3's ordering holds on this close path too.
-  // Guarded re-entry: after the first run flips pagerOpen to false, re-runs are no-ops.
+  // Flatten cache (memoizes per-block wrapping across the append-only committed array). Rebuilt when
+  // the highlighter loads (a one-time transition) so already-cached code fences re-render highlighted;
+  // columns/verbose changes are handled by the cache's own internal invalidation.
+  const cache = useMemo(() => makeFlattenCache(), [highlight]);
+
+  // --- derived per render -------------------------------------------------------------------------
+  const welcome = useMemo(() => welcomeLines(version, model, cwd), [version, model, cwd]);
+  const bodyLines = cache.lines(state.committed, { columns, verbose, highlight });
+  const lineLog = welcome.concat(bodyLines);
+
+  const activeCap = Math.ceil(rows / 3);
+  const dimToolDot = Math.floor(nowMs / 500) % 2 === 0;
+  const atAll = activeTurnLines(state.activeAssistant, state.activeTools, { columns, highlight, dimToolDot });
+  const atVisible = atAll.slice(-activeCap); // JS tail-slice (HARD CONSTRAINT 2)
+
+  const barRows = bottomBarRows({
+    tasksVisible, tasks: state.tasks, agents: state.agents,
+    running: state.turnRunning, pending: state.pending, activeTurnRows: atVisible.length,
+  });
+  const viewH = Math.max(1, (rows - 1) - barRows);
+
+  const { visible, vp: clampedVp } = viewportSlice(lineLog, vp, viewH);
+
+  // Keep `len`/`viewH` current for the input handlers + the mouse emitter patch (both may run from a
+  // closure created on an earlier render); refs updated during render, read at event time.
+  const lineCountRef = useRef(lineLog.length);
+  const viewHRef = useRef(viewH);
+  lineCountRef.current = lineLog.length;
+  viewHRef.current = viewH;
+
+  // Fold back a clamp (e.g. verbose toggle shrank the log under a stored scrollTop) so state stays
+  // consistent — no-op when viewportSlice returned the same reference.
   useEffect(() => {
-    if (!pagerOpen || !state.pending) return;
-    setPagerOpen(false);
-    setStaticCap(null);
-    leaveAltScreen(writeOut);
-  }, [pagerOpen, state.pending, writeOut]);
+    if (clampedVp !== vp) setVp(clampedVp);
+  }, [clampedVp, vp]);
+
+  // --- mouse: intercept SGR reports at the shared stdin input emitter, BEFORE any useInput consumer
+  // (this App's or the composer's) sees them. Ink emits the RAW chunk (ESC intact) on
+  // internal_eventEmitter 'input' (its App.js), so parseMouseInput's strict regex matches directly.
+  // A wheel report scrolls ±3; every mouse report (wheel or button/motion) is dropped so no mouse
+  // bytes ever reach the composer buffer. Restored on unmount. ---
+  const { internal_eventEmitter: inputEmitter } = useStdin();
+  useEffect(() => {
+    const em = inputEmitter;
+    if (!em) return;
+    const orig = em.emit.bind(em) as (event: string, ...args: unknown[]) => boolean;
+    const patched = (event: string, ...args: unknown[]): boolean => {
+      if (event === "input") {
+        const m = parseMouseInput(String(args[0]));
+        if (m.isMouse) {
+          if (m.wheel) {
+            const delta = m.wheel.dir === "up" ? -3 : 3;
+            setVp((cur) => scrollBy(cur, delta, lineCountRef.current, viewHRef.current));
+          }
+          return true; // swallow — no listener fires for this chunk
+        }
+      }
+      return orig(event, ...args);
+    };
+    em.emit = patched as typeof em.emit;
+    return () => { em.emit = orig as typeof em.emit; };
+  }, [inputEmitter]);
 
   const onSubmit = (text: string) => { void client.send(sessionId, text); };
   const onSteer = (text: string) => { void client.steer(sessionId, text); };
@@ -177,94 +275,64 @@ export function App({ client, bridge, sessionId, cwd, initialPolicy, version, mo
     void client.planRespond({ sessionId, callId, ...resp });
   };
 
-  // --- pager open/close (HARD CONSTRAINT 3: enter BEFORE showing, leave AFTER hiding, via
-  // alt-screen.ts). The escape write is synchronous; the React state flip is deferred — so the
-  // enter escape always precedes the pager's first frame and the leave escape always precedes the
-  // restored non-pager frame, regardless of statement order. ---
-  const openPager = () => {
-    enterAltScreen(writeOut);
-    setPagerRows(typeof process.stdout.rows === "number" ? process.stdout.rows : 24);
-    setPagerOffset(0);
-    // Freeze Static at exactly what it has already painted (this render's settled count — the
-    // useInput closure and Static's flush index both come from the same last commit), fix B.
-    setStaticCap(settledCount(state.committed));
-    setPagerOpen(true);
-  };
-  const closePager = () => {
-    setPagerOpen(false);
-    setStaticCap(null); // lift the freeze in the SAME update — held items flush into the restored buffer
-    leaveAltScreen(writeOut);
-  };
-  const scrollPager = (delta: number) => {
-    setPagerOffset((o) => {
-      const max = Math.max(0, pagerLines(state.committed).length - pagerWindowRows(pagerRows));
-      return Math.min(max, Math.max(0, o + delta));
-    });
-  };
-
   useInput(
     (input, key) => {
-      if (key.ctrl && input === "o") {
-        if (pagerOpen) closePager();
-        else openPager();
-        return;
-      }
-      if (pagerOpen) {
-        // While the pager owns the screen it consumes all navigation; every other key is swallowed
-        // so nothing leaks to (the disabled) composer or mutates hidden state.
-        const pageStep = Math.max(1, pagerRows - 2);
-        if (key.escape) { closePager(); return; }
-        if (key.upArrow) { scrollPager(-1); return; }
-        if (key.downArrow) { scrollPager(1); return; }
-        if (key.pageUp) { scrollPager(-pageStep); return; }
-        if (key.pageDown) { scrollPager(pageStep); return; }
-        return;
-      }
+      // Mouse defense-in-depth: the emitter patch above already swallows SGR reports before this
+      // handler, but if any mouse-shaped input slips through (Ink strips the leading ESC), swallow it
+      // here too so it never triggers a key branch below. Scrolling is handled by the patch, not here.
+      const m = parseMouseInput(input.startsWith("\x1b") ? input : `\x1b${input}`);
+      if (m.isMouse) return;
+
+      const len = lineCountRef.current;
+      const vh = viewHRef.current;
+      if (key.pageUp) { setVp((cur) => scrollBy(cur, -(vh - 1), len, vh)); return; }
+      if (key.pageDown) { setVp((cur) => scrollBy(cur, vh - 1, len, vh)); return; }
+      if (key.ctrl && input === "u") { setVp((cur) => scrollBy(cur, -Math.ceil(vh / 2), len, vh)); return; }
+      if (key.ctrl && input === "d") { setVp((cur) => scrollBy(cur, Math.ceil(vh / 2), len, vh)); return; }
+      if (key.ctrl && input === "o") { setVerbose((v) => !v); return; }
       if (key.ctrl && input === "t") { setTasksVisible((v) => !v); return; }
+      if (key.ctrl && input === "c") { onExitRequest?.(); return; } // TODO(T5): temporary single-press quit
     },
     { isActive: !state.pending },
   );
 
   return (
-    <Box flexDirection="column">
-      <CommittedTranscript
-        items={state.committed}
-        header={<Welcome version={version} model={model} cwd={cwd} />}
-        highlight={highlight}
-        staticCap={staticCap}
-      />
-      {pagerOpen ? (
-        <Pager blocks={state.committed} rows={pagerRows} offset={pagerOffset} />
-      ) : (
-        <>
-          <ActiveTurn assistant={state.activeAssistant} tools={state.activeTools} nowMs={nowMs} />
-          <Spinner
+    <Box flexDirection="column" height={rows - 1}>
+      <Box flexGrow={1} flexDirection="column" overflow="hidden">
+        {visible.map((line, i) => (
+          <Text key={i}>{line.length > 0 ? line : " "}</Text>
+        ))}
+      </Box>
+      <Box flexDirection="column" flexShrink={0}>
+        {atVisible.map((line, i) => (
+          <Text key={`at${i}`}>{line.length > 0 ? line : " "}</Text>
+        ))}
+        {state.tasks.length > 0 && tasksVisible ? <TaskList tasks={state.tasks} nowMs={nowMs} /> : null}
+        <Spinner
+          running={state.turnRunning}
+          turnStartMs={state.turnStartMs}
+          nowMs={nowMs}
+          outTokens={state.outTokens}
+          tasks={state.tasks}
+        />
+        {state.pending ? (
+          <PendingCards pending={state.pending} onApprove={onApprove} onAnswer={onAnswer} onPlan={onPlan} />
+        ) : (
+          <Composer
             running={state.turnRunning}
-            turnStartMs={state.turnStartMs}
+            policy={policy}
+            disabled={!!state.pending}
+            onSubmit={onSubmit}
+            onSteer={onSteer}
+            onInterrupt={onInterrupt}
+            onCyclePolicy={onCyclePolicy}
             nowMs={nowMs}
-            outTokens={state.outTokens}
-            tasks={state.tasks}
+            sessionId={sessionId}
           />
-          {tasksVisible ? <TaskList tasks={state.tasks} nowMs={nowMs} /> : null}
-          {state.pending ? (
-            <PendingCards pending={state.pending} onApprove={onApprove} onAnswer={onAnswer} onPlan={onPlan} />
-          ) : (
-            <Composer
-              running={state.turnRunning}
-              policy={policy}
-              disabled={!!state.pending || pagerOpen}
-              onSubmit={onSubmit}
-              onSteer={onSteer}
-              onInterrupt={onInterrupt}
-              onCyclePolicy={onCyclePolicy}
-              nowMs={nowMs}
-              sessionId={sessionId}
-            />
-          )}
-          {state.agents.length > 0 ? <AgentList agents={state.agents} nowMs={nowMs} /> : null}
-          <Footer policy={policy} running={state.turnRunning} agents={state.agents} />
-        </>
-      )}
+        )}
+        {state.agents.length > 0 ? <AgentList agents={state.agents} nowMs={nowMs} /> : null}
+        <Footer policy={policy} running={state.turnRunning} agents={state.agents} />
+      </Box>
     </Box>
   );
 }

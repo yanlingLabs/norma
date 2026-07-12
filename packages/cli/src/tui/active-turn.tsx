@@ -28,7 +28,7 @@ import React from "react";
 import { Box, Text } from "ink";
 import { renderMarkdown, splitStableBoundary } from "./markdown";
 import { theme } from "./theme";
-import { formatArgsHead } from "./transcript";
+import { formatArgsHead } from "./format";
 
 /** Memoized so the (potentially expensive, re-lexed-on-every-boundary-advance) markdown render of
  *  the STABLE prefix only re-runs when `stable` itself changes — not on every streaming delta, which

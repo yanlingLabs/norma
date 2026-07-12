@@ -8,11 +8,10 @@
  *  same determinism trick as `markdown.ts`) — only the LOOK (dim/bold/color per `theme.ts`) and the
  *  visible text need to agree.
  *
- *  `formatArgsHead` is imported from `transcript.tsx` (the same cross-import `pager.tsx` already
- *  uses) rather than re-implemented, so the args-head truncation rule has exactly one definition.
- *  `MAX_RESULT_LINES` is NOT exported by `transcript.tsx` today, so it is duplicated here (kept in
- *  sync by inspection); unifying every per-kind builder behind one shared module is T4's job when
- *  it rewires `<CommittedTranscript>` on top of this file and deletes `pager.tsx`.
+ *  `formatArgsHead` + `MAX_RESULT_LINES` are imported from the React-free `format.ts` (Task 4 moved
+ *  them there out of the React-bearing `transcript.tsx`), so this module — the fullscreen line-log
+ *  source — pulls in NO Ink/React graph, and the args-head/result caps have exactly one definition
+ *  shared with the `transcript.tsx` grammar renderers.
  *
  *  GUTTER MODEL (why lines line up the way they do): `transcript.tsx` renders assistant/tool-head/
  *  collapsed-run rows as an Ink `flexDirection="row"` pair — a fixed-width gutter `Box` (glyph)
@@ -44,16 +43,13 @@ import { Chalk } from "chalk";
 import wrapAnsi from "wrap-ansi";
 import type { Block } from "./state";
 import { theme } from "./theme";
-import { renderMarkdown, type Highlighter } from "./markdown";
+import { renderMarkdown, splitStableBoundary, type Highlighter } from "./markdown";
 import { pickVerb, TURN_VERBS } from "./spinner-verbs";
 import { formatElapsed, formatTokens } from "../task-display";
 import { groupBlocks } from "./group-blocks";
-import { formatArgsHead } from "./transcript";
+import { formatArgsHead, MAX_RESULT_LINES } from "./format";
 
 const ansi = new Chalk({ level: 3 });
-
-/** Mirrors `transcript.tsx`'s (non-exported) `MAX_RESULT_LINES` — see file header. */
-const MAX_RESULT_LINES = 10;
 
 export interface FlattenOpts {
   columns: number;
@@ -167,6 +163,40 @@ export function flattenBlock(block: Block, opts: FlattenOpts): string[] {
  *  calls this, after `groupBlocks` has folded a run of collapsible tool blocks into a summary. */
 function flattenCollapsedSummary(summary: string, columns: number): string[] {
   return gutterRows(2, `${ansi.dim("⏺")} `, "  ", [ansi.dim(`${summary} (ctrl+o to expand)`)], columns);
+}
+
+/** The IN-FLIGHT (not-yet-committed) active turn as wrapped ANSI lines — the string analog of
+ *  `<ActiveTurn>` (active-turn.tsx), so `app.tsx` can JS-WINDOW it (tail-slice to ⌈rows/3⌉) into the
+ *  pinned bottom bar instead of leaning on a Yoga `maxHeight` (HARD CONSTRAINT 2: Yoga clipping is
+ *  unreliable). Mirrors `<ActiveTurn>`'s visible layout:
+ *   - streaming assistant text: the 2-col `⏺` gutter (steady `theme.text` dot) + the stable prefix
+ *     rendered through `renderMarkdown` then the still-growing `tail` as plain text (same
+ *     `splitStableBoundary` split the component uses — the tail is NOT markdown-parsed, avoiding
+ *     half-parsed flicker mid-stream);
+ *   - each in-flight tool: the 2-col gutter (dot dimmed when `dimToolDot`, the blink the component
+ *     drives off `nowMs` parity) + `bold(name)(argsHead)`.
+ *  Returns [] when idle (no assistant text, no in-flight tools) — the component's "hidden when idle". */
+export function activeTurnLines(
+  assistant: string,
+  tools: { name: string; argsJson: string }[],
+  opts: { columns: number; highlight?: Highlighter; dimToolDot: boolean },
+): string[] {
+  const { columns, highlight, dimToolDot } = opts;
+  const out: string[] = [];
+  if (assistant) {
+    const { stable, tail } = splitStableBoundary(assistant);
+    const content: string[] = [];
+    if (stable) content.push(...renderMarkdown(stable, highlight).split("\n"));
+    if (tail) content.push(...tail.split("\n"));
+    out.push(...gutterRows(2, `${ansi.hex(theme.text)("⏺")} `, "  ", content, columns));
+  }
+  for (const t of tools) {
+    const argsHead = formatArgsHead(t.argsJson);
+    const headText = `${ansi.bold(t.name)}${argsHead ? `(${argsHead})` : ""}`;
+    const dot = dimToolDot ? ansi.dim("⏺") : "⏺";
+    out.push(...gutterRows(2, `${dot} `, "  ", headText.split("\n"), columns));
+  }
+  return out;
 }
 
 /** Memoizing wrapper over `flattenBlock` (+ the collapsed-run summary) across an APPEND-ONLY
