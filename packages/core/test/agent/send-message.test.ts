@@ -171,11 +171,16 @@ describe("AgentEngine: send_message (4h-ii-b Task 4 — CC SendMessage parity)",
     for (let i = 0; i < 400 && bgAgents.get("worker", sessionId)?.status === "running"; i++) {
       await new Promise((r) => setTimeout(r, 5));
     }
-    // the detached resumed run re-completed the entry and (unlike a sync path) left it UN-notified
-    // — claimable by a completion-notice mechanism (bg-retrigger Task 1's takeForNotification;
-    // NOTE: the detached-RESUME settle path does not yet call notifyBgCompletion — see that task's
-    // report — so nothing claims this entry today)
-    expect(bgAgents.get("worker", sessionId)).toMatchObject({ status: "completed", notified: false });
+    // bg-retrigger T1 (concern fix): the detached RESUME's settle handler now persists the
+    // completion notice itself (notifyBgCompletion), exactly like a fresh detached spawn —
+    // reopen() reset `notified` at resume time, so the claim fires again for the resumed run's
+    // OWN completion (CC parity: a resumed agent that finishes again notifies again). The
+    // original SYNC spawn completed {notified:true}, so this is the session's ONLY notification.
+    expect(bgAgents.get("worker", sessionId)).toMatchObject({ status: "completed", notified: true });
+    const notes = store.read(sessionId).filter((e) => e.type === "task_notification");
+    expect(notes).toHaveLength(1);
+    expect((notes[0] as Extract<SessionEvent, { type: "task_notification" }>).content)
+      .toContain("<result>child-out-2</result>");
 
     // the resume re-ran the SAME thread with [opening + prior reply + the message]
     const fp = provider as FakeProvider;

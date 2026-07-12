@@ -634,12 +634,17 @@ export class AgentEngine {
     // sanitizeForReminder's doc comment above (a persisted event replays on every later turn, so
     // injected structure would be durable). `result` is only set by registry.complete() — a
     // stop()-terminated entry never gets one, so the <result> line is omitted entirely then.
-    const label = this.sanitizeForReminder(e.name ?? e.agentId);
+    // LOCAL hardening on top of sanitizeForReminder (which is shared with the <system-reminder>
+    // builders and deliberately untouched): entity-escape a literal closing task-notification tag
+    // (any casing/inner whitespace) so a hostile result can't close THIS block early — the real
+    // closing tag below must stay the only one.
+    const clean = (s: string) => this.sanitizeForReminder(s).replace(/<\/\s*task-notification\s*>/gi, "&lt;/task-notification&gt;");
+    const label = clean(e.name ?? e.agentId);
     const summary = e.status === "completed" ? `Agent "${label}" completed`
       : e.status === "failed" ? `Agent "${label}" failed`
       : e.status === "timeout" ? `Agent "${label}" timed out`
       : `Agent "${label}" was stopped`;
-    const result = e.result ? `\n<result>${this.sanitizeForReminder(e.result)}</result>` : "";
+    const result = e.result ? `\n<result>${clean(e.result)}</result>` : "";
     const content = `<task-notification>\n<task-id>${e.agentId}</task-id>\n<status>${e.status}</status>\n<summary>${summary}</summary>${result}\n</task-notification>`;
     this.cfg.hub.append(sessionId, { type: "task_notification", sessionId, threadId: MAIN_THREAD, content });
   }
@@ -1949,6 +1954,10 @@ export class AgentEngine {
             // `timeoutMs: null` above) — wired now, same as the fresh bg spawn's `.then`, so a
             // timed-out resumed child is never misreported as generic "failed".
             !result.ok && result.timedOut ? { timedOut: true } : undefined);
+          // bg-retrigger T1 (concern fix): LAST, exactly like the fresh detached spawn's `.then` —
+          // a detached RESUME completion is as invisible to the parent as a fresh bg spawn's, and
+          // reopen() reset `notified`, so the resumed run's OWN completion notifies again (CC parity).
+          this.notifyBgCompletion(sessionId, entry.agentId);
         })
         .catch((err) => {
           // Defensive: SubagentManager.run() never throws; this guards a throw in the .then handler
@@ -1957,6 +1966,9 @@ export class AgentEngine {
           this.emit(sessionId, { type: "thread_completed", sessionId, threadId: entry.threadId, stopReason: "error" });
           this.completeThread(sessionId, entry.threadId, "error");
           this.cfg.bgAgents!.complete(entry.agentId, { ok: false, result: message });
+          // bg-retrigger T1 (concern fix): LAST, mirroring the `.then` above — the single-consumer
+          // claim makes a double persist impossible even if the .then already notified before throwing.
+          this.notifyBgCompletion(sessionId, entry.agentId);
         })
         .catch(() => { /* terminal net: a throw in the .catch above (persistent IO fault on the completion emit) has no caller to surface to on a detached run — swallow rather than emit an unhandled rejection */ });
       return { output: JSON.stringify({ agentId: entry.threadId, status: "running" }), isError: false };
