@@ -172,6 +172,26 @@ describe("state.ts — pending cards (f)", () => {
     expect(s.pending).toEqual({ kind: "question", callId: "q1", questions });
   });
 
+  test("question_resolved clears the pending question card and commits an answer note per question", () => {
+    let s = initialState();
+    const questions = [{ question: "which db?", header: "DB", options: [{ label: "postgres" }, { label: "sqlite" }], multiSelect: false }];
+    s = reduce(s, { type: "question_asked", threadId: "main", callId: "q1", questions }, T0);
+    expect(s.pending).not.toBeNull();
+    s = reduce(s, { type: "question_resolved", threadId: "main", callId: "q1", answers: { "which db?": "postgres" }, by: "user" }, T0 + 5);
+    expect(s.pending).toBeNull();
+    expect(s.committed).toContainEqual({ kind: "note", text: "which db?: postgres" });
+  });
+
+  test("question_resolved with empty answers (broker timeout / resolved elsewhere) still clears pending", () => {
+    let s = initialState();
+    const questions = [{ question: "which db?", header: "DB", options: [{ label: "postgres" }], multiSelect: false }];
+    s = reduce(s, { type: "question_asked", threadId: "main", callId: "q1", questions }, T0);
+    const before = s.committed.length;
+    s = reduce(s, { type: "question_resolved", threadId: "main", callId: "q1", answers: {}, by: "broker" }, T0 + 5);
+    expect(s.pending).toBeNull();
+    expect(s.committed.length).toBe(before); // no answers → no notes committed
+  });
+
   test("plan_presented sets a plan pending card; plan_resolved clears it and commits the matched wording", () => {
     let s = initialState();
     s = reduce(s, { type: "plan_presented", threadId: "main", callId: "p1", plan: "1. do X\n2. do Y" }, T0);

@@ -185,6 +185,18 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
     case "question_asked":
       return { ...s, pending: { kind: "question", callId: str(e.callId), questions: (e.questions as unknown[]) ?? [] } };
 
+    case "question_resolved": {
+      // Symmetric to approval_resolved/plan_resolved: the resolution event — also fired when another
+      // attached client answers or the QuestionBroker times out — clears the pending card and leaves a
+      // transcript trace of the answers. main.ts renders no dedicated question_resolved line (its
+      // cooked-stdin echo of the typed answers served that role); in the Ink model the card lived in
+      // the live region, so a committed note is the only surviving trace. Empty answers (timeout /
+      // resolved elsewhere with no payload) → clear pending, commit nothing.
+      const answers = (e.answers ?? {}) as Record<string, string>;
+      const notes = Object.entries(answers).map(([q, a]) => ({ kind: "note" as const, text: `${q}: ${a}` }));
+      return { ...s, pending: null, committed: [...s.committed, ...notes] };
+    }
+
     case "plan_presented":
       return { ...s, pending: { kind: "plan", callId: str(e.callId), plan: str(e.plan) } };
 
