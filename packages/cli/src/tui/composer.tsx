@@ -178,7 +178,14 @@ export interface ComposerProps {
    *  model). App wires this to `runCommand(ctx, text)` (fire-and-forget; the runner's own note
    *  lands in the transcript asynchronously via `CommandCtx.appendNote`). Optional so legacy call
    *  sites without command support are unaffected (a slash-shaped buffer with no `onRunCommand`
-   *  wired still clears/is "handled" — it just runs nothing). */
+   *  wired still clears/is "handled" — it just runs nothing).
+   *
+   *  Phase 3d T4: ALSO the callback the printable-input path below invokes with the literal string
+   *  `"/help"` when "?" is typed against an EMPTY buffer (see that branch's doc) — the identical
+   *  `runCommand` round-trip a typed `/help` + Enter would take, just a one-keystroke shortcut into
+   *  it. Optional here too: with no `onRunCommand` wired, the "?" shortcut simply no-ops (same
+   *  "runs nothing" fallback as an unwired slash command above) rather than falling through to
+   *  insert — see that branch. */
   onRunCommand?: (text: string) => void;
   /** Phase 3d T2: fires on mount and every time the completion menu's VISIBLE row count changes —
    *  `min(6, filteredCount)` while open, `0` while closed — mirroring the same "push derived UI
@@ -534,6 +541,18 @@ export function Composer({
       if (key.ctrl && input === "e") { setState(end); return; }
       if (key.leftArrow) { setState(key.ctrl || key.meta ? wordLeft : left); return; }
       if (key.rightArrow) { setState(key.ctrl || key.meta ? wordRight : right); return; }
+
+      // Phase 3d T4: "?" typed against an EMPTY buffer surfaces help instead of inserting — the
+      // single actor for this keystroke, composer-internal and BEFORE the generic insert path
+      // below (never a second App-level consumer). Gated on `input === "?"` EXACTLY (not
+      // `.includes`/`.startsWith`) so a multi-char paste that happens to contain "?" (Ink delivers
+      // a whole paste as ONE `input` string — see the doc below) types normally; only a genuine
+      // single "?" keystroke matches. A NON-empty buffer falls straight through to the ordinary
+      // insert path, so "?" types like any other character once there's text already.
+      if (input === "?" && state.text.length === 0 && !key.ctrl && !key.meta) {
+        onRunCommand?.("/help");
+        return;
+      }
 
       // Plain printable input (a single char, or a whole pasted string delivered as one event —
       // Ink's own doc for useInput). Backspace/Delete/Home/End never reach here — Ink forces

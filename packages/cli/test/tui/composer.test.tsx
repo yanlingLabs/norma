@@ -632,6 +632,99 @@ describe("Composer", () => {
   });
 });
 
+describe("Composer — '?' on empty runs /help (Phase 3d T4)", () => {
+  test("'?' on an EMPTY buffer calls onRunCommand('/help') instead of inserting", async () => {
+    const ran: string[] = [];
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        onRunCommand={(t) => ran.push(t)}
+      />,
+    );
+    await wait();
+    stdin.write("?");
+    await wait();
+
+    expect(ran).toEqual(["/help"]);
+    expect(stripAnsi(lastFrame() ?? "")).toContain("❯  "); // buffer stayed empty — "?" never inserted
+  });
+
+  test("'?' with a NON-empty buffer types normally — never calls onRunCommand", async () => {
+    const ran: string[] = [];
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        onRunCommand={(t) => ran.push(t)}
+      />,
+    );
+    await wait();
+    stdin.write("a");
+    await wait();
+    stdin.write("?");
+    await wait();
+
+    expect(ran).toEqual([]);
+    expect(stripAnsi(lastFrame() ?? "")).toContain("❯ a?");
+  });
+
+  test("a multi-char paste-like input containing '?' (e.g. 'a?b' delivered as ONE input event) types literally — never treated as the '?' shortcut", async () => {
+    const ran: string[] = [];
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        onRunCommand={(t) => ran.push(t)}
+      />,
+    );
+    await wait();
+    stdin.write("a?b"); // one write -> one Ink "input" event (paste-shaped), buffer starts EMPTY
+    await wait();
+
+    expect(ran).toEqual([]); // never mistaken for the single-"?"-keystroke shortcut
+    expect(stripAnsi(lastFrame() ?? "")).toContain("❯ a?b");
+  });
+
+  test("no onRunCommand wired: '?' on empty simply no-ops (never inserted, no crash)", async () => {
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+      />,
+    );
+    await wait();
+    stdin.write("?");
+    await wait();
+
+    expect(stripAnsi(lastFrame() ?? "")).toContain("❯  ");
+  });
+});
+
 describe("computeSlashQuery (pure predicate)", () => {
   test("non-slash text -> null", () => {
     expect(computeSlashQuery({ text: "hello", cursor: 3 })).toBeNull();

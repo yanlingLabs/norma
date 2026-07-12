@@ -53,7 +53,7 @@ const baseProps = { sessionId: "s1", cwd: "/tmp", initialPolicy: "ask" as const,
 // The composer's real inverse-video cursor (`<Text inverse>`) — a unique fingerprint of "the
 // composer is rendered" (nothing else in the TUI uses `inverse`).
 const COMPOSER_CURSOR = "\x1b[7m";
-const FOOTER_HINT = "shift+tab to cycle modes";
+const FOOTER_HINT = "? for shortcuts · shift+tab to cycle modes"; // Phase 3d T4 exact fallback text
 
 // SGR mouse wheel-up report (mode 1006). Ink strips the leading ESC before useInput, but the App's
 // emitter patch sees the raw chunk (ESC intact) — so mouse input is swallowed before the composer.
@@ -670,6 +670,99 @@ describe("App — @-file mention index lifecycle (Phase 3d T3)", () => {
       rmSync(original, { recursive: true, force: true });
       rmSync(redirected, { recursive: true, force: true });
     }
+  });
+});
+
+describe("App — help surfacing: '?' on empty runs /help (Phase 3d T4)", () => {
+  test("'?' on an EMPTY composer commits the /help note — never inserted as text, never sent to the model", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("?");
+    await wait();
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("/help — List commands and keybindings"); // helpText() content
+    expect(frame).toContain("/compact — Compact conversation history to a summary");
+    expect(frame).toContain("Keys:"); // the keybinding line (may hard-wrap at 80 cols; unchecked verbatim here)
+    expect(frame).not.toContain("❯ ?"); // the "?" itself was never inserted into the buffer
+    expect(frame).toContain(COMPOSER_CURSOR); // composer back to idle
+    expect(client.calls).toEqual([]); // never reached the model
+  });
+
+  test("'?' with existing text in the buffer types normally — never runs /help", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("a");
+    await wait();
+    stdin.write("?");
+    await wait();
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("❯ a?"); // typed literally, buffer intact
+    expect(frame).not.toContain("Keys:"); // /help never ran
+    expect(client.calls).toEqual([]);
+  });
+});
+
+describe("App — command + mention e2e wiring (Phase 3d T4)", () => {
+  test("(T4-a) '/compact' typed + entered through the real App wiring: note lands, buffer clears, and neither send nor steer ever fire", async () => {
+    const bridge = makeEventBridge();
+    const client = { ...fakeClient(), compact: async () => ({ compacted: true, uptoSeq: 7, summaryChars: 99 }) };
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("/compact");
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("compacted (through seq 7, 99 char summary)"); // the command note block
+    expect(frame).toContain(COMPOSER_CURSOR); // composer back to idle
+    expect(frame).not.toContain("❯ /compact"); // buffer cleared, not left holding the typed command
+    expect(client.calls.filter((c) => c.method === "send")).toEqual([]); // never reached the model
+    expect(client.calls.filter((c) => c.method === "steer")).toEqual([]);
+  });
+
+  test("(T4-b) '@' mention: type + Tab-complete + Enter composes the FULL text with the path inline and really sends it", async () => {
+    const root = mkdtempSync(join(tmpdir(), "norma-app-help-e2e-"));
+    writeFileSync(join(root, "target.ts"), "");
+    try {
+      const bridge = makeEventBridge();
+      const client = fakeClient();
+      const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} cwd={root} />);
+      await wait();
+      stdin.write("look at @target");
+      await wait(100); // real fs readdir — give buildFileIndex time to resolve
+      expect(lastFrame() ?? "").toContain("target.ts"); // the real match is visible in the menu
+
+      stdin.write("\t"); // Tab-complete the "@target" span in place
+      await wait();
+      stdin.write("\r"); // a normal Enter now — cursor sits past the (closed) file token
+
+      await wait();
+      expect(client.calls).toEqual([{ method: "send", args: ["s1", "look at target.ts "] }]);
+      expect(lastFrame() ?? "").toContain(COMPOSER_CURSOR); // idle composer again, buffer cleared
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("App — headless sanity (Phase 3d T4)", () => {
+  test("(T4-d) `echo \"\" | bun src/main.ts --help` prints usage and exits 0 (never hangs on stdin, never crashes)", () => {
+    const cliRoot = join(import.meta.dir, "..", ".."); // test/tui -> packages/cli
+    const proc = Bun.spawnSync(["bun", "src/main.ts", "--help"], {
+      cwd: cliRoot,
+      stdin: new TextEncoder().encode("\n"),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(proc.exitCode).toBe(0);
+    expect(proc.stdout.toString()).toContain("norma (Phase 1b-ii-d) — commands:");
   });
 });
 

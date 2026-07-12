@@ -51,14 +51,15 @@ describe("Footer (e, f, g)", () => {
     expect(lastFrame() ?? "").toContain("1 agent · ctrl+t");
   });
 
-  test("fallback: no mode/running/agents renders 'shift+tab to cycle modes'", () => {
+  test("fallback: no mode/running/agents renders EXACTLY '? for shortcuts · shift+tab to cycle modes' (phase 3d T4)", () => {
     const { lastFrame } = render(<Footer policy="ask" running={false} agents={[]} />);
-    expect(lastFrame() ?? "").toContain("shift+tab to cycle modes");
+    expect(lastFrame() ?? "").toContain("? for shortcuts · shift+tab to cycle modes");
   });
 
   test("no fallback once any other segment renders", () => {
     const { lastFrame } = render(<Footer policy="ask" running agents={[]} />);
     expect(lastFrame() ?? "").not.toContain("shift+tab to cycle modes");
+    expect(lastFrame() ?? "").not.toContain("? for shortcuts");
   });
 
   test("(T5) exitArmed replaces the whole line with the exact key-specific dim hint, even when other segments would apply", () => {
