@@ -26,6 +26,7 @@ import { Box, Text, useInput } from "ink";
 import type { PendingCard } from "./state";
 import { formatOptionLines, isOtherChoice, parseQuestionAnswer } from "../questions";
 import { parsePlanResponse } from "../plan-response";
+import { theme } from "./theme";
 
 export interface AnswerPayload {
   answers: Record<string, string>;
@@ -64,8 +65,10 @@ function ApprovalCard({ pending, onApprove }: { pending: Extract<PendingCard, { 
     setBuffer("");
   });
 
+  // Phase 3b T7 restyle (theme colors only — no behavior/parse change): the approval prompt line is
+  // rendered in `theme.permission` (CC's approval-request hue); the summary keeps its dim de-emphasis.
   return (
-    <Text>
+    <Text color={theme.permission}>
       approve {pending.toolName}? <Text dimColor>{pending.summary}</Text> [y/N] {buffer}
     </Text>
   );
@@ -77,9 +80,11 @@ function PlanCard({ pending, onPlan }: { pending: Extract<PendingCard, { kind: "
     setBuffer("");
   });
 
+  // Phase 3b T7 restyle (theme colors only): the "Plan" header takes the Norma accent; the plan body
+  // and the fixed menu are unchanged.
   return (
     <Box flexDirection="column">
-      <Text>Plan</Text>
+      <Text color={theme.accent}>Plan</Text>
       <Text>{pending.plan}</Text>
       <Text>{"  1) approve — I'll approve each edit"}</Text>
       <Text>{"  2) approve + auto-accept edits"}</Text>

@@ -24,7 +24,7 @@ import React from "react";
 import { Box, Static, Text } from "ink";
 import type { Block } from "./state";
 import { theme } from "./theme";
-import { renderMarkdown } from "./markdown";
+import { renderMarkdown, type Highlighter } from "./markdown";
 import { pickVerb, TURN_VERBS } from "./spinner-verbs";
 import { formatElapsed, formatTokens } from "../task-display";
 import { groupBlocks, type DisplayItem } from "./group-blocks";
@@ -75,7 +75,7 @@ function ToolResult({ output, isError }: { output: string; isError?: boolean }) 
   );
 }
 
-function TranscriptEntry({ block }: { block: Block }) {
+function TranscriptEntry({ block, highlight }: { block: Block; highlight?: Highlighter }) {
   switch (block.kind) {
     case "user":
       return (
@@ -94,7 +94,7 @@ function TranscriptEntry({ block }: { block: Block }) {
             <Text color={theme.text}>⏺</Text>
           </Box>
           <Box flexGrow={1}>
-            <Text>{renderMarkdown(block.text)}</Text>
+            <Text>{renderMarkdown(block.text, highlight)}</Text>
           </Box>
         </Box>
       );
@@ -176,11 +176,17 @@ function CollapsedEntry({ summary }: { summary: string }) {
   );
 }
 
-function DisplayEntry({ item }: { item: DisplayItem }) {
-  return item.kind === "collapsed" ? <CollapsedEntry summary={item.summary} /> : <TranscriptEntry block={item.block} />;
+function DisplayEntry({ item, highlight }: { item: DisplayItem; highlight?: Highlighter }) {
+  return item.kind === "collapsed" ? <CollapsedEntry summary={item.summary} /> : <TranscriptEntry block={item.block} highlight={highlight} />;
 }
 
-export function CommittedTranscript({ items }: { items: Block[] }) {
+/** A synthetic leading Static entry (the welcome banner, Phase 3b Task 7) sits alongside the real
+ *  transcript items so it lands ONCE at the top of scrollback — Ink supports a single `<Static>` per
+ *  tree, so the header can't be a separate sibling Static; it rides as the first element of this
+ *  Static's items array instead, past which the flush pointer never returns. */
+type StaticItem = { kind: "header"; node: React.ReactNode } | DisplayItem;
+
+export function CommittedTranscript({ items, header, highlight }: { items: Block[]; header?: React.ReactNode; highlight?: Highlighter }) {
   // Ink's <Static> (build/components/Static.js) paints whatever it renders on a pass PERMANENTLY —
   // later renders only ever render the NEW tail past the previous items.length, and never revisit
   // an index it already painted. groupBlocks(items) is NOT safe to feed it directly: a still-open
@@ -201,18 +207,20 @@ export function CommittedTranscript({ items }: { items: Block[] }) {
   const settled = tailIsOpenRun ? displayItems.slice(0, -1) : displayItems;
   const openTail = tailIsOpenRun ? displayItems[displayItems.length - 1]! : null;
 
+  const staticItems: StaticItem[] = header != null ? [{ kind: "header", node: header }, ...settled] : settled;
+
   return (
     <Box flexDirection="column">
-      <Static items={settled}>
+      <Static items={staticItems}>
         {(item, i) => (
           <Box key={i}>
-            <DisplayEntry item={item} />
+            {item.kind === "header" ? item.node : <DisplayEntry item={item} highlight={highlight} />}
           </Box>
         )}
       </Static>
       {openTail ? (
         <Box>
-          <DisplayEntry item={openTail} />
+          <DisplayEntry item={openTail} highlight={highlight} />
         </Box>
       ) : null}
     </Box>

@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 import { render } from "ink-testing-library";
 import { CommittedTranscript, formatArgsHead } from "../../src/tui/transcript";
 import { ActiveTurn } from "../../src/tui/active-turn";
-import { StatusLine } from "../../src/tui/status-line";
 import { TaskList } from "../../src/tui/task-list";
 import { AgentList } from "../../src/tui/agent-list";
 import { pickVerb, TURN_VERBS } from "../../src/tui/spinner-verbs";
@@ -240,24 +239,10 @@ describe("AgentList — tree rows (phase 3b Task 6, c)", () => {
   });
 });
 
-describe("StatusLine (c)", () => {
-  test("running shows elapsed + tokens", () => {
-    const { lastFrame } = render(
-      <StatusLine running turnStartMs={0} nowMs={12_000} inTokens={13_700} outTokens={149} />,
-    );
-    const frame = lastFrame() ?? "";
-    expect(frame).toContain("12s");
-    expect(frame).toContain("13.7k");
-    expect(frame).toContain("149");
-  });
-
-  test("hidden when not running", () => {
-    const { lastFrame } = render(
-      <StatusLine running={false} turnStartMs={0} nowMs={12_000} inTokens={13_700} outTokens={149} />,
-    );
-    expect((lastFrame() ?? "").trim()).toBe("");
-  });
-});
+// The Ink <StatusLine> component was removed in Phase 3b Task 7 — the Spinner (turn chrome) + Footer
+// (mode/interrupt/agents hints) now own that surface, so there is nothing single-line-status left to
+// test here. (The legacy TTY renderStatusLine/truncateStatusLine in task-block.ts are unrelated and
+// still covered by test/task-block.test.ts.)
 
 describe("TaskList — CC task rows (phase 3b Task 6, a+b)", () => {
   test("hidden when empty", () => {
