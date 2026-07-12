@@ -142,7 +142,13 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
 
     case "turn_started": {
       if (e.threadId !== MAIN) return feedAgents(s, e);
-      return { ...s, turnRunning: true, turnStartMs: nowMs };
+      // Drop finished subagents from the live roster at the next main turn. Their named finish notes are
+      // already committed on thread_completed, so nothing is lost — this keeps the don't-prune-on-
+      // turn_completed guard (the `Agent "" · 0s` fix) intact while bounding the pinned live region's
+      // height, so a long agent-heavy session can't grow <AgentList> past the terminal and re-hide the
+      // composer (whole-branch review, Important). Restores legacy's per-turn roster clear cadence.
+      const agents = s.agents.some((a) => a.status === "done") ? s.agents.filter((a) => a.status !== "done") : s.agents;
+      return { ...s, turnRunning: true, turnStartMs: nowMs, agents };
     }
 
     case "turn_completed": {

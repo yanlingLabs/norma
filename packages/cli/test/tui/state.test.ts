@@ -133,6 +133,45 @@ describe("state.ts — THE BUG FIX: bg-agent finish survives the main turn_compl
   });
 });
 
+describe("state.ts — prune done agents on next main turn_started", () => {
+  test("a done agent is dropped from state.agents on the next main turn_started, a still-working agent remains, and its finish note in state.committed survives", () => {
+    let s = initialState();
+    // agent A: starts, runs, and finishes -> status "done", finish note committed
+    s = reduce(s, {
+      type: "thread_started", threadId: "th_a", parentThreadId: "main", agentType: "general-purpose",
+      prompt: "refactor widget", description: "refactor widget",
+    }, T0);
+    s = reduce(s, { type: "turn_started", threadId: "th_a", ts: T0 + 100 }, T0 + 100);
+    s = reduce(s, { type: "thread_completed", threadId: "th_a", stopReason: "end_turn", ts: T0 + 5_100 }, T0 + 5_100);
+    expect(s.agents.find((a) => a.threadId === "th_a")?.status).toBe("done");
+
+    // agent B: starts and is still working (no thread_completed yet)
+    s = reduce(s, {
+      type: "thread_started", threadId: "th_b", parentThreadId: "main", agentType: "general-purpose",
+      prompt: "run tests", description: "run tests",
+    }, T0 + 200);
+    s = reduce(s, { type: "turn_started", threadId: "th_b", ts: T0 + 300 }, T0 + 300);
+    expect(s.agents.find((a) => a.threadId === "th_b")?.status).toBe("working");
+
+    const finishNoteBefore = s.committed.find((b) => b.kind === "note" && b.text.includes("refactor widget"));
+    expect(finishNoteBefore).toBeDefined();
+
+    // the main thread starts its NEXT turn — this must prune th_a (done) but keep th_b (working)
+    s = reduce(s, { type: "turn_started", threadId: "main" }, T0 + 6_000);
+
+    expect(s.agents.find((a) => a.threadId === "th_a")).toBeUndefined(); // (a) done agent gone
+    expect(s.agents.find((a) => a.threadId === "th_b")).toBeDefined(); // (b) working agent remains
+    expect(s.agents.find((a) => a.threadId === "th_b")?.status).toBe("working");
+    // (c) the finish note is still in committed — pruning `agents` must not touch `committed`
+    expect(s.committed).toContainEqual({ kind: "note", text: 'Agent "refactor widget" finished · 5s' });
+
+    // (d) a turn_started with NO done agents is a referential no-op on `agents`
+    const agentsRef = s.agents;
+    const s2 = reduce(s, { type: "turn_started", threadId: "main" }, T0 + 7_000);
+    expect(s2.agents).toBe(agentsRef);
+  });
+});
+
 describe("state.ts — task upsert/delete (e)", () => {
   test("task_updated upserts by id; a 'deleted' status removes the row", () => {
     let s = initialState();
