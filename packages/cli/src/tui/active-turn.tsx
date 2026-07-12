@@ -9,13 +9,13 @@
  *  most deltas only extend `tail`. `tail` (the still-growing, not-yet-parseable remainder) renders as
  *  plain text — no markdown pass, no dim — one `<Text>` sibling next to the memoized stable child.
  *
- *  AMBIGUITY RESOLUTION (streaming assistant gutter): the task brief's Key Semantics section
- *  describes the `⏺` gutter for the ASSISTANT block in transcript.tsx and separately calls out
- *  "gutter ⏺ BLINKING" only for in-flight TOOLS — it does not mention a gutter for the still-
- *  streaming assistant text. Read literally (the brief is this task's single source of truth over
- *  the study reference), the streaming assistant renders WITHOUT a gutter; the `⏺` appears once the
- *  text is committed as a Block (transcript.tsx). This is a deliberate scope-minimizing reading, not
- *  an oversight — flagged in the task report for whole-branch review.
+ *  STREAMING ASSISTANT GUTTER (T3 review adjudication): the streaming text shares the SAME `⏺`
+ *  2-col gutter layout as the committed assistant block (transcript.tsx's pattern — `⏺` in a
+ *  `minWidth={2}` gutter colored `theme.text`, stable/tail column in the flexGrow slot). CC renders
+ *  in-progress assistant messages through the same bullet layout (its "static" flag only controls
+ *  the render freeze, not the layout); omitting the gutter here caused a visible 2-column text jump
+ *  + bullet pop-in at every turn's commit. The assistant dot is STEADY (`theme.text`) — blinking
+ *  belongs to the in-flight TOOL dot only.
  *
  *  BLINKING TOOL DOT: `Math.floor(nowMs / 500) % 2` flips every 500ms — an even parity dims the `⏺`,
  *  odd leaves it normal. `nowMs` is the caller's injected clock (same discipline as every other Ink
@@ -27,6 +27,7 @@
 import React from "react";
 import { Box, Text } from "ink";
 import { renderMarkdown, splitStableBoundary } from "./markdown";
+import { theme } from "./theme";
 import { formatArgsHead } from "./transcript";
 
 /** Memoized so the (potentially expensive, re-lexed-on-every-boundary-advance) markdown render of
@@ -55,9 +56,14 @@ export function ActiveTurn({
   return (
     <Box flexDirection="column">
       {assistant ? (
-        <Box flexDirection="column">
-          {stable ? <StableAssistantText stable={stable} /> : null}
-          {tail ? <Text>{tail}</Text> : null}
+        <Box flexDirection="row">
+          <Box minWidth={2}>
+            <Text color={theme.text}>⏺</Text>
+          </Box>
+          <Box flexGrow={1} flexDirection="column">
+            {stable ? <StableAssistantText stable={stable} /> : null}
+            {tail ? <Text>{tail}</Text> : null}
+          </Box>
         </Box>
       ) : null}
       {tools.map((t, i) => {

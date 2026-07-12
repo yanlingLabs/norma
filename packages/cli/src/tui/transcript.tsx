@@ -30,7 +30,9 @@ import { formatElapsed, formatTokens } from "../task-display";
 
 /** Same 2-line/160-char args-head cap the tool USE line and ActiveTurn's in-flight tool line both
  *  use (widened from 3a's 120-char single-line cap per the brief) — kept RAW (no re-serialization
- *  of the argsJson), matching 3a's "slice the raw string" approach, just with the wider cap. */
+ *  of the argsJson), matching 3a's "slice the raw string" approach, just with the wider cap. A
+ *  trailing `…` marks truncation (either cap), per the study's documented "trimmed + …" behavior;
+ *  an args string already within both caps passes through unchanged. */
 const ARGS_HEAD_CHARS = 160;
 const ARGS_HEAD_LINES = 2;
 
@@ -40,8 +42,14 @@ const ARGS_HEAD_LINES = 2;
 const MAX_RESULT_LINES = 10;
 
 export function formatArgsHead(argsJson: string): string {
-  const headLines = argsJson.split("\n").slice(0, ARGS_HEAD_LINES).join("\n");
-  return headLines.slice(0, ARGS_HEAD_CHARS);
+  const lines = argsJson.split("\n");
+  let head = lines.slice(0, ARGS_HEAD_LINES).join("\n");
+  let truncated = lines.length > ARGS_HEAD_LINES;
+  if (head.length > ARGS_HEAD_CHARS) {
+    head = head.slice(0, ARGS_HEAD_CHARS);
+    truncated = true;
+  }
+  return truncated ? `${head}…` : head;
 }
 
 function ToolResult({ output, isError }: { output: string; isError?: boolean }) {

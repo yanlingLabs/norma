@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { render } from "ink-testing-library";
-import { CommittedTranscript } from "../../src/tui/transcript";
+import { CommittedTranscript, formatArgsHead } from "../../src/tui/transcript";
 import { ActiveTurn } from "../../src/tui/active-turn";
 import { StatusLine } from "../../src/tui/status-line";
 import { TaskList } from "../../src/tui/task-list";
@@ -61,6 +61,27 @@ describe("CommittedTranscript — tool block (d)", () => {
     const frame = lastFrame() ?? "";
     expect(frame).toContain("bash");
     expect(frame).not.toContain("()");
+  });
+});
+
+describe("formatArgsHead — the shared 160-char/2-line args cap (T3 review fix)", () => {
+  test("a 300-char single-line args string truncates to 160 chars + …", () => {
+    const args = "x".repeat(300);
+    const head = formatArgsHead(args);
+    expect(head).toBe("x".repeat(160) + "…");
+  });
+
+  test("a 4-line args string shows only the first 2 lines + …", () => {
+    const args = ["line-a", "line-b", "line-c", "line-d"].join("\n");
+    const head = formatArgsHead(args);
+    expect(head).toBe("line-a\nline-b…");
+    expect(head).not.toContain("line-c");
+    expect(head).not.toContain("line-d");
+  });
+
+  test("a short args string passes through unchanged (no …)", () => {
+    expect(formatArgsHead('{"command":"ls"}')).toBe('{"command":"ls"}');
+    expect(formatArgsHead("")).toBe("");
   });
 });
 
@@ -185,6 +206,17 @@ describe("ActiveTurn — streaming assistant text (memoized stable prefix)", () 
     expect(frame).not.toContain("**para**");
     expect(frame).toContain("complete.");
     expect(frame).toContain("Second para partial");
+  });
+
+  test("streaming text shares the ⏺ gutter layout (T3 review fix): the dot renders on the FIRST streamed line, so committing the block causes no indent jump", () => {
+    const { lastFrame } = render(<ActiveTurn assistant="streaming reply text" tools={[]} nowMs={0} />);
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("⏺");
+    // the gutter and the text share one row: "⏺ streaming reply text" (2-col gutter → one space
+    // between the dot and the flexGrow column), identical to the committed assistant block's layout
+    const firstLine = frame.split("\n")[0] ?? "";
+    expect(firstLine).toContain("⏺");
+    expect(firstLine).toContain("streaming reply text");
   });
 
   test("hidden when idle (no assistant text, no in-flight tools)", () => {
