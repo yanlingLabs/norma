@@ -3,6 +3,7 @@ import type { Question, Task } from "@norma/protocol";
 import type { ToolSpec } from "../../providers/types";
 import { isWithin } from "../paths";
 import type { AskOutcome } from "../questions";
+import type { ComputerUseService } from "../computer-use";
 
 export interface ToolContext {
   cwd: string;
@@ -18,6 +19,19 @@ export interface ToolContext {
   builtinDeferral?: boolean; // true when built-in ToolSearch deferral is active for this session (mirrors the engine's toolSearchEnabled()) — any def registered `deferred: true` rides deferral whenever this is true, independent of the external count/threshold
   ask?: (questions: Question[]) => Promise<AskOutcome>; // engine bridge: emits question_asked/question_resolved events and blocks on the QuestionBroker; the ask_user tool calls it
   taskEvent?: (task: Task) => void; // engine bridge: emits task_updated; called by the task tools (task_create/task_update/task_list)
+  // Computer use (Phase 5 CU): the lease-holding service the `computer` tool drives (screenshot/
+  // ax-read/input-drive via the peripheral broker). Absent → the computer tool isn't wired for this
+  // session (it's registered only when settings.computerUse.enabled, so normally both are set or
+  // neither is).
+  computerUse?: ComputerUseService;
+  // Stages a vision image (a `data:` URL) for the model — the engine appends it to the turn's input
+  // as an `{type:"image"}` item at round end (see engine.ts's pendingCuImages). The `computer`
+  // tool's screenshot action calls this; every other tool ignores it.
+  attachImage?: (dataUrl: string) => void;
+  // Whether the turn's resolved model accepts image input (ModelInfo.supportsVision). The computer
+  // tool's screenshot action refuses when this is explicitly false (ax_snapshot still works). Unset
+  // = unknown → not blocked.
+  visionCapable?: boolean;
 }
 export interface ToolOutcome { output: string; isError: boolean }
 

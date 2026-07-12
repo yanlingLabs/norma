@@ -21,6 +21,7 @@ import type { SubagentManager } from "./subagents";
 import type { AgentStore } from "./agents";
 import type { BackgroundAgentRegistry, ResumeContext } from "./bg-agent-registry";
 import type { HookResult } from "../plugins/hook-runner";
+import type { ComputerUseService } from "./computer-use";
 
 /** Structural narrowing of BackgroundTaskRegistry (bg-registry.ts) to just what pinnedTools
  *  (below) needs — lets the engine (and tests) work with anything shaped like a per-session task
@@ -176,6 +177,13 @@ export interface EngineConfig {
   // Absent (every test/config predating Task 3) means no hook call site fires at all — this field
   // existing on the type does NOT by itself add any behavior.
   hooks?: { runFor(event: string, extra: Record<string, unknown>, sessionId: string, signal?: AbortSignal): Promise<Array<{ pluginId: string; result: HookResult }>> };
+  // Computer use (Phase 5 CU): the lease-holding service the `computer` tool drives. Absent (every
+  // config where settings.computerUse.enabled is not set) → `ctx.computerUse`/`ctx.attachImage` stay
+  // undefined and no CU image is ever staged/drained — byte-identical to pre-CU behavior. Wired, the
+  // engine (1) exposes it + an image-staging callback on the tool ctx, (2) drains staged screenshots
+  // into the turn's input as `{type:"image"}` items at each round's end, and (3) releases the
+  // session's held leases when the top-level turn settles (runTurn's finally).
+  computerUse?: ComputerUseService;
 }
 
 export class AgentEngine {
@@ -226,6 +234,19 @@ export class AgentEngine {
   // it already started; CC has the same re-fire-on-restart shape). Only consulted when cfg.hooks
   // is wired, so it's inert (allocated-but-untouched) for every hook-less config — byte-identical.
   private hookSessionStarted = new Set<string>();
+  // Computer use (Phase 5 CU): screenshots staged by the `computer` tool this turn, keyed by
+  // cuImageKey(sessionId, threadId, callId) — NOT bare callId: callIds are provider-minted with no
+  // cross-session/cross-thread uniqueness guarantee, and a bare-callId collision between two
+  // concurrent sessions would drain one session's screen content into the OTHER's model input (a
+  // cross-session leak). `ctx.attachImage` (wired in executeCall) pushes here; the round-end drain
+  // in runThread (drainRoundImages) pops each processed call's images into `input` as `{type:
+  // "image"}` items and deletes the entry; runTurn's finally sweeps this session's leftovers.
+  // Never persisted (see the TurnInputItem image variant's doc comment) — a purely in-turn,
+  // in-memory hand-off from tool to provider input.
+  private pendingCuImages = new Map<string, string[]>();
+  private static cuImageKey(sessionId: string, threadId: string, callId: string): string {
+    return `${sessionId}|${threadId}|${callId}`;
+  }
   constructor(private readonly cfg: EngineConfig) {}
 
   /** True while a turn is executing for the session. */
@@ -268,6 +289,30 @@ export class AgentEngine {
       this.runningTurns.delete(sessionId);
       this.aborters.delete(sessionId);
       this.steerQueue.delete(sessionId);
+      // Computer use (Phase 5 CU): release any peripheral leases the session held for CU when the
+      // top-level turn settles (all terminal paths incl. abort) — UNLESS a detached background
+      // agent of this session is still running: such a child shares the sessionId, runs OUTSIDE
+      // any runTurn, and may be mid-CU-loop — yanking its lease here would misreport "computer use
+      // unavailable — Norma.app not running" and force a fresh approval card mid-bg-run. The
+      // service's own idle backstop (maxIdleMs, default 60s without a CU action) bounds the hold
+      // for that case instead. Guarded so CU-less configs are byte-identical. Runs before the
+      // bg-retrigger drain so a follow-up turn starts with a clean lease slate.
+      if (this.cfg.computerUse) {
+        const bgRunning = this.cfg.bgAgents?.list(sessionId).some((e) => e.status === "running") ?? false;
+        if (!bgRunning) {
+          this.cfg.computerUse.releaseSession(sessionId);
+          // Teardown sweep for staged-but-undrained screenshots (an abnormal unwind between
+          // staging and the round-end drain — e.g. an emit throw mid-dispatch — would otherwise
+          // leak the base64 in the map for the daemon's lifetime). Keys are namespaced
+          // `${sessionId}|...` (cuImageKey) so this touches only THIS session's leftovers, and it
+          // runs only when NO detached child is live (same bgRunning guard as the release above) —
+          // a mid-round child's staged-but-not-yet-drained image must never be swept out from
+          // under its own round-end drain.
+          for (const key of this.pendingCuImages.keys()) {
+            if (key.startsWith(`${sessionId}|`)) this.pendingCuImages.delete(key);
+          }
+        }
+      }
       if (this.retriggerPending.delete(sessionId) && !ac.signal.aborted) {
         // A detached agent finished mid-turn; its task_notification is already persisted. Drain it
         // now (CC parity: between-turns queue drain) so the model reacts without a user message.
@@ -830,6 +875,11 @@ export class AgentEngine {
   }): Promise<{ finalText: string; stopReason: "end_turn" | "aborted" | "error"; errorMessage?: string }> {
     const { sessionId, threadId, instructionsFull, input, meta, signal, loaded, excludeTools, allowTools, rootsOverride } = opts;
     let cwd = opts.cwd;
+    // Computer use (Phase 5 CU): whether THIS thread's resolved model accepts image input — the
+    // `computer` tool's screenshot action refuses when this is explicitly false (ax_snapshot still
+    // works). Undefined when the provider can't enumerate its models (openai-compatible with no
+    // static list) → the tool treats undefined as "unknown, not blocked". Computed once per thread.
+    const visionCapable = this.cfg.provider.provider.models().find((m) => m.id === opts.model)?.supportsVision;
     const tsEnabled = this.toolSearchEnabled();
     const deferThreshold = this.toolSearchThreshold();
     const usage = { inputTokens: 0, outputTokens: 0 };
@@ -1704,7 +1754,7 @@ export class AgentEngine {
               timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
               summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
               // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
-            }, loaded, async () => this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd), pins, rootsOverride);
+            }, loaded, async () => this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd), pins, rootsOverride, visionCapable);
           } else {
             outcome = this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd);
           }
@@ -1714,7 +1764,7 @@ export class AgentEngine {
             timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
             summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
             // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
-          }, loaded, undefined, pins, rootsOverride);
+          }, loaded, undefined, pins, rootsOverride, visionCapable);
         } else if (call.name === "exit_plan_mode" && this.cfg.plans && meta.approvalPolicy === "plan") {
           outcome = await this.runPlanBridge(call, sessionId, threadId, meta);
         } else if (call.name === "enter_plan_mode") {
@@ -1734,7 +1784,7 @@ export class AgentEngine {
             justification = typeof a.justification === "string" ? a.justification : undefined;
           } catch { /* fall through to review of "" → likely unsafe */ }
           if (command && bashLooksSafe(command, this.cfg.reviewerAllow ?? [])) {
-            outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride);
+            outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
           } else {
             let v: { verdict: "safe" | "unsafe"; reason: string };
             try {
@@ -1747,13 +1797,13 @@ export class AgentEngine {
                 timeoutMs: Number(process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS ?? 60_000),
                 summary: `⚠ safety reviewer: ${v.reason} — ${call.name} ${command.slice(0, 120)}`,
                 denialMessage: `blocked by the safety reviewer: ${v.reason}. No approval within 60s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.`,
-              }, loaded, undefined, pins, rootsOverride);
+              }, loaded, undefined, pins, rootsOverride, visionCapable);
             } else {
-              outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride);
+              outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
             }
           }
         } else {
-          outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride);
+          outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
         }
 
         this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
@@ -1769,6 +1819,7 @@ export class AgentEngine {
         // user then says. Any later calls in this same batch were never emitted/pushed (the
         // loop pushes function_call + tool_result one at a time), so nothing is left dangling.
         if (outcome.deniedByHuman) {
+          this.drainRoundImages(sessionId, threadId, calls, input); // clear any staged screenshots (turn ends; input discarded)
           cleanupThreadSteer();
           this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "end_turn", ...usage });
           if (this.cfg.hooks) await this.fireTurnEnd(sessionId, threadId, "end_turn", usage); // [4f turn-end] deniedByHuman terminal
@@ -1776,6 +1827,12 @@ export class AgentEngine {
           return { finalText: lastText, stopReason: "end_turn" };
         }
       }
+
+      // Computer use (Phase 5 CU): after the whole assistant batch's tool_results are in `input`,
+      // append any screenshots the `computer` tool staged this round as `{type:"image"}` user items
+      // — the model sees them on the NEXT round's provider call. Placed here (round end, not per
+      // call) so an image never splits a function_call/tool_result pair. No-op when nothing staged.
+      this.drainRoundImages(sessionId, threadId, calls, input);
     }
 
     const capMessage = `tool-iteration cap (${effectiveMaxIterations}) reached`;
@@ -2042,6 +2099,9 @@ export class AgentEngine {
     onApprove?: () => Promise<{ output: string; isError: boolean }>,
     pins: Set<string> = new Set(),
     rootsOverride?: string[],
+    // Computer use (Phase 5 CU): forwarded to the default onApprove's executeCall so an approved
+    // `computer` screenshot under `ask` policy still sees the model's vision capability.
+    visionCapable?: boolean,
   ): Promise<{ output: string; isError: boolean; deniedByHuman?: boolean }> {
     const waiting = this.cfg.broker.wait(sessionId, call.callId, opts.timeoutMs);
     try {
@@ -2057,7 +2117,7 @@ export class AgentEngine {
     const res = await waiting;
     this.emit(sessionId, { type: "approval_resolved", sessionId, threadId, callId: call.callId, approved: res.approved, by: res.by });
     if (res.approved) {
-      return await (onApprove ? onApprove() : this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride));
+      return await (onApprove ? onApprove() : this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable));
     }
     // An EXPLICIT human denial (any `by` other than the broker's "timeout") ends the turn and
     // hands control back to the user (Claude Code parity) — see the caller's `deniedByHuman`
@@ -2223,6 +2283,25 @@ export class AgentEngine {
     }
   }
 
+  /** Computer use (Phase 5 CU): drain the screenshots the `computer` tool staged for this round's
+   *  calls (via ctx.attachImage → pendingCuImages, keyed by cuImageKey — session|thread|callId, see
+   *  the map's doc comment) into `input` as `{type:"image"}` items. Called at the END of a round's
+   *  dispatch loop — AFTER every tool_result — so an image never splits a function_call/tool_result
+   *  pair (the whole assistant batch stays intact, then the images follow as a user turn the model
+   *  sees next round). Also called before the deniedByHuman early return so the map never leaks
+   *  staged entries. A no-op (byte-identical) when nothing was staged — i.e. always, unless the
+   *  `computer` tool ran a screenshot this round. */
+  private drainRoundImages(sessionId: string, threadId: string, calls: Array<{ callId: string }>, input: TurnInputItem[]): void {
+    if (this.pendingCuImages.size === 0) return;
+    for (const c of calls) {
+      const key = AgentEngine.cuImageKey(sessionId, threadId, c.callId);
+      const imgs = this.pendingCuImages.get(key);
+      if (!imgs) continue;
+      this.pendingCuImages.delete(key);
+      for (const url of imgs) input.push({ type: "image", imageUrl: url });
+    }
+  }
+
   private executeCall(
     call: { callId: string; name: string; argsJson: string },
     cwd: string,
@@ -2248,6 +2327,10 @@ export class AgentEngine {
     // EXACTLY that child's `[worktreeDir]`, replacing (not extending) the session-wide roots
     // this.cfg.dirs.roots(sessionId) would otherwise return.
     rootsOverride?: string[],
+    // Computer use (Phase 5 CU): whether the turn's model accepts image input — forwarded from
+    // runThread's per-thread `visionCapable` (and through requestApproval's default onApprove). Set
+    // on ctx.visionCapable so the `computer` tool's screenshot action can refuse a non-vision model.
+    visionCapable?: boolean,
   ): Promise<{ output: string; isError: boolean }> {
     let args: unknown;
     try { args = call.argsJson.length ? JSON.parse(call.argsJson) : {}; }
@@ -2302,6 +2385,19 @@ export class AgentEngine {
     // The calling thread's own `loaded` set (see its doc comment above), unioned with this
     // round's pins into a NEW Set — `loaded` itself is NEVER copied/mutated by this union.
     const effectiveLoaded = pins.size ? new Set([...loaded, ...pins]) : loaded;
+    // Computer use (Phase 5 CU): wire the `computer` tool's bridges ONLY when the service is
+    // configured — otherwise both stay undefined and the tool ctx is byte-identical to pre-CU.
+    // `attachImage` closes over this call's namespaced key (session|thread|callId — see the
+    // pendingCuImages doc comment for why bare callId is unsafe): a staged screenshot lands in
+    // pendingCuImages under that key, drained into `input` at this round's end (drainRoundImages).
+    const attachImage = this.cfg.computerUse
+      ? (dataUrl: string) => {
+          const key = AgentEngine.cuImageKey(sessionId, threadId, call.callId);
+          const arr = this.pendingCuImages.get(key) ?? [];
+          arr.push(dataUrl);
+          this.pendingCuImages.set(key, arr);
+        }
+      : undefined;
     return this.cfg.registry.execute(call.name, args, {
       cwd, roots, tmpDir, sessionId, signal, markSkillLoaded,
       markToolLoaded,
@@ -2311,6 +2407,9 @@ export class AgentEngine {
       builtinDeferral: this.toolSearchEnabled(),
       ask,
       taskEvent,
+      computerUse: this.cfg.computerUse,
+      attachImage,
+      visionCapable,
     });
   }
 }

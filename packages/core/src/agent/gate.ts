@@ -43,7 +43,12 @@ export type SessionApprovalPolicy = "ask" | "auto" | "plan";
 // task_stop's primary target is Norma's own subagent bookkeeping. Flagged here explicitly so a
 // whole-branch review adjudicates the split rather than silently accepting it.
 const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop"]);
-const MUTATING = new Set(["write", "edit", "bash", "bash_kill", "notebook_edit", "enter_worktree", "exit_worktree"]);
+// `computer` (Phase 5 CU) is MUTATING: a computer-use action drives real mouse/keyboard/screen, so
+// it must pass the gate on EVERY call (spec §4.6: "every CU action passes the permission gate") —
+// ask → per-action approval card, auto → allow, plan → deny (CU makes changes). Note this is the
+// PER-ACTION gate; the per-CLASS lease gate (2f: broker.lease follows the session policy) is a
+// SEPARATE, earlier consent, and the whole tool is additionally opt-in via settings.computerUse.
+const MUTATING = new Set(["write", "edit", "bash", "bash_kill", "notebook_edit", "enter_worktree", "exit_worktree", "computer"]);
 const SELF_GATING = new Set(["request_directory"]);
 // web_fetch (4g Task 5, T6 adds web_search here) is Norma's ONLY network-capable tool — it does NOT
 // belong in READ_ONLY (it makes a live outbound request; the response bytes are DATA that could

@@ -53,11 +53,11 @@ final class PeripheralProviderTests: XCTestCase {
         return String(data: data, encoding: .utf8)!
     }
 
-    private func makeProvider() -> PeripheralProvider {
-        PeripheralProvider(client: NormaClient(makeTransport: { FeedScriptedTransport() }, token: "tok", clientName: "provider-test"))
+    private func makeProvider(capabilities: ComputerCapabilities? = nil) -> PeripheralProvider {
+        PeripheralProvider(client: NormaClient(makeTransport: { FeedScriptedTransport() }, token: "tok", clientName: "provider-test"), capabilities: capabilities)
     }
 
-    private func connectedProvider() async throws -> (PeripheralProvider, FeedScriptedTransport) {
+    private func connectedProvider(capabilities: ComputerCapabilities? = nil) async throws -> (PeripheralProvider, FeedScriptedTransport) {
         let t = FeedScriptedTransport()
         let client = NormaClient(makeTransport: { t }, token: "tok", clientName: "provider-test")
         async let c: Void = client.connect()
@@ -65,7 +65,7 @@ final class PeripheralProviderTests: XCTestCase {
         let hello = feedLineJSON(t.sent[0])
         t.feed(#"{"jsonrpc":"2.0","id":\#(hello["id"] as! Int),"result":{"ok":true}}"#)
         try await c
-        return (PeripheralProvider(client: client), t)
+        return (PeripheralProvider(client: client, capabilities: capabilities), t)
     }
 
     // MARK: - Pure decision core: shouldServe
@@ -117,12 +117,22 @@ final class PeripheralProviderTests: XCTestCase {
         XCTAssertEqual(shouldServe(call, leases: [lease], nowMs: 500), .deny("expired"))
     }
 
-    func testShouldServeDeniesUnsupportedClassEvenWithAValidLease() {
-        // v1 only serves noop — a real, valid, unexpired, correctly-tokened lease for
-        // "screenshot" is still denied.
-        let lease = PeripheralLeaseInfo(leaseId: "lease_1", class: "screenshot", holder: holder(), expiresAt: 1000, tokenHash: Self.defaultTokenHash)
-        let call = PeripheralCallRequest(requestId: "req_1", leaseId: "lease_1", token: "tok_1", class: "screenshot", payloadJson: "{}")
+    func testShouldServeDeniesGenuinelyUnsupportedClass() {
+        // Phase 5 CU widened the served set to {noop, screenshot, ax-read, input-drive}. A class
+        // outside that set — even with a real, valid, unexpired, correctly-tokened lease — is still
+        // denied unsupported_class.
+        let lease = PeripheralLeaseInfo(leaseId: "lease_1", class: "bogus", holder: holder(), expiresAt: 1000, tokenHash: Self.defaultTokenHash)
+        let call = PeripheralCallRequest(requestId: "req_1", leaseId: "lease_1", token: "tok_1", class: "bogus", payloadJson: "{}")
         XCTAssertEqual(shouldServe(call, leases: [lease], nowMs: 500), .deny("unsupported_class"))
+    }
+
+    func testShouldServeNowServesTheThreeRealClasses() {
+        // Phase 5 CU: screenshot/ax-read/input-drive are implemented — a valid lease serves.
+        for cls in ["screenshot", "ax-read", "input-drive"] {
+            let lease = PeripheralLeaseInfo(leaseId: "lease_1", class: cls, holder: holder(), expiresAt: 1000, tokenHash: Self.defaultTokenHash)
+            let call = PeripheralCallRequest(requestId: "req_1", leaseId: "lease_1", token: "tok_1", class: cls, payloadJson: "{}")
+            XCTAssertEqual(shouldServe(call, leases: [lease], nowMs: 500), .serve, "\(cls) should now serve")
+        }
     }
 
     // MARK: - handle(): activeLeases tracking (no network)
@@ -232,11 +242,39 @@ final class PeripheralProviderTests: XCTestCase {
         await handled
     }
 
-    func testPeripheralCallRequestedDeniesUnsupportedClass() async throws {
-        let (provider, t) = try await connectedProvider()
+    func testPeripheralCallRequestedServesScreenshotViaCapability() async throws {
+        // Phase 5 CU: a valid screenshot lease + a well-formed payload routes through the capability
+        // seam and ships the encoded result over the wire.
+        let fake = FakeComputerCapabilities()
+        fake.result = .screenshot(CUScreenshot(dataUrl: "data:image/png;base64,ABC", width: 1512, height: 982, scaledWidth: 1280, scaledHeight: 831))
+        let (provider, t) = try await connectedProvider(capabilities: fake)
         await provider.handle(leaseGrantedEvent(class: "screenshot"))
 
-        async let handled: Void = provider.handle(callRequestedEvent(class: "screenshot"))
+        async let handled: Void = provider.handle(callRequestedEvent(class: "screenshot", payloadJson: #"{"op":"screenshot"}"#))
+
+        await feedWaitUntil { t.sent.count >= 2 }
+        let respond = feedLineJSON(t.sent[1])
+        let params = respond["params"] as? [String: Any]
+        XCTAssertNil(params?["error"])
+        let resultJson = params?["resultJson"] as? String
+        XCTAssertNotNil(resultJson)
+        // Parse the inner resultJson (JSONEncoder escapes `/` in the data-URL — valid JSON the JS
+        // core parses back cleanly — so compare the decoded field, not a raw substring).
+        let result = feedLineJSON(resultJson!)
+        XCTAssertEqual(result["dataUrl"] as? String, "data:image/png;base64,ABC")
+        XCTAssertEqual(result["scaledWidth"] as? Int, 1280)
+        XCTAssertEqual(fake.performed.count, 1)
+
+        ackLastSent(t, index: 1)
+        await handled
+    }
+
+    func testPeripheralCallRequestedDeniesGenuinelyUnsupportedClass() async throws {
+        // A lease for a class the provider doesn't implement is still denied at call time.
+        let (provider, t) = try await connectedProvider()
+        await provider.handle(leaseGrantedEvent(class: "bogus"))
+
+        async let handled: Void = provider.handle(callRequestedEvent(class: "bogus"))
 
         await feedWaitUntil { t.sent.count >= 2 }
         let respond = feedLineJSON(t.sent[1])
@@ -245,6 +283,54 @@ final class PeripheralProviderTests: XCTestCase {
 
         ackLastSent(t, index: 1)
         await handled
+    }
+
+    func testPeripheralCallRequestedSurfacesCapabilityErrorAsWireError() async throws {
+        let fake = FakeComputerCapabilities()
+        fake.error = ComputerError(message: "screen recording permission not granted")
+        let (provider, t) = try await connectedProvider(capabilities: fake)
+        await provider.handle(leaseGrantedEvent(class: "screenshot"))
+
+        async let handled: Void = provider.handle(callRequestedEvent(class: "screenshot", payloadJson: #"{"op":"screenshot"}"#))
+
+        await feedWaitUntil { t.sent.count >= 2 }
+        let params = feedLineJSON(t.sent[1])["params"] as? [String: Any]
+        XCTAssertEqual(params?["error"] as? String, "screen recording permission not granted")
+
+        ackLastSent(t, index: 1)
+        await handled
+    }
+
+    func testPeripheralCallRequestedRejectsMalformedPayloadBeforeCapability() async throws {
+        let fake = FakeComputerCapabilities()
+        let (provider, t) = try await connectedProvider(capabilities: fake)
+        await provider.handle(leaseGrantedEvent(class: "input-drive"))
+        // click with no target → parse failure, capability never called.
+        async let handled: Void = provider.handle(callRequestedEvent(class: "input-drive", payloadJson: #"{"op":"click"}"#))
+
+        await feedWaitUntil { t.sent.count >= 2 }
+        let params = feedLineJSON(t.sent[1])["params"] as? [String: Any]
+        XCTAssertEqual(params?["error"] as? String, "click needs a target (element_id or x,y)")
+        XCTAssertEqual(fake.performed.count, 0)
+
+        ackLastSent(t, index: 1)
+        await handled
+    }
+
+    func testLeaseLostForAxReadClearsElementCache() async throws {
+        let fake = FakeComputerCapabilities()
+        let provider = makeProvider(capabilities: fake)
+        await provider.handle(leaseGrantedEvent(class: "ax-read"))
+        await provider.handle(leaseLostEvent(class: "ax-read", reason: "expired"))
+        XCTAssertEqual(fake.cacheCleared, 1)
+    }
+
+    func testPanicClearsElementCache() async throws {
+        let fake = FakeComputerCapabilities()
+        let provider = makeProvider(capabilities: fake)
+        await provider.handle(leaseGrantedEvent(class: "input-drive"))
+        provider.panic()
+        XCTAssertGreaterThanOrEqual(fake.cacheCleared, 1)
     }
 
     // MARK: - panic()
@@ -321,5 +407,93 @@ final class PeripheralProviderTests: XCTestCase {
 
         // Still empty after the round-trip completes — the fresh advertise doesn't resurrect them.
         XCTAssertTrue(provider.activeLeases.isEmpty)
+    }
+}
+
+/// A scriptable ComputerCapabilities for the dispatch tests — the seam that keeps PeripheralProvider
+/// unit-testable without TCC (no real capture/AX/CGEvent).
+@MainActor
+final class FakeComputerCapabilities: ComputerCapabilities {
+    var result: CUResult = .detail("ok")
+    var error: ComputerError?
+    var performed: [ComputerOp] = []
+    var cacheCleared = 0
+    func perform(_ op: ComputerOp) async throws -> CUResult {
+        performed.append(op)
+        if let error { throw error }
+        return result
+    }
+    func clearElementCache() { cacheCleared += 1 }
+}
+
+/// Pure-core tests (Phase 5 CU) — no TCC, no provider: payload parsing, formatting, downscale math,
+/// chord parsing, result encoding.
+final class ComputerCapabilitiesPureTests: XCTestCase {
+    func testParsePayloadValidatesOpAgainstClass() {
+        XCTAssertEqual(try? parseComputerPayload(cls: "screenshot", payloadJson: #"{"op":"screenshot"}"#).get(), .screenshot(maxDim: nil))
+        XCTAssertEqual(try? parseComputerPayload(cls: "screenshot", payloadJson: #"{"op":"screenshot","maxDim":1024}"#).get(), .screenshot(maxDim: 1024))
+        XCTAssertEqual(try? parseComputerPayload(cls: "ax-read", payloadJson: #"{"op":"ax_snapshot"}"#).get(), .axSnapshot)
+        XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"click","target":{"elementId":3},"button":"left","clicks":1}"#).get(),
+                       .click(target: .element(3), button: "left", clicks: 1))
+        XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"click","target":{"x":10,"y":20},"button":"right","clicks":2}"#).get(),
+                       .click(target: .point(x: 10, y: 20), button: "right", clicks: 2))
+        XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"type","text":"hi"}"#).get(), .type(text: "hi"))
+        XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"key","keys":"cmd+s"}"#).get(), .key(keys: "cmd+s"))
+        XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"scroll","dy":-120}"#).get(), .scroll(target: nil, dx: 0, dy: -120))
+    }
+
+    func testScrollDeltasAreClampedNotTrapped() {
+        // Int(_: Double) is a trapping conversion — a model-controlled absurd delta must clamp,
+        // never fatalError the app.
+        XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"scroll","dy":1e40}"#).get(),
+                       .scroll(target: nil, dx: 0, dy: 100_000))
+        XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"scroll","dx":-1e40,"dy":50}"#).get(),
+                       .scroll(target: nil, dx: -100_000, dy: 50))
+    }
+
+    func testParsePayloadRejectsMismatchAndMissingFields() {
+        // op valid for a DIFFERENT class
+        if case .success = parseComputerPayload(cls: "screenshot", payloadJson: #"{"op":"click"}"#) { XCTFail("class/op mismatch should fail") }
+        // click without a target
+        if case .success = parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"click"}"#) { XCTFail("missing target should fail") }
+        // type without text
+        if case .success = parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"type"}"#) { XCTFail("missing text should fail") }
+        // malformed json
+        if case .success = parseComputerPayload(cls: "screenshot", payloadJson: "not json") { XCTFail("malformed json should fail") }
+    }
+
+    func testDownscaleCapsLongestSideAndNeverUpscales() {
+        XCTAssertEqual(cuDownscaledSize(width: 3024, height: 1964, maxDim: 1280).width, 1280)
+        let (w, h) = cuDownscaledSize(width: 2000, height: 1000, maxDim: 1000)
+        XCTAssertEqual(w, 1000); XCTAssertEqual(h, 500)
+        // already within cap → unchanged (no upscale)
+        XCTAssertEqual(cuDownscaledSize(width: 800, height: 600, maxDim: 1280).width, 800)
+    }
+
+    func testFormatAXElements() {
+        let els = [
+            CUAXElement(id: 0, role: "AXWindow", label: "Doc", value: nil, x: 0, y: 0, width: 1000, height: 800),
+            CUAXElement(id: 1, role: "AXButton", label: "Save", value: nil, x: 820, y: 610, width: 40, height: 20),
+            CUAXElement(id: 2, role: "AXTextField", label: "Name", value: "Jane", x: 100, y: 200, width: 200, height: 24),
+        ]
+        let text = formatAXElements(els)
+        XCTAssertTrue(text.contains("#1 AXButton \"Save\" @ (840,620)"))
+        XCTAssertTrue(text.contains("#2 AXTextField \"Name\" = \"Jane\" @ (200,212)"))
+        XCTAssertEqual(formatAXElements([]), "(no accessible elements found in the frontmost window)")
+    }
+
+    func testParseChord() {
+        XCTAssertEqual(parseChord("cmd+s"), CUChord(flags: .maskCommand, keyCode: 1))
+        XCTAssertEqual(parseChord("return"), CUChord(flags: [], keyCode: 36))
+        XCTAssertEqual(parseChord("cmd+shift+4"), CUChord(flags: [.maskCommand, .maskShift], keyCode: 21))
+        XCTAssertNil(parseChord("cmd+notakey"))
+        XCTAssertNil(parseChord("cmd")) // modifier only, no key
+    }
+
+    func testEncodeCUResult() {
+        let s = encodeCUResult(.screenshot(CUScreenshot(dataUrl: "data:x", width: 100, height: 50, scaledWidth: 100, scaledHeight: 50)))!
+        XCTAssertTrue(s.contains("\"dataUrl\":\"data:x\""))
+        XCTAssertTrue(encodeCUResult(.text("hello"))!.contains("\"text\":\"hello\""))
+        XCTAssertTrue(encodeCUResult(.detail("clicked"))!.contains("\"detail\":\"clicked\""))
     }
 }

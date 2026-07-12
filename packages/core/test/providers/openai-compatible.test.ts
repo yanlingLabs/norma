@@ -233,3 +233,30 @@ describe("mapInput reasoning passthrough", () => {
     expect(out).toEqual([{ type: "reasoning", summary: [], encrypted_content: "X" }]);
   });
 });
+
+describe("mapInput image (Phase 5 CU)", () => {
+  const dataUrl = "data:image/png;base64,AAAA";
+  test("image item maps to a user message with input_image (spike-verified shape)", () => {
+    const out = mapInput([{ type: "image", imageUrl: dataUrl }]);
+    expect(out).toEqual([
+      { type: "message", role: "user", content: [{ type: "input_image", image_url: dataUrl }] },
+    ]);
+  });
+  test("alt rides as a leading input_text part", () => {
+    const out = mapInput([{ type: "image", imageUrl: dataUrl, alt: "screen after click" }]);
+    expect(out).toEqual([
+      {
+        type: "message", role: "user",
+        content: [
+          { type: "input_text", text: "screen after click" },
+          { type: "input_image", image_url: dataUrl },
+        ],
+      },
+    ]);
+  });
+  test("image_url is a plain data-URL string, not the chat-completions {url} object", () => {
+    const out = mapInput([{ type: "image", imageUrl: dataUrl }]) as any[];
+    expect(out[0].content[0].image_url).toBe(dataUrl);
+    expect(typeof out[0].content[0].image_url).toBe("string");
+  });
+});

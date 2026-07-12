@@ -95,6 +95,16 @@ type WireEvent = { type: string; threadId?: string; [k: string]: unknown };
 const str = (v: unknown, fallback = ""): string => (typeof v === "string" ? v : fallback);
 const num = (v: unknown, fallback = 0): number => (typeof v === "number" ? v : fallback);
 
+/** Human label for a peripheral capability class in the CU lease notes (Phase 5 CU). Unknown
+ *  classes fall back to the raw class string. */
+const CU_CLASS_LABELS: Record<string, string> = {
+  screenshot: "screen capture",
+  "ax-read": "accessibility",
+  "input-drive": "mouse/keyboard",
+  noop: "noop",
+};
+const cuClassLabel = (cls: string): string => CU_CLASS_LABELS[cls] ?? cls;
+
 /** Feeds ONE event into `updateSubagents` and returns the possibly-updated `agents` array — the
  *  single call site every child-thread branch below shares, so the "which events reach
  *  updateSubagents" decision lives in exactly one place. Deliberately NEVER called for a
@@ -278,6 +288,20 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
 
     case "worktree_exited": {
       const text = `⟲ left worktree ${str(e.name)}${e.removed ? " (removed)" : ""}`;
+      return { ...s, committed: [...s.committed, { kind: "note", text }] };
+    }
+
+    // Computer use (Phase 5 CU): the peripheral lease acquire/release events (transient, broadcast
+    // on the requester's session). Rendered as one-line notes so CU control is visible in the
+    // transcript. CLI-only — no Swift-lockstep twin; the -p path (main.ts) has no lease branch, so
+    // headless output is unchanged.
+    case "lease_granted": {
+      const text = `⌘ Norma acquired ${cuClassLabel(str(e.class))} control`;
+      return { ...s, committed: [...s.committed, { kind: "note", text }] };
+    }
+
+    case "lease_lost": {
+      const text = `⌘ Norma released ${cuClassLabel(str(e.class))} control (${str(e.reason)})`;
       return { ...s, committed: [...s.committed, { kind: "note", text }] };
     }
 

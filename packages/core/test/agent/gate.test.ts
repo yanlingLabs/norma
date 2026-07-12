@@ -44,6 +44,12 @@ describe("PermissionGate v1", () => {
     expect(gate.evaluate("bash_kill", "auto")).toBe("allow");
   });
 
+  test("computer (Phase 5 CU) is mutating: ask under ask, allow under auto, deny under plan", () => {
+    expect(gate.evaluate("computer", "ask")).toBe("ask");
+    expect(gate.evaluate("computer", "auto")).toBe("allow");
+    expect(gate.evaluate("computer", "plan")).toBe("deny");
+  });
+
   test("Skill is read-only: always allowed (loading a skill body must not require approval)", () => {
     expect(gate.evaluate("Skill", "ask")).toBe("allow");
     expect(gate.evaluate("Skill", "auto")).toBe("allow");
