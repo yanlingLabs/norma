@@ -126,6 +126,28 @@ describe("SessionStore", () => {
     expect(store.meta(plain)).toMatchObject({ cwd: null, approvalPolicy: "ask" });
   });
 
+  // Phase 5 routines T3 (design doc §3): additive session-meta `origin` — persisted at create,
+  // round-trips through list(). Same "index-only metadata" class as cwd/approvalPolicy above
+  // (not derived from the event log, unlike title/first_message) — so it resets on index loss,
+  // covered by the next test.
+  test("createSession persists origin; list() round-trips it; omitted origin is undefined (not null)", () => {
+    const { store } = makeStore();
+    const id = store.createSession("routine", { cwd: "/tmp/proj", approvalPolicy: "auto", origin: "routine/abc123" });
+    expect(store.list().find((r) => r.sessionId === id)?.origin).toBe("routine/abc123");
+    const plain = store.createSession("global");
+    expect(store.list().find((r) => r.sessionId === plain)?.origin).toBeUndefined();
+  });
+
+  test("origin resets on index rebuild (index-only metadata, same precedent as cwd/approvalPolicy)", () => {
+    const { store, dir } = makeStore();
+    const id = store.createSession("routine", { origin: "routine/abc123" });
+    store.close();
+    rmSync(join(dir, "sessions", "index.db"));
+    const reopened = new SessionStore(dir);
+    expect(reopened.list().find((r) => r.sessionId === id)?.origin).toBeUndefined();
+    reopened.close();
+  });
+
   test("meta survives index rebuild only for known columns", () => {
     const { store, dir } = makeStore();
     const id = store.createSession("global", { cwd: "/tmp/x", approvalPolicy: "auto" });

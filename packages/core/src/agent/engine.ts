@@ -974,7 +974,11 @@ export class AgentEngine {
         else if (ev.type === "usage") { usage.inputTokens += ev.inputTokens; usage.outputTokens += ev.outputTokens; }
         else if (ev.type === "done") stop = ev.stopReason;
         else if (ev.type === "error") {
-          this.emit(sessionId, { type: "agent_error", sessionId, threadId, message: ev.message });
+          // Phase 5 routines T3: forward the provider's structured error code (ProviderEvent's
+          // "auth"|"rate_limit"|"server"|"network"|"bad_request" — providers/types.ts) as the
+          // additive-optional `agent_error.code` field, so a consumer (routines/runner.ts's quota
+          // detection) can check `code === "rate_limit"` instead of string-matching `message`.
+          this.emit(sessionId, { type: "agent_error", sessionId, threadId, message: ev.message, code: ev.code });
           this.emit(sessionId, { type: "turn_completed", sessionId, threadId, stopReason: "error", ...usage });
           if (this.cfg.hooks) await this.fireTurnEnd(sessionId, threadId, "error", usage); // [4f turn-end] provider-error terminal
           // `errorMessage` is consumed ONLY by the spawn bridge below (a CHILD thread's failure

@@ -48,7 +48,14 @@ const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill",
 // ask → per-action approval card, auto → allow, plan → deny (CU makes changes). Note this is the
 // PER-ACTION gate; the per-CLASS lease gate (2f: broker.lease follows the session policy) is a
 // SEPARATE, earlier consent, and the whole tool is additionally opt-in via settings.computerUse.
-const MUTATING = new Set(["write", "edit", "bash", "bash_kill", "notebook_edit", "enter_worktree", "exit_worktree", "computer"]);
+// schedule (phase 5 routines T3, design doc §4) sits in MUTATING, not READ_ONLY: `schedule create`
+// stands up an unattended, headless-firing routine — a standing prompt-injection surface (the
+// design doc's own Security section calls this out explicitly) — so it must be gate-carded exactly
+// like write/edit/bash: ask under `ask`, allow under `auto`, and outright denied under `plan` (a
+// plan-mode session must not be able to SCHEDULE a future mutation any more than it can perform one
+// now). `list`/`enable`/`disable`/`delete` ride the same class as a deliberate simplification — one
+// tool, one gate decision, no op-dependent carve-out.
+const MUTATING = new Set(["write", "edit", "bash", "bash_kill", "notebook_edit", "enter_worktree", "exit_worktree", "computer", "schedule"]);
 const SELF_GATING = new Set(["request_directory"]);
 // web_fetch (4g Task 5, T6 adds web_search here) is Norma's ONLY network-capable tool — it does NOT
 // belong in READ_ONLY (it makes a live outbound request; the response bytes are DATA that could

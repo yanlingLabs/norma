@@ -8,8 +8,27 @@ import {
   PlanRespondResult, SessionSetPolicyResult, type ApprovalPolicy,
   DaemonStatusResult, QuotaStateResult, TrustListResult, TrustRemoveResult,
   PluginRevokeTokenResult, PluginRestartResult,
+  RoutinesCreateResult, RoutinesListResult, RoutinesUpdateResult, RoutinesDeleteResult,
   ConnWriter, type WritableSocket,
 } from "@norma/protocol";
+
+/** Mirrors `RoutineSchema` (protocol/src/methods.ts) / `Routine` (core/src/routines/store.ts)
+ *  field-for-field — a plain inline interface, matching this file's own convention of spelling
+ *  out result shapes by hand rather than importing zod just for `z.infer` (no other method here
+ *  does that either). */
+export interface Routine {
+  id: string;
+  spec: string;
+  prompt: string;
+  policy: "auto" | "plan";
+  cwd: string;
+  enabled: boolean;
+  lastRunAt: number | null;
+  nextRunAt: number;
+  createdAt: number;
+  lastResult: string | null;
+  deferAttempts: number;
+}
 
 export interface ConnectOptions {
   socketPath: string;
@@ -205,6 +224,24 @@ export class NormaClient {
    *  above — NOT one of the six plugin-role verbs. */
   async restartPlugin(pluginId: string): Promise<{ ok: true }> {
     return this.validated(PluginRestartResult, await this.request(METHODS.pluginRestart, { pluginId }), METHODS.pluginRestart);
+  }
+  /** Phase 5 routines T3: management surface over the daemon's RoutineStore — the four
+   *  `routines.*` RPCs, mirrored here like every other method in this file (harness/admin role,
+   *  same precedent as `pluginsList`/`daemonStatus` above — no special gating). */
+  async routinesCreate(params: { spec: string; prompt: string; policy?: "auto" | "plan"; cwd?: string }): Promise<{ routine: Routine }> {
+    return this.validated(RoutinesCreateResult, await this.request(METHODS.routinesCreate, params), METHODS.routinesCreate);
+  }
+  async routinesList(): Promise<{ routines: Routine[] }> {
+    return this.validated(RoutinesListResult, await this.request(METHODS.routinesList, {}), METHODS.routinesList);
+  }
+  async routinesUpdate(params: {
+    id: string;
+    patch: { spec?: string; prompt?: string; policy?: "auto" | "plan"; enabled?: boolean };
+  }): Promise<{ routine: Routine }> {
+    return this.validated(RoutinesUpdateResult, await this.request(METHODS.routinesUpdate, params), METHODS.routinesUpdate);
+  }
+  async routinesDelete(id: string): Promise<{ ok: true; removed: boolean }> {
+    return this.validated(RoutinesDeleteResult, await this.request(METHODS.routinesDelete, { id }), METHODS.routinesDelete);
   }
   close(): void { this.socket.end(); }
 }

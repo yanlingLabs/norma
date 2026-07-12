@@ -88,6 +88,15 @@ import {
   ShortcutInvokeResult,
   TileActionParams,
   TileActionResult,
+  RoutineSchema,
+  RoutinesCreateParams,
+  RoutinesCreateResult,
+  RoutinesListParams,
+  RoutinesListResult,
+  RoutinesUpdateParams,
+  RoutinesUpdateResult,
+  RoutinesDeleteParams,
+  RoutinesDeleteResult,
   METHODS,
 } from "../src/methods";
 
@@ -154,6 +163,25 @@ describe("agent method schemas", () => {
     expect(p.approvalPolicy).toBe("auto");
     expect(SessionCreateParams.parse({ scope: "global" }).approvalPolicy).toBe("ask");
     expect(() => SessionCreateParams.parse({ scope: "global", cwd: "relative/path" })).toThrow();
+  });
+
+  // Phase 5 routines T3 (design doc §3): additive session-meta `origin` — optional on both the
+  // create params and each session.list row (superseding T2's title-only stamp with a real,
+  // machine-readable field).
+  test("session.create accepts optional origin; session.list rows carry it (both optional, older shapes still parse)", () => {
+    const p = SessionCreateParams.parse({ scope: "global", origin: "routine/abc123" });
+    expect(p.origin).toBe("routine/abc123");
+    expect(SessionCreateParams.parse({ scope: "global" }).origin).toBeUndefined();
+    expect(() => SessionCreateParams.parse({ scope: "global", origin: "" })).toThrow();
+
+    const listed = SessionListResult.parse({
+      sessions: [
+        { sessionId: "s_1", scope: "global", createdAt: 1, lastSeq: 0, origin: "routine/abc123" },
+        { sessionId: "s_2", scope: "global", createdAt: 1, lastSeq: 0 }, // no origin — pre-existing shape
+      ],
+    });
+    expect(listed.sessions[0]!.origin).toBe("routine/abc123");
+    expect(listed.sessions[1]!.origin).toBeUndefined();
   });
 });
 
@@ -647,5 +675,70 @@ describe("shortcut.invoke / tile.action (Phase 4d Task 2, spec §6/§7 — harne
     expect(TileActionResult.parse({ ok: true })).toEqual({ ok: true });
     expect(TileActionResult.parse({ code: "not_connected" })).toEqual({ code: "not_connected" });
     expect(TileActionResult.parse({ code: "unknown_plugin" })).toEqual({ code: "unknown_plugin" });
+  });
+});
+
+describe("routines RPCs (Phase 5 routines T3, design doc §3)", () => {
+  const routine = {
+    id: "r_abc123456789", spec: "every 30m", prompt: "check inbox", policy: "auto" as const,
+    cwd: "/tmp/proj", enabled: true, lastRunAt: null, nextRunAt: 1700000000000,
+    createdAt: 1699999999000, lastResult: null, deferAttempts: 0,
+  };
+
+  test("METHODS carries all four verbs", () => {
+    expect(METHODS.routinesCreate).toBe("routines.create");
+    expect(METHODS.routinesList).toBe("routines.list");
+    expect(METHODS.routinesUpdate).toBe("routines.update");
+    expect(METHODS.routinesDelete).toBe("routines.delete");
+  });
+
+  test("RoutineSchema mirrors the store's Routine shape and rejects policy \"ask\"", () => {
+    expect(RoutineSchema.parse(routine)).toEqual(routine);
+    expect(() => RoutineSchema.parse({ ...routine, policy: "ask" })).toThrow();
+  });
+
+  test("routines.create params: spec + prompt required; policy/cwd optional; policy \"ask\" rejected at the wire schema", () => {
+    const p = RoutinesCreateParams.parse({ spec: "every 30m", prompt: "check inbox" });
+    expect(p.policy).toBeUndefined();
+    expect(p.cwd).toBeUndefined();
+    expect(RoutinesCreateParams.parse({ spec: "every 30m", prompt: "x", policy: "plan", cwd: "/tmp/proj" }).policy).toBe("plan");
+    expect(() => RoutinesCreateParams.parse({ spec: "every 30m", prompt: "x", policy: "ask" })).toThrow();
+    expect(() => RoutinesCreateParams.parse({ spec: "", prompt: "x" })).toThrow();
+    expect(() => RoutinesCreateParams.parse({ spec: "every 30m", prompt: "" })).toThrow();
+    expect(() => RoutinesCreateParams.parse({ spec: "every 30m", prompt: "x", cwd: "relative/path" })).toThrow();
+  });
+
+  test("routines.create result: {routine}", () => {
+    expect(RoutinesCreateResult.parse({ routine })).toEqual({ routine });
+  });
+
+  test("routines.list params/result", () => {
+    expect(RoutinesListParams.parse({})).toEqual({});
+    expect(RoutinesListResult.parse({ routines: [routine] })).toEqual({ routines: [routine] });
+    expect(RoutinesListResult.parse({ routines: [] })).toEqual({ routines: [] });
+  });
+
+  test("routines.update params: patch is enabled?/spec?/prompt?/policy? only (no cwd — narrower than the store's own patch shape)", () => {
+    const p = RoutinesUpdateParams.parse({ id: "r_1", patch: { enabled: false } });
+    expect(p.patch).toEqual({ enabled: false });
+    expect(RoutinesUpdateParams.parse({ id: "r_1", patch: {} }).patch).toEqual({});
+    expect(RoutinesUpdateParams.parse({ id: "r_1", patch: { spec: "every 1h", prompt: "new prompt", policy: "plan", enabled: true } }).patch)
+      .toEqual({ spec: "every 1h", prompt: "new prompt", policy: "plan", enabled: true });
+    expect(() => RoutinesUpdateParams.parse({ id: "r_1", patch: { policy: "ask" } })).toThrow();
+    expect(() => RoutinesUpdateParams.parse({ id: "", patch: {} })).toThrow();
+    // cwd is not part of the wire patch shape — an extra key is silently stripped (zod default),
+    // not rejected, matching every other z.object() schema in this file.
+    expect((RoutinesUpdateParams.parse({ id: "r_1", patch: { cwd: "/tmp/x" } }).patch as Record<string, unknown>).cwd).toBeUndefined();
+  });
+
+  test("routines.update result: {routine}", () => {
+    expect(RoutinesUpdateResult.parse({ routine })).toEqual({ routine });
+  });
+
+  test("routines.delete params/result", () => {
+    expect(RoutinesDeleteParams.parse({ id: "r_1" })).toEqual({ id: "r_1" });
+    expect(() => RoutinesDeleteParams.parse({ id: "" })).toThrow();
+    expect(RoutinesDeleteResult.parse({ ok: true, removed: true })).toEqual({ ok: true, removed: true });
+    expect(RoutinesDeleteResult.parse({ ok: true, removed: false })).toEqual({ ok: true, removed: false });
   });
 });

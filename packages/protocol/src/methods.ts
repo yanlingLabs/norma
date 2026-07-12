@@ -33,6 +33,13 @@ export const SessionCreateParams = z.object({
   scope: z.string().regex(/^[a-z0-9]([a-z0-9-]{0,39}[a-z0-9])?$/), // slug: no leading/trailing hyphen, ≤41 chars
   cwd: AbsoluteDirPath.optional(),        // absolute path (not '/'); session working directory for tools
   approvalPolicy: ApprovalPolicy.default("ask"),
+  // Phase 5 routines T3 (design doc §3): a machine-readable "who/what created this session" tag —
+  // routines/runner.ts's runHeadless stamps `routine/<id>` here (ALONGSIDE the session-title stamp
+  // T2 already ships as a documented fallback — see that file's own doc comment: the title is
+  // user-visible, this field is the machine-readable record, and neither is ever overwritten by
+  // the other). Additive/optional so every existing caller (CLI, NormaKit) that never sends it is
+  // unaffected — SessionStore.createSession defaults it to `undefined`/NULL on the row.
+  origin: z.string().min(1).optional(),
 });
 export const SessionCreateResult = z.object({ sessionId: z.string(), trusted: z.boolean() });
 
@@ -42,6 +49,9 @@ export const SessionListResult = z.object({
     scope: z.string(),
     createdAt: z.number().int(),
     lastSeq: z.number().int().nonnegative(),
+    // Additive (phase 5 routines T3): round-trips SessionCreateParams.origin — undefined for
+    // every session created before this field existed, or created without one.
+    origin: z.string().optional(),
   })),
 });
 
@@ -513,6 +523,66 @@ export const PluginSetConsentResult = z.union([
   z.object({ code: z.literal("unknown_plugin") }),
 ]);
 
+// ---------------------------------------------------------------------------------------------
+// Scheduled routines (Phase 5 / Routines, design doc §3): the management surface over
+// `RoutineStore` (core/src/routines/store.ts) — mirrors that store's `Routine` shape field-for-
+// field via `RoutineSchema`. Routines run headless/unattended (T1: `policy` is restricted to
+// "auto"|"plan" — "ask" is rejected, at the store boundary AND here at the wire schema, since a
+// headless turn has nobody to answer an approval prompt). No typed error-code unions here (unlike
+// the plugin-lifecycle verbs above) — invalid input (a bad spec, `policy:"ask"`, an unknown id on
+// update) is a thrown RpcFailure (INVALID_PARAMS / NOT_FOUND — see ipc/server.ts), same precedent
+// as `session.setPolicy`/`session.setCwd` above.
+// ---------------------------------------------------------------------------------------------
+
+/** Restricted to "auto"|"plan" (NOT the full `ApprovalPolicy` union above) — a routine fires with
+ *  nobody present to answer an "ask" approval prompt, so the wire schema rejects it up front
+ *  (before ever reaching RoutineStore's own runtime `validatePolicy` guard, which every OTHER
+ *  caller — the `schedule` tool, a future CLI — must still go through, since they don't necessarily
+ *  route through this zod schema first). */
+export const RoutinePolicySchema = z.enum(["auto", "plan"]);
+
+/** Mirrors `Routine` (core/src/routines/store.ts) field-for-field. */
+export const RoutineSchema = z.object({
+  id: z.string(),
+  spec: z.string(),
+  prompt: z.string(),
+  policy: RoutinePolicySchema,
+  cwd: z.string(),
+  enabled: z.boolean(),
+  lastRunAt: z.number().int().nonnegative().nullable(),
+  nextRunAt: z.number().int().nonnegative(),
+  createdAt: z.number().int().nonnegative(),
+  lastResult: z.string().nullable(),
+  deferAttempts: z.number().int().nonnegative(),
+});
+
+export const RoutinesCreateParams = z.object({
+  spec: z.string().min(1),
+  prompt: z.string().min(1),
+  policy: RoutinePolicySchema.optional(),
+  cwd: AbsoluteDirPath.optional(),
+});
+export const RoutinesCreateResult = z.object({ routine: RoutineSchema });
+
+export const RoutinesListParams = z.object({});
+export const RoutinesListResult = z.object({ routines: z.array(RoutineSchema) });
+
+/** Only the fields the design doc names for `routines.update` — enable/disable, and editing the
+ *  spec/prompt/policy. (`RoutineStore.update` also accepts a `cwd` patch; that's deliberately not
+ *  exposed over this RPC yet — narrower wire surface than the store's own capability, widenable
+ *  later without a breaking change.) */
+export const RoutinePatchSchema = z.object({
+  spec: z.string().min(1).optional(),
+  prompt: z.string().min(1).optional(),
+  policy: RoutinePolicySchema.optional(),
+  enabled: z.boolean().optional(),
+});
+export const RoutinesUpdateParams = z.object({ id: z.string().min(1), patch: RoutinePatchSchema });
+export const RoutinesUpdateResult = z.object({ routine: RoutineSchema });
+
+export const RoutinesDeleteParams = z.object({ id: z.string().min(1) });
+export const RoutinesDeleteResult = z.object({ ok: z.literal(true), removed: z.boolean() });
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -567,4 +637,8 @@ export const METHODS = {
   pluginDisable: "plugin.disable",
   pluginRemove: "plugin.remove",
   pluginSetConsent: "plugin.setConsent",
+  routinesCreate: "routines.create",
+  routinesList: "routines.list",
+  routinesUpdate: "routines.update",
+  routinesDelete: "routines.delete",
 } as const;

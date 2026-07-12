@@ -50,6 +50,17 @@ describe("PermissionGate v1", () => {
     expect(gate.evaluate("computer", "plan")).toBe("deny");
   });
 
+  // Phase 5 routines T3 (design doc §4/security): `schedule` creates a standing, unattended,
+  // prompt-injection-shaped side effect (a routine that fires headless later) — MUTATING, not
+  // READ_ONLY, same class as bash/write/edit: ask under `ask`, allow under `auto`, denied outright
+  // under `plan` (plan mode's whole point is "nothing mutates until the plan is approved" — that
+  // must include "nothing gets SCHEDULED to mutate later" too).
+  test("schedule is mutating: ask under ask-policy, allow under auto-policy, denied under plan", () => {
+    expect(gate.evaluate("schedule", "ask")).toBe("ask");
+    expect(gate.evaluate("schedule", "auto")).toBe("allow");
+    expect(gate.evaluate("schedule", "plan")).toBe("deny");
+  });
+
   test("Skill is read-only: always allowed (loading a skill body must not require approval)", () => {
     expect(gate.evaluate("Skill", "ask")).toBe("allow");
     expect(gate.evaluate("Skill", "auto")).toBe("allow");

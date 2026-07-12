@@ -42,6 +42,7 @@ import {
 } from "./plugin-cli";
 import { parseModelArgs, validateEffort, validateModelSlug } from "./model-cli";
 import { formatElapsed, formatTokens } from "./task-display";
+import { formatRoutineDetail } from "./routines-cli";
 import { formatOptionLines, isOtherChoice, parseQuestionAnswer } from "./questions";
 import { parsePlanResponse } from "./plan-response";
 import { makeEventBridge, type EventBridge } from "./tui/event-bridge";
@@ -1231,6 +1232,86 @@ if (import.meta.main) {
     c.close();
     break;
   }
+  case "routines": {
+    // usage: norma routines [list] | routines create "<spec>" [--policy auto|plan] -- <prompt…>
+    //        | routines delete <id> | routines enable <id> | routines disable <id>
+    // Argument validation happens BEFORE connecting (mirrors `bg`'s fail-fast usage check just
+    // above) — a bad invocation never opens a daemon socket at all.
+    const routinesUsage = 'usage: norma routines [list] | routines create "<spec>" [--policy auto|plan] -- <prompt…> | routines delete <id> | routines enable <id> | routines disable <id>';
+    const createUsage = 'usage: norma routines create "<spec>" [--policy auto|plan] -- <prompt…>';
+    const routinesSub = process.argv[3];
+
+    if (routinesSub === "create") {
+      const spec = process.argv[4];
+      const tail = process.argv.slice(5);
+      const dashIdx = tail.indexOf("--");
+      if (!spec || dashIdx === -1) { console.error(createUsage); process.exit(1); }
+      const flags = tail.slice(0, dashIdx);
+      const prompt = tail.slice(dashIdx + 1).join(" ").trim();
+      let policy: "auto" | "plan" | undefined;
+      const policyIdx = flags.indexOf("--policy");
+      if (policyIdx !== -1) {
+        const val = flags[policyIdx + 1];
+        if (val !== "auto" && val !== "plan") { console.error(createUsage); process.exit(1); }
+        policy = val;
+      }
+      if (!prompt) { console.error(createUsage); process.exit(1); }
+      const c = await connect("cli-routines");
+      try {
+        const { routine } = await c.routinesCreate({ spec, prompt, ...(policy ? { policy } : {}) });
+        console.log(`${AQUA}created ${routine.id}${RESET} ${DIM}${formatRoutineDetail(routine)}${RESET}`);
+      } catch (err) {
+        console.error((err as Error).message);
+        c.close();
+        process.exit(1);
+      }
+      c.close();
+      break;
+    }
+
+    if (routinesSub === "delete") {
+      const id = process.argv[4];
+      if (!id) { console.error("usage: norma routines delete <id>"); process.exit(1); }
+      const c = await connect("cli-routines");
+      const { removed } = await c.routinesDelete(id);
+      if (!removed) {
+        console.error(`no routine found with id ${id}`);
+        c.close();
+        process.exit(1);
+      }
+      console.log(`${AQUA}deleted ${id}${RESET}`);
+      c.close();
+      break;
+    }
+
+    if (routinesSub === "enable" || routinesSub === "disable") {
+      const id = process.argv[4];
+      if (!id) { console.error(`usage: norma routines ${routinesSub} <id>`); process.exit(1); }
+      const c = await connect("cli-routines");
+      try {
+        const { routine } = await c.routinesUpdate({ id, patch: { enabled: routinesSub === "enable" } });
+        console.log(`${AQUA}${routinesSub}d ${routine.id}${RESET} ${DIM}${formatRoutineDetail(routine)}${RESET}`);
+      } catch (err) {
+        console.error((err as Error).message);
+        c.close();
+        process.exit(1);
+      }
+      c.close();
+      break;
+    }
+
+    if (routinesSub === undefined || routinesSub === "list") {
+      const c = await connect("cli-routines");
+      const { routines } = await c.routinesList();
+      if (routines.length === 0) console.log(`${DIM}(no routines)${RESET}`);
+      for (const r of routines) console.log(`${AQUA}${r.id}${RESET} ${DIM}${formatRoutineDetail(r)}${RESET}`);
+      c.close();
+      break;
+    }
+
+    console.error(routinesUsage);
+    process.exit(1);
+  }
   case "watch": {
     const sessionId = process.argv[3];
     if (!sessionId) { console.error("usage: norma watch <sessionId>"); process.exit(1); }
@@ -1426,6 +1507,8 @@ if (import.meta.main) {
   mcp                                              list configured MCP servers and their tools
   plugin list | install <git-url> [name] | enable <name> | disable <name> | remove <name> | restart <name>
   bg list <session> | bg peek <session> <taskId> | bg kill <session> <taskId>
+  routines [list] | routines create "<spec>" [--policy auto|plan] -- <prompt>
+    | routines delete <id> | routines enable <id> | routines disable <id>       manage scheduled routines
   login [--api-key] [--web-search-key] | logout | provider | provider-smoke [--prompt <text>]
   init                                            generate/update NORMA.md by surveying the project
   -p "<prompt>" [--auto|--plan] [--trust|--no-trust]   headless agent turn (asks for tool approval unless --auto/--plan)`);
