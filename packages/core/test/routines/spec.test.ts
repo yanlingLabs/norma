@@ -88,6 +88,17 @@ describe("parseSpec — cron: field grammar", () => {
   test("non-positive step throws", () => {
     expect(() => parseSpec("*/0 * * * *")).toThrow(TypeError);
   });
+
+  test("step on a single value (5/15) is rejected — step requires a range or *", () => {
+    expect(() => parseSpec("5/15 * * * *")).toThrow(TypeError);
+    expect(() => parseSpec("5/15 * * * *")).toThrow(/step requires a range or \*/);
+    // ...including inside a list, and in other fields
+    expect(() => parseSpec("1,5/15 * * * *")).toThrow(/step requires a range or \*/);
+    expect(() => parseSpec("* * * * 3/2")).toThrow(/step requires a range or \*/);
+    // range and * bases with steps remain valid
+    expect(() => parseSpec("2-10/2 * * * *")).not.toThrow();
+    expect(() => parseSpec("*/15 * * * *")).not.toThrow();
+  });
 });
 
 describe("nextRunAt — interval", () => {
@@ -173,11 +184,37 @@ describe("nextRunAt — cron: dom/dow POSIX OR-semantics", () => {
   });
 });
 
+describe("nextRunAt — cron: leap years", () => {
+  // 2026 and 2027 are non-leap; the next Feb 29 after them is in 2028 (leap year).
+  test("Feb 29 from a non-leap year resolves to the next leap year, not 'unsatisfiable'", () => {
+    const spec = parseSpec("0 0 29 2 *");
+    const from = at(2026, 3, 1, 0, 0, 0); // March 2026 — just missed any Feb; gap spans 2 non-leap Febs
+    expect(nextRunAt(spec, from)).toBe(at(2028, 2, 29, 0, 0, 0));
+  });
+
+  test("Feb 29 chained via recordRun-style recompute: from just after a Feb 29 fire", () => {
+    const spec = parseSpec("0 0 29 2 *");
+    const from = at(2028, 2, 29, 0, 0, 0); // the moment a Feb 29 routine just fired
+    expect(nextRunAt(spec, from)).toBe(at(2032, 2, 29, 0, 0, 0)); // ~4 years out — must not throw
+  });
+
+  test("leap-year scan completes fast (day-level stepping, not minute-by-minute over years)", () => {
+    const spec = parseSpec("0 0 29 2 *");
+    const start = performance.now();
+    nextRunAt(spec, at(2028, 2, 29, 0, 0, 0)); // worst realistic case: ~4-year gap
+    const elapsed = performance.now() - start;
+    expect(elapsed).toBeLessThan(250);
+  });
+});
+
 describe("nextRunAt — cron: unsatisfiable spec", () => {
-  test("Feb 30th never exists — throws after scanning within 366 days", () => {
+  test("Feb 30th never exists — throws after the bounded scan, and fast", () => {
     const spec = parseSpec("0 0 30 2 *");
     const from = at(2026, 1, 1, 0, 0, 0);
+    const start = performance.now();
     expect(() => nextRunAt(spec, from)).toThrow(TypeError);
     expect(() => nextRunAt(spec, from)).toThrow(/unsatisfiable/);
+    const elapsed = performance.now() - start;
+    expect(elapsed).toBeLessThan(1000); // full-bound scan must stay cheap (day-level stepping)
   });
 });

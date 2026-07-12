@@ -7,7 +7,10 @@
 //   - Cron:      5 whitespace-separated fields  "m h dom mon dow"
 //
 // Cron field grammar (each of the 5 fields is a comma-separated list of parts):
-//   part := ('*' | N | A-B) ['/' step]
+//   part := N | ('*' | A-B) ['/' step]
+// A step is only meaningful over a span, so it requires a '*' or range base — a bare-value
+// step like "5/15" is rejected (Vixie cron would silently treat it as just "5"; failing loud
+// beats silently diverging from whatever the user meant).
 // Standard ranges: minute 0-59, hour 0-23, day-of-month 1-31, month 1-12,
 // day-of-week 0-6 (0 = Sunday; 7 is also accepted and normalized to 0, per common cron usage).
 //
@@ -74,6 +77,12 @@ function parseCronField(raw: string, key: FieldKey): CronField {
     if (basePart === "*") {
       lo = min;
       hi = max;
+    } else if (stepPart !== undefined && !basePart.includes("-")) {
+      // "5/15" — a step over a single value is a silent no-op in Vixie cron (== "5");
+      // reject it loudly instead of quietly meaning something else.
+      throw new TypeError(
+        `invalid cron field "${raw}" (${label}): step requires a range or * base (e.g. "*/15" or "2-10/2"), got "${part}"`,
+      );
     } else if (basePart.includes("-")) {
       const rangeMatch = /^(\d+)-(\d+)$/.exec(basePart);
       if (!rangeMatch) {
@@ -138,14 +147,11 @@ function fieldMatches(field: CronField, value: number): boolean {
   return field.any || field.values.has(value);
 }
 
-function cronMatches(spec: Extract<RoutineSpec, { kind: "cron" }>, date: Date): boolean {
-  if (!fieldMatches(spec.m, date.getMinutes())) return false;
-  if (!fieldMatches(spec.h, date.getHours())) return false;
+/** Date-level (mon + dom/dow) match for a calendar day, with POSIX dom/dow OR-semantics:
+ *  if BOTH dom and dow are restricted (not bare "*"), the day matches when EITHER matches;
+ *  if only one is restricted, that one alone decides; if neither, every day matches. */
+function dayMatches(spec: Extract<RoutineSpec, { kind: "cron" }>, date: Date): boolean {
   if (!fieldMatches(spec.mon, date.getMonth() + 1)) return false;
-
-  // POSIX dom/dow OR-semantics: if BOTH fields are restricted (not bare "*"), a time matches
-  // when EITHER matches; if only one is restricted, that one alone decides; if neither is
-  // restricted, this step is trivially satisfied.
   if (spec.dom.any && spec.dow.any) return true;
   if (spec.dom.any) return fieldMatches(spec.dow, date.getDay());
   if (spec.dow.any) return fieldMatches(spec.dom, date.getDate());
@@ -153,11 +159,20 @@ function cronMatches(spec: Extract<RoutineSpec, { kind: "cron" }>, date: Date): 
 }
 
 const MINUTE_MS = 60_000;
-const MAX_SCAN_MS = 366 * 24 * 60 * 60 * 1000;
+// 8 years: covers the longest possible gap between Feb 29 occurrences (e.g. 1896 → 1904
+// across a non-leap century year), so "0 0 29 2 *" always resolves instead of falsely
+// throwing. Genuinely impossible dates (Feb 30) still exhaust the scan and throw.
+const MAX_SCAN_MS = 2922 * 24 * 60 * 60 * 1000;
 
-/** Strictly greater than fromMs. Interval specs: fromMs + ms. Cron specs: scans forward
- *  minute-by-minute (local time, zero seconds) for the next matching minute boundary,
- *  giving up after 366 days (an unsatisfiable spec, e.g. "0 0 30 2 *" — Feb 30 never exists). */
+/** Strictly greater than fromMs. Interval specs: fromMs + ms. Cron specs: finds the next
+ *  matching minute boundary (local time, zero seconds), scanning up to ~8 years before
+ *  declaring the spec unsatisfiable (e.g. "0 0 30 2 *" — Feb 30 never exists).
+ *
+ *  The scan steps at DAY granularity while the calendar date doesn't match (and HOUR
+ *  granularity while the hour doesn't), so the widened 8-year bound stays cheap — worst
+ *  case is ~2,922 day-checks plus the minutes of the matching days, not 4M+ minute-checks.
+ *  Jumps are computed via the local-time Date constructor (never raw ms arithmetic) so
+ *  DST transitions can't skip over or double-count a wall-clock hour. */
 export function nextRunAt(spec: RoutineSpec, fromMs: number): number {
   if (spec.kind === "interval") return fromMs + spec.ms;
 
@@ -175,10 +190,23 @@ export function nextRunAt(spec: RoutineSpec, fromMs: number): number {
 
   const deadline = fromMs + MAX_SCAN_MS;
   while (candidate <= deadline) {
-    if (cronMatches(spec, new Date(candidate))) return candidate;
+    const d = new Date(candidate);
+    if (!dayMatches(spec, d)) {
+      // Skip to the next local midnight (guard: never move backwards/stall on odd tz rules).
+      const next = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 0, 0).getTime();
+      candidate = next > candidate ? next : candidate + MINUTE_MS;
+      continue;
+    }
+    if (!fieldMatches(spec.h, d.getHours())) {
+      // Skip to the top of the next local hour.
+      const next = new Date(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours() + 1, 0, 0, 0).getTime();
+      candidate = next > candidate ? next : candidate + MINUTE_MS;
+      continue;
+    }
+    if (fieldMatches(spec.m, d.getMinutes())) return candidate;
     candidate += MINUTE_MS;
   }
   throw new TypeError(
-    `cron spec is unsatisfiable: no matching time found within 366 days of ${new Date(fromMs).toISOString()}`,
+    `cron spec is unsatisfiable: no matching time found within 8 years of ${new Date(fromMs).toISOString()}`,
   );
 }
