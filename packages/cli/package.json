@@ -3,13 +3,21 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "bin": { "norma": "./src/main.ts" },
+  "bin": {
+    "norma": "./src/main.ts"
+  },
   "scripts": {
     "test": "bun test",
     "compile": "bun build --compile src/main.ts --outfile ../../dist/norma"
   },
   "dependencies": {
+    "@norma/core": "workspace:*",
     "@norma/protocol": "workspace:*",
-    "@norma/core": "workspace:*"
+    "ink": "^5",
+    "react": "^18"
+  },
+  "devDependencies": {
+    "@types/react": "^18",
+    "ink-testing-library": "^4"
   }
 }
