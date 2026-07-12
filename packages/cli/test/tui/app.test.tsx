@@ -45,6 +45,11 @@ const ev = (o: Record<string, unknown>) => o as any;
 
 const baseProps = { sessionId: "s1", cwd: "/tmp", initialPolicy: "ask" as const, version: "0.0.1", model: "gpt-5-codex" };
 
+// Phase 3c T3's composer replaced its trailing "▌" block-cursor glyph with a real inverse-video
+// cursor (`<Text inverse>`) — this SGI "start inverse" code is a unique fingerprint of "the
+// composer is rendered" (nothing else in the TUI uses `inverse`).
+const COMPOSER_CURSOR = "\x1b[7m";
+
 describe("App (integration)", () => {
   test("(a) a full mini-turn (buffered before subscribe) commits the assistant text + returns to an idle composer", async () => {
     const bridge = makeEventBridge();
@@ -64,7 +69,7 @@ describe("App (integration)", () => {
     const frame = lastFrame() ?? "";
     expect(frame).toContain("hi there friend"); // committed assistant block flushed from the buffer
     expect(frame).toContain("❯ hello"); // committed user block (⏺/❯ grammar)
-    expect(frame).toContain("▌"); // idle composer prompt (its block cursor) present
+    expect(frame).toContain(COMPOSER_CURSOR); // idle composer prompt (its cursor) present
     expect(client.calls).toEqual([]); // App issued no RPCs on its own
   });
 
@@ -90,7 +95,7 @@ describe("App (integration)", () => {
     expect(frame).toContain("9s"); // banked span (10000-1000), not 0s
     expect(frame).toContain("(scout)"); // roster tree row survived the main turn_completed (not pruned)
     expect(frame).toContain("all wrapped up"); // the following main message rendered
-    expect(frame).toContain("▌"); // composer still present, never overwritten
+    expect(frame).toContain(COMPOSER_CURSOR); // composer still present, never overwritten
   });
 
   test("(c) a bg_task_output chunk lands in the committed transcript and the composer stays present after it", async () => {
@@ -104,7 +109,7 @@ describe("App (integration)", () => {
 
     const frame = lastFrame() ?? "";
     expect(frame).toContain("BUILD-LOG-XYZ"); // committed to Static (scrollback), not the live region
-    expect(frame).toContain("▌"); // composer still rendered below it (invisible-prompt invariant)
+    expect(frame).toContain(COMPOSER_CURSOR); // composer still rendered below it (invisible-prompt invariant)
   });
 
   test("(d) welcome banner is the first line: bold Norma + version, then model · cwd", async () => {

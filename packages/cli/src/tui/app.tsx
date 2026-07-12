@@ -257,6 +257,8 @@ export function App({ client, bridge, sessionId, cwd, initialPolicy, version, mo
               onSteer={onSteer}
               onInterrupt={onInterrupt}
               onCyclePolicy={onCyclePolicy}
+              nowMs={nowMs}
+              sessionId={sessionId}
             />
           )}
           {state.agents.length > 0 ? <AgentList agents={state.agents} nowMs={nowMs} /> : null}

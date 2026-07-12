@@ -47,6 +47,11 @@ const ev = (o: Record<string, unknown>) => o as any;
 const ENTER_ALT = "\x1b[?1049h\x1b[2J\x1b[H";
 const LEAVE_ALT = "\x1b[?1049l";
 
+// Phase 3c T3's composer replaced its trailing "▌" block-cursor glyph with a real inverse-video
+// cursor (`<Text inverse>`) — this SGI "start inverse" code is a unique fingerprint of "the
+// composer is rendered" (nothing else in the TUI uses `inverse`).
+const COMPOSER_CURSOR = "\x1b[7m";
+
 describe("pagerLines (verbose flatten — full outputs, NO grouping)", () => {
   test("expands every block individually with the FULL tool output and no +N / group-summary hints", () => {
     const bigOutput = Array.from({ length: 25 }, (_, i) => `out-${String(i).padStart(2, "0")}`).join("\n");
@@ -152,13 +157,13 @@ describe("<App> ctrl+o pager (alt-screen enter/leave via injected sink)", () => 
     await wait();
     expect(sink).toEqual([ENTER_ALT]); // enter escape written BEFORE the pager frame commits
     expect(lastFrame() ?? "").toContain(PAGER_FOOTER);
-    expect(lastFrame() ?? "").not.toContain("▌"); // composer (its block cursor) is gone
+    expect(lastFrame() ?? "").not.toContain(COMPOSER_CURSOR); // composer (its cursor) is gone
 
     stdin.write("\x0f"); // ctrl+o -> close
     await wait();
     expect(sink).toEqual([ENTER_ALT, LEAVE_ALT]); // leave escape follows, in order
     expect(lastFrame() ?? "").not.toContain(PAGER_FOOTER);
-    expect(lastFrame() ?? "").toContain("▌"); // composer restored
+    expect(lastFrame() ?? "").toContain(COMPOSER_CURSOR); // composer restored
   });
 
   test("esc closes the pager (leave escape written)", async () => {
