@@ -1,0 +1,236 @@
+import { describe, expect, test } from "bun:test";
+import { render } from "ink-testing-library";
+import { PendingCards } from "../../src/tui/pending-cards";
+import type { PendingCard } from "../../src/tui/state";
+
+// Same caveat as composer.test.tsx: useInput wires its stdin listener inside a React effect,
+// which runs on the next tick after render() returns — a short wait after render() and after
+// each write keeps every assertion below deterministic.
+const wait = (ms = 10) => new Promise((r) => setTimeout(r, ms));
+
+describe("PendingCards — approval", () => {
+  const card: PendingCard = { kind: "approval", callId: "c1", toolName: "bash", summary: "rm -rf /tmp/x" };
+
+  test("(a1) 'y\\r' -> onApprove(callId, true)", async () => {
+    const calls: [string, boolean][] = [];
+    const { stdin } = render(<PendingCards pending={card} onApprove={(id, yes) => calls.push([id, yes])} onAnswer={() => {}} onPlan={() => {}} />);
+    await wait();
+    stdin.write("y");
+    await wait();
+    stdin.write("\r");
+    await wait();
+    expect(calls).toEqual([["c1", true]]);
+  });
+
+  test("(a2) 'n\\r' -> onApprove(callId, false)", async () => {
+    const calls: [string, boolean][] = [];
+    const { stdin } = render(<PendingCards pending={card} onApprove={(id, yes) => calls.push([id, yes])} onAnswer={() => {}} onPlan={() => {}} />);
+    await wait();
+    stdin.write("n");
+    await wait();
+    stdin.write("\r");
+    await wait();
+    expect(calls).toEqual([["c1", false]]);
+  });
+
+  test("(a3) 'Y\\r' -> true (case-insensitive)", async () => {
+    const calls: [string, boolean][] = [];
+    const { stdin } = render(<PendingCards pending={card} onApprove={(id, yes) => calls.push([id, yes])} onAnswer={() => {}} onPlan={() => {}} />);
+    await wait();
+    stdin.write("Y");
+    await wait();
+    stdin.write("\r");
+    await wait();
+    expect(calls).toEqual([["c1", true]]);
+  });
+
+  test("(a4) 'yes\\r' -> false (only bare 'y' is true)", async () => {
+    const calls: [string, boolean][] = [];
+    const { stdin } = render(<PendingCards pending={card} onApprove={(id, yes) => calls.push([id, yes])} onAnswer={() => {}} onPlan={() => {}} />);
+    await wait();
+    stdin.write("yes");
+    await wait();
+    stdin.write("\r");
+    await wait();
+    expect(calls).toEqual([["c1", false]]);
+  });
+
+  test("(d1) frame renders the approval prompt + tool name + summary", async () => {
+    const { lastFrame } = render(<PendingCards pending={card} onApprove={() => {}} onAnswer={() => {}} onPlan={() => {}} />);
+    await wait();
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("approve bash?");
+    expect(frame).toContain("rm -rf /tmp/x");
+    expect(frame).toContain("[y/N]");
+  });
+});
+
+describe("PendingCards — plan", () => {
+  const card: PendingCard = { kind: "plan", callId: "p1", plan: "Step 1: refactor foo\nStep 2: ship it" };
+
+  test("(c1) '1\\r' -> onPlan(callId, {approved:true, autoAccept:false})", async () => {
+    const calls: unknown[] = [];
+    const { stdin } = render(<PendingCards pending={card} onApprove={() => {}} onAnswer={() => {}} onPlan={(id, r) => calls.push([id, r])} />);
+    await wait();
+    stdin.write("1");
+    await wait();
+    stdin.write("\r");
+    await wait();
+    expect(calls).toEqual([["p1", { approved: true, autoAccept: false }]]);
+  });
+
+  test("(c2) '2\\r' -> onPlan(callId, {approved:true, autoAccept:true})", async () => {
+    const calls: unknown[] = [];
+    const { stdin } = render(<PendingCards pending={card} onApprove={() => {}} onAnswer={() => {}} onPlan={(id, r) => calls.push([id, r])} />);
+    await wait();
+    stdin.write("2");
+    await wait();
+    stdin.write("\r");
+    await wait();
+    expect(calls).toEqual([["p1", { approved: true, autoAccept: true }]]);
+  });
+
+  test("(c3) '3 nope\\r' -> onPlan(callId, {approved:false, autoAccept:false, feedback:'nope'})", async () => {
+    const calls: unknown[] = [];
+    const { stdin } = render(<PendingCards pending={card} onApprove={() => {}} onAnswer={() => {}} onPlan={(id, r) => calls.push([id, r])} />);
+    await wait();
+    stdin.write("3 nope");
+    await wait();
+    stdin.write("\r");
+    await wait();
+    expect(calls).toEqual([["p1", { approved: false, autoAccept: false, feedback: "nope" }]]);
+  });
+
+  test("(d2) frame renders Plan header, plan text, and the 3 menu lines + prompt", async () => {
+    const { lastFrame } = render(<PendingCards pending={card} onApprove={() => {}} onAnswer={() => {}} onPlan={() => {}} />);
+    await wait();
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("Plan");
+    expect(frame).toContain("Step 1: refactor foo");
+    expect(frame).toContain("1) approve — I'll approve each edit");
+    expect(frame).toContain("2) approve + auto-accept edits");
+    expect(frame).toContain("3) reject (type: 3 <reason>)");
+    // Ink's frame buffer trims trailing whitespace per line, so the prompt's trailing space
+    // (present in the actual rendered <Text>) doesn't survive into lastFrame() — assert without it.
+    expect(frame).toContain("choose (number or text):");
+  });
+});
+
+describe("PendingCards — question (ask_user)", () => {
+  const twoOptionQuestion = {
+    header: "Approach",
+    question: "Which approach?",
+    options: [{ label: "Alpha" }, { label: "Beta" }],
+    multiSelect: false,
+  };
+
+  test("(b1) single question, 2 options, '2\\r' then blank note -> onAnswer fires once with the picked label", async () => {
+    const calls: [string, unknown][] = [];
+    const card: PendingCard = { kind: "question", callId: "q1", questions: [twoOptionQuestion] };
+    const { stdin } = render(<PendingCards pending={card} onApprove={() => {}} onAnswer={(id, payload) => calls.push([id, payload])} onPlan={() => {}} />);
+    await wait();
+    stdin.write("2");
+    await wait();
+    stdin.write("\r"); // answer phase -> note phase
+    await wait();
+    expect(calls).toEqual([]); // not yet — still waiting on the note prompt
+    stdin.write("\r"); // blank note -> skip, done (only question)
+    await wait();
+    expect(calls).toEqual([["q1", { answers: { "Which approach?": "Beta" } }]]);
+    // notes key must be omitted entirely, not sent as {}
+    const payload = calls[0]![1] as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(payload, "notes")).toBe(false);
+  });
+
+  test("(b2) multiSelect, '1,2\\r' -> joined labels", async () => {
+    const calls: unknown[] = [];
+    const multiQuestion = {
+      header: "Pick",
+      question: "Which ones?",
+      options: [{ label: "A" }, { label: "B" }, { label: "C" }],
+      multiSelect: true,
+    };
+    const card: PendingCard = { kind: "question", callId: "q2", questions: [multiQuestion] };
+    const { stdin } = render(<PendingCards pending={card} onApprove={() => {}} onAnswer={(id, payload) => calls.push([id, payload])} onPlan={() => {}} />);
+    await wait();
+    stdin.write("1,2");
+    await wait();
+    stdin.write("\r");
+    await wait();
+    stdin.write("\r"); // blank note
+    await wait();
+    expect(calls).toEqual([["q2", { answers: { "Which ones?": "A, B" } }]]);
+  });
+
+  test("(b3) choosing 'Other' by its menu number re-prompts for free text, recorded verbatim", async () => {
+    const calls: unknown[] = [];
+    const card: PendingCard = { kind: "question", callId: "q3", questions: [twoOptionQuestion] };
+    const { stdin } = render(<PendingCards pending={card} onApprove={() => {}} onAnswer={(id, payload) => calls.push([id, payload])} onPlan={() => {}} />);
+    await wait();
+    stdin.write("3"); // options.length(2) + 1 = Other
+    await wait();
+    stdin.write("\r"); // answer phase detects isOtherChoice -> otherAnswer phase
+    await wait();
+    stdin.write("my custom answer");
+    await wait();
+    stdin.write("\r"); // otherAnswer phase -> note phase
+    await wait();
+    stdin.write("\r"); // blank note -> done
+    await wait();
+    expect(calls).toEqual([["q3", { answers: { "Which approach?": "my custom answer" } }]]);
+  });
+
+  test("(b4) a non-empty note lands in `notes`", async () => {
+    const calls: unknown[] = [];
+    const card: PendingCard = { kind: "question", callId: "q4", questions: [twoOptionQuestion] };
+    const { stdin } = render(<PendingCards pending={card} onApprove={() => {}} onAnswer={(id, payload) => calls.push([id, payload])} onPlan={() => {}} />);
+    await wait();
+    stdin.write("1");
+    await wait();
+    stdin.write("\r"); // answer phase -> note phase
+    await wait();
+    stdin.write("because reasons");
+    await wait();
+    stdin.write("\r"); // note phase -> done
+    await wait();
+    expect(calls).toEqual([["q4", { answers: { "Which approach?": "Alpha" }, notes: { "Which approach?": "because reasons" } }]]);
+  });
+
+  test("(b5) two questions -> onAnswer fires ONCE at the end with both answers", async () => {
+    const calls: unknown[] = [];
+    const q1 = { header: "Q1", question: "First?", options: [{ label: "One" }, { label: "Two" }], multiSelect: false };
+    const q2 = { header: "Q2", question: "Second?", options: [{ label: "Red" }, { label: "Blue" }], multiSelect: false };
+    const card: PendingCard = { kind: "question", callId: "q5", questions: [q1, q2] };
+    const { stdin } = render(<PendingCards pending={card} onApprove={() => {}} onAnswer={(id, payload) => calls.push([id, payload])} onPlan={() => {}} />);
+    await wait();
+    stdin.write("1"); // First -> "One"
+    await wait();
+    stdin.write("\r"); // answer -> note
+    await wait();
+    stdin.write("\r"); // blank note -> advance to Q2
+    await wait();
+    expect(calls).toEqual([]); // not done yet — second question still pending
+
+    stdin.write("2"); // Second -> "Blue"
+    await wait();
+    stdin.write("\r"); // answer -> note
+    await wait();
+    stdin.write("\r"); // blank note -> done, both questions answered
+    await wait();
+
+    expect(calls).toEqual([["q5", { answers: { "First?": "One", "Second?": "Blue" } }]]);
+  });
+
+  test("(d3) frame renders header, question, numbered options, Other line, and the choose prompt", async () => {
+    const card: PendingCard = { kind: "question", callId: "q6", questions: [twoOptionQuestion] };
+    const { lastFrame } = render(<PendingCards pending={card} onApprove={() => {}} onAnswer={() => {}} onPlan={() => {}} />);
+    await wait();
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("Approach");
+    expect(frame).toContain("Which approach?");
+    expect(frame).toContain("1) Alpha");
+    expect(frame).toContain("2) Beta");
+    expect(frame).toContain("3) Other (type your answer)");
+    expect(frame).toContain("choose (number or text):"); // trailing space trimmed by Ink's frame buffer
+  });
+});
