@@ -61,7 +61,7 @@ describe("App (integration)", () => {
 
     const frame = lastFrame() ?? "";
     expect(frame).toContain("hi there friend"); // committed assistant block flushed from the buffer
-    expect(frame).toContain("› hello"); // committed user block
+    expect(frame).toContain("❯ hello"); // committed user block (phase 3b Task 3 grammar: ❯, not ›)
     expect(frame).toContain("›"); // idle composer prompt present
     expect(frame).toContain("ask mode"); // mode bar
     expect(client.calls).toEqual([]); // App issued no RPCs on its own

@@ -172,6 +172,44 @@ describe("state.ts — prune done agents on next main turn_started", () => {
   });
 });
 
+describe("state.ts — turn-summary / interrupted blocks (phase 3b Task 3, a+b)", () => {
+  test("(a) main turn_completed(end_turn) commits ONE turn-summary block with real duration + tokens", () => {
+    let s = initialState();
+    s = reduce(s, { type: "turn_started", threadId: "main" }, T0);
+    s = reduce(s, { type: "turn_completed", threadId: "main", stopReason: "end_turn", inputTokens: 13_700, outputTokens: 149 }, T0 + 12_000);
+    expect(s.committed.at(-1)).toEqual({ kind: "turn-summary", durationMs: 12_000, inTokens: 13_700, outTokens: 149 });
+    expect(s.committed.filter((b) => b.kind === "turn-summary")).toHaveLength(1);
+  });
+
+  test("(b) main turn_completed(stopReason 'aborted') commits an interrupted block, NOT a turn-summary", () => {
+    let s = initialState();
+    s = reduce(s, { type: "turn_started", threadId: "main" }, T0);
+    s = reduce(s, { type: "turn_completed", threadId: "main", stopReason: "aborted", inputTokens: 5, outputTokens: 2 }, T0 + 3_000);
+    expect(s.committed.at(-1)).toEqual({ kind: "interrupted" });
+    expect(s.committed.some((b) => b.kind === "turn-summary")).toBe(false);
+    // tokens are still tracked on state even when the turn was interrupted
+    expect(s.inTokens).toBe(5);
+    expect(s.outTokens).toBe(2);
+  });
+
+  test("(b) a child thread's turn_completed (any stopReason) commits neither turn-summary nor interrupted", () => {
+    let s = initialState();
+    s = reduce(s, { type: "thread_started", threadId: "th_a", parentThreadId: "main", agentType: "general-purpose", prompt: "go" }, T0);
+    s = reduce(s, { type: "turn_started", threadId: "th_a" }, T0 + 1);
+    const before = s.committed.length;
+    s = reduce(s, { type: "turn_completed", threadId: "th_a", stopReason: "aborted", inputTokens: 5, outputTokens: 5 }, T0 + 50);
+    expect(s.committed.length).toBe(before);
+    s = reduce(s, { type: "turn_completed", threadId: "th_a", stopReason: "end_turn", inputTokens: 5, outputTokens: 5 }, T0 + 60);
+    expect(s.committed.length).toBe(before);
+  });
+
+  test("turnStartMs unset (no prior main turn_started) -> durationMs is 0", () => {
+    let s = initialState();
+    s = reduce(s, { type: "turn_completed", threadId: "main", stopReason: "end_turn", inputTokens: 1, outputTokens: 1 }, T0 + 999);
+    expect(s.committed.at(-1)).toEqual({ kind: "turn-summary", durationMs: 0, inTokens: 1, outTokens: 1 });
+  });
+});
+
 describe("state.ts — task upsert/delete (e)", () => {
   test("task_updated upserts by id; a 'deleted' status removes the row", () => {
     let s = initialState();

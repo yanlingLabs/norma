@@ -35,7 +35,9 @@ export type Block =
   | { kind: "assistant"; text: string }
   | { kind: "tool"; name: string; argsJson: string; output?: string; isError?: boolean }
   | { kind: "skill"; name: string } // reserved: no current wire event drives this (future skill-detection)
-  | { kind: "note"; text: string }; // dir-added / worktree / bg-task / agent-finish / approval-resolved one-liners
+  | { kind: "note"; text: string } // dir-added / worktree / bg-task / agent-finish / approval-resolved one-liners
+  | { kind: "turn-summary"; durationMs: number; inTokens: number; outTokens: number } // main turn_completed, stopReason !== "aborted"
+  | { kind: "interrupted" }; // main turn_completed, stopReason === "aborted"
 
 /** `AgentRow` IS `CliSubagent`-shaped (the brief's interface matches it field-for-field) — reuse the
  *  type directly rather than re-declaring an equivalent interface that could drift out of lockstep. */
@@ -155,7 +157,18 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
       // MAIN-thread only — and critically NEVER routed through updateSubagents (see file header):
       // that is the one-line fix for the `Agent "" · 0s` bug.
       if (e.threadId !== MAIN) return feedAgents(s, e);
-      return { ...s, turnRunning: false, inTokens: num(e.inputTokens), outTokens: num(e.outputTokens) };
+      const inTokens = num(e.inputTokens);
+      const outTokens = num(e.outputTokens);
+      // Commits exactly ONE transcript-visible marker for the just-finished main turn: an
+      // "interrupted" block when the user cancelled it (stopReason "aborted"), otherwise a
+      // "turn-summary" block carrying the real elapsed span (nowMs - turnStartMs; 0 if a
+      // turn_completed somehow arrives with no matching turn_started) + the token counts. Phase
+      // 3b Task 3 — rendering (verb/glyph/wording) lives in transcript.tsx, not here.
+      const block: Block =
+        e.stopReason === "aborted"
+          ? { kind: "interrupted" }
+          : { kind: "turn-summary", durationMs: s.turnStartMs !== undefined ? nowMs - s.turnStartMs : 0, inTokens, outTokens };
+      return { ...s, turnRunning: false, inTokens, outTokens, committed: [...s.committed, block] };
     }
 
     case "thread_started":
