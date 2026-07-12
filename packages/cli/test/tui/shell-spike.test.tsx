@@ -42,7 +42,7 @@ describe("ShellSpike", () => {
     const content = Array.from({ length: 100 }, (_, i) => `line-${i}`);
     const { lastFrame } = render(<ShellSpike rows={20} lines={content} />);
     const lines = frameLines(lastFrame());
-    expect(lines.length).toBeLessThanOrEqual(19); // rows - 1
+    expect(lines).toHaveLength(19); // rows - 1 EXACTLY — outputHeight is a hard invariant (review: <= would mask a frame-shrink regression)
     expect(lines.at(-1)).toBe("BOTTOM");
     // The visible region shows the TAIL of an overflowing list (last-in-view, like a live
     // transcript) — the head is truncated, not shrunk/distorted (see shell-spike.tsx's doc comment

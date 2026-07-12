@@ -19,7 +19,8 @@
  *      every child instead of overflowing past the boundary — computed tops become fractional,
  *      round to colliding integer rows, and the frame shows a scattered subsequence of lines with
  *      later ones winning ties (e.g. "line-5", "line-10", "line-15", ... instead of "line-0"..").
- *   2. Text children pinned to `flexShrink={0}` (refusing to shrink): Yoga then grows the flexGrow
+ *   2. The CONTAINER Box pinned to `flexShrink={0}` (`<Text flexShrink>` is a silent no-op — Ink's
+ *      Text hardcodes its style and forwards no flex props; review-verified): Yoga then grows the flexGrow
  *      region's effective content past its flex-allotted share, which pushes the BOTTOM sibling's
  *      own absolute row past the root's last valid index — BOTTOM's write silently lands outside the
  *      pre-sized output buffer and vanishes from the frame entirely (verified directly: content with
