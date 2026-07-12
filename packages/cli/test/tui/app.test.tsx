@@ -62,8 +62,9 @@ describe("App (integration)", () => {
     const frame = lastFrame() ?? "";
     expect(frame).toContain("hi there friend"); // committed assistant block flushed from the buffer
     expect(frame).toContain("❯ hello"); // committed user block (phase 3b Task 3 grammar: ❯, not ›)
-    expect(frame).toContain("›"); // idle composer prompt present
-    expect(frame).toContain("ask mode"); // mode bar
+    expect(frame).toContain("❯"); // idle composer prompt present
+    // (phase 3b Task 5: the composer's old inline "ask mode" bar moved OUT to <Footer>, which a
+    // later task wires into <App> — no mode text is asserted here anymore.)
     expect(client.calls).toEqual([]); // App issued no RPCs on its own
   });
 
@@ -91,8 +92,7 @@ describe("App (integration)", () => {
     expect(frame).toContain("9s"); // banked span (10000-1000), not 0s
     expect(frame).toContain("Agent(scout)"); // roster row survived the main turn_completed (not pruned)
     expect(frame).toContain("all wrapped up"); // the following main message rendered
-    expect(frame).toContain("›"); // composer still present, never overwritten
-    expect(frame).toContain("ask mode");
+    expect(frame).toContain("❯"); // composer still present, never overwritten
   });
 
   test("(c) a bg_task_output chunk lands in the committed transcript and the composer stays present after it", async () => {
@@ -108,8 +108,7 @@ describe("App (integration)", () => {
 
     const frame = lastFrame() ?? "";
     expect(frame).toContain("BUILD-LOG-XYZ"); // committed to Static (scrollback), not the live region
-    expect(frame).toContain("›"); // composer still rendered below it (invisible-prompt invariant)
-    expect(frame).toContain("ask mode");
+    expect(frame).toContain("❯"); // composer still rendered below it (invisible-prompt invariant)
   });
 });
 

@@ -30,7 +30,7 @@ describe("Composer", () => {
 
     expect(submitted).toEqual(["hi"]);
     expect(steered).toEqual([]);
-    expect(lastFrame() ?? "").toContain("› ▌"); // buffer cleared after submit
+    expect(lastFrame() ?? "").toContain("❯ ▌"); // buffer cleared after submit
   });
 
   test("(b) type text + Enter while running calls onSteer, not onSubmit", async () => {
@@ -135,6 +135,6 @@ describe("Composer", () => {
     stdin.write("\x7f"); // backspace
     await wait();
 
-    expect(lastFrame() ?? "").toContain("› ab▌");
+    expect(lastFrame() ?? "").toContain("❯ ab▌");
   });
 });
