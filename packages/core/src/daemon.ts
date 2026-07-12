@@ -58,6 +58,10 @@ import { AuditLog } from "./peripheral/audit";
 import { PeripheralBroker, type PeripheralClass } from "./peripheral/broker";
 import { ProviderLink } from "./peripheral/provider-link";
 import { HardwareBroker } from "./peripheral/hardware";
+import { openRoutineStore } from "./routines/store";
+import { RoutineAuditLog } from "./routines/audit";
+import { makeDaemonRoutineRunner } from "./routines/runner";
+import { makeRoutineScheduler } from "./routines/scheduler";
 import type { NewSessionEvent } from "@norma/protocol";
 
 export const CORE_VERSION = "0.0.1";
@@ -465,6 +469,27 @@ export async function startDaemon(opts: {
     });
   }
 
+  // Scheduled routines (Phase 5 T2, design doc §2). Built unconditionally (same precedent as
+  // peripheral/hardware below) — a no-provider daemon still owns the store/audit so `routines.*`
+  // RPCs (T3) work and existing routines aren't silently dropped; `engine` being null just makes
+  // every fire fail cleanly via runHeadless's own "agent disabled" short-circuit (below `engine` is
+  // ALREADY its final value — this sits after the `if (agentProvider)` block closes, never
+  // reassigned again — so no thunk/live-read indirection is needed here, unlike hooksEnabledHot's
+  // mtime-cached settings re-read, which exists for a genuinely different reason: hot-reloading a
+  // boolean without a restart). `routines.maxConcurrent` is a boot-time settings snapshot (the SAME
+  // precedent as `subagents.maxConcurrent` above — not hot-reloaded; a live "no restart needed"
+  // override wasn't asked for here the way it was for `hooks.enabled`).
+  const routineStore = openRoutineStore(join(normaHome, "routines.db"));
+  const routinesAudit = new RoutineAuditLog(join(normaHome, "routines-audit.jsonl"));
+  const routineRunner = makeDaemonRoutineRunner({ store, hub, engine });
+  const routineScheduler = makeRoutineScheduler({
+    store: routineStore,
+    runner: routineRunner,
+    audit: (line) => routinesAudit.append(line),
+    maxConcurrent: () => settings?.routines?.maxConcurrent,
+  });
+  routineScheduler.start();
+
   // Peripheral lease v1 (Phase 2f). Built unconditionally (like approvalBroker/quota above) —
   // leasing has nothing to do with whether an LLM provider is configured. `audit` itself is now
   // constructed further up (before the `if (agentProvider)` gate — see that comment) so
@@ -548,7 +573,11 @@ export async function startDaemon(opts: {
   return {
     socketPath: dirs.socketPath,
     tokens,
-    stop() { server.stop(); mcp?.stopAll(); pluginSupervisor.stopAll(); bgRegistry.killAll(); store.close(); lock.release(); },
+    stop() {
+      server.stop(); mcp?.stopAll(); pluginSupervisor.stopAll(); bgRegistry.killAll();
+      routineScheduler.stop(); routineStore.close(); // no orphan tick timer past drain
+      store.close(); lock.release();
+    },
   };
 }
 

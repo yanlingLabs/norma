@@ -103,6 +103,16 @@ export const Settings = z.object({
   hooks: z.object({
     enabled: z.boolean().optional(),
   }).optional(),
+  /** Scheduled routines (Phase 5, design doc header — USER-DECIDED pin: "routines run in
+   *  PARALLEL ... routines.maxConcurrent? settings knob, default unlimited"). Undefined (block or
+   *  field absent) means unlimited — mirrors subagents.maxConcurrent's own optional-means-default
+   *  shape above, read once at daemon boot (same boot-snapshot precedent as subagents.maxConcurrent,
+   *  not hot-reloaded — routines/scheduler.ts's makeRoutineScheduler takes it as a `() => number |
+   *  undefined` thunk purely to match its own injectable-dependency shape, not because this needs
+   *  to change without a daemon restart). */
+  routines: z.object({
+    maxConcurrent: z.number().int().positive().optional(),
+  }).optional(),
 });
 export type Settings = z.infer<typeof Settings>;
 
