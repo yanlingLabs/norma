@@ -91,6 +91,16 @@ export const Settings = z.object({
     heartbeatMs: z.number().int().positive().optional(),
     expiryMs: z.number().int().positive().optional(),
   }).optional(),
+  /** Computer use (Phase 5 CU). `enabled` is the capability opt-in: the `computer` tool is
+   *  registered ONLY when true (the strongest reading of "full-auto CU requires explicit opt-in" —
+   *  absent/false means CU does not exist for the session). `screenshotMaxDim` caps the longest
+   *  side of a captured screenshot (default 1280, Norma.app-side) to bound the base64 payload well
+   *  under the NDJSON line limit and the model's image budget. The lease heartbeat/expiry reuse the
+   *  `peripheral` block above. */
+  computerUse: z.object({
+    enabled: z.boolean().optional(),
+    screenshotMaxDim: z.number().int().positive().optional(),
+  }).optional(),
   /** web_search backend (4g Task 6). `provider` defaults to "brave" when the block/field is
    *  absent — the literal union is forward-room for other search backends later; today "brave"
    *  is the only accepted value. */

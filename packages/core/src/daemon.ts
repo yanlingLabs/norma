@@ -29,6 +29,8 @@ import { registerSpawnAgentTool } from "./agent/tools/spawn";
 import { registerSendMessageTool } from "./agent/tools/send-message";
 import { registerTaskStopTool } from "./agent/tools/task-stop";
 import { registerWebTools } from "./agent/tools/web";
+import { registerComputerTool } from "./agent/tools/computer";
+import { ComputerUseService } from "./agent/computer-use";
 import { McpManager } from "./agent/mcp/manager";
 import { PermissionGate } from "./agent/gate";
 import { ApprovalBroker } from "./agent/approvals";
@@ -292,6 +294,32 @@ export async function startDaemon(opts: {
   // line 135, and AuditLog's own constructor is cheap (mkdir is lazy, on first write — see audit.ts).
   const audit = new AuditLog(join(normaHome, "audit.jsonl"));
 
+  // Peripheral lease v1 (Phase 2f) — HOISTED above the `if (agentProvider)` gate (phase 5 CU): the
+  // ComputerUseService (built inside the gate) needs this broker to lease screenshot/ax-read/input-
+  // drive in-process, and the `computer` tool is registered inside the gate. Construction only needs
+  // audit/store/approvalBroker/hub, all ready above — same "build unconditionally, leasing is
+  // independent of an LLM provider" rationale it had further down. `hardware` (which shares this
+  // SAME providerLink) stays below; it only references providerLink, which is now in scope earlier.
+  const providerLink = new ProviderLink();
+  const peripheral = new PeripheralBroker({
+    audit,
+    heartbeatMs: settings?.peripheral?.heartbeatMs,
+    expiryMs: settings?.peripheral?.expiryMs,
+    policy: buildLeasePolicy({ store, approvals: approvalBroker, hub }),
+    // lease_granted/lease_lost are emitted on the REQUESTER's session (broadcastTransient scopes
+    // fan-out to that session's attached harnesses), but the provider connection (Norma.app) is
+    // rarely attached to the requesting session — it needs its own copy of these two event types
+    // to track its active-lease set regardless of what it's attached to. peripheral_call_requested
+    // already reaches the provider via pushToProvider; lease_granted/lease_lost did not, which
+    // would have left the provider's lease-tracking silently blind whenever it wasn't attached to
+    // the leasing session. Pushed in addition to (not instead of) the session broadcast.
+    emitTransient: (sessionId, event) => {
+      hub.broadcastTransient(sessionId, event);
+      if (event.type === "lease_granted" || event.type === "lease_lost") providerLink.push(event);
+    },
+    pushToProvider: (event) => providerLink.push(event),
+  });
+
   if (agentProvider) {
     const registry = new ToolRegistry();
     sharedRegistry = registry;
@@ -347,6 +375,15 @@ export async function startDaemon(opts: {
     // is a PLAIN TOOL (no engine bridge — see task-stop.ts's own doc comment), deferred like
     // bash_kill (registerBackgroundTools above).
     registerTaskStopTool(registry, { bgAgents, bgRegistry, deferred: true });
+    // Computer use (Phase 5 CU): opt-in via settings.computerUse.enabled (the strongest reading of
+    // "full-auto CU requires explicit opt-in" — absent/false, the `computer` tool does not exist).
+    // The service holds leases on the SAME `peripheral` broker (hoisted above this gate) that
+    // Norma.app serves screenshot/ax-read/input-drive behind. reuses settings.peripheral.heartbeatMs.
+    let computerUse: ComputerUseService | undefined;
+    if (settings?.computerUse?.enabled) {
+      computerUse = new ComputerUseService({ broker: peripheral, heartbeatMs: settings?.peripheral?.heartbeatMs });
+      registerComputerTool(registry, { screenshotMaxDim: settings?.computerUse?.screenshotMaxDim });
+    }
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
     await mcp.startAll(settings?.mcpServers ?? {});
     // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled &&
@@ -456,6 +493,7 @@ export async function startDaemon(opts: {
       reviewerEnabled: reviewerCfg?.enabled,
       reviewerAllow: reviewerCfg?.allow ?? [],
       titler,
+      computerUse,
       toolSearch: {
         enabled: settings?.toolSearch?.enabled,
         deferThreshold: settings?.toolSearch?.deferThreshold ?? Number(process.env.NORMA_TOOLSEARCH_THRESHOLD ?? 12),
@@ -464,30 +502,6 @@ export async function startDaemon(opts: {
       hooks: hookFacade,
     });
   }
-
-  // Peripheral lease v1 (Phase 2f). Built unconditionally (like approvalBroker/quota above) —
-  // leasing has nothing to do with whether an LLM provider is configured. `audit` itself is now
-  // constructed further up (before the `if (agentProvider)` gate — see that comment) so
-  // registerWebTools can share this SAME instance; this block just reuses it.
-  const providerLink = new ProviderLink();
-  const peripheral = new PeripheralBroker({
-    audit,
-    heartbeatMs: settings?.peripheral?.heartbeatMs,
-    expiryMs: settings?.peripheral?.expiryMs,
-    policy: buildLeasePolicy({ store, approvals: approvalBroker, hub }),
-    // lease_granted/lease_lost are emitted on the REQUESTER's session (broadcastTransient scopes
-    // fan-out to that session's attached harnesses), but the provider connection (Norma.app) is
-    // rarely attached to the requesting session — it needs its own copy of these two event types
-    // to track its active-lease set regardless of what it's attached to. peripheral_call_requested
-    // already reaches the provider via pushToProvider; lease_granted/lease_lost did not, which
-    // would have left the provider's lease-tracking silently blind whenever it wasn't attached to
-    // the leasing session. Pushed in addition to (not instead of) the session broadcast.
-    emitTransient: (sessionId, event) => {
-      hub.broadcastTransient(sessionId, event);
-      if (event.type === "lease_granted" || event.type === "lease_lost") providerLink.push(event);
-    },
-    pushToProvider: (event) => providerLink.push(event),
-  });
 
   // Hardware helper (Phase 4c Task 2, spec §5). Built unconditionally, same precedent as
   // `peripheral` above — hardware access has nothing to do with whether an LLM provider is
