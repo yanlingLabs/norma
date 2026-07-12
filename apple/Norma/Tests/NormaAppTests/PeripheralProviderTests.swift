@@ -434,12 +434,75 @@ final class ComputerCapabilitiesPureTests: XCTestCase {
         XCTAssertEqual(try? parseComputerPayload(cls: "screenshot", payloadJson: #"{"op":"screenshot","maxDim":1024}"#).get(), .screenshot(maxDim: 1024))
         XCTAssertEqual(try? parseComputerPayload(cls: "ax-read", payloadJson: #"{"op":"ax_snapshot"}"#).get(), .axSnapshot)
         XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"click","target":{"elementId":3},"button":"left","clicks":1}"#).get(),
-                       .click(target: .element(3), button: "left", clicks: 1))
+                       .click(target: .element(3), button: "left", clicks: 1, modifiers: []))
         XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"click","target":{"x":10,"y":20},"button":"right","clicks":2}"#).get(),
-                       .click(target: .point(x: 10, y: 20), button: "right", clicks: 2))
+                       .click(target: .point(x: 10, y: 20), button: "right", clicks: 2, modifiers: []))
         XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"type","text":"hi"}"#).get(), .type(text: "hi"))
         XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"key","keys":"cmd+s"}"#).get(), .key(keys: "cmd+s"))
         XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"scroll","dy":-120}"#).get(), .scroll(target: nil, dx: 0, dy: -120))
+    }
+
+    func testParseClickModifiersTripleAndMiddle() {
+        // modifier-click: tokens fold into CGEventFlags; unknown tokens are a typed error.
+        XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"click","target":{"elementId":2},"modifiers":["shift","cmd"]}"#).get(),
+                       .click(target: .element(2), button: "left", clicks: 1, modifiers: [.maskShift, .maskCommand]))
+        if case .success = parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"click","target":{"elementId":2},"modifiers":["hyper"]}"#) {
+            XCTFail("unknown modifier should fail")
+        }
+        // triple-click accepted; clicks clamp to 1...3 defensively.
+        XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"click","target":{"elementId":1},"clicks":3}"#).get(),
+                       .click(target: .element(1), button: "left", clicks: 3, modifiers: []))
+        XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"click","target":{"elementId":1},"clicks":9}"#).get(),
+                       .click(target: .element(1), button: "left", clicks: 3, modifiers: []))
+        // middle button accepted; unknown buttons rejected.
+        XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"click","target":{"x":1,"y":2},"button":"middle"}"#).get(),
+                       .click(target: .point(x: 1, y: 2), button: "middle", clicks: 1, modifiers: []))
+        if case .success = parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"click","target":{"x":1,"y":2},"button":"back"}"#) {
+            XCTFail("unknown button should fail")
+        }
+    }
+
+    func testParseDrag() {
+        XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"drag","from":{"elementId":3},"to":{"x":500,"y":300}}"#).get(),
+                       .drag(from: .element(3), to: .point(x: 500, y: 300), modifiers: []))
+        XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"drag","from":{"x":1,"y":2},"to":{"elementId":9},"modifiers":["shift"]}"#).get(),
+                       .drag(from: .point(x: 1, y: 2), to: .element(9), modifiers: [.maskShift]))
+        if case .success = parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"drag","from":{"elementId":3}}"#) {
+            XCTFail("drag without `to` should fail")
+        }
+        if case .success = parseComputerPayload(cls: "screenshot", payloadJson: #"{"op":"drag","from":{"elementId":3},"to":{"elementId":4}}"#) {
+            XCTFail("drag on the screenshot class should fail")
+        }
+    }
+
+    func testParseZoom() {
+        XCTAssertEqual(try? parseComputerPayload(cls: "screenshot", payloadJson: #"{"op":"zoom","x":850,"y":400,"width":400,"height":300,"maxDim":1280}"#).get(),
+                       .zoom(x: 850, y: 400, width: 400, height: 300, maxDim: 1280))
+        if case .success = parseComputerPayload(cls: "screenshot", payloadJson: #"{"op":"zoom","x":850,"y":400,"width":400}"#) {
+            XCTFail("zoom without a full region should fail")
+        }
+        if case .success = parseComputerPayload(cls: "screenshot", payloadJson: #"{"op":"zoom","x":0,"y":0,"width":-5,"height":10}"#) {
+            XCTFail("negative region should fail")
+        }
+        if case .success = parseComputerPayload(cls: "ax-read", payloadJson: #"{"op":"zoom","x":0,"y":0,"width":10,"height":10}"#) {
+            XCTFail("zoom on the ax-read class should fail")
+        }
+    }
+
+    func testEncodeZoomResultCarriesRegionOrigin() {
+        let s = encodeCUResult(.screenshot(CUScreenshot(dataUrl: "data:z", width: 400, height: 300, scaledWidth: 400, scaledHeight: 300, originX: 850, originY: 400)))!
+        XCTAssertTrue(s.contains("\"originX\":850"))
+        XCTAssertTrue(s.contains("\"originY\":400"))
+        // full-screen capture: no origin fields at all
+        let full = encodeCUResult(.screenshot(CUScreenshot(dataUrl: "data:f", width: 100, height: 50, scaledWidth: 100, scaledHeight: 50)))!
+        XCTAssertFalse(full.contains("originX"))
+    }
+
+    func testModifierFlagsHelper() {
+        XCTAssertEqual(cuModifierFlags(from: ["shift", "cmd"]), [.maskShift, .maskCommand])
+        XCTAssertEqual(cuModifierFlags(from: nil), [])
+        XCTAssertEqual(cuModifierFlags(from: []), [])
+        XCTAssertNil(cuModifierFlags(from: ["nope"]))
     }
 
     func testScrollDeltasAreClampedNotTrapped() {
