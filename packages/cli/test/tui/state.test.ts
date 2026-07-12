@@ -1,0 +1,253 @@
+import { describe, expect, test } from "bun:test";
+import { initialState, reduce, type TuiState } from "../../src/tui/state";
+
+const T0 = 1_700_000_000_000;
+
+describe("state.ts — initialState", () => {
+  test("returns the empty/idle shape", () => {
+    expect(initialState()).toEqual({
+      committed: [],
+      activeAssistant: "",
+      activeTools: [],
+      tasks: [],
+      agents: [],
+      turnRunning: false,
+      inTokens: 0,
+      outTokens: 0,
+      pending: null,
+    });
+  });
+});
+
+describe("state.ts — assistant streaming (a)", () => {
+  test("two deltas then assistant_message: activeAssistant empties, one committed block with joined text", () => {
+    let s = initialState();
+    s = reduce(s, { type: "assistant_delta", threadId: "main", delta: "Hello, " }, T0);
+    s = reduce(s, { type: "assistant_delta", threadId: "main", delta: "world!" }, T0 + 10);
+    expect(s.activeAssistant).toBe("Hello, world!");
+    s = reduce(s, { type: "assistant_message", threadId: "main", text: "Hello, world!" }, T0 + 20);
+    expect(s.activeAssistant).toBe("");
+    expect(s.committed).toEqual([{ kind: "assistant", text: "Hello, world!" }]);
+  });
+
+  test("a non-main assistant_delta is NOT appended to activeAssistant (feeds agents instead)", () => {
+    let s = initialState();
+    s = reduce(s, { type: "thread_started", threadId: "th_a", parentThreadId: "main", agentType: "general-purpose", prompt: "go" }, T0);
+    s = reduce(s, { type: "assistant_delta", threadId: "th_a", delta: "child text" }, T0 + 5);
+    expect(s.activeAssistant).toBe("");
+    expect(s.agents[0]!.liveOutputChars).toBe(10);
+  });
+});
+
+describe("state.ts — tool call/result (b)", () => {
+  test("tool_call then tool_result: one committed tool block, activeTools empty", () => {
+    let s = initialState();
+    s = reduce(s, { type: "tool_call", threadId: "main", callId: "c1", name: "bash", argsJson: '{"command":"ls"}' }, T0);
+    expect(s.activeTools).toEqual([{ name: "bash", argsJson: '{"command":"ls"}' }]);
+    s = reduce(s, { type: "tool_result", threadId: "main", callId: "c1", output: "file.txt", isError: false }, T0 + 5);
+    expect(s.activeTools).toEqual([]);
+    expect(s.committed).toEqual([{ kind: "tool", name: "bash", argsJson: '{"command":"ls"}', output: "file.txt", isError: false }]);
+  });
+});
+
+describe("state.ts — turn lifecycle (c)", () => {
+  test("turn_started sets turnRunning+turnStartMs; turn_completed sets tokens+turnRunning=false and leaves agents intact", () => {
+    let s = initialState();
+    s = reduce(s, { type: "thread_started", threadId: "th_a", parentThreadId: "main", agentType: "general-purpose", prompt: "go" }, T0);
+    s = reduce(s, { type: "turn_started", threadId: "main" }, T0 + 1);
+    expect(s.turnRunning).toBe(true);
+    expect(s.turnStartMs).toBe(T0 + 1);
+    s = reduce(s, { type: "turn_completed", threadId: "main", stopReason: "end_turn", inputTokens: 120, outputTokens: 45 }, T0 + 500);
+    expect(s.turnRunning).toBe(false);
+    expect(s.inTokens).toBe(120);
+    expect(s.outTokens).toBe(45);
+    expect(s.agents).toHaveLength(1); // NOT wiped
+    expect(s.agents[0]!.threadId).toBe("th_a");
+  });
+
+  test("a child thread's turn_started/turn_completed do not touch turnRunning/tokens", () => {
+    let s = initialState();
+    s = reduce(s, { type: "thread_started", threadId: "th_a", parentThreadId: "main", agentType: "general-purpose", prompt: "go" }, T0);
+    s = reduce(s, { type: "turn_started", threadId: "th_a" }, T0 + 1);
+    expect(s.turnRunning).toBe(false);
+    expect(s.turnStartMs).toBeUndefined();
+    s = reduce(s, { type: "turn_completed", threadId: "th_a", stopReason: "end_turn", inputTokens: 5, outputTokens: 5 }, T0 + 50);
+    expect(s.turnRunning).toBe(false);
+    expect(s.inTokens).toBe(0);
+    expect(s.outTokens).toBe(0);
+  });
+});
+
+describe("state.ts — THE BUG FIX: bg-agent finish survives the main turn_completed", () => {
+  test("thread_started(child) -> turn_started(child) -> thread_completed(child), THEN main turn_completed: committed finish note has real label + non-zero activeMs, and agents is not wiped", () => {
+    let s = initialState();
+    s = reduce(s, {
+      type: "thread_started", threadId: "th_bg", parentThreadId: "main", agentType: "general-purpose",
+      prompt: "refactor the widget", description: "refactor widget",
+    }, T0);
+    s = reduce(s, { type: "turn_started", threadId: "th_bg", ts: T0 + 100 }, T0 + 100);
+    s = reduce(s, { type: "tool_call", threadId: "th_bg", callId: "bg1", name: "bash", argsJson: '{"command":"echo hi"}' }, T0 + 150);
+    // the child finishes BEFORE the main turn completes (the common case; the historical bug hit
+    // when this ordering reversed — either way agents must never be wiped by main turn_completed)
+    // updateSubagents banks activeMs off the EVENT's own `ts` (wire events always carry one; `nowMs`
+    // here is `reduce`'s separately-injected clock param), so thread_completed's `ts` is what drives
+    // the 14s active span, not the third argument.
+    s = reduce(s, { type: "thread_completed", threadId: "th_bg", stopReason: "end_turn", ts: T0 + 14_100 }, T0 + 14_100);
+
+    const finishNote = s.committed.find((b) => b.kind === "note" && b.text.includes("refactor widget"));
+    expect(finishNote).toBeDefined();
+    expect(finishNote).toEqual({ kind: "note", text: 'Agent "refactor widget" finished · 14s\n⎿ Ran 1 tool calls' });
+
+    const agentBefore = s.agents.find((a) => a.threadId === "th_bg");
+    expect(agentBefore?.status).toBe("done");
+    expect(agentBefore?.activeMs).toBeGreaterThan(0);
+
+    // Now the MAIN thread's own turn_completed lands — must NOT wipe `agents` or `committed`.
+    s = reduce(s, { type: "turn_completed", threadId: "main", stopReason: "end_turn", inputTokens: 10, outputTokens: 10 }, T0 + 15_000);
+
+    expect(s.committed).toContainEqual({ kind: "note", text: 'Agent "refactor widget" finished · 14s\n⎿ Ran 1 tool calls' });
+    const agentAfter = s.agents.find((a) => a.threadId === "th_bg");
+    expect(agentAfter).toBeDefined();
+    expect(agentAfter?.label).toBe("refactor widget");
+    expect(agentAfter?.activeMs).toBeGreaterThan(0);
+  });
+
+  test("the historical ordering: main turn_completed fires BEFORE the bg child's own thread_completed — the finish note still gets the real label/stats, not empty/zero", () => {
+    let s = initialState();
+    s = reduce(s, {
+      type: "thread_started", threadId: "th_bg", parentThreadId: "main", agentType: "general-purpose",
+      prompt: "long background job", description: "long background job",
+    }, T0);
+    s = reduce(s, { type: "turn_started", threadId: "th_bg", ts: T0 + 100 }, T0 + 100);
+    // main's OWN turn finishes first (the run_in_background case: main doesn't wait for the child)
+    s = reduce(s, { type: "turn_completed", threadId: "main", stopReason: "end_turn", inputTokens: 1, outputTokens: 1 }, T0 + 300);
+    expect(s.agents).toHaveLength(1); // still there — not pruned by main's turn_completed
+
+    // ... the bg child finishes much later (123s active span, matching formatElapsed's own "2m 3s" fixture)
+    s = reduce(s, { type: "thread_completed", threadId: "th_bg", stopReason: "end_turn", ts: T0 + 100 + 123_000 }, T0 + 100 + 123_000);
+    const finishNote = s.committed.at(-1);
+    expect(finishNote).toEqual({ kind: "note", text: 'Agent "long background job" finished · 2m 3s' });
+    // crucially: NOT `Agent "" finished · 0s` (the pre-fix bug — see main.ts:637-649's comment)
+    expect((finishNote as { text: string }).text).not.toContain('Agent "" finished');
+    expect((finishNote as { text: string }).text).not.toContain("· 0s");
+  });
+});
+
+describe("state.ts — task upsert/delete (e)", () => {
+  test("task_updated upserts by id; a 'deleted' status removes the row", () => {
+    let s = initialState();
+    s = reduce(s, { type: "task_updated", threadId: "main", task: { id: "t1", subject: "write tests", status: "pending" } }, T0);
+    s = reduce(s, { type: "task_updated", threadId: "main", task: { id: "t2", subject: "ship it", status: "pending" } }, T0 + 1);
+    expect(s.tasks.map((t) => t.id)).toEqual(["t1", "t2"]);
+    s = reduce(s, { type: "task_updated", threadId: "main", task: { id: "t1", subject: "write tests", status: "in_progress" } }, T0 + 2);
+    expect(s.tasks.find((t) => t.id === "t1")?.status).toBe("in_progress");
+    expect(s.tasks).toHaveLength(2);
+    s = reduce(s, { type: "task_updated", threadId: "main", task: { id: "t1", subject: "write tests", status: "deleted" } }, T0 + 3);
+    expect(s.tasks.map((t) => t.id)).toEqual(["t2"]);
+  });
+});
+
+describe("state.ts — pending cards (f)", () => {
+  test("approval_requested sets pending; approval_resolved clears it and commits a resolved note", () => {
+    let s = initialState();
+    s = reduce(s, { type: "approval_requested", threadId: "main", callId: "call1", toolName: "bash", summary: "rm -rf tmp/" }, T0);
+    expect(s.pending).toEqual({ kind: "approval", callId: "call1", toolName: "bash", summary: "rm -rf tmp/" });
+    s = reduce(s, { type: "approval_resolved", threadId: "main", callId: "call1", approved: true, by: "user" }, T0 + 5);
+    expect(s.pending).toBeNull();
+    expect(s.committed).toContainEqual({ kind: "note", text: "approved bash" });
+  });
+
+  test("approval_resolved(denied) commits a denied note", () => {
+    let s = initialState();
+    s = reduce(s, { type: "approval_requested", threadId: "main", callId: "call1", toolName: "write", summary: "edit file" }, T0);
+    s = reduce(s, { type: "approval_resolved", threadId: "main", callId: "call1", approved: false, by: "user" }, T0 + 5);
+    expect(s.pending).toBeNull();
+    expect(s.committed).toContainEqual({ kind: "note", text: "denied write" });
+  });
+
+  test("question_asked sets a question pending card", () => {
+    let s = initialState();
+    const questions = [{ question: "which db?", header: "DB", options: [{ label: "postgres" }, { label: "sqlite" }], multiSelect: false }];
+    s = reduce(s, { type: "question_asked", threadId: "main", callId: "q1", questions }, T0);
+    expect(s.pending).toEqual({ kind: "question", callId: "q1", questions });
+  });
+
+  test("plan_presented sets a plan pending card; plan_resolved clears it and commits the matched wording", () => {
+    let s = initialState();
+    s = reduce(s, { type: "plan_presented", threadId: "main", callId: "p1", plan: "1. do X\n2. do Y" }, T0);
+    expect(s.pending).toEqual({ kind: "plan", callId: "p1", plan: "1. do X\n2. do Y" });
+    s = reduce(s, { type: "plan_resolved", threadId: "main", callId: "p1", approved: true, autoAccept: true, by: "user" }, T0 + 5);
+    expect(s.pending).toBeNull();
+    expect(s.committed).toContainEqual({ kind: "note", text: "plan approved (auto-accept edits)" });
+  });
+
+  test("plan_resolved(rejected)", () => {
+    let s = initialState();
+    s = reduce(s, { type: "plan_presented", threadId: "main", callId: "p1", plan: "1. do X" }, T0);
+    s = reduce(s, { type: "plan_resolved", threadId: "main", callId: "p1", approved: false, autoAccept: false, by: "user" }, T0 + 5);
+    expect(s.committed).toContainEqual({ kind: "note", text: "plan rejected" });
+  });
+});
+
+describe("state.ts — user messages", () => {
+  test("user_message commits a user block", () => {
+    let s = initialState();
+    s = reduce(s, { type: "user_message", threadId: "main", text: "hi there", clientName: "cli-chat" }, T0);
+    expect(s.committed).toEqual([{ kind: "user", text: "hi there" }]);
+  });
+});
+
+describe("state.ts — note one-liners match main.ts's wording (bg-task/worktree/directory/agent_error)", () => {
+  test("directory_added", () => {
+    let s = initialState();
+    s = reduce(s, { type: "directory_added", threadId: "main", path: "/tmp/x", persisted: true }, T0);
+    expect(s.committed).toEqual([{ kind: "note", text: "+ dir /tmp/x (remembered)" }]);
+    s = reduce(s, { type: "directory_added", threadId: "main", path: "/tmp/y", persisted: false }, T0);
+    expect(s.committed[1]).toEqual({ kind: "note", text: "+ dir /tmp/y" });
+  });
+
+  test("bg_task_started / bg_task_output / bg_task_exited", () => {
+    let s = initialState();
+    s = reduce(s, { type: "bg_task_started", threadId: "main", taskId: "bg1", command: "npm run build" }, T0);
+    expect(s.committed.at(-1)).toEqual({ kind: "note", text: "▶ bg bg1 started: npm run build" });
+    s = reduce(s, { type: "bg_task_output", threadId: "main", taskId: "bg1", chunk: "compiling...\n" }, T0);
+    expect(s.committed.at(-1)).toEqual({ kind: "note", text: "compiling...\n" });
+    s = reduce(s, { type: "bg_task_exited", threadId: "main", taskId: "bg1", exitCode: 0, killed: false }, T0);
+    expect(s.committed.at(-1)).toEqual({ kind: "note", text: "■ bg bg1 exited (exit 0)" });
+    s = reduce(s, { type: "bg_task_exited", threadId: "main", taskId: "bg1", exitCode: null, killed: true }, T0);
+    expect(s.committed.at(-1)).toEqual({ kind: "note", text: "■ bg bg1 exited (killed)" });
+    // not killed but no exit code available — matches main.ts's `"exit " + e.exitCode` verbatim
+    // (string-coerces null to "null"), rather than silently defaulting to "exit 0".
+    s = reduce(s, { type: "bg_task_exited", threadId: "main", taskId: "bg1", exitCode: null, killed: false }, T0);
+    expect(s.committed.at(-1)).toEqual({ kind: "note", text: "■ bg bg1 exited (exit null)" });
+  });
+
+  test("worktree_entered / worktree_exited", () => {
+    let s = initialState();
+    s = reduce(s, { type: "worktree_entered", threadId: "main", name: "feature-x", path: "/tmp/wt", branch: "feature-x" }, T0);
+    expect(s.committed.at(-1)).toEqual({ kind: "note", text: "⛿ entered worktree feature-x (branch feature-x)" });
+    s = reduce(s, { type: "worktree_exited", threadId: "main", name: "feature-x", action: "remove", removed: true }, T0);
+    expect(s.committed.at(-1)).toEqual({ kind: "note", text: "⟲ left worktree feature-x (removed)" });
+    s = reduce(s, { type: "worktree_exited", threadId: "main", name: "feature-y", action: "keep", removed: false }, T0);
+    expect(s.committed.at(-1)).toEqual({ kind: "note", text: "⟲ left worktree feature-y" });
+  });
+
+  test("agent_error", () => {
+    let s = initialState();
+    s = reduce(s, { type: "agent_error", threadId: "main", message: "provider timeout" }, T0);
+    expect(s.committed.at(-1)).toEqual({ kind: "note", text: "agent error: provider timeout" });
+  });
+});
+
+describe("state.ts — purity", () => {
+  test("reduce never touches Date.now(): identical nowMs replays produce identical output", () => {
+    const events = [
+      { type: "turn_started", threadId: "main" },
+      { type: "assistant_delta", threadId: "main", delta: "hi" },
+      { type: "assistant_message", threadId: "main", text: "hi" },
+      { type: "turn_completed", threadId: "main", stopReason: "end_turn", inputTokens: 1, outputTokens: 1 },
+    ];
+    const run = () => events.reduce<TuiState>((acc, e) => reduce(acc, e, T0 + 42), initialState());
+    expect(run()).toEqual(run());
+  });
+});
