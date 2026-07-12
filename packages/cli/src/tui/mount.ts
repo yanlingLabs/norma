@@ -19,6 +19,8 @@ export interface MountOpts {
   sessionId: string;
   cwd: string;
   initialPolicy: ApprovalPolicy;
+  version: string; // CLI version — welcome banner (packages/cli/package.json)
+  model: string; // resolved provider model — welcome banner (settings.provider.model)
 }
 
 export interface TuiHandle {
@@ -42,6 +44,8 @@ export function mountTui(opts: MountOpts, renderImpl: RenderLike = inkRender): T
       sessionId: opts.sessionId,
       cwd: opts.cwd,
       initialPolicy: opts.initialPolicy,
+      version: opts.version,
+      model: opts.model,
     }),
   );
   return { waitUntilExit };

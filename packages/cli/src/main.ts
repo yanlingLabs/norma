@@ -1,6 +1,6 @@
 import { join, resolve } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
-import { resolveNormaHome, KeychainSecretStore, startDaemon, TOKEN_NAMES } from "@norma/core";
+import { resolveNormaHome, KeychainSecretStore, startDaemon, TOKEN_NAMES, loadSettings } from "@norma/core";
 import type { Settings } from "@norma/core";
 import { METHODS, type ApprovalPolicy, type Task } from "@norma/protocol";
 import { NormaClient } from "./client";
@@ -725,7 +725,19 @@ async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boole
   // dangling legacy timers/listener and exit cleanly, exactly as the legacy chat teardown does.
   if (inkMode) {
     const { mountTui } = await import("./tui/mount");
-    await mountTui({ client: c, bridge: bridge!, sessionId, cwd, initialPolicy: policy }).waitUntilExit();
+    // Welcome-banner data. Version: this package's own manifest (read relative to THIS module, not
+    // cwd — the CLI runs from the user's project dir). Model: the resolved provider model the daemon
+    // will use, read from settings.json (same source as `norma model`). Both best-effort with inert
+    // fallbacks so a missing manifest / settings never blocks the interactive session.
+    let version = "0.0.0";
+    try {
+      version = (JSON.parse(readFileSync(join(import.meta.dir, "..", "package.json"), "utf8")) as { version?: string }).version ?? version;
+    } catch { /* keep fallback */ }
+    let model = "";
+    try {
+      model = loadSettings(join(resolveNormaHome(), "settings.json")).provider.model;
+    } catch { /* keep fallback */ }
+    await mountTui({ client: c, bridge: bridge!, sessionId, cwd, initialPolicy: policy, version, model }).waitUntilExit();
     clearInterval(spinnerTimer);
     keyListener.destroy();
     c.close();

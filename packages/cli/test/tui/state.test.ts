@@ -96,7 +96,7 @@ describe("state.ts — THE BUG FIX: bg-agent finish survives the main turn_compl
 
     const finishNote = s.committed.find((b) => b.kind === "note" && b.text.includes("refactor widget"));
     expect(finishNote).toBeDefined();
-    expect(finishNote).toEqual({ kind: "note", text: 'Agent "refactor widget" finished · 14s\n⎿ Ran 1 tool calls' });
+    expect(finishNote).toEqual({ kind: "note", text: 'Agent "refactor widget": Done (1 tool use · 14s)' });
 
     const agentBefore = s.agents.find((a) => a.threadId === "th_bg");
     expect(agentBefore?.status).toBe("done");
@@ -105,7 +105,7 @@ describe("state.ts — THE BUG FIX: bg-agent finish survives the main turn_compl
     // Now the MAIN thread's own turn_completed lands — must NOT wipe `agents` or `committed`.
     s = reduce(s, { type: "turn_completed", threadId: "main", stopReason: "end_turn", inputTokens: 10, outputTokens: 10 }, T0 + 15_000);
 
-    expect(s.committed).toContainEqual({ kind: "note", text: 'Agent "refactor widget" finished · 14s\n⎿ Ran 1 tool calls' });
+    expect(s.committed).toContainEqual({ kind: "note", text: 'Agent "refactor widget": Done (1 tool use · 14s)' });
     const agentAfter = s.agents.find((a) => a.threadId === "th_bg");
     expect(agentAfter).toBeDefined();
     expect(agentAfter?.label).toBe("refactor widget");
@@ -126,9 +126,9 @@ describe("state.ts — THE BUG FIX: bg-agent finish survives the main turn_compl
     // ... the bg child finishes much later (123s active span, matching formatElapsed's own "2m 3s" fixture)
     s = reduce(s, { type: "thread_completed", threadId: "th_bg", stopReason: "end_turn", ts: T0 + 100 + 123_000 }, T0 + 100 + 123_000);
     const finishNote = s.committed.at(-1);
-    expect(finishNote).toEqual({ kind: "note", text: 'Agent "long background job" finished · 2m 3s' });
-    // crucially: NOT `Agent "" finished · 0s` (the pre-fix bug — see main.ts:637-649's comment)
-    expect((finishNote as { text: string }).text).not.toContain('Agent "" finished');
+    expect(finishNote).toEqual({ kind: "note", text: 'Agent "long background job": Done (0 tool uses · 2m 3s)' });
+    // crucially: NOT the pre-fix bug's empty label / zero-duration placeholder
+    expect((finishNote as { text: string }).text).not.toContain('Agent "": Done');
     expect((finishNote as { text: string }).text).not.toContain("· 0s");
   });
 });
@@ -163,12 +163,50 @@ describe("state.ts — prune done agents on next main turn_started", () => {
     expect(s.agents.find((a) => a.threadId === "th_b")).toBeDefined(); // (b) working agent remains
     expect(s.agents.find((a) => a.threadId === "th_b")?.status).toBe("working");
     // (c) the finish note is still in committed — pruning `agents` must not touch `committed`
-    expect(s.committed).toContainEqual({ kind: "note", text: 'Agent "refactor widget" finished · 5s' });
+    expect(s.committed).toContainEqual({ kind: "note", text: 'Agent "refactor widget": Done (0 tool uses · 5s)' });
 
     // (d) a turn_started with NO done agents is a referential no-op on `agents`
     const agentsRef = s.agents;
     const s2 = reduce(s, { type: "turn_started", threadId: "main" }, T0 + 7_000);
     expect(s2.agents).toBe(agentsRef);
+  });
+});
+
+describe("state.ts — turn-summary / interrupted blocks (phase 3b Task 3, a+b)", () => {
+  test("(a) main turn_completed(end_turn) commits ONE turn-summary block with real duration + tokens", () => {
+    let s = initialState();
+    s = reduce(s, { type: "turn_started", threadId: "main" }, T0);
+    s = reduce(s, { type: "turn_completed", threadId: "main", stopReason: "end_turn", inputTokens: 13_700, outputTokens: 149 }, T0 + 12_000);
+    expect(s.committed.at(-1)).toEqual({ kind: "turn-summary", durationMs: 12_000, inTokens: 13_700, outTokens: 149 });
+    expect(s.committed.filter((b) => b.kind === "turn-summary")).toHaveLength(1);
+  });
+
+  test("(b) main turn_completed(stopReason 'aborted') commits an interrupted block, NOT a turn-summary", () => {
+    let s = initialState();
+    s = reduce(s, { type: "turn_started", threadId: "main" }, T0);
+    s = reduce(s, { type: "turn_completed", threadId: "main", stopReason: "aborted", inputTokens: 5, outputTokens: 2 }, T0 + 3_000);
+    expect(s.committed.at(-1)).toEqual({ kind: "interrupted" });
+    expect(s.committed.some((b) => b.kind === "turn-summary")).toBe(false);
+    // tokens are still tracked on state even when the turn was interrupted
+    expect(s.inTokens).toBe(5);
+    expect(s.outTokens).toBe(2);
+  });
+
+  test("(b) a child thread's turn_completed (any stopReason) commits neither turn-summary nor interrupted", () => {
+    let s = initialState();
+    s = reduce(s, { type: "thread_started", threadId: "th_a", parentThreadId: "main", agentType: "general-purpose", prompt: "go" }, T0);
+    s = reduce(s, { type: "turn_started", threadId: "th_a" }, T0 + 1);
+    const before = s.committed.length;
+    s = reduce(s, { type: "turn_completed", threadId: "th_a", stopReason: "aborted", inputTokens: 5, outputTokens: 5 }, T0 + 50);
+    expect(s.committed.length).toBe(before);
+    s = reduce(s, { type: "turn_completed", threadId: "th_a", stopReason: "end_turn", inputTokens: 5, outputTokens: 5 }, T0 + 60);
+    expect(s.committed.length).toBe(before);
+  });
+
+  test("turnStartMs unset (no prior main turn_started) -> durationMs is 0", () => {
+    let s = initialState();
+    s = reduce(s, { type: "turn_completed", threadId: "main", stopReason: "end_turn", inputTokens: 1, outputTokens: 1 }, T0 + 999);
+    expect(s.committed.at(-1)).toEqual({ kind: "turn-summary", durationMs: 0, inTokens: 1, outTokens: 1 });
   });
 });
 

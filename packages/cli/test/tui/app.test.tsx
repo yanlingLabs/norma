@@ -1,12 +1,14 @@
-/** Task 6 integration tests — <App> (the assembled Ink TUI) + mountTui's non-TTY guard.
+/** Task 7 integration tests — <App> (the CC-layout Ink TUI) + mountTui's non-TTY guard.
  *
  *  <App> is driven exactly the way main.ts drives it in production: a real makeEventBridge() whose
  *  events the test pushes, and a FAKE client that only records the callback args (App calls no
- *  client method on its own — only in response to composer/card input, which these tests don't
- *  exercise). ink-testing-library renders in debug mode, so lastFrame() carries the FULL accumulated
- *  <Static> transcript plus the live dynamic region — a committed block added several renders ago
- *  still shows in the final frame (verified against ink's build: debug writes fullStaticOutput +
- *  output every render). */
+ *  client method on its own — only in response to composer/card/key input). ink-testing-library
+ *  renders in debug mode, so lastFrame() carries the FULL accumulated <Static> transcript plus the
+ *  live dynamic region — a committed block added several renders ago still shows in the final frame.
+ *
+ *  Phase 3b Task 7 re-skins the layout: the welcome banner is the first Static line; StatusLine is
+ *  gone (Spinner + Footer own the turn chrome); ctrl+t toggles the task view; ctrl+o opens the
+ *  alt-screen pager (its own coverage lives in pager.test.tsx). */
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { cleanup, render } from "ink-testing-library";
@@ -41,6 +43,8 @@ function fakeClient() {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const ev = (o: Record<string, unknown>) => o as any;
 
+const baseProps = { sessionId: "s1", cwd: "/tmp", initialPolicy: "ask" as const, version: "0.0.1", model: "gpt-5-codex" };
+
 describe("App (integration)", () => {
   test("(a) a full mini-turn (buffered before subscribe) commits the assistant text + returns to an idle composer", async () => {
     const bridge = makeEventBridge();
@@ -54,25 +58,20 @@ describe("App (integration)", () => {
     bridge.push(ev({ type: "turn_completed", threadId: "main", inputTokens: 10, outputTokens: 5 }));
 
     const client = fakeClient();
-    const { lastFrame } = render(
-      <App client={client} bridge={bridge} sessionId="s1" cwd="/tmp" initialPolicy="ask" />,
-    );
+    const { lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
     await wait();
 
     const frame = lastFrame() ?? "";
     expect(frame).toContain("hi there friend"); // committed assistant block flushed from the buffer
-    expect(frame).toContain("› hello"); // committed user block
-    expect(frame).toContain("›"); // idle composer prompt present
-    expect(frame).toContain("ask mode"); // mode bar
+    expect(frame).toContain("❯ hello"); // committed user block (⏺/❯ grammar)
+    expect(frame).toContain("▌"); // idle composer prompt (its block cursor) present
     expect(client.calls).toEqual([]); // App issued no RPCs on its own
   });
 
   test("(b) parity bug e2e: a bg child's finish line keeps its real label/elapsed and the composer is never overwritten", async () => {
     const bridge = makeEventBridge();
     const client = fakeClient();
-    const { lastFrame } = render(
-      <App client={client} bridge={bridge} sessionId="s1" cwd="/tmp" initialPolicy="ask" />,
-    );
+    const { lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
     await wait();
 
     // A run_in_background child that opens a timed span, finishes, THEN the main turn completes and
@@ -87,20 +86,17 @@ describe("App (integration)", () => {
     await wait();
 
     const frame = lastFrame() ?? "";
-    expect(frame).toContain('Agent "scout" finished'); // real label, not ""
+    expect(frame).toContain('Agent "scout": Done'); // real label, not "" (Task 6 wording)
     expect(frame).toContain("9s"); // banked span (10000-1000), not 0s
-    expect(frame).toContain("Agent(scout)"); // roster row survived the main turn_completed (not pruned)
+    expect(frame).toContain("(scout)"); // roster tree row survived the main turn_completed (not pruned)
     expect(frame).toContain("all wrapped up"); // the following main message rendered
-    expect(frame).toContain("›"); // composer still present, never overwritten
-    expect(frame).toContain("ask mode");
+    expect(frame).toContain("▌"); // composer still present, never overwritten
   });
 
   test("(c) a bg_task_output chunk lands in the committed transcript and the composer stays present after it", async () => {
     const bridge = makeEventBridge();
     const client = fakeClient();
-    const { lastFrame } = render(
-      <App client={client} bridge={bridge} sessionId="s1" cwd="/tmp" initialPolicy="ask" />,
-    );
+    const { lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
     await wait();
 
     bridge.push(ev({ type: "bg_task_output", taskId: "t1", chunk: "BUILD-LOG-XYZ" }));
@@ -108,26 +104,69 @@ describe("App (integration)", () => {
 
     const frame = lastFrame() ?? "";
     expect(frame).toContain("BUILD-LOG-XYZ"); // committed to Static (scrollback), not the live region
-    expect(frame).toContain("›"); // composer still rendered below it (invisible-prompt invariant)
-    expect(frame).toContain("ask mode");
+    expect(frame).toContain("▌"); // composer still rendered below it (invisible-prompt invariant)
+  });
+
+  test("(d) welcome banner is the first line: bold Norma + version, then model · cwd", async () => {
+    const bridge = makeEventBridge();
+    const { lastFrame } = render(
+      <App client={fakeClient()} bridge={bridge} sessionId="s" cwd="/work/proj" initialPolicy="ask" version="0.0.1" model="gpt-5-codex" />,
+    );
+    await wait();
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("Norma");
+    expect(frame).toContain("v0.0.1");
+    expect(frame).toContain("gpt-5-codex · /work/proj");
+  });
+
+  test("(e) ctrl+t toggles the task view (hidden by default, visible after the toggle)", async () => {
+    const bridge = makeEventBridge();
+    const { stdin, lastFrame } = render(<App client={fakeClient()} bridge={bridge} {...baseProps} />);
+    await wait();
+    bridge.push(ev({ type: "task_updated", task: { id: "t1", subject: "ship the feature", status: "pending" } }));
+    await wait();
+    expect(lastFrame() ?? "").not.toContain("ship the feature"); // tasks hidden by default
+
+    stdin.write("\x14"); // ctrl+t
+    await wait();
+    expect(lastFrame() ?? "").toContain("ship the feature"); // now visible
+
+    stdin.write("\x14"); // ctrl+t again -> hidden
+    await wait();
+    expect(lastFrame() ?? "").not.toContain("ship the feature");
+  });
+
+  test("(f) Footer shows the plan-mode indicator when initialPolicy is plan", async () => {
+    const bridge = makeEventBridge();
+    const { lastFrame } = render(
+      <App client={fakeClient()} bridge={bridge} sessionId="s" cwd="/tmp" initialPolicy="plan" version="0.0.1" model="m" />,
+    );
+    await wait();
+    expect(lastFrame() ?? "").toContain("⏸ plan mode on");
   });
 });
 
 describe("mountTui (non-TTY guard)", () => {
-  test("(d) does NOT render Ink when stdout is not a TTY and returns a resolved no-op handle", async () => {
+  const mountOpts = () => ({
+    client: fakeClient(),
+    bridge: makeEventBridge(),
+    sessionId: "s",
+    cwd: "/tmp",
+    initialPolicy: "ask" as const,
+    version: "0.0.1",
+    model: "m",
+  });
+
+  test("(g) does NOT render Ink when stdout is not a TTY and returns a resolved no-op handle", async () => {
     const prev = process.stdout.isTTY;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (process.stdout as any).isTTY = false;
     try {
       let renders = 0;
-      const handle = mountTui(
-        { client: fakeClient(), bridge: makeEventBridge(), sessionId: "s", cwd: "/tmp", initialPolicy: "ask" },
-        // injected renderer — must never be called on a non-TTY
-        () => {
-          renders += 1;
-          return { waitUntilExit: () => new Promise<void>(() => {}) };
-        },
-      );
+      const handle = mountTui(mountOpts(), () => {
+        renders += 1;
+        return { waitUntilExit: () => new Promise<void>(() => {}) };
+      });
       expect(renders).toBe(0);
       let resolved = false;
       await Promise.race([handle.waitUntilExit().then(() => { resolved = true; }), wait(30)]);
@@ -138,19 +177,16 @@ describe("mountTui (non-TTY guard)", () => {
     }
   });
 
-  test("(d2) DOES render (once) when stdout IS a TTY", () => {
+  test("(g2) DOES render (once) when stdout IS a TTY", () => {
     const prev = process.stdout.isTTY;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (process.stdout as any).isTTY = true;
     try {
       let renders = 0;
-      mountTui(
-        { client: fakeClient(), bridge: makeEventBridge(), sessionId: "s", cwd: "/tmp", initialPolicy: "ask" },
-        () => {
-          renders += 1;
-          return { waitUntilExit: () => new Promise<void>(() => {}) };
-        },
-      );
+      mountTui(mountOpts(), () => {
+        renders += 1;
+        return { waitUntilExit: () => new Promise<void>(() => {}) };
+      });
       expect(renders).toBe(1);
     } finally {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any

@@ -1,39 +1,64 @@
-/** `<AgentList>` (Phase 3a Task 3) — the subagent roster (`TuiState.agents`, `AgentRow` =
- *  `CliSubagent`), one row per entry: `{glyph} Agent(label) agentType · N tools · elapsed[ ·
- *  tokens]`. Hidden entirely when there are no agents.
+/** `<AgentList>` (Phase 3b Task 6) — the live-region subagent roster (`TuiState.agents`, `AgentRow`
+ *  = `CliSubagent`), rewritten from 3a's single-line-per-agent panel into CC's git-log-graph TREE
+ *  rows (`cc-ui-study-transcript.md` §4, `AgentProgressLine.tsx`, adapted not copied): a head row
+ *  per agent —
  *
- *  Ambiguity resolution #1 (per the task brief): renders the row's `.label` DIRECTLY — it is
- *  already the resolved label `subagent-state.ts` computed via `subagentLabel` at `thread_started`
- *  time and persisted onto the row; this component must NOT re-derive it (the row carries no raw
- *  description/prompt to feed `subagentLabel` with). This is also where THE BUG FIX (state.ts's
- *  header) becomes visible: a DONE child thread's row is never wiped by a main-thread
- *  `turn_completed`, so its real label/stats render here instead of an empty/`0s` placeholder.
+ *    ├─ <bold agentType> (<label>) · N tool use(s)      (not the last agent, dim gutter)
+ *    └─ <bold agentType> (<label>) · N tool use(s)      (the LAST agent, dim gutter)
  *
- *  Reuses `subagent-display.ts`'s pure helpers (`subagentGlyph`, `subagentTokens`,
- *  `subagentElapsedMs`) rather than re-deriving glyph/token/elapsed formatting. Pure — no client,
- *  no side effects; `nowMs` is the caller's injected clock (only matters for a still-`"working"`
- *  row's open span — `subagentElapsedMs` reads `activeMs` alone for a `"done"` row). */
+ *  — followed by a dim continuation row reusing the `⎿` glyph:
+ *
+ *    │  ⎿  <activity, or "Working…" if none yet>        (not last, still not done)
+ *       ⎿  Done                                          (last, done)
+ *
+ *  The component's prop shape (`{ agents: AgentRow[]; nowMs: number }`) is UNCHANGED from 3a so
+ *  `app.tsx` (which still renders `<AgentList agents={state.agents} nowMs={nowMs} />` verbatim)
+ *  keeps compiling without modification. `nowMs` is accepted but unused here — this tree view shows
+ *  no per-row elapsed time (that now only appears once, in state.ts's `Done (...)` finish note).
+ *
+ *  Deliberately does NOT reuse `subagent-display.ts`'s `subagentGlyph`/`subagentElapsedMs` (that
+ *  file stays Swift-lockstep and READ-only from here) — the tree layout has no room for a
+ *  per-status glyph column, and elapsed time moved to the finish note. `.activity` (already
+ *  computed onto the row by `subagent-state.ts`'s `tool_call` case via `extractToolDetail`) is read
+ *  directly, same "row already carries the derived field, don't re-derive it" discipline as 3a's
+ *  `.label` resolution note. Pure — no client, no side effects. */
 
 import React from "react";
 import { Box, Text } from "ink";
 import type { AgentRow } from "./state";
-import { formatElapsed } from "../task-display";
-import { subagentElapsedMs, subagentGlyph, subagentTokens } from "../subagent-display";
+
+function pluralizeToolUse(n: number): string {
+  return `${n} tool use${n === 1 ? "" : "s"}`;
+}
+
+function AgentTreeRow({ agent, isLast }: { agent: AgentRow; isLast: boolean }) {
+  const headGutter = isLast ? "└─ " : "├─ ";
+  const contGutter = isLast ? "   ⎿  " : "│  ⎿  ";
+  const continuation = agent.status === "done" ? "Done" : (agent.activity ?? "Working…");
+  return (
+    <Box flexDirection="column">
+      <Text>
+        <Text dimColor>{headGutter}</Text>
+        <Text bold>{agent.agentType}</Text>
+        {` (${agent.label})`}
+        {` · ${pluralizeToolUse(agent.toolCalls)}`}
+      </Text>
+      <Text dimColor>
+        {contGutter}
+        {continuation}
+      </Text>
+    </Box>
+  );
+}
 
 export function AgentList({ agents, nowMs }: { agents: AgentRow[]; nowMs: number }) {
+  void nowMs;
   if (agents.length === 0) return null;
   return (
     <Box flexDirection="column">
-      {agents.map((a) => {
-        const elapsed = formatElapsed(subagentElapsedMs(a, nowMs));
-        const tokens = subagentTokens(a.inputTokens, a.outputTokens, a.liveOutputChars);
-        return (
-          <Text key={a.threadId}>
-            {subagentGlyph(a.status)} Agent({a.label}) {a.agentType} · {a.toolCalls} tools · {elapsed}
-            {tokens ? ` · ${tokens}` : ""}
-          </Text>
-        );
-      })}
+      {agents.map((a, i) => (
+        <AgentTreeRow key={a.threadId} agent={a} isLast={i === agents.length - 1} />
+      ))}
     </Box>
   );
 }
