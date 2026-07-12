@@ -334,6 +334,15 @@ describe("state.ts — note one-liners match main.ts's wording (bg-task/worktree
     s = reduce(s, { type: "agent_error", threadId: "main", message: "provider timeout" }, T0);
     expect(s.committed.at(-1)).toEqual({ kind: "note", text: "agent error: provider timeout" });
   });
+
+  test("local_note (Phase 3d T2 — App-internal only, never a real wire event): commits a note block", () => {
+    let s = initialState();
+    s = reduce(s, { type: "local_note", text: "compacted (through seq 42, 900 char summary)" }, T0);
+    expect(s.committed).toEqual([{ kind: "note", text: "compacted (through seq 42, 900 char summary)" }]);
+    // Purely additive: every other field is untouched.
+    expect(s.turnRunning).toBe(false);
+    expect(s.pending).toBeNull();
+  });
 });
 
 describe("state.ts — purity", () => {

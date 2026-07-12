@@ -2,8 +2,10 @@
  *  hint line beneath the composer: an approval-policy mode indicator (plan/auto, colored per
  *  `theme.planMode`/`theme.autoAccept`), an `esc to interrupt` hint while a turn runs, and an
  *  agents pill (`N agent(s) · ctrl+t`) when any subagents are live — segments joined with `" · "`.
- *  When none of those render, a fallback `shift+tab to cycle modes` hint keeps the line non-empty
- *  (cc-ui-study-chrome.md §1's `PromptInputFooterLeftSide` empty-state hint, adapted).
+ *  When none of those render, a fallback `? for shortcuts · shift+tab to cycle modes` hint keeps
+ *  the line non-empty (cc-ui-study-chrome.md §1's `PromptInputFooterLeftSide` empty-state hint,
+ *  adapted; Phase 3d T4 adds the `? for shortcuts` half, pointing at the composer's own `?`-on-
+ *  empty -> `/help` shortcut — composer.tsx).
  *
  *  T5: while the double-ctrl+C/ctrl+D exit window is armed (`exitArmed` carries WHICH key armed it —
  *  whole-branch review item 3), this REPLACES the whole line with the exact key-specific dim hint
@@ -67,7 +69,7 @@ export function Footer({ policy, running, agents, exitArmed }: FooterProps) {
   }
 
   if (segments.length === 0) {
-    segments.push(<Text key="fallback">shift+tab to cycle modes</Text>);
+    segments.push(<Text key="fallback">? for shortcuts · shift+tab to cycle modes</Text>);
   }
 
   return (

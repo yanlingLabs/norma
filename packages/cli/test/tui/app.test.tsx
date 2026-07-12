@@ -12,6 +12,9 @@
  *  the window; "stick" auto-follows the tail until the user scrolls away. */
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { cleanup, render } from "ink-testing-library";
 import { App, bottomBarRows } from "../../src/tui/app";
 import { makeEventBridge } from "../../src/tui/event-bridge";
@@ -50,7 +53,7 @@ const baseProps = { sessionId: "s1", cwd: "/tmp", initialPolicy: "ask" as const,
 // The composer's real inverse-video cursor (`<Text inverse>`) — a unique fingerprint of "the
 // composer is rendered" (nothing else in the TUI uses `inverse`).
 const COMPOSER_CURSOR = "\x1b[7m";
-const FOOTER_HINT = "shift+tab to cycle modes";
+const FOOTER_HINT = "? for shortcuts · shift+tab to cycle modes"; // Phase 3d T4 exact fallback text
 
 // SGR mouse wheel-up report (mode 1006). Ink strips the leading ESC before useInput, but the App's
 // emitter patch sees the raw chunk (ESC intact) — so mouse input is swallowed before the composer.
@@ -531,6 +534,238 @@ describe("App — resume replay (Phase 3c Task 5)", () => {
   });
 });
 
+describe("App — slash-command wiring (Phase 3d T2: onRunCommand + local_note)", () => {
+  test("(v1) '/help' typed into the composer runs through the registry and commits its note — never client.send", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("/help");
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("/compact — Compact conversation history to a summary"); // helpText() content
+    expect(frame).toContain("Keys:"); // the keybinding line
+    expect(frame).toContain(COMPOSER_CURSOR); // composer back to idle, buffer cleared
+    expect(client.calls).toEqual([]); // never reached the model
+  });
+
+  test("(v2) an unknown slash command commits the 'Unknown command' note", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("/nope");
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    expect(lastFrame() ?? "").toContain("Unknown command: /nope — /help lists commands");
+    expect(client.calls).toEqual([]);
+  });
+
+  test("(v3) a command that DOES need the client (/compact) round-trips through CommandCtx.client", async () => {
+    const bridge = makeEventBridge();
+    const client = { ...fakeClient(), compact: async () => ({ compacted: true, uptoSeq: 5, summaryChars: 42 }) };
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("/compact");
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    expect(lastFrame() ?? "").toContain("compacted (through seq 5, 42 char summary)");
+  });
+
+  test("(v4) the completion menu renders inside the full App tree while typing '/', and the composer stays present", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("/mo");
+    await wait();
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("Show or switch the active model/effort"); // /model row visible
+    expect(frame).toContain(COMPOSER_CURSOR); // composer (with its "/mo" buffer) still rendered below it
+  });
+
+  test("(v5) /cd propagates its daemon-confirmed cwd to later commands in the same session (T2 review item 3)", async () => {
+    const bridge = makeEventBridge();
+    const skillsCalls: unknown[][] = [];
+    const client = {
+      ...fakeClient(),
+      setCwd: async (_sessionId: string, _path: string) => "/resolved/newdir",
+      listSkills: async (...args: unknown[]) => { skillsCalls.push(args); return []; },
+    };
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("/cd ../x");
+    await wait();
+    stdin.write("\r");
+    await wait();
+    expect(lastFrame() ?? "").toContain("cwd → /resolved/newdir"); // runCd's note landed
+
+    stdin.write("/skills");
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    // The DAEMON-CONFIRMED cwd from /cd — not baseProps' mount-time "/tmp" — reaches /skills.
+    expect(skillsCalls).toEqual([["/resolved/newdir"]]);
+  });
+});
+
+describe("App — @-file mention index lifecycle (Phase 3d T3)", () => {
+  test("(x1) the first '@'-trigger builds the real file index against the session's cwd, and matches appear once it resolves", async () => {
+    const root = mkdtempSync(join(tmpdir(), "norma-app-file-index-"));
+    writeFileSync(join(root, "alpha.ts"), "");
+    writeFileSync(join(root, "beta.md"), "");
+    try {
+      const bridge = makeEventBridge();
+      const client = fakeClient();
+      const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} cwd={root} />);
+      await wait();
+      stdin.write("@alpha");
+      await wait(100); // real fs readdir — give the buildFileIndex promise time to resolve
+
+      const frame = lastFrame() ?? "";
+      expect(frame).toContain("alpha.ts");
+      expect(frame).not.toContain("beta.md"); // fuzzy-filtered out by the "alpha" query
+      expect(frame).toContain(COMPOSER_CURSOR); // composer stays mounted/live underneath the menu
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("(x2) a '/cd' issued BEFORE the first '@' redirects the index build to the daemon-confirmed new cwd", async () => {
+    const original = mkdtempSync(join(tmpdir(), "norma-app-file-index-orig-"));
+    const redirected = mkdtempSync(join(tmpdir(), "norma-app-file-index-new-"));
+    writeFileSync(join(original, "onlyinoriginal.ts"), "");
+    writeFileSync(join(redirected, "onlyinredirected.ts"), "");
+    try {
+      const bridge = makeEventBridge();
+      const client = { ...fakeClient(), setCwd: async () => redirected };
+      const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} cwd={original} />);
+      await wait();
+      stdin.write("/cd anywhere");
+      await wait();
+      stdin.write("\r");
+      await wait();
+      // The long tmpdir path can hard-wrap onto its own line at 80 columns, so check the note's
+      // pieces independently rather than one contiguous "cwd → <path>" substring.
+      const cdFrame = lastFrame() ?? "";
+      expect(cdFrame).toContain("cwd → ");
+      expect(cdFrame).toContain(redirected); // runCd's note landed first
+
+      stdin.write("@onlyin"); // the FIRST "@"-trigger, AFTER the /cd
+      await wait(100); // real fs readdir
+
+      const frame = lastFrame() ?? "";
+      expect(frame).toContain("onlyinredirected.ts"); // built against the NEW cwd (cwdRef.current)
+      expect(frame).not.toContain("onlyinoriginal.ts"); // never scanned the original mount-time cwd
+    } finally {
+      rmSync(original, { recursive: true, force: true });
+      rmSync(redirected, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("App — help surfacing: '?' on empty runs /help (Phase 3d T4)", () => {
+  test("'?' on an EMPTY composer commits the /help note — never inserted as text, never sent to the model", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("?");
+    await wait();
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("/help — List commands and keybindings"); // helpText() content
+    expect(frame).toContain("/compact — Compact conversation history to a summary");
+    expect(frame).toContain("Keys:"); // the keybinding line (may hard-wrap at 80 cols; unchecked verbatim here)
+    expect(frame).not.toContain("❯ ?"); // the "?" itself was never inserted into the buffer
+    expect(frame).toContain(COMPOSER_CURSOR); // composer back to idle
+    expect(client.calls).toEqual([]); // never reached the model
+  });
+
+  test("'?' with existing text in the buffer types normally — never runs /help", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("a");
+    await wait();
+    stdin.write("?");
+    await wait();
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("❯ a?"); // typed literally, buffer intact
+    expect(frame).not.toContain("Keys:"); // /help never ran
+    expect(client.calls).toEqual([]);
+  });
+});
+
+describe("App — command + mention e2e wiring (Phase 3d T4)", () => {
+  test("(T4-a) '/compact' typed + entered through the real App wiring: note lands, buffer clears, and neither send nor steer ever fire", async () => {
+    const bridge = makeEventBridge();
+    const client = { ...fakeClient(), compact: async () => ({ compacted: true, uptoSeq: 7, summaryChars: 99 }) };
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("/compact");
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("compacted (through seq 7, 99 char summary)"); // the command note block
+    expect(frame).toContain(COMPOSER_CURSOR); // composer back to idle
+    expect(frame).not.toContain("❯ /compact"); // buffer cleared, not left holding the typed command
+    expect(client.calls.filter((c) => c.method === "send")).toEqual([]); // never reached the model
+    expect(client.calls.filter((c) => c.method === "steer")).toEqual([]);
+  });
+
+  test("(T4-b) '@' mention: type + Tab-complete + Enter composes the FULL text with the path inline and really sends it", async () => {
+    const root = mkdtempSync(join(tmpdir(), "norma-app-help-e2e-"));
+    writeFileSync(join(root, "target.ts"), "");
+    try {
+      const bridge = makeEventBridge();
+      const client = fakeClient();
+      const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} cwd={root} />);
+      await wait();
+      stdin.write("look at @target");
+      await wait(100); // real fs readdir — give buildFileIndex time to resolve
+      expect(lastFrame() ?? "").toContain("target.ts"); // the real match is visible in the menu
+
+      stdin.write("\t"); // Tab-complete the "@target" span in place
+      await wait();
+      stdin.write("\r"); // a normal Enter now — cursor sits past the (closed) file token
+
+      await wait();
+      expect(client.calls).toEqual([{ method: "send", args: ["s1", "look at target.ts "] }]);
+      expect(lastFrame() ?? "").toContain(COMPOSER_CURSOR); // idle composer again, buffer cleared
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("App — headless sanity (Phase 3d T4)", () => {
+  test("(T4-d) `echo \"\" | bun src/main.ts --help` prints usage and exits 0 (never hangs on stdin, never crashes)", () => {
+    const cliRoot = join(import.meta.dir, "..", ".."); // test/tui -> packages/cli
+    const proc = Bun.spawnSync(["bun", "src/main.ts", "--help"], {
+      cwd: cliRoot,
+      stdin: new TextEncoder().encode("\n"),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(proc.exitCode).toBe(0);
+    expect(proc.stdout.toString()).toContain("norma (Phase 1b-ii-d) — commands:");
+  });
+});
+
 describe("bottomBarRows (pinned-bar line-count model)", () => {
   const task = (subject: string, status: TaskRow["status"]): TaskRow => ({ id: subject, subject, status });
   const agent = (threadId: string): AgentRow => ({
@@ -545,7 +780,7 @@ describe("bottomBarRows (pinned-bar line-count model)", () => {
   type Base = Parameters<typeof bottomBarRows>[0];
   const base = (overrides: Partial<Base>): Base => ({
     tasksVisible: true, tasks: [], agents: [], running: false, pending: null, activeTurnRows: 0,
-    columns: 80, composerText: "", composerCursor: 0, resuming: false,
+    columns: 80, composerText: "", composerCursor: 0, resuming: false, menuRows: 0,
     ...overrides,
   });
 
@@ -607,6 +842,20 @@ describe("bottomBarRows (pinned-bar line-count model)", () => {
         pending: { kind: "approval", callId: "c", toolName: "bash", summary: "x" },
       }));
       expect(rows).toBe(1 + 1); // approval card (1) + footer (1) — the composer's wrap math never runs
+    });
+  });
+
+  describe("completion menu row count (Phase 3d T2)", () => {
+    test("menuRows adds directly to the bar when the composer is showing", () => {
+      expect(bottomBarRows(base({ menuRows: 3 }))).toBe(4 + 3); // composer(3) + footer(1) + menu(3)
+    });
+
+    test("menuRows is ignored while a pending card owns the bottom bar", () => {
+      const rows = bottomBarRows(base({
+        menuRows: 6,
+        pending: { kind: "approval", callId: "c", toolName: "bash", summary: "x" },
+      }));
+      expect(rows).toBe(1 + 1); // approval card (1) + footer (1) — menuRows never added
     });
   });
 });

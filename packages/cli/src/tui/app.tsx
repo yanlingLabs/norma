@@ -66,7 +66,7 @@ import { Box, Text, useInput, useStdin } from "ink";
 import { Chalk } from "chalk";
 import wrapAnsi from "wrap-ansi";
 import { METHODS, type ApprovalPolicy, type SessionEvent } from "@norma/protocol";
-import { initialState, reduce, type AgentRow, type PendingCard, type TuiState } from "./state";
+import { initialState, reduce, type AgentRow, type LocalEvent, type PendingCard, type TuiState } from "./state";
 import { activeTurnLines, makeFlattenCache } from "./flatten-blocks";
 import { scrollBy, scrollToBottom, scrollToTop, viewportSlice, type ViewportState } from "./viewport";
 import { collapseCompleted, sortTasksForDisplay, type TaskRow } from "../task-display";
@@ -83,6 +83,9 @@ import { loadSafeHighlighter } from "./highlight-guard";
 import type { Highlighter } from "./markdown";
 import type { EventBridge } from "./event-bridge";
 import type { parsePlanResponse } from "../plan-response";
+import { runCommand, type CommandCtx } from "./commands";
+import { buildFileIndex } from "./file-index";
+import type { NormaClient } from "../client";
 
 /** The subset of `NormaClient` `<App>` actually calls — declared structurally so tests can pass a
  *  fake that only records these callbacks (the real `NormaClient` satisfies it field-for-field). */
@@ -95,6 +98,13 @@ export interface AppClient {
   planRespond(params: { sessionId: string; callId: string; approved: boolean; autoAccept?: boolean; feedback?: string }): unknown;
   request(method: string, params?: unknown): unknown;
 }
+
+/** Phase 3d T2 — everything the reducer's `dispatch` can be fed: every real wire `SessionEvent`
+ *  PLUS the one App-internal synthetic event (`LocalEvent`, state.ts) the slash-command runners use
+ *  to commit a note block (see `appendNote` below). `reduce`'s own second parameter stays the loose
+ *  structural `WireEvent` (state.ts) — both members here satisfy it — so this union only widens
+ *  what `dispatch` itself accepts, not `reduce`'s implementation. */
+type AppEvent = SessionEvent | LocalEvent;
 
 export interface AppProps {
   client: AppClient;
@@ -201,13 +211,19 @@ export function bottomBarRows(input: {
   composerCursor: number;
   /** T5: the "Resuming conversation…" line renders (and counts) while true. */
   resuming: boolean;
+  /** Phase 3d T2: the slash-command completion menu's CURRENT visible row count — `min(6,
+   *  filteredCount)` while open, `0` while closed — mirrored off `Composer`'s `onMenuRowsChange`
+   *  (the same "App mirrors a Composer-owned derived value" convention `composerText`/
+   *  `composerCursor` already use above). Irrelevant while `pending` is set for the same reason:
+   *  the composer (and its menu) isn't even mounted then. */
+  menuRows: number;
 }): number {
-  const { tasksVisible, tasks, agents, running, pending, activeTurnRows, columns, composerText, composerCursor, resuming } = input;
+  const { tasksVisible, tasks, agents, running, pending, activeTurnRows, columns, composerText, composerCursor, resuming, menuRows } = input;
   let n = activeTurnRows; // in-flight active turn (already tail-capped at ⌈rows/3⌉)
   if (tasks.length > 0 && tasksVisible) n += taskListRows(tasks);
   if (running) n += 1; // Spinner
   if (resuming) n += 1; // "Resuming conversation…"
-  n += pending ? pendingCardRows(pending) : composerRows(composerText, composerCursor, columns);
+  n += pending ? pendingCardRows(pending) : composerRows(composerText, composerCursor, columns) + menuRows;
   if (agents.length > 0) n += agents.length * 2; // each agent: head row + continuation row
   n += 1; // Footer
   return n;
@@ -218,7 +234,7 @@ export function App({
   now = Date.now, onExitRequest, resumeTargetSeq,
 }: AppProps) {
   const [state, dispatch] = useReducer(
-    (s: TuiState, e: SessionEvent) => reduce(s, e, now()),
+    (s: TuiState, e: AppEvent) => reduce(s, e, now()),
     undefined,
     initialState,
   );
@@ -236,6 +252,55 @@ export function App({
   // wrapped line (the exact Yoga shrink-distortion risk this task's hard requirement fixes).
   const [composerState, setComposerState] = useState<InputState>({ text: "", cursor: 0 });
   const onComposerStateChange = useCallback((s: InputState) => setComposerState(s), []);
+
+  // Phase 3d T2: mirrors the completion menu's visible row count off `Composer`'s
+  // `onMenuRowsChange` — same reasoning as `composerState` above (`bottomBarRows` must recompute on
+  // the SAME render the menu is about to lay out on), PLUS it's the only way App can observe an
+  // Esc-dismissed menu at all: dismissal changes no `InputState` field.
+  const [menuRows, setMenuRows] = useState(0);
+  const onComposerMenuRowsChange = useCallback((n: number) => setMenuRows(n), []);
+
+  // Phase 3d T2: the in-chat slash-command registry (commands.ts, T1) — `appendNote` commits a note
+  // block through the SAME reducer/dispatch path every other transcript line goes through, via the
+  // App-internal `local_note` event (state.ts's `LocalEvent` — never a real wire event). `client` is
+  // cast to the full `NormaClient` the runners need (`CommandCtx.client`) — `AppClient` above is
+  // deliberately only the subset App itself calls; the real production `client` prop (main.ts) is
+  // always a genuine `NormaClient`, which satisfies both shapes.
+  //
+  // T2 review item 3: the SESSION'S live cwd lives in a ref, seeded from the mount-time prop (the
+  // welcome banner keeps the original value on purpose), and every run builds a FRESH ctx reading
+  // it at run time — so a `/cd`'s daemon-confirmed new cwd (delivered back through `onCwdChanged`,
+  // commands.ts's runCd) is what LATER commands in the same session (`/skills`, `/mcp`) receive as
+  // `ctx.cwd`.
+  const appendNote = useCallback((text: string) => dispatch({ type: "local_note", text }), []);
+  const cwdRef = useRef(cwd);
+  const onRunCommand = useCallback((text: string) => {
+    const ctx: CommandCtx = {
+      client: client as unknown as NormaClient,
+      sessionId,
+      cwd: cwdRef.current,
+      appendNote,
+      onCwdChanged: (newCwd: string) => { cwdRef.current = newCwd; },
+    };
+    void runCommand(ctx, text);
+  }, [client, sessionId, appendNote]);
+
+  // Phase 3d T3: the "@"-file mention index (file-index.ts) — App owns the ONE lazy build for the
+  // composer's whole lifetime, per the brief ("keep it simple: one build per session, no refresh in
+  // v1"). `fileIndexRef` is the guard: `onNeedFileIndex` (fired by the composer's first "@"-trigger
+  // — see its prop doc on composer.tsx) starts `buildFileIndex` at most once no matter how many
+  // times it's called afterward; `fileIndex` state is what actually reaches the composer (via the
+  // `fileIndex` prop below) once that promise resolves, turning the menu's "indexing…" placeholder
+  // into live matches. Uses the SAME live-cwd ref `onRunCommand` above reads (`cwdRef`) rather than
+  // the original mount-time `cwd` prop, so a `/cd` issued before the first "@" is honored.
+  const fileIndexRef = useRef<Promise<string[]> | null>(null);
+  const [fileIndex, setFileIndex] = useState<string[] | undefined>(undefined);
+  const onNeedFileIndex = useCallback(() => {
+    if (fileIndexRef.current) return; // already building/built — one per session
+    const built = buildFileIndex(cwdRef.current);
+    fileIndexRef.current = built;
+    void built.then((list) => setFileIndex(list));
+  }, []);
 
   // T5 double-press ctrl+C/ctrl+D exit-armed state (see the file-top doc comment's KEY ROUTING #2).
   // Carries WHICH key armed it (whole-branch review item 3) so the footer hint names the right key;
@@ -313,6 +378,7 @@ export function App({
     tasksVisible, tasks: state.tasks, agents: state.agents,
     running: state.turnRunning, pending: state.pending, activeTurnRows: atVisible.length,
     columns, composerText: composerState.text, composerCursor: composerState.cursor, resuming,
+    menuRows,
   });
   const viewH = Math.max(1, (rows - 1) - barRows);
 
@@ -476,6 +542,11 @@ export function App({
             onStateChange={onComposerStateChange}
             onScrollTop={onComposerScrollTop}
             onScrollBottom={onComposerScrollBottom}
+            onRunCommand={onRunCommand}
+            onMenuRowsChange={onComposerMenuRowsChange}
+            columns={columns}
+            fileIndex={fileIndex}
+            onNeedFileIndex={onNeedFileIndex}
           />
         )}
         {state.agents.length > 0 ? <AgentList agents={state.agents} nowMs={nowMs} /> : null}
