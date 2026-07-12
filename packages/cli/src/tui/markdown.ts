@@ -63,7 +63,9 @@ function lex(text: string): Token[] {
 // Content with no markdown indicators at all skips `marked.lexer` entirely —
 // the overwhelmingly common case of a short plain-text reply shouldn't pay
 // for a full lex+format pass.
-const MARKDOWN_INDICATOR_RE = /[*_`#>~[\]]|^\s*[-+]\s|^\s*\d+[.)]\s/m;
+// `|` is included so GFM tables (whose only indicator character may be the
+// pipe) never take the fast path and skip table rendering.
+const MARKDOWN_INDICATOR_RE = /[*_`#>~[\]|]|^\s*[-+]\s|^\s*\d+[.)]\s/m;
 
 function looksLikeMarkdown(text: string): boolean {
   return MARKDOWN_INDICATOR_RE.test(text);
@@ -191,6 +193,8 @@ function formatBlock(token: Token, depth: number, highlight?: Highlighter): stri
     }
     case "list":
       return formatList(token as Tokens.List, depth, highlight);
+    case "table":
+      return formatTable(token as Tokens.Table);
     case "hr":
       return ansi.dim("───");
     default: {
@@ -235,6 +239,40 @@ function formatList(list: Tokens.List, depth: number, highlight?: Highlighter): 
   });
 
   return lines.join("\n");
+}
+
+// Simple ASCII table for GFM tables: column widths from the widest cell per
+// column (left-aligned, no wrapping — long cells just widen their column),
+// header row bold, `─┼─` separator row beneath, plain rows after. This is the
+// string-context fallback; a reflow-aware React table component is future
+// work. Cells use their plain `.text` (not inline-formatted) so column-width
+// math stays trivially correct — ANSI escapes inside a cell would break the
+// visible-width padding.
+function formatTable(table: Tokens.Table): string {
+  const headerTexts = table.header.map((cell) => cell.text);
+  const rowTexts = table.rows.map((row) => row.map((cell) => cell.text));
+
+  const widths = headerTexts.map((headerText, col) => {
+    let width = headerText.length;
+    for (const row of rowTexts) {
+      const cell = row[col];
+      if (cell !== undefined && cell.length > width) width = cell.length;
+    }
+    return width;
+  });
+
+  const pad = (text: string, width: number): string =>
+    text + " ".repeat(Math.max(0, width - text.length));
+
+  const headerLine = headerTexts
+    .map((headerText, col) => ansi.bold(pad(headerText, widths[col] ?? headerText.length)))
+    .join(" | ");
+  const separatorLine = widths.map((width) => "─".repeat(width)).join("─┼─");
+  const bodyLines = rowTexts.map((row) =>
+    row.map((cell, col) => pad(cell, widths[col] ?? cell.length)).join(" | "),
+  );
+
+  return [headerLine, separatorLine, ...bodyLines].join("\n");
 }
 
 // --- public API ------------------------------------------------------------

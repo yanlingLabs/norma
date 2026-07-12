@@ -82,6 +82,47 @@ describe("markdown.ts — fenced code blocks (f)", () => {
   });
 });
 
+describe("markdown.ts — GFM tables (review fix)", () => {
+  const TABLE = "| Name | Value |\n| --- | --- |\n| al | 1 |\n| be | 22 |";
+  const CELLS = ["Name", "Value", "al", "1", "be", "22"];
+
+  test("a 2x2 table renders ALL cell texts with a separator row (nothing dropped)", () => {
+    const out = renderMarkdown(TABLE);
+    for (const cell of CELLS) {
+      expect(out).toContain(cell);
+    }
+    // separator row of ─ with ┼ column junctions
+    expect(out).toMatch(/─+┼─+/);
+    // one line each for header, separator, and the two body rows
+    expect(out.split("\n").length).toBe(4);
+  });
+
+  test("header cells are bold", () => {
+    const out = renderMarkdown(TABLE);
+    // Header is the widest cell in each column of this fixture, so header
+    // cells carry no padding inside the bold wrap.
+    expect(out).toContain(ansi.bold("Name"));
+    expect(out).toContain(ansi.bold("Value"));
+  });
+
+  test("a table mid-document does not disturb surrounding blocks", () => {
+    const out = renderMarkdown(`Before para.\n\n${TABLE}\n\nAfter para.`);
+    expect(out.startsWith("Before para.\n\n")).toBe(true);
+    expect(out.endsWith("\n\nAfter para.")).toBe(true);
+    for (const cell of CELLS) {
+      expect(out).toContain(cell);
+    }
+  });
+
+  test("regression: table output is no longer an empty string", () => {
+    const out = renderMarkdown(TABLE);
+    expect(out.length).toBeGreaterThan(0);
+    for (const cell of CELLS) {
+      expect(out).toContain(cell);
+    }
+  });
+});
+
 describe("markdown.ts — splitStableBoundary (g)", () => {
   test("mid-paragraph text with no completed block boundary: everything is tail", () => {
     const text = "just some mid paragraph text with no boundary yet";
