@@ -39,6 +39,17 @@ describe("PermissionGate v1", () => {
     expect(gate.evaluate("bash_output", "ask")).toBe("allow");
   });
 
+  // Phase 5a Task 1: agent_list/agent_output only ever read BackgroundAgentRegistry/SessionStore
+  // state (agent_output never flips `notified`) — same READ_ONLY class as task_get/task_list, and
+  // must stay allowed under `plan` so a planning session can still check on its background agents.
+  test("agent_list + agent_output are read-only: allowed under ask/auto/plan", () => {
+    for (const name of ["agent_list", "agent_output"]) {
+      expect(gate.evaluate(name, "ask")).toBe("allow");
+      expect(gate.evaluate(name, "auto")).toBe("allow");
+      expect(gate.evaluate(name, "plan")).toBe("allow");
+    }
+  });
+
   test("bash_kill is mutating: ask under ask-policy, allow under auto-policy", () => {
     expect(gate.evaluate("bash_kill", "ask")).toBe("ask");
     expect(gate.evaluate("bash_kill", "auto")).toBe("allow");

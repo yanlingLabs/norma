@@ -420,6 +420,10 @@ export class AgentEngine {
     // task_stop is ALSO pinned whenever a bg AGENT is running (independent of any bg bash task) —
     // that's its primary target (CC TaskStop parity: stop a running background agent).
     if (this.cfg.bgAgents?.list(sessionId).some((e) => e.status === "running")) pins.add("task_stop");
+    // phase 5a Task 1: agent_list/agent_output are pinned whenever ANY bg agent entry exists for
+    // this session — running OR terminal (unlike task_stop's running-only pin above), since a
+    // FINISHED agent must stay collectable via agent_output without a ToolSearch load.
+    if (this.cfg.bgAgents?.list(sessionId).length) { pins.add("agent_list"); pins.add("agent_output"); }
     return pins;
   }
 
@@ -1284,8 +1288,11 @@ export class AgentEngine {
           // 4h-ii-c Task 2: task_stop is excluded from EVERY child UNCONDITIONALLY too, same
           // rationale — v1 depth-0-only: a child must not be able to kill its siblings' or its
           // parent's OWN background agents/tasks, only the main thread orchestrates.
+          // phase 5a Task 1: agent_list/agent_output are excluded from EVERY child for the SAME
+          // depth-0-only reason — a child must not enumerate or read its siblings'/parent's OWN
+          // background agents, only the main thread orchestrates.
           const childDepth = opts.depth + 1;
-          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode", "send_message", "task_stop"]);
+          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode", "send_message", "task_stop", "agent_list", "agent_output"]);
           if (childDepth >= maxDepth) childExcludeTools.add("spawn_agent");
           // 4h-ii-b Task 1: instructionsFull is computed ONCE here — hoisted out of the bg and
           // sync closures below, which used to each build their own copy independently — so it

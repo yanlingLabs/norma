@@ -42,7 +42,12 @@ export type SessionApprovalPolicy = "ask" | "auto" | "plan";
 // (any bash caller can reach the exact same kill via bash_kill under ITS OWN gate), whereas
 // task_stop's primary target is Norma's own subagent bookkeeping. Flagged here explicitly so a
 // whole-branch review adjudicates the split rather than silently accepting it.
-const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop"]);
+// agent_list/agent_output (phase 5a Task 1) are read-only too, per the plan's own global
+// constraint ("New tools are READ_ONLY ... they only read registry/store state"): both only ever
+// read BackgroundAgentRegistry/SessionStore state (agent_output never flips `notified`) — same
+// class as task_get/task_list, and must stay allowed under `plan` so a planning session can still
+// check on its background agents.
+const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output"]);
 // `computer` (Phase 5 CU) is MUTATING: a computer-use action drives real mouse/keyboard/screen, so
 // it must pass the gate on EVERY call (spec §4.6: "every CU action passes the permission gate") —
 // ask → per-action approval card, auto → allow, plan → deny (CU makes changes). Note this is the

@@ -28,6 +28,7 @@ import { registerWorktreeTools } from "./agent/tools/worktree";
 import { registerSpawnAgentTool } from "./agent/tools/spawn";
 import { registerSendMessageTool } from "./agent/tools/send-message";
 import { registerTaskStopTool } from "./agent/tools/task-stop";
+import { registerAgentQueryTools } from "./agent/tools/agent-query";
 import { registerScheduleTool } from "./agent/tools/schedule";
 import { registerWebTools } from "./agent/tools/web";
 import { registerComputerTool } from "./agent/tools/computer";
@@ -389,6 +390,12 @@ export async function startDaemon(opts: {
     // is a PLAIN TOOL (no engine bridge — see task-stop.ts's own doc comment), deferred like
     // bash_kill (registerBackgroundTools above).
     registerTaskStopTool(registry, { bgAgents, bgRegistry, deferred: true });
+    // phase 5a Task 1: agent_list/agent_output — the read-only "collect your subagents"
+    // counterpart to spawn_agent/send_message/task_stop above, same bgAgents instance so what
+    // they report is exactly what the engine's own pin/completion bookkeeping sees. `deferred:
+    // true` is hardcoded inside registerAgentQueryTools itself (unlike task_stop's caller-supplied
+    // flag), so no `deferred` option is passed here.
+    registerAgentQueryTools(registry, { bgAgents, store });
     // Computer use (Phase 5 CU): opt-in via settings.computerUse.enabled (the strongest reading of
     // "full-auto CU requires explicit opt-in" — absent/false, the `computer` tool does not exist).
     // The service holds leases on the SAME `peripheral` broker (hoisted above this gate) that
