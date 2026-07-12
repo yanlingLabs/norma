@@ -514,6 +514,32 @@ final class ComputerCapabilitiesPureTests: XCTestCase {
                        .scroll(target: nil, dx: -100_000, dy: 50))
     }
 
+    func testCuSafeIntNeverTraps() {
+        // Every coordinate/delta Int() conversion (scroll deltas, click/move/drag detail strings,
+        // zoom error message) routes through this — it must survive the model's worst input without
+        // a fatalError. Bare `Int(1e40)`/`Int(.infinity)`/`Int(.nan)` all TRAP; cuSafeInt clamps.
+        XCTAssertEqual(cuSafeInt(1e40), 100_000)
+        XCTAssertEqual(cuSafeInt(-1e40), -100_000)
+        XCTAssertEqual(cuSafeInt(.infinity), 100_000)
+        XCTAssertEqual(cuSafeInt(-.infinity), -100_000)
+        XCTAssertEqual(cuSafeInt(.nan), 0)
+        XCTAssertEqual(cuSafeInt(42.9), 42) // ordinary values pass through (truncated)
+        XCTAssertEqual(cuSafeInt(-7.2), -7)
+    }
+
+    func testAbsurdCoordinatesParseWithoutTrapping() {
+        // The gate's crash vector: model-controlled .point coordinates flow into Int() display/error
+        // sites (drag/click/move detail strings, zoom out-of-bounds error). Parsing an absurd
+        // coordinate must NOT trap, and the enum must carry the raw finite Double through (the live
+        // detail/error strings then use cuSafeInt, verified above).
+        XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"drag","from":{"x":1,"y":2},"to":{"x":1e40,"y":1e40}}"#).get(),
+                       .drag(from: .point(x: 1, y: 2), to: .point(x: 1e40, y: 1e40), modifiers: []))
+        XCTAssertEqual(try? parseComputerPayload(cls: "input-drive", payloadJson: #"{"op":"click","target":{"x":1e40,"y":-1e40}}"#).get(),
+                       .click(target: .point(x: 1e40, y: -1e40), button: "left", clicks: 1, modifiers: []))
+        XCTAssertEqual(try? parseComputerPayload(cls: "screenshot", payloadJson: #"{"op":"zoom","x":1e40,"y":1e40,"width":10,"height":10}"#).get(),
+                       .zoom(x: 1e40, y: 1e40, width: 10, height: 10, maxDim: nil))
+    }
+
     func testParsePayloadRejectsMismatchAndMissingFields() {
         // op valid for a DIFFERENT class
         if case .success = parseComputerPayload(cls: "screenshot", payloadJson: #"{"op":"click"}"#) { XCTFail("class/op mismatch should fail") }

@@ -225,7 +225,8 @@ export function registerComputerTool(
         if (a.seconds === undefined) throw new Error("action 'wait' needs `seconds` (max 5)");
         const s = Math.min(a.seconds, MAX_WAIT_S);
         await sleep(s * 1000, ctx.signal);
-        return `waited ${s}s`;
+        // Report the truth: an aborted turn cuts the sleep short, so don't claim the full duration.
+        return ctx.signal?.aborted ? "wait interrupted" : `waited ${s}s`;
       }
       if ((a.action === "screenshot" || a.action === "zoom") && ctx.visionCapable === false) {
         throw new Error("screenshots need a vision-capable model; use action 'ax_snapshot' to read the screen instead");

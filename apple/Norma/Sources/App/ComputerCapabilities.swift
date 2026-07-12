@@ -112,6 +112,19 @@ private func resolveTarget(_ raw: RawTarget?) -> CUTarget? {
     return nil
 }
 
+/// Safe Double→Int for scroll deltas AND every DISPLAY/error-string coordinate conversion.
+/// `Int(_: Double)` TRAPS (fatalError) on NaN/±Inf and on magnitudes outside Int64 — and EVERY
+/// coordinate/delta here is model-controlled (core's zod schema is a bare z.number()), so a value
+/// like `to_x: 1e40` reaching a bare `Int(x)` would crash the whole peripheral provider. Clamp to
+/// ±100_000 (beyond any real screen coordinate or scroll intent, safely inside Int32) and map NaN
+/// to 0. The ACTUAL CGEvent uses CGFloat (never traps); this guards only the Int() sites — scroll
+/// wheel fields, click/move/drag detail strings, and the zoom out-of-bounds error message. Pure +
+/// unit-tested.
+func cuSafeInt(_ v: Double) -> Int {
+    if v.isNaN { return 0 }
+    return Int(min(max(v, -100_000), 100_000))
+}
+
 /// The one modifier-token → CGEventFlags map, shared by `parseChord` (chord strings like "cmd+s")
 /// and `cuModifierFlags` (the click/drag `modifiers` array). Pure.
 func cuModifierFlag(for token: String) -> CGEventFlags? {
@@ -180,12 +193,10 @@ func parseComputerPayload(cls: String, payloadJson: String) -> Result<ComputerOp
         guard let keys = raw.keys, !keys.isEmpty else { return .failure(ComputerError(message: "key needs a chord")) }
         return .success(.key(keys: keys))
     case ("input-drive", "scroll"):
-        // Clamp BEFORE Int conversion: `Int(_: Double)` is a TRAPPING conversion, and dx/dy are
-        // model-controlled doubles (core's zod schema is a bare z.number()) — an absurd value like
-        // 1e40 must become a bounded scroll, not a fatalError on the main actor. ±100_000 px is far
-        // beyond any real scroll intent and safely inside Int32 for the CGEvent wheel fields.
-        let clamp = { (v: Double) -> Int in Int(min(max(v, -100_000), 100_000)) }
-        return .success(.scroll(target: resolveTarget(raw.target), dx: clamp(raw.dx ?? 0), dy: clamp(raw.dy ?? 0)))
+        // cuSafeInt clamps BEFORE the trapping Int conversion — dx/dy are model-controlled doubles
+        // (core's zod schema is a bare z.number()), so 1e40/Inf/NaN must become a bounded scroll,
+        // not a fatalError on the main actor. See cuSafeInt's doc comment.
+        return .success(.scroll(target: resolveTarget(raw.target), dx: cuSafeInt(raw.dx ?? 0), dy: cuSafeInt(raw.dy ?? 0)))
     default:
         return .failure(ComputerError(message: "op '\(raw.op)' is not valid for class '\(cls)'"))
     }
@@ -335,7 +346,7 @@ final class LiveComputerCapabilities: ComputerCapabilities {
             try requireInputTrust()
             let p = try point(for: target)
             postMouse(type: .mouseMoved, at: p, button: .left)
-            return .detail("moved to (\(Int(p.x)),\(Int(p.y)))")
+            return .detail("moved to (\(cuSafeInt(p.x)),\(cuSafeInt(p.y)))")
         case .drag(let from, let to, let modifiers):
             try requireInputTrust()
             return .detail(try await drag(from: from, to: to, modifiers: modifiers))
@@ -420,12 +431,14 @@ final class LiveComputerCapabilities: ComputerCapabilities {
         let requested = CGRect(x: x, y: y, width: width, height: height)
         let region = requested.intersection(bounds).integral
         guard !region.isNull, region.width >= 1, region.height >= 1 else {
-            throw ComputerError(message: "zoom region (\(Int(x)),\(Int(y)) \(Int(width))×\(Int(height))) is outside the screen (\(image.width)×\(image.height))")
+            throw ComputerError(message: "zoom region (\(cuSafeInt(x)),\(cuSafeInt(y)) \(cuSafeInt(width))×\(cuSafeInt(height))) is outside the screen (\(image.width)×\(image.height))")
         }
         guard let cropped = image.cropping(to: region) else {
             throw ComputerError(message: "zoom crop failed")
         }
-        return try encodeShot(cropped, maxDim: maxDim, originX: Int(region.origin.x), originY: Int(region.origin.y))
+        // region is the intersection with display bounds (finite, in-range) so Int() here is
+        // already safe — routed through cuSafeInt anyway for one uniform coordinate→Int path.
+        return try encodeShot(cropped, maxDim: maxDim, originX: cuSafeInt(region.origin.x), originY: cuSafeInt(region.origin.y))
     }
 
     private func pngData(from image: CGImage, width: Int, height: Int) -> Data? {
@@ -547,7 +560,7 @@ final class LiveComputerCapabilities: ComputerCapabilities {
             postMouse(type: ev.up, at: p, button: ev.button, clickCount: i, flags: modifiers)
         }
         let mods = modifiers.isEmpty ? "" : " (modified)"
-        return "clicked (\(Int(p.x)),\(Int(p.y)))\(mods)"
+        return "clicked (\(cuSafeInt(p.x)),\(cuSafeInt(p.y)))\(mods)"
     }
 
     /// Drag: press at `from`, glide through interpolated dragged events (apps ignore a teleporting
@@ -567,7 +580,7 @@ final class LiveComputerCapabilities: ComputerCapabilities {
             try? await Task.sleep(nanoseconds: 15_000_000) // ~15ms per step ≈ 180ms total glide
         }
         postMouse(type: ev.up, at: b, button: ev.button, flags: modifiers)
-        return "dragged (\(Int(a.x)),\(Int(a.y))) → (\(Int(b.x)),\(Int(b.y)))"
+        return "dragged (\(cuSafeInt(a.x)),\(cuSafeInt(a.y))) → (\(cuSafeInt(b.x)),\(cuSafeInt(b.y)))"
     }
 
     private func postMouse(type: CGEventType, at point: CGPoint, button: CGMouseButton, clickCount: Int = 1, flags: CGEventFlags = []) {

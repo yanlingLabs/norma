@@ -133,9 +133,9 @@ describe("computer tool", () => {
     expect(out.output).toBe("waited 0.02s");
     expect(Date.now() - started).toBeGreaterThanOrEqual(15);
     expect(cu.calls.length).toBe(0); // never touched the peripheral
-    // clamped to 5s max — and an already-aborted signal returns immediately (no real 5s wait)
+    // an already-aborted signal returns immediately (no real 5s wait) and reports the truth
     const clamped = await run(reg, { action: "wait", seconds: 99 }, ctx({ computerUse: cu.service, signal: AbortSignal.abort() }));
-    expect(clamped.output).toBe("waited 5s");
+    expect(clamped.output).toBe("wait interrupted");
   });
 
   test("wait without seconds → typed error", async () => {
