@@ -5,7 +5,7 @@
  *  time and (once non-zero) output-token count. Hidden entirely while `!running`.
  *
  *  Pure — no `Date.now()`/timers in here; `nowMs`/`turnStartMs` are the caller's injected clock
- *  (the App ticks it), matching `status-line.tsx`/`task-list.tsx`'s existing convention. The frame
+ *  (the App ticks it), matching `task-list.tsx`'s existing convention. The frame
  *  index math is exposed as the standalone pure helper `spinnerFrame(elapsedMs)` per the brief, so
  *  tests can assert the cycle without mounting the component. */
 

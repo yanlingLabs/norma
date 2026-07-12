@@ -16,6 +16,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { cleanup, render } from "ink-testing-library";
 import { App } from "../../src/tui/app";
 import { Pager, pagerLines, pagerViewport, pagerWindowRows, PAGER_FOOTER } from "../../src/tui/pager";
+import { CommittedTranscript, settledCount } from "../../src/tui/transcript";
 import { makeEventBridge } from "../../src/tui/event-bridge";
 import type { Block } from "../../src/tui/state";
 
@@ -193,5 +194,123 @@ describe("<App> ctrl+o pager (alt-screen enter/leave via injected sink)", () => 
     stdin.write("\r");
     await wait();
     expect(client.calls.map((c) => c.method)).toContain("send");
+  });
+
+  test("fix A: a pending card arriving while the pager is open AUTO-CLOSES it (leave escape written, card mounted)", async () => {
+    const { stdin, lastFrame, sink, bridge } = renderApp();
+    await wait();
+    stdin.write("\x0f"); // ctrl+o -> open
+    await wait();
+    expect(lastFrame() ?? "").toContain(PAGER_FOOTER);
+
+    // An approval card lands mid-pager. Without the auto-close this soft-locks: the App useInput is
+    // inactive (isActive: !pending) and <PendingCards> only mounts on the non-pager branch.
+    bridge.push(ev({ type: "approval_requested", callId: "c1", toolName: "bash", summary: "rm -rf /tmp/x" }));
+    await wait();
+
+    expect(sink).toEqual([ENTER_ALT, LEAVE_ALT]); // auto-closed: escapes in order, terminal restored
+    const frame = lastFrame() ?? "";
+    expect(frame).not.toContain(PAGER_FOOTER); // pager gone
+    expect(frame).toContain("approve bash?"); // card mounted, visible, owning input
+  });
+});
+
+const count = (haystack: string, needle: string) => haystack.split(needle).length - 1;
+
+describe("Static freeze-cap across the alt-screen excursion (fix B)", () => {
+  function renderApp() {
+    const sink: string[] = [];
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const r = render(
+      <App
+        client={client}
+        bridge={bridge}
+        sessionId="s"
+        cwd="/tmp"
+        initialPolicy="ask"
+        version="0.0.1"
+        model="m"
+        write={(s) => sink.push(s)}
+      />,
+    );
+    return { ...r, sink, client, bridge };
+  }
+
+  test("a block committed while the pager is open is held out of Static (appears ONCE, in the pager), then flushes exactly once after close", async () => {
+    const { stdin, lastFrame, bridge } = renderApp();
+    await wait();
+    bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: "BEFORE-OPEN-LINE" }));
+    await wait();
+
+    stdin.write("\x0f"); // open pager
+    await wait();
+    bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: "WHILE-OPEN-MARKER" }));
+    await wait();
+
+    // Debug-mode lastFrame = fullStaticOutput + dynamic output. Frozen Static must NOT have flushed
+    // the new block (it would land in the alt buffer and be discarded on close) — so the marker
+    // appears exactly ONCE: in the pager view. Twice would mean Static leaked it.
+    let frame = lastFrame() ?? "";
+    expect(frame).toContain(PAGER_FOOTER);
+    expect(count(frame, "WHILE-OPEN-MARKER")).toBe(1);
+
+    stdin.write("\x0f"); // close -> cap lifts in the same update, held items flush to Static
+    await wait();
+    frame = lastFrame() ?? "";
+    expect(frame).not.toContain(PAGER_FOOTER);
+    expect(count(frame, "WHILE-OPEN-MARKER")).toBe(1); // flushed exactly once — no loss, no duplication
+    expect(count(frame, "BEFORE-OPEN-LINE")).toBe(1); // pre-open content untouched
+  });
+
+  test("fix A auto-close also lifts the cap: a block committed mid-pager flushes once after the card takeover", async () => {
+    const { stdin, lastFrame, bridge } = renderApp();
+    await wait();
+    stdin.write("\x0f"); // open
+    await wait();
+    bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: "MID-PAGER-NOTE" }));
+    await wait();
+    bridge.push(ev({ type: "approval_requested", callId: "c9", toolName: "bash", summary: "x" })); // auto-close
+    await wait();
+
+    const frame = lastFrame() ?? "";
+    expect(frame).not.toContain(PAGER_FOOTER);
+    expect(frame).toContain("approve bash?");
+    expect(count(frame, "MID-PAGER-NOTE")).toBe(1); // held block flushed exactly once on the auto-close
+  });
+});
+
+describe("settledCount + CommittedTranscript staticCap (freeze-cap units, fix B)", () => {
+  const note = (text: string): Block => ({ kind: "note", text });
+  const read: Block = { kind: "tool", name: "read", argsJson: "{}", output: "x" };
+
+  test("settledCount excludes a trailing open collapsible run and only ever grows as blocks append", () => {
+    expect(settledCount([])).toBe(0);
+    expect(settledCount([note("a")])).toBe(1);
+    expect(settledCount([note("a"), read])).toBe(1); // trailing open run held back from Static
+    expect(settledCount([note("a"), read, note("b")])).toBe(3); // note closes the run: collapsed + note
+    // monotonic: appending blocks never lowers the settled count (the never-shrink invariant's source)
+    const seq: Block[] = [note("a"), read, read, note("b"), read];
+    let prev = 0;
+    for (let i = 0; i <= seq.length; i++) {
+      const n = settledCount(seq.slice(0, i));
+      expect(n).toBeGreaterThanOrEqual(prev);
+      prev = n;
+    }
+  });
+
+  test("staticCap holds later-settled items out of Static; lifting the cap flushes them (never re-emits the capped prefix)", async () => {
+    const items: Block[] = [note("CAP-KEEP"), note("CAP-HELD")];
+    const { lastFrame, rerender } = render(<CommittedTranscript items={items} staticCap={1} />);
+    await wait();
+    let frame = lastFrame() ?? "";
+    expect(frame).toContain("CAP-KEEP");
+    expect(frame).not.toContain("CAP-HELD"); // beyond the cap — held back
+
+    rerender(<CommittedTranscript items={items} staticCap={null} />);
+    await wait();
+    frame = lastFrame() ?? "";
+    expect(count(frame, "CAP-KEEP")).toBe(1); // prefix not re-emitted
+    expect(count(frame, "CAP-HELD")).toBe(1); // held item flushed exactly once
   });
 });

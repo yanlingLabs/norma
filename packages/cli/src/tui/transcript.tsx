@@ -186,7 +186,18 @@ function DisplayEntry({ item, highlight }: { item: DisplayItem; highlight?: High
  *  Static's items array instead, past which the flush pointer never returns. */
 type StaticItem = { kind: "header"; node: React.ReactNode } | DisplayItem;
 
-export function CommittedTranscript({ items, header, highlight }: { items: Block[]; header?: React.ReactNode; highlight?: Highlighter }) {
+/** Static-safe settled DisplayItem count for `items` — the freeze-cap unit (Task 7 fix B): the App
+ *  captures this at pager-open and passes it back as `staticCap` so Static appends are held back
+ *  while the alternate screen buffer is active. Monotonic: appending blocks can only close the open
+ *  tail run (moving it into the settled prefix) or extend/append — the settled count never
+ *  decreases, which is what makes a captured cap safe (`cap <= current settled length` forever). */
+export function settledCount(items: Block[]): number {
+  const displayItems = groupBlocks(items);
+  const tailIsOpenRun = displayItems.length > 0 && displayItems[displayItems.length - 1]!.kind === "collapsed";
+  return tailIsOpenRun ? displayItems.length - 1 : displayItems.length;
+}
+
+export function CommittedTranscript({ items, header, highlight, staticCap }: { items: Block[]; header?: React.ReactNode; highlight?: Highlighter; staticCap?: number | null }) {
   // Ink's <Static> (build/components/Static.js) paints whatever it renders on a pass PERMANENTLY —
   // later renders only ever render the NEW tail past the previous items.length, and never revisit
   // an index it already painted. groupBlocks(items) is NOT safe to feed it directly: a still-open
@@ -204,7 +215,20 @@ export function CommittedTranscript({ items, header, highlight }: { items: Block
   // into the Static-safe prefix on the very next render, where it can never change again.
   const displayItems = groupBlocks(items);
   const tailIsOpenRun = displayItems.length > 0 && displayItems[displayItems.length - 1]!.kind === "collapsed";
-  const settled = tailIsOpenRun ? displayItems.slice(0, -1) : displayItems;
+  const settledAll = tailIsOpenRun ? displayItems.slice(0, -1) : displayItems;
+
+  // Freeze-cap (Task 7 fix B, whole-branch review): while the ctrl+o pager holds the terminal on the
+  // ALTERNATE screen buffer, anything <Static> flushes is written into that buffer — and the
+  // `\x1b[?1049l` on close DISCARDS the alt buffer wholesale, while Static's internal flush index has
+  // still advanced past those items: they would be permanently missing from the normal buffer's
+  // scrollback. The App therefore freezes the Static feed at pager-open (`staticCap` = the settled
+  // count captured then); this slice holds every later-settled item back until the cap lifts (in the
+  // SAME state update as the pager close, after the leave escape is written) — the held items then
+  // flush into the restored normal buffer. NEVER-SHRINK invariant (what keeps Static's index sound):
+  // the cap is captured FROM a past `settledAll.length` and `settledCount` is monotonic, so
+  // `cap <= settledAll.length` always — the array Static sees has constant length while capped and
+  // only ever GROWS when the cap lifts; Math.min is a pure belt-and-braces guard.
+  const settled = staticCap != null ? settledAll.slice(0, Math.min(staticCap, settledAll.length)) : settledAll;
   const openTail = tailIsOpenRun ? displayItems[displayItems.length - 1]! : null;
 
   const staticItems: StaticItem[] = header != null ? [{ kind: "header", node: header }, ...settled] : settled;

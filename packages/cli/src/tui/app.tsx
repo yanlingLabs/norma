@@ -31,7 +31,7 @@ import React, { useEffect, useReducer, useRef, useState } from "react";
 import { Box, Text, useInput } from "ink";
 import { METHODS, type ApprovalPolicy, type SessionEvent } from "@norma/protocol";
 import { initialState, reduce, type TuiState } from "./state";
-import { CommittedTranscript } from "./transcript";
+import { CommittedTranscript, settledCount } from "./transcript";
 import { ActiveTurn } from "./active-turn";
 import { Spinner } from "./spinner";
 import { TaskList } from "./task-list";
@@ -107,9 +107,15 @@ export function App({ client, bridge, sessionId, cwd, initialPolicy, version, mo
 
   // ctrl+o pager state. `pagerRows` is the terminal height captured at OPEN time (fallback 24) — the
   // pager reserves rows off it so its total painted height stays strictly under it (see pager.tsx).
+  // `staticCap` (fix B, whole-branch review) freezes <Static>'s item feed while the pager holds the
+  // alternate screen buffer: items flushed there would be discarded by `\x1b[?1049l` on close while
+  // Static's flush index still advanced — permanently missing from scrollback. Captured at open
+  // (= the settled count Static has already painted), lifted in the SAME state update as every
+  // close path so the held items flush into the restored normal buffer.
   const [pagerOpen, setPagerOpen] = useState(false);
   const [pagerOffset, setPagerOffset] = useState(0);
   const [pagerRows, setPagerRows] = useState(24);
+  const [staticCap, setStaticCap] = useState<number | null>(null);
 
   // Subscribe to the bridge; flush its pre-subscribe (attach-replay) backlog then forward live.
   useEffect(() => bridge.subscribe(dispatch), [bridge]);
@@ -128,6 +134,22 @@ export function App({ client, bridge, sessionId, cwd, initialPolicy, version, mo
     void loadSafeHighlighter().then((hl) => { if (live) setHighlight(() => hl); });
     return () => { live = false; };
   }, []);
+
+  // Fix A (whole-branch review): a pending card arriving while the pager is open would soft-lock the
+  // session — this component's useInput goes inactive (isActive: !pending) and <PendingCards> only
+  // mounts on the non-pager branch, leaving an un-closeable pager over an invisible card (and a
+  // Ctrl+C exit would strand the terminal on the alternate buffer, never writing leaveAltScreen).
+  // Auto-close instead: leave the alt screen and drop the pager + Static freeze-cap in one batched
+  // update; the card then mounts normally with its own input. The leave escape is written
+  // synchronously here and React repaints after the effect, so the escape still precedes the
+  // restored (card-bearing) frame — HARD CONSTRAINT 3's ordering holds on this close path too.
+  // Guarded re-entry: after the first run flips pagerOpen to false, re-runs are no-ops.
+  useEffect(() => {
+    if (!pagerOpen || !state.pending) return;
+    setPagerOpen(false);
+    setStaticCap(null);
+    leaveAltScreen(writeOut);
+  }, [pagerOpen, state.pending, writeOut]);
 
   const onSubmit = (text: string) => { void client.send(sessionId, text); };
   const onSteer = (text: string) => { void client.steer(sessionId, text); };
@@ -163,10 +185,14 @@ export function App({ client, bridge, sessionId, cwd, initialPolicy, version, mo
     enterAltScreen(writeOut);
     setPagerRows(typeof process.stdout.rows === "number" ? process.stdout.rows : 24);
     setPagerOffset(0);
+    // Freeze Static at exactly what it has already painted (this render's settled count — the
+    // useInput closure and Static's flush index both come from the same last commit), fix B.
+    setStaticCap(settledCount(state.committed));
     setPagerOpen(true);
   };
   const closePager = () => {
     setPagerOpen(false);
+    setStaticCap(null); // lift the freeze in the SAME update — held items flush into the restored buffer
     leaveAltScreen(writeOut);
   };
   const scrollPager = (delta: number) => {
@@ -205,6 +231,7 @@ export function App({ client, bridge, sessionId, cwd, initialPolicy, version, mo
         items={state.committed}
         header={<Welcome version={version} model={model} cwd={cwd} />}
         highlight={highlight}
+        staticCap={staticCap}
       />
       {pagerOpen ? (
         <Pager blocks={state.committed} rows={pagerRows} offset={pagerOffset} />
