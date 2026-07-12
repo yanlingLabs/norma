@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { render } from "ink-testing-library";
-import { Composer } from "../../src/tui/composer";
+import { Composer, computeSlashQuery } from "../../src/tui/composer";
 import { appendHistory } from "../../src/tui/history-store";
 
 // useInput wires its stdin listener inside a React effect, which runs on the next tick after
@@ -629,5 +629,407 @@ describe("Composer", () => {
 
     expect(scrolls).toBe(0);
     expect(submitted).toEqual(["abcd"]); // both edits landed at the cursor edges — ops still work
+  });
+});
+
+describe("computeSlashQuery (pure predicate)", () => {
+  test("non-slash text -> null", () => {
+    expect(computeSlashQuery({ text: "hello", cursor: 3 })).toBeNull();
+    expect(computeSlashQuery({ text: "", cursor: 0 })).toBeNull();
+  });
+
+  test("cursor within the first token -> the in-progress query", () => {
+    expect(computeSlashQuery({ text: "/mo", cursor: 3 })).toBe("mo");
+    expect(computeSlashQuery({ text: "/mo", cursor: 1 })).toBe("");
+  });
+
+  test("a space after the command closes it once the cursor is past it", () => {
+    // "/mo foo": '/'=0 'm'=1 'o'=2 ' '=3 'f'=4 ... — the space itself is at index 3.
+    expect(computeSlashQuery({ text: "/mo foo", cursor: 3 })).toBe("mo"); // right before the space: still open
+    expect(computeSlashQuery({ text: "/mo foo", cursor: 4 })).toBeNull(); // past the space: closed
+  });
+
+  test("cursor before the leading slash -> null", () => {
+    expect(computeSlashQuery({ text: "/mo", cursor: 0 })).toBeNull();
+  });
+});
+
+describe("Composer — slash-command completion menu (Phase 3d T2)", () => {
+  test("(q) '/' opens the menu showing the registry; plain text never opens it", async () => {
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+      />,
+    );
+    await wait();
+    stdin.write("hello");
+    await wait();
+    expect(stripAnsi(lastFrame() ?? "")).not.toContain("/help —");
+
+    stdin.write("/");
+    await wait();
+    // "hello/" isn't slash mode either — the "/" landed mid/after plain text, not at the start.
+    expect(stripAnsi(lastFrame() ?? "")).not.toContain("/help —");
+
+    const { stdin: stdin2, lastFrame: lastFrame2 } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+      />,
+    );
+    await wait();
+    stdin2.write("/"); // a bare "/" at the very start of an empty buffer -> opens the menu
+    await wait();
+
+    const frame = stripAnsi(lastFrame2() ?? "");
+    expect(frame).toContain("/help —");
+    expect(frame).toContain("/compact —");
+  });
+
+  test("(r) the menu filters live as text changes", async () => {
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+      />,
+    );
+    await wait();
+    stdin.write("/mo");
+    await wait();
+
+    const frame = stripAnsi(lastFrame() ?? "");
+    expect(frame).toContain("/model ");
+    expect(frame).not.toContain("/compact —");
+    expect(frame).not.toContain("/status —");
+  });
+
+  test("(s) ↑/↓ move the bounded selection while the menu is open, never recalling history", async () => {
+    const path = historyPath();
+    appendHistory(path, { display: "unrelated history entry", ts: 1, sessionId: "s1" });
+
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={path}
+        sessionId="s1"
+      />,
+    );
+    await wait();
+    stdin.write("/s"); // matches exactly status, sessions, skills (in that registry order)
+    await wait();
+
+    let frame = stripAnsi(lastFrame() ?? "");
+    expect(frame).toContain("/s"); // buffer unaffected by history so far
+    let lines = frame.split("\n");
+    let statusLine = lines.find((l) => l.includes("/status"))!;
+    let sessionsLine = lines.find((l) => l.includes("/sessions"))!;
+    expect((lastFrame() ?? "").split("\n")[lines.indexOf(statusLine)]).toContain("\x1b[7m"); // status selected first
+
+    stdin.write("\x1b[B"); // down -> sessions
+    await wait();
+    frame = stripAnsi(lastFrame() ?? "");
+    lines = frame.split("\n");
+    statusLine = lines.find((l) => l.includes("/status"))!;
+    sessionsLine = lines.find((l) => l.includes("/sessions"))!;
+    expect((lastFrame() ?? "").split("\n")[lines.indexOf(sessionsLine)]).toContain("\x1b[7m");
+    expect((lastFrame() ?? "").split("\n")[lines.indexOf(statusLine)]).not.toContain("\x1b[7m");
+
+    stdin.write("\x1b[B"); // down -> skills
+    await wait();
+    stdin.write("\x1b[B"); // down again -> bounded, stays on skills (only 3 matches)
+    await wait();
+    let skillsLineIdx = stripAnsi(lastFrame() ?? "").split("\n").findIndex((l) => l.includes("/skills"));
+    expect((lastFrame() ?? "").split("\n")[skillsLineIdx]).toContain("\x1b[7m");
+
+    stdin.write("\x1b[A"); // up -> back to sessions — never touched history (buffer still "/s")
+    await wait();
+    expect(stripAnsi(lastFrame() ?? "")).toContain("/s");
+  });
+
+  test("(t) Tab completes the selected command, adding a trailing space when it takes args", async () => {
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+      />,
+    );
+    await wait();
+    stdin.write("/mo"); // uniquely matches "model", which takes args
+    await wait();
+    stdin.write("\t");
+    await wait();
+
+    const frame = stripAnsi(lastFrame() ?? "");
+    expect(frame).toContain("❯ /model "); // trailing space added, cursor at the end
+    // With a trailing space the cursor is now past the first token -> menu closes.
+    expect(frame).not.toContain("Show or switch the active model/effort");
+  });
+
+  test("(t2) Tab-completing a no-arg command leaves the menu OPEN (cursor still inside the token)", async () => {
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+      />,
+    );
+    await wait();
+    stdin.write("/comp"); // uniquely matches "compact", which takes no args
+    await wait();
+    stdin.write("\t");
+    await wait();
+
+    const frame = stripAnsi(lastFrame() ?? "");
+    expect(frame).toContain("❯ /compact"); // no trailing space
+    expect(frame).toContain("/compact —"); // menu still open, now showing just the exact match
+  });
+
+  test("(u) Enter runs a fully-typed known command (/compact) — never onSubmit/onSteer", async () => {
+    const ran: string[] = [];
+    const submitted: string[] = [];
+    const { stdin } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={(t) => submitted.push(t)}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        onRunCommand={(t) => ran.push(t)}
+      />,
+    );
+    await wait();
+    stdin.write("/compact");
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    expect(ran).toEqual(["/compact"]);
+    expect(submitted).toEqual([]);
+  });
+
+  test("(v) Enter on a '/partial' matching the selected item completes it instead of running", async () => {
+    const ran: string[] = [];
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        onRunCommand={(t) => ran.push(t)}
+      />,
+    );
+    await wait();
+    stdin.write("/comp"); // uniquely matches "compact"
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    expect(ran).toEqual([]); // completed, not run
+    expect(stripAnsi(lastFrame() ?? "")).toContain("❯ /compact");
+  });
+
+  test("(w) Enter on an unknown slash command with no matches runs it anyway (produces the note downstream)", async () => {
+    const ran: string[] = [];
+    const { stdin } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        onRunCommand={(t) => ran.push(t)}
+      />,
+    );
+    await wait();
+    stdin.write("/zzznotacommand");
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    expect(ran).toEqual(["/zzznotacommand"]);
+  });
+
+  test("(x) Esc closes the menu WITHOUT clearing the text and without arming the double-esc hint", async () => {
+    const hints: string[] = [];
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={1000}
+        historyPath={historyPath()}
+        onHint={(h) => hints.push(h)}
+      />,
+    );
+    await wait();
+    stdin.write("/mo");
+    await wait();
+    expect(stripAnsi(lastFrame() ?? "")).toContain("Show or switch the active model/effort");
+
+    stdin.write("\x1b"); // esc — closes the menu ONLY
+    await wait();
+
+    expect(hints).toEqual([]); // no double-esc bookkeeping armed
+    const frame = stripAnsi(lastFrame() ?? "");
+    expect(frame).toContain("/mo"); // text untouched
+    expect(frame).not.toContain("Show or switch the active model/effort"); // menu gone
+  });
+
+  test("(y) after an Esc-close, a SECOND Esc is a fresh first press (hints, does not clear) — double-esc requires the menu closed", async () => {
+    const hints: string[] = [];
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={1000}
+        historyPath={historyPath()}
+        onHint={(h) => hints.push(h)}
+      />,
+    );
+    await wait();
+    stdin.write("/mo");
+    await wait();
+    stdin.write("\x1b"); // 1st esc — closes the menu only
+    await wait();
+    stdin.write("\x1b"); // 2nd esc — menu already closed: a FRESH first press of double-esc-clear
+    await wait();
+
+    expect(hints).toEqual(["Esc again to clear"]);
+    expect(stripAnsi(lastFrame() ?? "")).toContain("/mo"); // not cleared
+  });
+
+  test("(z) history ↑ is inert while the menu is open, and works again once it's closed", async () => {
+    const path = historyPath();
+    appendHistory(path, { display: "recall me", ts: 1, sessionId: "s1" });
+
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={path}
+        sessionId="s1"
+      />,
+    );
+    await wait();
+    stdin.write("/mo");
+    await wait();
+    stdin.write("\x1b[A"); // up while the menu is open -> selection move, NOT history recall
+    await wait();
+    expect(stripAnsi(lastFrame() ?? "")).toContain("/mo"); // buffer unchanged by history
+
+    stdin.write("\x1b"); // close the menu
+    await wait();
+    stdin.write("\x1b[A"); // up now that the menu is closed -> history recall works
+    await wait();
+
+    expect(stripAnsi(lastFrame() ?? "")).toContain("recall me");
+  });
+
+  test("(aa) onMenuRowsChange mirrors the visible row count: 0 on mount, min(6,count) while open, 0 once closed", async () => {
+    const seen: number[] = [];
+    const { stdin } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        onMenuRowsChange={(n) => seen.push(n)}
+      />,
+    );
+    await wait();
+    expect(seen.at(0)).toBe(0); // mount, no slash mode
+
+    stdin.write("/s"); // matches exactly 3 (status, sessions, skills)
+    await wait();
+    expect(seen.at(-1)).toBe(3);
+
+    stdin.write("\x1b"); // esc-dismiss — no InputState change, but the row count must still drop
+    await wait();
+    expect(seen.at(-1)).toBe(0);
+  });
+
+  test("(ab) a space after the command closes the menu even without pressing Esc", async () => {
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+      />,
+    );
+    await wait();
+    stdin.write("/mo");
+    await wait();
+    expect(stripAnsi(lastFrame() ?? "")).toContain("Show or switch the active model/effort");
+
+    stdin.write(" extra");
+    await wait();
+    expect(stripAnsi(lastFrame() ?? "")).not.toContain("Show or switch the active model/effort");
   });
 });

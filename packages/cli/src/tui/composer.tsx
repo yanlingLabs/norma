@@ -59,6 +59,8 @@ import {
   type InputState,
 } from "./input-model";
 import { appendHistory, loadHistory, makeHistoryNav } from "./history-store";
+import { COMMANDS, filterCommands, parseSlashInput } from "./commands";
+import { CompletionMenu } from "./completion-menu";
 
 // The composer never has footer keyboard focus (that's a later task) — this is the one constant
 // FooterSelection it ever passes to footerKeyAction, selecting the "no footer focus" branch of its
@@ -82,6 +84,22 @@ const ansi = new Chalk({ level: 3 });
 
 function defaultHistoryPath(): string {
   return join(homedir(), ".norma", "history.jsonl");
+}
+
+/** Phase 3d T2 — pure predicate: is the `/`-slash-command menu open for this `InputState`, and if
+ *  so what's the in-progress query? Slash mode is active exactly when the text starts with "/" AND
+ *  the cursor sits inside the first whitespace-delimited token — so typing a space, or moving the
+ *  cursor past it, closes the menu automatically with NO separate flag to keep in sync (the "open"
+ *  state is entirely a function of `state`). `null` means "not in slash mode". Exported (not baked
+ *  into the component) so T3's analogous "@"-file predicate can share this shape, and so it's
+ *  independently testable. */
+export function computeSlashQuery(state: InputState): string | null {
+  const { text, cursor } = state;
+  if (!text.startsWith("/")) return null;
+  const firstWs = text.search(/\s/);
+  const tokenEnd = firstWs === -1 ? text.length : firstWs;
+  if (cursor < 1 || cursor > tokenEnd) return null;
+  return text.slice(1, cursor);
 }
 
 export interface ComposerProps {
@@ -119,6 +137,23 @@ export interface ComposerProps {
    *  (harmless no-ops on empty text). */
   onScrollTop?: () => void;
   onScrollBottom?: () => void;
+  /** Phase 3d T2: the composer's Enter handler consults `parseSlashInput`/`COMMANDS` FIRST — a
+   *  buffer that parses as a slash command NEVER reaches `onSubmit`/`onSteer` (it never goes to the
+   *  model). App wires this to `runCommand(ctx, text)` (fire-and-forget; the runner's own note
+   *  lands in the transcript asynchronously via `CommandCtx.appendNote`). Optional so legacy call
+   *  sites without command support are unaffected (a slash-shaped buffer with no `onRunCommand`
+   *  wired still clears/is "handled" — it just runs nothing). */
+  onRunCommand?: (text: string) => void;
+  /** Phase 3d T2: fires on mount and every time the completion menu's VISIBLE row count changes —
+   *  `min(6, filteredCount)` while open, `0` while closed — mirroring the same "push derived UI
+   *  state up to the parent" convention `onStateChange` (T5) already uses. App.tsx needs this
+   *  (rather than deriving it from the mirrored `InputState` alone) because Esc-dismissing the menu
+   *  closes it WITHOUT changing `text`/`cursor` — a state.ts fact App can't observe any other way. */
+  onMenuRowsChange?: (n: number) => void;
+  /** Terminal width — feeds the completion menu's hard JS truncation (`completion-menu.tsx`'s file
+   *  doc: never Yoga-wrap, so `bottomBarRows`' per-row budget stays exact). Defaults to 80, the same
+   *  fallback `app.tsx`'s own `readCols` uses. */
+  columns?: number;
 }
 
 export function Composer({
@@ -136,6 +171,9 @@ export function Composer({
   onStateChange,
   onScrollTop,
   onScrollBottom,
+  onRunCommand,
+  onMenuRowsChange,
+  columns = 80,
 }: ComposerProps) {
   // `policy` stays a prop (callers/tests still pass it; `<Footer>`, a sibling, is the one that
   // renders it) — this component no longer renders it directly, matching `task-list.tsx`'s
@@ -153,6 +191,53 @@ export function Composer({
   // effect, since there's no cleanup and no need to re-run on every render.
   const [historyEntries] = useState(() => loadHistory(effectiveHistoryPath, sessionId));
   const historyNav = useMemo(() => makeHistoryNav(historyEntries), [historyEntries]);
+
+  // ---- Phase 3d T2: slash-command completion menu state ---------------------------------------
+  // `rawQuery` is a PURE function of `state` (see `computeSlashQuery`'s doc) — the menu's "open"
+  // condition needs no separate flag to track in the common case. Esc, though, must be able to
+  // dismiss the menu WITHOUT touching `text`/`cursor` (so text editing keeps working normally while
+  // it stays shut) — `dismissedQuery` records exactly which query string was last Esc-dismissed;
+  // the moment `rawQuery` changes to anything else (a new keystroke), the "adjusting state during
+  // render" block below clears it, reopening the menu automatically.
+  const rawQuery = useMemo(() => computeSlashQuery(state), [state.text, state.cursor]);
+  const [dismissedQuery, setDismissedQuery] = useState<string | null>(null);
+  const [selected, setSelected] = useState(0);
+  const lastRawQueryRef = useRef<string | null>(null);
+  if (rawQuery !== lastRawQueryRef.current) {
+    // React's sanctioned "adjust state during render when a derived value changes" pattern (guarded
+    // so it only ever fires once per actual change, never loops): resets BOTH the Esc-dismissal and
+    // the selection the instant the underlying query changes, so the very next keystroke/keypress
+    // already sees the corrected value — no extra render tick, unlike an effect.
+    lastRawQueryRef.current = rawQuery;
+    if (dismissedQuery !== null) setDismissedQuery(null);
+    if (selected !== 0) setSelected(0);
+  }
+  const filtered = useMemo(() => (rawQuery !== null ? filterCommands(rawQuery) : []), [rawQuery]);
+  const slashOpen = rawQuery !== null && dismissedQuery !== rawQuery;
+  const boundedSelected = filtered.length > 0 ? Math.min(selected, filtered.length - 1) : 0;
+  const menuItems = useMemo(
+    () => filtered.map((c) => ({ label: `/${c.name}${c.args ? ` ${c.args}` : ""}`, hint: c.description })),
+    [filtered],
+  );
+
+  // Mirrors the menu's visible row count up to the parent (see the `onMenuRowsChange` prop doc) —
+  // fires on mount too (same "T5" convention as the `onStateChange` effect above), including the
+  // Esc-dismissed transition (which changes no `InputState` field app.tsx could otherwise observe).
+  useEffect(() => {
+    onMenuRowsChange?.(slashOpen ? Math.min(6, filtered.length) : 0);
+  }, [slashOpen, filtered.length, onMenuRowsChange]);
+
+  // Tab AND the "enter completes a partial" case share this: fill the buffer with the selected
+  // command's full name (`/name args` gets a trailing space so the cursor lands ready to type an
+  // arg; a no-arg command doesn't — the cursor sitting right after the name with no space keeps the
+  // menu OPEN, since `computeSlashQuery` still sees the cursor inside the first token). A no-op
+  // when there's nothing filtered to complete to.
+  function completeSelected(): void {
+    const cmd = filtered[boundedSelected];
+    if (!cmd) return;
+    const newText = `/${cmd.name}${cmd.args ? " " : ""}`;
+    setState({ text: newText, cursor: newText.length });
+  }
 
   // Whole-branch review item 2: the raw side-channel handler below runs from a closure created when
   // its effect last wired (its deps deliberately exclude `state`), so it reads text-emptiness at
@@ -206,6 +291,39 @@ export function Composer({
         return;
       }
 
+      // ---- Phase 3d T2: slash-menu key gating — the SINGLE actor for ↑/↓/tab/esc while the menu
+      // is open (history nav below, and the esc/double-esc state machine that follows, never also
+      // see these same keystrokes while `slashOpen` — the binding "one actor per key" rule). Enter
+      // deliberately falls through to the unified handler further down: it needs the exact same
+      // known-command/partial-match decision whether or not the menu happens to still be open.
+      if (slashOpen) {
+        if (k === "esc") {
+          // "esc closes the menu ONLY" — no double-esc bookkeeping (`lastEscMs`/`onHint`) runs at
+          // all, and this wins even over precedence #1 (running-interrupt) below: while the menu is
+          // open it owns Esc completely.
+          setDismissedQuery(rawQuery);
+          return;
+        }
+        if (k === "up") {
+          setSelected((sel) => {
+            const bounded = filtered.length > 0 ? Math.min(sel, filtered.length - 1) : 0;
+            return Math.max(0, bounded - 1);
+          });
+          return;
+        }
+        if (k === "down") {
+          setSelected((sel) => {
+            const bounded = filtered.length > 0 ? Math.min(sel, filtered.length - 1) : 0;
+            return filtered.length > 0 ? Math.min(filtered.length - 1, bounded + 1) : 0;
+          });
+          return;
+        }
+        if (key.tab && !key.shift) {
+          completeSelected();
+          return;
+        }
+      }
+
       if (k === "esc") {
         // Precedence #1 (UNCHANGED from 3a/3b): a running turn always interrupts on Esc, no matter
         // what's in the buffer.
@@ -229,8 +347,29 @@ export function Composer({
       }
 
       if (k === "enter") {
-        if (state.text.length === 0) return; // never submit/steer an empty buffer
+        if (state.text.length === 0) return; // never submit/steer/run an empty buffer
         const text = state.text;
+        // Phase 3d T2: the slash-command check runs FIRST — a buffer that parses as a slash
+        // command never reaches onSubmit/onSteer (it never goes to the model).
+        const parsed = parseSlashInput(text);
+        if (parsed !== null) {
+          const isKnown = COMMANDS.some((c) => c.name === parsed.cmd);
+          if (!isKnown && slashOpen && filtered.length > 0) {
+            // A "/partial" matching the currently-selected menu item -> complete it (exactly like
+            // Tab), never run.
+            completeSelected();
+            return;
+          }
+          // A known command (with or without args), OR an unknown command with the menu already
+          // closed (cursor past the first token) -> run it. `runCommand` (commands.ts, called by
+          // App's onRunCommand) is what actually tells known from unknown and produces the
+          // "Unknown command" note — this composer only decides WHETHER to run vs. complete.
+          onRunCommand?.(text);
+          appendHistory(effectiveHistoryPath, { display: text, ts: nowMs, sessionId });
+          setState({ text: "", cursor: 0 });
+          setLastEscMs(null);
+          return;
+        }
         if (running) onSteer(text);
         else onSubmit(text);
         appendHistory(effectiveHistoryPath, { display: text, ts: nowMs, sessionId });
@@ -268,32 +407,38 @@ export function Composer({
   const { before, at, after } = renderWithCursor(state);
 
   return (
-    <Box
-      borderStyle="round"
-      borderTop
-      borderBottom
-      borderLeft={false}
-      borderRight={false}
-      borderColor={theme.promptBorder}
-      width="100%"
-    >
-      {/* ONE root <Text> with exactly ONE nested <Text> (the inverse cursor) — not two sibling
-       *  Text nodes (the 3a/3b shape: a separate dimColor prompt Text next to a separate buffer
-       *  Text). Ink v5.2.1's Yoga-backed layout mismeasures a bordered, width:100% Box's row on
-       *  the FIRST render where MORE THAN ONE Text descendant has independent style/content
-       *  (reproduced in isolation: 2 sibling Texts, or 1 root + 2 nested children, both glitch —
-       *  garbled/truncated text, sometimes bleeding into the border row; 1 root + 1 nested child
-       *  never does). To keep the reference behavior — ONLY the "❯ " glyph dims while a turn runs,
-       *  never the user's typed text — the glyph's dim is baked into the root STRING as raw ANSI
-       *  codes (`ansi.dim`, the module-level Chalk instance) instead of a styled <Text> child that
-       *  would re-trigger the bug. Ink measures text width ANSI-aware (string-width), so the baked
-       *  codes don't skew layout; verified clean on the bug's trigger case (first content frame
-       *  after empty) in composer.test.tsx (n). */}
-      <Text>
-        {`${running ? ansi.dim("❯ ") : "❯ "}${before}`}
-        <Text inverse>{at || " "}</Text>
-        {after}
-      </Text>
-    </Box>
+    <>
+      {/* Phase 3d T2: the completion menu renders ABOVE the open-rule box, never inside it — it's
+       *  no part of the bordered composer's own single-root-Text layout (see the render note
+       *  below), just a sibling that appears/disappears above it. */}
+      {slashOpen ? <CompletionMenu items={menuItems} selected={boundedSelected} columns={columns} /> : null}
+      <Box
+        borderStyle="round"
+        borderTop
+        borderBottom
+        borderLeft={false}
+        borderRight={false}
+        borderColor={theme.promptBorder}
+        width="100%"
+      >
+        {/* ONE root <Text> with exactly ONE nested <Text> (the inverse cursor) — not two sibling
+         *  Text nodes (the 3a/3b shape: a separate dimColor prompt Text next to a separate buffer
+         *  Text). Ink v5.2.1's Yoga-backed layout mismeasures a bordered, width:100% Box's row on
+         *  the FIRST render where MORE THAN ONE Text descendant has independent style/content
+         *  (reproduced in isolation: 2 sibling Texts, or 1 root + 2 nested children, both glitch —
+         *  garbled/truncated text, sometimes bleeding into the border row; 1 root + 1 nested child
+         *  never does). To keep the reference behavior — ONLY the "❯ " glyph dims while a turn runs,
+         *  never the user's typed text — the glyph's dim is baked into the root STRING as raw ANSI
+         *  codes (`ansi.dim`, the module-level Chalk instance) instead of a styled <Text> child that
+         *  would re-trigger the bug. Ink measures text width ANSI-aware (string-width), so the baked
+         *  codes don't skew layout; verified clean on the bug's trigger case (first content frame
+         *  after empty) in composer.test.tsx (n). */}
+        <Text>
+          {`${running ? ansi.dim("❯ ") : "❯ "}${before}`}
+          <Text inverse>{at || " "}</Text>
+          {after}
+        </Text>
+      </Box>
+    </>
   );
 }

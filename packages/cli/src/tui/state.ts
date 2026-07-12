@@ -40,6 +40,15 @@ export type Block =
   | { kind: "turn-summary"; durationMs: number; inTokens: number; outTokens: number } // main turn_completed, stopReason !== "aborted"
   | { kind: "interrupted" }; // main turn_completed, stopReason === "aborted"
 
+/** Phase 3d Task 2 — `"local_note"` is an App-INTERNAL synthetic event, never a real wire
+ *  `SessionEvent` (protocol/events.ts has no such variant, and never will — see app.tsx's
+ *  `AppEvent` union). It exists purely so the in-chat slash-command runners (commands.ts's
+ *  `CommandCtx.appendNote`) have a way to commit a note block through the SAME reducer/dispatch
+ *  path every other transcript line goes through, instead of a separate ad-hoc "local blocks" list
+ *  that the transcript/flatten-cache would need to know about too. Pure additive case — reduce's
+ *  handling of every real wire event type is completely unaffected. */
+export type LocalEvent = { type: "local_note"; text: string };
+
 /** `AgentRow` IS `CliSubagent`-shaped (the brief's interface matches it field-for-field) — reuse the
  *  type directly rather than re-declaring an equivalent interface that could drift out of lockstep. */
 export type AgentRow = CliSubagent;
@@ -278,6 +287,10 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
       const text = `agent error: ${str(e.message)}`;
       return { ...s, committed: [...s.committed, { kind: "note", text }] };
     }
+
+    case "local_note":
+      // See the `LocalEvent` doc comment above — App-internal only, never a real wire event.
+      return { ...s, committed: [...s.committed, { kind: "note", text: str(e.text) }] };
 
     default:
       return s; // unknown/unhandled event types are no-ops (both CLI/app already skip unknowns)

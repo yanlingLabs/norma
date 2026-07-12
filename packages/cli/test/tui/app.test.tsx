@@ -531,6 +531,65 @@ describe("App — resume replay (Phase 3c Task 5)", () => {
   });
 });
 
+describe("App — slash-command wiring (Phase 3d T2: onRunCommand + local_note)", () => {
+  test("(v1) '/help' typed into the composer runs through the registry and commits its note — never client.send", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("/help");
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("/compact — Compact conversation history to a summary"); // helpText() content
+    expect(frame).toContain("Keys:"); // the keybinding line
+    expect(frame).toContain(COMPOSER_CURSOR); // composer back to idle, buffer cleared
+    expect(client.calls).toEqual([]); // never reached the model
+  });
+
+  test("(v2) an unknown slash command commits the 'Unknown command' note", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("/nope");
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    expect(lastFrame() ?? "").toContain("Unknown command: /nope — /help lists commands");
+    expect(client.calls).toEqual([]);
+  });
+
+  test("(v3) a command that DOES need the client (/compact) round-trips through CommandCtx.client", async () => {
+    const bridge = makeEventBridge();
+    const client = { ...fakeClient(), compact: async () => ({ compacted: true, uptoSeq: 5, summaryChars: 42 }) };
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("/compact");
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    expect(lastFrame() ?? "").toContain("compacted (through seq 5, 42 char summary)");
+  });
+
+  test("(v4) the completion menu renders inside the full App tree while typing '/', and the composer stays present", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("/mo");
+    await wait();
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("Show or switch the active model/effort"); // /model row visible
+    expect(frame).toContain(COMPOSER_CURSOR); // composer (with its "/mo" buffer) still rendered below it
+  });
+});
+
 describe("bottomBarRows (pinned-bar line-count model)", () => {
   const task = (subject: string, status: TaskRow["status"]): TaskRow => ({ id: subject, subject, status });
   const agent = (threadId: string): AgentRow => ({
@@ -545,7 +604,7 @@ describe("bottomBarRows (pinned-bar line-count model)", () => {
   type Base = Parameters<typeof bottomBarRows>[0];
   const base = (overrides: Partial<Base>): Base => ({
     tasksVisible: true, tasks: [], agents: [], running: false, pending: null, activeTurnRows: 0,
-    columns: 80, composerText: "", composerCursor: 0, resuming: false,
+    columns: 80, composerText: "", composerCursor: 0, resuming: false, menuRows: 0,
     ...overrides,
   });
 
@@ -607,6 +666,20 @@ describe("bottomBarRows (pinned-bar line-count model)", () => {
         pending: { kind: "approval", callId: "c", toolName: "bash", summary: "x" },
       }));
       expect(rows).toBe(1 + 1); // approval card (1) + footer (1) — the composer's wrap math never runs
+    });
+  });
+
+  describe("completion menu row count (Phase 3d T2)", () => {
+    test("menuRows adds directly to the bar when the composer is showing", () => {
+      expect(bottomBarRows(base({ menuRows: 3 }))).toBe(4 + 3); // composer(3) + footer(1) + menu(3)
+    });
+
+    test("menuRows is ignored while a pending card owns the bottom bar", () => {
+      const rows = bottomBarRows(base({
+        menuRows: 6,
+        pending: { kind: "approval", callId: "c", toolName: "bash", summary: "x" },
+      }));
+      expect(rows).toBe(1 + 1); // approval card (1) + footer (1) — menuRows never added
     });
   });
 });
