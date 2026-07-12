@@ -42,13 +42,17 @@ struct PeripheralCallRequest: Equatable {
 }
 
 /// What the provider should do with an incoming capability call, decided without touching the
-/// network. `.serve` means "the lease checks out AND this v1 provider actually implements the
-/// class" (only `noop` in 2f — screenshot/ax-read/input-drive are Phase 5g). `.deny(code)` carries
-/// a short typed-error code string sent back verbatim as `peripheral.respond`'s `error` field.
+/// network. `.serve` means "the lease checks out AND this provider implements the class"
+/// (Phase 5 CU: `noop` + `screenshot` + `ax-read` + `input-drive`). `.deny(code)` carries a short
+/// typed-error code string sent back verbatim as `peripheral.respond`'s `error` field.
 enum PeripheralServeDecision: Equatable {
     case serve
     case deny(String)
 }
+
+/// Capability classes this provider actually implements (Phase 5 CU widened this from just `noop`).
+/// A lease for a class outside this set is denied `unsupported_class` at call time.
+let cuSupportedClasses: Set<String> = ["noop", "screenshot", "ax-read", "input-drive"]
 
 /// sha256 hex digest of `token`, lowercase — matches `hashToken()` in
 /// `packages/core/src/peripheral/broker.ts` (`createHash("sha256").update(token).digest("hex")`)
@@ -80,7 +84,7 @@ func shouldServe(_ call: PeripheralCallRequest, leases: [PeripheralLeaseInfo], n
     guard nowMs < lease.expiresAt else {
         return .deny("expired")
     }
-    guard call.class == "noop" else {
+    guard cuSupportedClasses.contains(call.class) else {
         return .deny("unsupported_class")
     }
     return .serve
@@ -104,6 +108,9 @@ final class PeripheralProvider: ObservableObject {
     @Published private(set) var activeLeases: [PeripheralLeaseInfo] = []
 
     private let client: NormaClient
+    /// The computer-use capability implementation (Phase 5 CU) — the LIVE one in production, a fake
+    /// in tests (the seam that keeps the provider's dispatch unit-testable without TCC).
+    private let capabilities: ComputerCapabilities
 
     /// Set only by `registerPanicSurfaces()` (real app boot, never under unit tests — mirrors
     /// `MultitouchTrigger`/`HotkeyTrigger.shared.start()`'s own `!isRunningUnitTests` gating in
@@ -151,8 +158,9 @@ final class PeripheralProvider: ObservableObject {
         return noErr
     }
 
-    init(client: NormaClient) {
+    init(client: NormaClient, capabilities: ComputerCapabilities? = nil) {
         self.client = client
+        self.capabilities = capabilities ?? LiveComputerCapabilities()
     }
 
     // MARK: - Advertise (spec §A4: "advertises on connect ... and on TCC change")
@@ -242,6 +250,10 @@ final class PeripheralProvider: ObservableObject {
             updatePanicRegistration()
         case .leaseLost(let l):
             activeLeases.removeAll { $0.leaseId == l.leaseId }
+            // Computer use (Phase 5 CU): the AX element-id cache is only valid while the ax-read
+            // lease is held — a lost ax-read lease means the cached AXUIElement handles are stale,
+            // so drop them (a later click must re-run ax_snapshot to get fresh ids).
+            if l.class == "ax-read" { capabilities.clearElementCache() }
             updatePanicRegistration()
         case .peripheralCallRequested(let call):
             await respond(to: call)
@@ -255,9 +267,38 @@ final class PeripheralProvider: ObservableObject {
         let nowMs = Int(Date().timeIntervalSince1970 * 1000)
         switch shouldServe(request, leases: activeLeases, nowMs: nowMs) {
         case .serve:
-            await serveNoop(requestId: call.requestId, payloadJson: call.payloadJson)
+            if call.class == "noop" {
+                await serveNoop(requestId: call.requestId, payloadJson: call.payloadJson)
+            } else {
+                await serveComputer(call)
+            }
         case .deny(let code):
             await sendRespond(requestId: call.requestId, resultJson: nil, error: code)
+        }
+    }
+
+    /// Computer use (Phase 5 CU): serve a screenshot / ax-read / input-drive call. Parses the
+    /// payload against the lease class (pure `parseComputerPayload`), runs it through the capability
+    /// seam, and encodes the result — every failure (bad payload, missing TCC, unknown element) is a
+    /// typed `error` string the core `computer` tool surfaces to the model. Never throws across its
+    /// surface (mirrors serveNoop).
+    private func serveComputer(_ call: SessionEvent.PeripheralCallRequested) async {
+        switch parseComputerPayload(cls: call.class, payloadJson: call.payloadJson) {
+        case .failure(let e):
+            await sendRespond(requestId: call.requestId, resultJson: nil, error: e.message)
+        case .success(let op):
+            do {
+                let result = try await capabilities.perform(op)
+                guard let json = encodeCUResult(result) else {
+                    await sendRespond(requestId: call.requestId, resultJson: nil, error: "encode_failed")
+                    return
+                }
+                await sendRespond(requestId: call.requestId, resultJson: json, error: nil)
+            } catch let e as ComputerError {
+                await sendRespond(requestId: call.requestId, resultJson: nil, error: e.message)
+            } catch {
+                await sendRespond(requestId: call.requestId, resultJson: nil, error: "computer_use_failed")
+            }
         }
     }
 
@@ -303,6 +344,7 @@ final class PeripheralProvider: ObservableObject {
     /// call with zero active leases (a cheap no-op `peripheral.revoke(all)` server-side).
     private func revokeAllLocally(reason: String) {
         activeLeases.removeAll()
+        capabilities.clearElementCache() // Phase 5 CU: all control released — drop stale AX handles
         updatePanicRegistration()
         let client = self.client
         Task {
