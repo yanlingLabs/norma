@@ -3,6 +3,7 @@ import type { SessionEvent } from "@norma/protocol";
 import type { ModelInfo, Provider, ProviderEvent, TurnRequest } from "../../src/providers/types";
 import { FakeProvider } from "../../src/agent/fake-provider";
 import { deferred } from "../../src/agent/test-providers";
+import { Compactor } from "../../src/agent/compactor";
 import { setup } from "./engine-spawn.test";
 
 // bg-retrigger Task 1 (CC parity: <task-notification>): a `run_in_background` child's completion
@@ -507,5 +508,129 @@ describe("AgentEngine: auto-run a turn on bg completion (bg-retrigger Task 2)", 
     await sleep(30); // give a (buggy) auto-wake a beat to fire, if one ever did
     expect(provider.requests.length).toBe(afterTurn1);
     expect(engine.isRunning(sessionId)).toBe(false);
+  });
+});
+
+// bg-retrigger Task 3: the full-loop integration e2e. T1 persists, T2 wakes — this test drives the
+// WHOLE loop with one scripted provider end to end: spawn -> detached completion -> persisted
+// notification -> idle auto-turn (input = full history + notification LAST) -> its own assistant
+// text landing in the store -> a LATER manual turn still replaying the notification in seq
+// position (persistence across turns, not just the one wake that produced it).
+describe("AgentEngine: full-loop integration (spawn -> completion -> auto-turn -> persists across turns) (bg-retrigger Task 3)", () => {
+  test("full loop: auto-turn's request = full prior history + notification LAST; its assistant text is stored; a later turn still replays the notification in seq position, strictly after thread_completed", async () => {
+    const provider = new BgNotifyProvider();
+    // runDetachedToNotification drives: turn 1 (spawn + wrap-up) -> detached child completes ->
+    // notification persisted -> its idle wake (the auto-turn) fully settles before returning.
+    const { engine, store, sessionId, childId } = await runDetachedToNotification(provider);
+
+    const events = store.read(sessionId);
+    const note = notificationsOf(events)[0]!;
+    const completed = events.find((e) => e.type === "thread_completed" && e.threadId === childId)!;
+    // the notification's seq is strictly AFTER the child's own thread_completed
+    expect(note.seq).toBeGreaterThan(completed.seq);
+
+    // mainRequestsOf strips the detached child's own streamTurn call (BgNotifyProvider/
+    // WakeTestProvider's shared dispatch convention, see isChildRequest above) — leaving exactly
+    // the 3 MAIN-thread rounds: round 0 (spawn), round 1 (turn 1's wrap-up), round 2 (the idle
+    // auto-turn the notification's wake fired).
+    const mainReqs = mainRequestsOf(provider.requests);
+    expect(mainReqs.length).toBe(3);
+    const autoTurnReq = mainReqs[2]!;
+
+    const fc = events.find((e) => e.type === "tool_call" && e.callId === "s1") as Extract<SessionEvent, { type: "tool_call" }>;
+    const tr = events.find((e) => e.type === "tool_result" && e.callId === "s1") as Extract<SessionEvent, { type: "tool_result" }>;
+    // the auto-turn's own request input = the FULL prior history (spawn's fc/tr, turn 1's closing
+    // text) with the notification as its LAST item — exact array, not just a membership check.
+    expect(autoTurnReq.input).toEqual([
+      { type: "function_call", callId: "s1", name: fc.name, argsJson: fc.argsJson },
+      { type: "tool_result", callId: "s1", output: tr.output, isError: tr.isError },
+      { type: "message", role: "assistant", content: "main round 1" },
+      { type: "message", role: "user", content: note.content },
+    ]);
+    expect(autoTurnReq.input.at(-1)).toEqual({ type: "message", role: "user", content: note.content });
+
+    // the auto-turn's OWN assistant text (BgNotifyProvider round n=2 -> "main round 2") landed in
+    // the store as a real assistant_message, not just as a provider-side reply.
+    const asstTexts = events.filter((e) => e.type === "assistant_message").map((e) => (e as Extract<SessionEvent, { type: "assistant_message" }>).text);
+    expect(asstTexts).toContain("main round 2");
+
+    // a LATER user send (turn 3, manual): the notification is STILL replayed, in the same seq
+    // position, exactly once — not dropped, not duplicated, not reordered — now with the
+    // auto-turn's own closing text appended after it.
+    const baseline = provider.requests.length;
+    await engine.runTurn(sessionId); // turn 3
+    const turn3Req = provider.requests[baseline]!;
+    expect(turn3Req.input).toEqual([
+      ...autoTurnReq.input,
+      { type: "message", role: "assistant", content: "main round 2" },
+    ]);
+    const noteIdx = turn3Req.input.findIndex((it) => "content" in it && it.content === note.content);
+    expect(noteIdx).toBe(3); // holds its seq position across the extra turn
+    expect(turn3Req.input.filter((it) => "content" in it && it.content === note.content)).toHaveLength(1);
+  });
+});
+
+// bg-retrigger Task 3: the compaction fold guard. A `task_notification` is NOT a message
+// (compactor.ts's `isMessage` only counts user_message/assistant_message), so it can never itself
+// become a checkpoint's `uptoSeq` boundary and is otherwise inert to the compactor's tool-pair
+// clamp (no callId, doesn't match any of the reasoning/tool-call/tool-result types spanStartSeq
+// walks over) — it folds out of replay exactly like any other pre-checkpoint event once its seq
+// falls at or below the (message-derived) boundary. This test seeds one landing INSIDE an
+// otherwise-fully-resolved tool_call/tool_result span (the "in range" scenario) and forces a real
+// checkpoint with a tiny keepTail (compactor.test.ts's own checkpoint-forcing pattern), then
+// rebuilds the turn input via the engine (historyInput) to confirm the fold is clean end to end.
+describe("Compactor: a task_notification in the folded range is inert to the boundary and the tool-pair clamp (bg-retrigger Task 3)", () => {
+  test("a checkpoint whose uptoSeq covers a task_notification folds it out of replay — uptoSeq stays a message seq, and the surrounding tool_call/tool_result pair is not orphaned", async () => {
+    const provider = new FakeProvider([[{ type: "text_delta", delta: "ok" }, done("end_turn")]]);
+    const { store, hub, engine, sessionId } = setup([], { provider });
+
+    store.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: "u0", clientName: "test" });
+    store.append(sessionId, { type: "assistant_message", sessionId, threadId: "main", text: "a0" });
+    store.append(sessionId, { type: "tool_call", sessionId, threadId: "main", callId: "c1", name: "read", argsJson: "{}" });
+    // the notification lands INSIDE the pair's span — the "in range" scenario the fold guard must
+    // handle: it must not be mistaken for a message (which would move the naive candidate) nor
+    // confuse the pair-orphan clamp (which only ever looks for tool_call/tool_result by callId).
+    const note = store.append(sessionId, { type: "task_notification", sessionId, threadId: "main", content: "<task-notification>done</task-notification>" }) as Extract<SessionEvent, { type: "task_notification" }>;
+    const evResult = store.append(sessionId, { type: "tool_result", sessionId, threadId: "main", callId: "c1", output: "result", isError: false });
+    store.append(sessionId, { type: "assistant_message", sessionId, threadId: "main", text: "a1" });
+    // tail: enough more message pairs that a tiny-keepTail Compactor forces a real checkpoint whose
+    // candidate boundary lands after all of the above.
+    for (let i = 0; i < 4; i++) {
+      store.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: `u${i + 1}`, clientName: "test" });
+      store.append(sessionId, { type: "assistant_message", sessionId, threadId: "main", text: `a${i + 2}` });
+    }
+
+    const summarizer = new FakeProvider([[{ type: "text_delta", delta: "SUMMARY" }, done("end_turn")]]);
+    const compactor = new Compactor({ provider: { provider: summarizer, model: "fake" }, store, hub, keepTail: 4 });
+    const res = await compactor.compact(sessionId);
+
+    expect(res.compacted).toBe(true);
+    // uptoSeq is a MESSAGE seq — never the notification's own seq (task_notification is outside
+    // compactor.ts's `isMessage` filter, so it can never itself become the boundary).
+    expect(res.uptoSeq).not.toBe(note.seq);
+    const msgSeqs = store.read(sessionId)
+      .filter((e) => e.type === "user_message" || e.type === "assistant_message")
+      .map((e) => e.seq);
+    expect(msgSeqs).toContain(res.uptoSeq);
+    // the notification and the pair around it sit BEFORE the boundary — folded, not split.
+    expect(res.uptoSeq).toBeGreaterThan(evResult.seq);
+
+    // rebuild the turn input via the engine (historyInput, checkpoint-aware): the folded
+    // notification must NOT resurface, and the pair must not be orphaned — both halves absent,
+    // consistently (neither survives alone).
+    await engine.runTurn(sessionId);
+    const input = provider.requests[0]!.input;
+    expect(input.some((it) => "content" in it && it.content === note.content)).toBe(false);
+    const hasCall = input.some((it) => it.type === "function_call" && it.callId === "c1");
+    const hasResult = input.some((it) => it.type === "tool_result" && it.callId === "c1");
+    expect(hasCall).toBe(false);
+    expect(hasResult).toBe(false);
+
+    // sanity: the checkpoint summary and the post-boundary tail ARE present.
+    const serialized = JSON.stringify(input);
+    expect(serialized).toContain("[Summary of earlier conversation]");
+    expect(serialized).toContain("SUMMARY");
+    expect(serialized).toContain("u4");
+    expect(serialized).toContain("a5");
   });
 });
