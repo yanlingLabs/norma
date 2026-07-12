@@ -335,6 +335,19 @@ describe("state.ts — note one-liners match main.ts's wording (bg-task/worktree
     expect(s.committed.at(-1)).toEqual({ kind: "note", text: "agent error: provider timeout" });
   });
 
+  test("lease_granted / lease_lost (Phase 5 CU) — CU control notes with friendly class labels", () => {
+    let s = initialState();
+    const holder = { kind: "session", id: "s1" };
+    s = reduce(s, { type: "lease_granted", threadId: "main", leaseId: "l1", class: "screenshot", holder, expiresAt: 0, tokenHash: "h" }, T0);
+    expect(s.committed.at(-1)).toEqual({ kind: "note", text: "⌘ Norma acquired screen capture control" });
+    s = reduce(s, { type: "lease_granted", threadId: "main", leaseId: "l2", class: "input-drive", holder, expiresAt: 0, tokenHash: "h" }, T0);
+    expect(s.committed.at(-1)).toEqual({ kind: "note", text: "⌘ Norma acquired mouse/keyboard control" });
+    s = reduce(s, { type: "lease_lost", threadId: "main", leaseId: "l1", class: "screenshot", holder, reason: "released" }, T0);
+    expect(s.committed.at(-1)).toEqual({ kind: "note", text: "⌘ Norma released screen capture control (released)" });
+    s = reduce(s, { type: "lease_lost", threadId: "main", leaseId: "l2", class: "ax-read", holder, reason: "provider-gone" }, T0);
+    expect(s.committed.at(-1)).toEqual({ kind: "note", text: "⌘ Norma released accessibility control (provider-gone)" });
+  });
+
   test("local_note (Phase 3d T2 — App-internal only, never a real wire event): commits a note block", () => {
     let s = initialState();
     s = reduce(s, { type: "local_note", text: "compacted (through seq 42, 900 char summary)" }, T0);
