@@ -44,6 +44,7 @@ import { parseModelArgs, validateEffort, validateModelSlug } from "./model-cli";
 import { formatElapsed, formatTokens } from "./task-display";
 import { formatOptionLines, isOtherChoice, parseQuestionAnswer } from "./questions";
 import { parsePlanResponse } from "./plan-response";
+import { makeEventBridge, type EventBridge } from "./tui/event-bridge";
 
 const AQUA = "\x1b[38;2;53;214;232m";
 
@@ -232,6 +233,15 @@ export const INIT_PROMPT =
 // down cleanly (timers cleared, terminal restored, client closed).
 async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boolean; existingSessionId?: string; chat: boolean }): Promise<void> {
   const { promptOverride, forceAuto = false, existingSessionId, chat } = opts;
+
+  // Ink TUI cutover (Phase 3a Task 6): the new Ink renderer owns the interactive chat TTY unless the
+  // NORMA_LEGACY_CLI escape hatch is set. Everything else — one-shot `-p`, piped/non-TTY, the escape
+  // hatch — keeps the byte-identical legacy path below. Decided here (not just at the connect point)
+  // because the legacy-only resize handler further down would otherwise paint the pinned block over
+  // Ink's surface; `inkMode` gates it off. `bridge` is the connect-time `onEvent` sink that <App>
+  // subscribes to (buffers attach-replay until the App mounts). Both are inert on the legacy path.
+  const inkMode = chat && !!process.stdout.isTTY && process.env.NORMA_LEGACY_CLI !== "1";
+  const bridge: EventBridge | null = inkMode ? makeEventBridge() : null;
 
   // -p teardown: mirrors Claude Code's headless grace-kill. Any bg tasks still running when the
   // turn completes get a grace period (NORMA_BG_PRINT_WAIT_MS, default 5000ms; 0 = poll until none
@@ -486,11 +496,11 @@ async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boole
   // paint chrome under it) — that's now subsumed by repaintBlockIfSafe's own composerActive gate,
   // so refreshBlock() alone is enough here: mid-turn it repaints as before, and during the composer
   // it's a no-op via that same gate (no separate turnRunning check needed).
-  if (process.stdout.isTTY) {
+  if (process.stdout.isTTY && !inkMode) {
     process.stdout.on("resize", () => { if (process.stdout.isTTY) refreshBlock(); });
   }
 
-  const c = await connect(chat ? "cli-chat" : "cli-p", (e) => {
+  const c = await connect(chat ? "cli-chat" : "cli-p", inkMode ? (e) => bridge!.push(e) : (e) => {
     const sa = streamAction(streaming, e as { type: string; threadId?: string }, selection.selectedThreadId);
     streaming = sa.streaming;
     // ↓ out-tokens proxy stays keyed to the MAIN thread (the status line describes the main turn),
@@ -703,6 +713,23 @@ async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boole
       if (wantTrust) { await c.trustDir(cwd); console.log(`${DIM}trusted ${cwd}${RESET}`); }
     }
     await c.attach(sessionId);
+  }
+
+  // Ink cutover (Phase 3a Task 6): with the session bootstrapped (created/attached/trusted/resumed
+  // and the policy seeded) — the SAME setup the legacy path uses — hand the interactive TTY to the
+  // Ink renderer and skip ALL the legacy-only machinery below (the y/N approval reader, the stall
+  // watchdog, the raw key-listener turn loop). The bridge was wired as this client's onEvent sink at
+  // connect, so it already holds any attach-replay backlog; <App> flushes it on subscribe. The Ink
+  // module graph is loaded here (dynamic import) so the non-TTY/-p/legacy branches never touch it.
+  // waitUntilExit resolves when Ink unmounts (its default Ctrl+C exit); we then tear down the
+  // dangling legacy timers/listener and exit cleanly, exactly as the legacy chat teardown does.
+  if (inkMode) {
+    const { mountTui } = await import("./tui/mount");
+    await mountTui({ client: c, bridge: bridge!, sessionId, cwd, initialPolicy: policy }).waitUntilExit();
+    clearInterval(spinnerTimer);
+    keyListener.destroy();
+    c.close();
+    process.exit(0);
   }
 
   // Persistent y/N approval reader. Installed whenever approvals are possible: one-shot keeps its
