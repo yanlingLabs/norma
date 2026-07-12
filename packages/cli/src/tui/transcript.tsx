@@ -27,6 +27,7 @@ import { theme } from "./theme";
 import { renderMarkdown } from "./markdown";
 import { pickVerb, TURN_VERBS } from "./spinner-verbs";
 import { formatElapsed, formatTokens } from "../task-display";
+import { groupBlocks, type DisplayItem } from "./group-blocks";
 
 /** Same 2-line/160-char args-head cap the tool USE line and ActiveTurn's in-flight tool line both
  *  use (widened from 3a's 120-char single-line cap per the brief) — kept RAW (no re-serialization
@@ -155,14 +156,65 @@ function TranscriptEntry({ block }: { block: Block }) {
   }
 }
 
-export function CommittedTranscript({ items }: { items: Block[] }) {
+/** A collapsed run renders as ONE dim `⏺`-gutter line: the summary text plus a dim
+ *  " (ctrl+o to expand)" hint (brief's Task 4 wiring instruction) — same gutter layout as the
+ *  assistant/tool cases above, just uncolored (dim) since no single tool's success/error state
+ *  applies to the run as a whole. */
+function CollapsedEntry({ summary }: { summary: string }) {
   return (
-    <Static items={items}>
-      {(block, i) => (
-        <Box key={i}>
-          <TranscriptEntry block={block} />
+    <Box flexDirection="row">
+      <Box minWidth={2}>
+        <Text dimColor>⏺</Text>
+      </Box>
+      <Box flexGrow={1}>
+        <Text dimColor>
+          {summary}
+          {" (ctrl+o to expand)"}
+        </Text>
+      </Box>
+    </Box>
+  );
+}
+
+function DisplayEntry({ item }: { item: DisplayItem }) {
+  return item.kind === "collapsed" ? <CollapsedEntry summary={item.summary} /> : <TranscriptEntry block={item.block} />;
+}
+
+export function CommittedTranscript({ items }: { items: Block[] }) {
+  // Ink's <Static> (build/components/Static.js) paints whatever it renders on a pass PERMANENTLY —
+  // later renders only ever render the NEW tail past the previous items.length, and never revisit
+  // an index it already painted. groupBlocks(items) is NOT safe to feed it directly: a still-open
+  // run at the END of `items` can absorb a newly-committed sibling block without the DisplayItem[]
+  // array growing (two reads collapse into the SAME one collapsed item, not a new one), so Static
+  // would silently skip repainting it and the on-screen summary would freeze at a stale, undercounted
+  // wording (e.g. stuck at "Read 1 file" forever once a second read/grep actually arrives).
+  //
+  // Fix: only ever hand Static a PREFIX of DisplayItem[] that can never again change — i.e. every
+  // group already closed by a later, non-matching block. The trailing run, if `items` still ends
+  // on a collapsible tool block (so a future sibling could still extend it), is rendered in a
+  // plain (always-freshly-recomputed) Box below Static instead — exactly the same "committed vs.
+  // still-live" split already used between this component and <ActiveTurn> in app.tsx, just nested
+  // one level deeper. The moment a breaking block arrives, that whole run becomes closed and moves
+  // into the Static-safe prefix on the very next render, where it can never change again.
+  const displayItems = groupBlocks(items);
+  const tailIsOpenRun = displayItems.length > 0 && displayItems[displayItems.length - 1]!.kind === "collapsed";
+  const settled = tailIsOpenRun ? displayItems.slice(0, -1) : displayItems;
+  const openTail = tailIsOpenRun ? displayItems[displayItems.length - 1]! : null;
+
+  return (
+    <Box flexDirection="column">
+      <Static items={settled}>
+        {(item, i) => (
+          <Box key={i}>
+            <DisplayEntry item={item} />
+          </Box>
+        )}
+      </Static>
+      {openTail ? (
+        <Box>
+          <DisplayEntry item={openTail} />
         </Box>
-      )}
-    </Static>
+      ) : null}
+    </Box>
   );
 }

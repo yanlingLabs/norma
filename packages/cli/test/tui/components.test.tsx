@@ -126,6 +126,54 @@ describe("CommittedTranscript — interrupted block (g)", () => {
   });
 });
 
+describe("CommittedTranscript — collapsed read/search groups (phase 3b T4)", () => {
+  test("a lone read collapses to one dim ⏺ line with the summary + ctrl+o hint", () => {
+    const items: Block[] = [{ kind: "tool", name: "read", argsJson: '{"path":"a.ts"}', output: "ok" }];
+    const { lastFrame } = render(<CommittedTranscript items={items} />);
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("⏺");
+    expect(frame).toContain("Read 1 file");
+    expect(frame).toContain("(ctrl+o to expand)");
+    expect(frame).not.toContain('{"path":"a.ts"}'); // collapsed — no per-call args/output leaked
+  });
+
+  test("a non-collapsible tool (bash) still renders individually, unaffected by grouping", () => {
+    const items: Block[] = [{ kind: "tool", name: "bash", argsJson: '{"command":"ls"}', output: "ok" }];
+    const { lastFrame } = render(<CommittedTranscript items={items} />);
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("bash");
+    expect(frame).not.toContain("ctrl+o to expand");
+  });
+
+  // Regression test for Ink's <Static> write-once semantics (build/components/Static.js: it slices
+  // `items.slice(index)` and permanently paints only that new tail — an already-painted index is
+  // NEVER revisited). Feeding `<Static>` a naively recomputed `groupBlocks(committed)` array breaks
+  // this: when a 2nd read arrives, the still-open run's DisplayItem[] length does not grow (it just
+  // absorbs the new block into the SAME collapsed item) so Static would silently skip repainting it
+  // and the summary would freeze stale at "Read 1 file" forever. CommittedTranscript instead holds
+  // the still-open trailing run out of Static (rendered in a plain, always-fresh Box) until a
+  // breaking block closes it — this test proves that split actually keeps the on-screen summary
+  // live across the exact rerender sequence that would otherwise go stale.
+  test("(regression) a run's summary updates correctly across rerenders as it grows, instead of freezing at the first count", () => {
+    const read: Block = { kind: "tool", name: "read", argsJson: '{"path":"a.ts"}', output: "ok" };
+    const grep: Block = { kind: "tool", name: "grep", argsJson: '{"pattern":"foo"}', output: "1 match" };
+    const assistantBlock: Block = { kind: "assistant", text: "done investigating" };
+
+    const { lastFrame, rerender } = render(<CommittedTranscript items={[read]} />);
+    expect(lastFrame() ?? "").toContain("Read 1 file");
+
+    rerender(<CommittedTranscript items={[read, grep]} />);
+    const afterGrep = lastFrame() ?? "";
+    expect(afterGrep).toContain("Read 1 file, searched 1 pattern"); // merged, NOT stuck at "Read 1 file"
+    expect(afterGrep).not.toContain("Read 1 file\n"); // stale single-read summary must not linger alongside the merged one
+
+    rerender(<CommittedTranscript items={[read, grep, assistantBlock]} />);
+    const afterClose = lastFrame() ?? "";
+    expect(afterClose).toContain("Read 1 file, searched 1 pattern"); // now-closed group renders correctly
+    expect(afterClose).toContain("done investigating");
+  });
+});
+
 describe("AgentList (b)", () => {
   test("a DONE agent row shows its persisted label/stats, not empty/0s", () => {
     const row: AgentRow = {
