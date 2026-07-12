@@ -12,6 +12,9 @@
  *  the window; "stick" auto-follows the tail until the user scrolls away. */
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { cleanup, render } from "ink-testing-library";
 import { App, bottomBarRows } from "../../src/tui/app";
 import { makeEventBridge } from "../../src/tui/event-bridge";
@@ -612,6 +615,61 @@ describe("App — slash-command wiring (Phase 3d T2: onRunCommand + local_note)"
 
     // The DAEMON-CONFIRMED cwd from /cd — not baseProps' mount-time "/tmp" — reaches /skills.
     expect(skillsCalls).toEqual([["/resolved/newdir"]]);
+  });
+});
+
+describe("App — @-file mention index lifecycle (Phase 3d T3)", () => {
+  test("(x1) the first '@'-trigger builds the real file index against the session's cwd, and matches appear once it resolves", async () => {
+    const root = mkdtempSync(join(tmpdir(), "norma-app-file-index-"));
+    writeFileSync(join(root, "alpha.ts"), "");
+    writeFileSync(join(root, "beta.md"), "");
+    try {
+      const bridge = makeEventBridge();
+      const client = fakeClient();
+      const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} cwd={root} />);
+      await wait();
+      stdin.write("@alpha");
+      await wait(100); // real fs readdir — give the buildFileIndex promise time to resolve
+
+      const frame = lastFrame() ?? "";
+      expect(frame).toContain("alpha.ts");
+      expect(frame).not.toContain("beta.md"); // fuzzy-filtered out by the "alpha" query
+      expect(frame).toContain(COMPOSER_CURSOR); // composer stays mounted/live underneath the menu
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("(x2) a '/cd' issued BEFORE the first '@' redirects the index build to the daemon-confirmed new cwd", async () => {
+    const original = mkdtempSync(join(tmpdir(), "norma-app-file-index-orig-"));
+    const redirected = mkdtempSync(join(tmpdir(), "norma-app-file-index-new-"));
+    writeFileSync(join(original, "onlyinoriginal.ts"), "");
+    writeFileSync(join(redirected, "onlyinredirected.ts"), "");
+    try {
+      const bridge = makeEventBridge();
+      const client = { ...fakeClient(), setCwd: async () => redirected };
+      const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} cwd={original} />);
+      await wait();
+      stdin.write("/cd anywhere");
+      await wait();
+      stdin.write("\r");
+      await wait();
+      // The long tmpdir path can hard-wrap onto its own line at 80 columns, so check the note's
+      // pieces independently rather than one contiguous "cwd → <path>" substring.
+      const cdFrame = lastFrame() ?? "";
+      expect(cdFrame).toContain("cwd → ");
+      expect(cdFrame).toContain(redirected); // runCd's note landed first
+
+      stdin.write("@onlyin"); // the FIRST "@"-trigger, AFTER the /cd
+      await wait(100); // real fs readdir
+
+      const frame = lastFrame() ?? "";
+      expect(frame).toContain("onlyinredirected.ts"); // built against the NEW cwd (cwdRef.current)
+      expect(frame).not.toContain("onlyinoriginal.ts"); // never scanned the original mount-time cwd
+    } finally {
+      rmSync(original, { recursive: true, force: true });
+      rmSync(redirected, { recursive: true, force: true });
+    }
   });
 });
 

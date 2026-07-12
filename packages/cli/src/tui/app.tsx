@@ -84,6 +84,7 @@ import type { Highlighter } from "./markdown";
 import type { EventBridge } from "./event-bridge";
 import type { parsePlanResponse } from "../plan-response";
 import { runCommand, type CommandCtx } from "./commands";
+import { buildFileIndex } from "./file-index";
 import type { NormaClient } from "../client";
 
 /** The subset of `NormaClient` `<App>` actually calls — declared structurally so tests can pass a
@@ -283,6 +284,23 @@ export function App({
     };
     void runCommand(ctx, text);
   }, [client, sessionId, appendNote]);
+
+  // Phase 3d T3: the "@"-file mention index (file-index.ts) — App owns the ONE lazy build for the
+  // composer's whole lifetime, per the brief ("keep it simple: one build per session, no refresh in
+  // v1"). `fileIndexRef` is the guard: `onNeedFileIndex` (fired by the composer's first "@"-trigger
+  // — see its prop doc on composer.tsx) starts `buildFileIndex` at most once no matter how many
+  // times it's called afterward; `fileIndex` state is what actually reaches the composer (via the
+  // `fileIndex` prop below) once that promise resolves, turning the menu's "indexing…" placeholder
+  // into live matches. Uses the SAME live-cwd ref `onRunCommand` above reads (`cwdRef`) rather than
+  // the original mount-time `cwd` prop, so a `/cd` issued before the first "@" is honored.
+  const fileIndexRef = useRef<Promise<string[]> | null>(null);
+  const [fileIndex, setFileIndex] = useState<string[] | undefined>(undefined);
+  const onNeedFileIndex = useCallback(() => {
+    if (fileIndexRef.current) return; // already building/built — one per session
+    const built = buildFileIndex(cwdRef.current);
+    fileIndexRef.current = built;
+    void built.then((list) => setFileIndex(list));
+  }, []);
 
   // T5 double-press ctrl+C/ctrl+D exit-armed state (see the file-top doc comment's KEY ROUTING #2).
   // Carries WHICH key armed it (whole-branch review item 3) so the footer hint names the right key;
@@ -527,6 +545,8 @@ export function App({
             onRunCommand={onRunCommand}
             onMenuRowsChange={onComposerMenuRowsChange}
             columns={columns}
+            fileIndex={fileIndex}
+            onNeedFileIndex={onNeedFileIndex}
           />
         )}
         {state.agents.length > 0 ? <AgentList agents={state.agents} nowMs={nowMs} /> : null}

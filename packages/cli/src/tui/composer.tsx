@@ -61,6 +61,13 @@ import {
 import { appendHistory, loadHistory, makeHistoryNav } from "./history-store";
 import { COMMANDS, filterCommands, parseSlashInput } from "./commands";
 import { CompletionMenu, MAX_MENU_ROWS } from "./completion-menu";
+import { fuzzyMatch } from "./file-index";
+
+/** Phase 3d T3 — the single disabled placeholder row shown while the App-owned file index is
+ *  still building (see the `fileIndex` prop doc below). Not a real match, so it's excluded from
+ *  every count/gating decision (`fileOpen`, `boundedSelected`, ...) the same way a genuine
+ *  zero-match query is — only the render differs (the row still appears; see `menuVisible`). */
+const INDEXING_LABEL = "indexing…";
 
 // The composer never has footer keyboard focus (that's a later task) — this is the one constant
 // FooterSelection it ever passes to footerKeyAction, selecting the "no footer focus" branch of its
@@ -100,6 +107,35 @@ export function computeSlashQuery(state: InputState): string | null {
   const tokenEnd = firstWs === -1 ? text.length : firstWs;
   if (cursor < 1 || cursor > tokenEnd) return null;
   return text.slice(1, cursor);
+}
+
+/** Phase 3d T3 — the "@"-file mention analogue of `computeSlashQuery`, but with one deliberate
+ *  difference: slash mode is anchored to the START OF THE WHOLE BUFFER (`text.startsWith("/")`)
+ *  because a slash command only ever makes sense as the very first thing typed, while an "@"-file
+ *  mention is meant to work ANYWHERE — "look at @src/foo" completes in place mid-sentence (the
+ *  brief's explicit example). So instead of checking the whole buffer's prefix, this scans
+ *  OUTWARD from the cursor to find the boundaries of whichever whitespace-delimited token the
+ *  cursor currently sits in, and asks whether THAT token starts with "@". Because a token can only
+ *  start with one character, a token beginning with "/" can never also open file mode here (and
+ *  vice versa for `computeSlashQuery` on a non-first token, which it never even considers) — the
+ *  two predicates are mutually exclusive by construction, so "@" and "/" can never both claim the
+ *  same keystroke. Returns the token's start index (needed to replace exactly the "@query" span on
+ *  completion — see `completeSelected` below) plus the in-progress query (the text from "@" to the
+ *  cursor, mirroring `computeSlashQuery`'s "up to cursor, not to token end" contract so a cursor
+ *  parked mid-token behaves the same way in both modes). `null` means "not in file mode". */
+export function computeFileToken(state: InputState): { start: number; query: string } | null {
+  const { text, cursor } = state;
+  let start = cursor;
+  while (start > 0 && !/\s/.test(text[start - 1]!)) start--;
+  if (text[start] !== "@") return null;
+  if (cursor < start + 1) return null; // cursor sits before/at the "@" itself — not "inside" yet
+  return { start, query: text.slice(start + 1, cursor) };
+}
+
+/** Convenience wrapper over `computeFileToken` for callers that only need the query string (the
+ *  same shape `computeSlashQuery` exposes) — independently testable, same as that sibling. */
+export function computeFileQuery(state: InputState): string | null {
+  return computeFileToken(state)?.query ?? null;
 }
 
 export interface ComposerProps {
@@ -154,6 +190,20 @@ export interface ComposerProps {
    *  doc: never Yoga-wrap, so `bottomBarRows`' per-row budget stays exact). Defaults to 80, the same
    *  fallback `app.tsx`'s own `readCols` uses. */
   columns?: number;
+  /** Phase 3d T3: the App-owned file index (see app.tsx's `fileIndexRef` doc) — `undefined` until
+   *  the FIRST "@"-trigger's build resolves, a (possibly empty) array once it has. While
+   *  `undefined` and the cursor is in an "@"-token, the menu shows the single disabled
+   *  `INDEXING_LABEL` row instead of real matches (and every key gates as a zero-match query — see
+   *  `fileOpen` below). Optional so every legacy call site (T1/T2 tests, any composer usage that
+   *  never triggers file mode) is unaffected. */
+  fileIndex?: string[];
+  /** Phase 3d T3: fires the FIRST time the cursor lands in a fresh "@"-token this composer's whole
+   *  lifetime (a `useRef` guard below ensures it's called at most once) — App wires this to kick
+   *  off its one lazy `buildFileIndex` call (spec: "index built lazily on first @-trigger"). A
+   *  no-op after the first call is fine even without the guard (App's own `fileIndexRef` is itself
+   *  idempotent — see its doc), but guarding here too avoids a pointless extra call on every
+   *  subsequent "@". Optional so legacy call sites are unaffected. */
+  onNeedFileIndex?: () => void;
 }
 
 export function Composer({
@@ -174,6 +224,8 @@ export function Composer({
   onRunCommand,
   onMenuRowsChange,
   columns = 80,
+  fileIndex,
+  onNeedFileIndex,
 }: ComposerProps) {
   // `policy` stays a prop (callers/tests still pass it; `<Footer>`, a sibling, is the one that
   // renders it) — this component no longer renders it directly, matching `task-list.tsx`'s
@@ -192,55 +244,127 @@ export function Composer({
   const [historyEntries] = useState(() => loadHistory(effectiveHistoryPath, sessionId));
   const historyNav = useMemo(() => makeHistoryNav(historyEntries), [historyEntries]);
 
-  // ---- Phase 3d T2: slash-command completion menu state ---------------------------------------
-  // `rawQuery` is a PURE function of `state` (see `computeSlashQuery`'s doc) — the menu's "open"
-  // condition needs no separate flag to track in the common case. Esc, though, must be able to
-  // dismiss the menu WITHOUT touching `text`/`cursor` (so text editing keeps working normally while
-  // it stays shut) — `dismissedQuery` records exactly which query string was last Esc-dismissed;
-  // the moment `rawQuery` changes to anything else (a new keystroke), the "adjusting state during
-  // render" block below clears it, reopening the menu automatically.
-  const rawQuery = useMemo(() => computeSlashQuery(state), [state.text, state.cursor]);
-  const [dismissedQuery, setDismissedQuery] = useState<string | null>(null);
+  // ---- Phase 3d T2/T3: completion menu state — slash-command menu (T2) AND "@"-file menu (T3),
+  // sharing one selection/dismissal state machine. This is deliberate, not just economical: the two
+  // predicates are mutually exclusive by construction (see `computeFileToken`'s doc — a token can
+  // only start with ONE of "/" or "@", and slash mode only ever considers the first token) so at
+  // most one of `rawSlashQuery`/`fileToken` is non-null on any given render — there's never a
+  // moment where both menus could plausibly be "open" at once, so one shared `selected`/dismissal
+  // pair (keyed on a mode-qualified string so switching FROM one mode TO the other always resets
+  // it, even in the edge case where both queries happen to be the same string, e.g. both "") is
+  // simpler than two parallel copies of the same bookkeeping.
+  const rawSlashQuery = useMemo(() => computeSlashQuery(state), [state.text, state.cursor]);
+  const fileToken = useMemo(() => computeFileToken(state), [state.text, state.cursor]);
+  const rawFileQuery = fileToken?.query ?? null;
+  const mode: "slash" | "file" | null = rawSlashQuery !== null ? "slash" : rawFileQuery !== null ? "file" : null;
+  // `null` outside either mode; otherwise mode-qualified so a same-string transition between modes
+  // (rare, but possible: e.g. an empty query in both) still counts as "changed" below.
+  const menuKey = mode === "slash" ? `s:${rawSlashQuery}` : mode === "file" ? `f:${rawFileQuery}` : null;
+
+  // `menuKey` is a PURE function of `state` (see `computeSlashQuery`/`computeFileToken`'s docs) — the
+  // menu's "open" condition needs no separate flag to track in the common case. Esc, though, must be
+  // able to dismiss the menu WITHOUT touching `text`/`cursor` (so text editing keeps working normally
+  // while it stays shut) — `dismissedMenuKey` records exactly which key was last Esc-dismissed; the
+  // moment `menuKey` changes to anything else (a new keystroke, or a mode switch), the "adjusting
+  // state during render" block below clears it, reopening the menu automatically.
+  const [dismissedMenuKey, setDismissedMenuKey] = useState<string | null>(null);
   const [selected, setSelected] = useState(0);
-  const lastRawQueryRef = useRef<string | null>(null);
-  if (rawQuery !== lastRawQueryRef.current) {
+  const lastMenuKeyRef = useRef<string | null>(null);
+  if (menuKey !== lastMenuKeyRef.current) {
     // React's sanctioned "adjust state during render when a derived value changes" pattern (guarded
     // so it only ever fires once per actual change, never loops): resets BOTH the Esc-dismissal and
-    // the selection the instant the underlying query changes, so the very next keystroke/keypress
-    // already sees the corrected value — no extra render tick, unlike an effect.
-    lastRawQueryRef.current = rawQuery;
-    if (dismissedQuery !== null) setDismissedQuery(null);
+    // the selection the instant the underlying query (or mode) changes, so the very next keystroke/
+    // keypress already sees the corrected value — no extra render tick, unlike an effect.
+    lastMenuKeyRef.current = menuKey;
+    if (dismissedMenuKey !== null) setDismissedMenuKey(null);
     if (selected !== 0) setSelected(0);
   }
-  const filtered = useMemo(() => (rawQuery !== null ? filterCommands(rawQuery) : []), [rawQuery]);
+
+  const filtered = useMemo(() => (mode === "slash" ? filterCommands(rawSlashQuery!) : []), [mode, rawSlashQuery]);
   // T2 review item 2: a zero-match query (e.g. "/zzz") renders no menu, so it must not act like an
   // open one either — `filtered.length > 0` is part of the open condition itself, which makes the
   // key gating below (↑/↓/tab/esc) fall straight through to history nav / normal esc / etc. exactly
   // as if the user had never typed a slash.
-  const slashOpen = rawQuery !== null && dismissedQuery !== rawQuery && filtered.length > 0;
-  const boundedSelected = filtered.length > 0 ? Math.min(selected, filtered.length - 1) : 0;
-  const menuItems = useMemo(
-    () => filtered.map((c) => ({ label: `/${c.name}${c.args ? ` ${c.args}` : ""}`, hint: c.description })),
-    [filtered],
+  const slashOpen = mode === "slash" && dismissedMenuKey !== menuKey && filtered.length > 0;
+
+  // Phase 3d T3: `fileIndex === undefined` means the App-owned build hasn't resolved yet (see the
+  // prop doc) — `fileMatches` is simply empty until it has, which (per the T2 precedent just above)
+  // makes `fileOpen` false too: the brief's explicit rule — "treat as zero matches for gating" while
+  // indexing — falls out of this for free, with NO separate "is indexing" branch needed in the key
+  // gating below. `fileIndexing` is tracked only for the RENDER decision (the placeholder row still
+  // needs to appear even though it gates no keys).
+  const fileIndexing = mode === "file" && fileIndex === undefined;
+  const fileMatches = useMemo(
+    () => (mode === "file" && fileIndex !== undefined ? fuzzyMatch(rawFileQuery ?? "", fileIndex) : []),
+    [mode, rawFileQuery, fileIndex],
   );
+  const fileOpen = mode === "file" && dismissedMenuKey !== menuKey && fileMatches.length > 0;
+
+  // Phase 3d T3: the FIRST time the cursor lands in an "@"-token, tell the parent to start building
+  // the index (see the `onNeedFileIndex` prop doc) — guarded so it fires at most once per composer
+  // mount, no matter how many times the user re-enters file mode afterward.
+  const firstFileTriggerRef = useRef(false);
+  useEffect(() => {
+    if (mode === "file" && !firstFileTriggerRef.current) {
+      firstFileTriggerRef.current = true;
+      onNeedFileIndex?.();
+    }
+  }, [mode, onNeedFileIndex]);
+
+  const activeCount = mode === "slash" ? filtered.length : mode === "file" ? fileMatches.length : 0;
+  const boundedSelected = activeCount > 0 ? Math.min(selected, activeCount - 1) : 0;
+  // Whether the menu RENDERS at all — distinct from `slashOpen`/`fileOpen` (which gate keys): the
+  // indexing placeholder renders with zero real matches, so it needs its own clause here. Esc does
+  // NOT dismiss it specially — `fileIndexing` implies `fileOpen` is false, so the esc-dismiss gate
+  // below never fires for it (the same "zero matches -> passthrough" rule applies to Esc too); the
+  // `dismissedMenuKey !== menuKey` check here is the same defensive shape `slashOpen`/`fileOpen`
+  // already use, kept for consistency even though nothing currently sets a dismissal while indexing.
+  const menuVisible = slashOpen || fileOpen || (fileIndexing && dismissedMenuKey !== menuKey);
+  const menuItems = useMemo(() => {
+    if (mode === "slash") {
+      return filtered.map((c) => ({ label: `/${c.name}${c.args ? ` ${c.args}` : ""}`, hint: c.description }));
+    }
+    if (mode === "file") {
+      if (fileIndexing) return [{ label: INDEXING_LABEL }];
+      // Label = relative path, no hint (per the brief — file matches carry no description).
+      return fileMatches.map((p) => ({ label: p }));
+    }
+    return [];
+  }, [mode, filtered, fileMatches, fileIndexing]);
 
   // Mirrors the menu's visible row count up to the parent (see the `onMenuRowsChange` prop doc) —
   // fires on mount too (same "T5" convention as the `onStateChange` effect above), including the
   // Esc-dismissed transition (which changes no `InputState` field app.tsx could otherwise observe).
+  // Derived straight from `menuVisible`/`menuItems` (not `slashOpen`/`fileOpen` individually) so it
+  // stays correct for the indexing placeholder too (one row, zero real matches).
   useEffect(() => {
-    onMenuRowsChange?.(slashOpen ? Math.min(MAX_MENU_ROWS, filtered.length) : 0);
-  }, [slashOpen, filtered.length, onMenuRowsChange]);
+    onMenuRowsChange?.(menuVisible ? Math.min(MAX_MENU_ROWS, menuItems.length) : 0);
+  }, [menuVisible, menuItems.length, onMenuRowsChange]);
 
   // Tab AND the "enter completes a partial" case share this: fill the buffer with the selected
   // command's full name (`/name args` gets a trailing space so the cursor lands ready to type an
   // arg; a no-arg command doesn't — the cursor sitting right after the name with no space keeps the
-  // menu OPEN, since `computeSlashQuery` still sees the cursor inside the first token). A no-op
-  // when there's nothing filtered to complete to.
+  // menu OPEN, since `computeSlashQuery` still sees the cursor inside the first token) — OR, in file
+  // mode, replace exactly the "@query" span (`fileToken.start` up to the CURRENT cursor, per
+  // `computeFileToken`'s doc) with the selected path plus a trailing space, preserving whatever came
+  // before the "@" and whatever sits at/after the cursor (mid-text "@" — the brief's explicit "look
+  // at @src/tui/ap" example). A no-op when there's nothing filtered to complete to.
   function completeSelected(): void {
-    const cmd = filtered[boundedSelected];
-    if (!cmd) return;
-    const newText = `/${cmd.name}${cmd.args ? " " : ""}`;
-    setState({ text: newText, cursor: newText.length });
+    if (mode === "slash") {
+      const cmd = filtered[boundedSelected];
+      if (!cmd) return;
+      const newText = `/${cmd.name}${cmd.args ? " " : ""}`;
+      setState({ text: newText, cursor: newText.length });
+      return;
+    }
+    if (mode === "file" && fileToken) {
+      const path = fileMatches[boundedSelected];
+      if (!path) return;
+      const before = state.text.slice(0, fileToken.start);
+      const after = state.text.slice(state.cursor);
+      const inserted = `${path} `;
+      setState({ text: before + inserted + after, cursor: before.length + inserted.length });
+    }
   }
 
   // Whole-branch review item 2: the raw side-channel handler below runs from a closure created when
@@ -295,35 +419,47 @@ export function Composer({
         return;
       }
 
-      // ---- Phase 3d T2: slash-menu key gating — the SINGLE actor for ↑/↓/tab/esc while the menu
-      // is open (history nav below, and the esc/double-esc state machine that follows, never also
-      // see these same keystrokes while `slashOpen` — the binding "one actor per key" rule). Enter
-      // deliberately falls through to the unified handler further down: it needs the exact same
-      // known-command/partial-match decision whether or not the menu happens to still be open.
-      if (slashOpen) {
+      // ---- Phase 3d T2/T3: menu key gating — the SINGLE actor for ↑/↓/tab/esc while EITHER menu is
+      // open (history nav below, and the esc/double-esc state machine that follows, never also see
+      // these same keystrokes while `slashOpen || fileOpen` — the binding "one actor per key" rule).
+      // `slashOpen`/`fileOpen` are mutually exclusive (see the state block's doc), so this never
+      // double-handles a single keystroke against two different match lists. Plain Enter deliberately
+      // falls through to the unified handler further down FOR SLASH MODE — it needs the exact same
+      // known-command/partial-match decision whether or not the menu happens to still be open — but
+      // FILE mode has no "run it anyway" equivalent (an "@path" mention isn't a runnable command), so
+      // Enter completes right here whenever `fileOpen` (never falls through to onSubmit/onSteer): the
+      // brief's explicit "enter on file mode NEVER submits/runs" rule, scoped to the case where a real
+      // match exists — a zero-match/still-indexing "@query" is NOT `fileOpen`, so Enter correctly
+      // passes through to the normal submit path in that case (same "zero matches -> passthrough" rule
+      // as everything else here).
+      if (slashOpen || fileOpen) {
         if (k === "esc" && !running) {
           // "esc closes the menu ONLY" — no double-esc bookkeeping (`lastEscMs`/`onHint`) runs.
           // Gated on `!running` (T2 review item 1): precedence #1 below — a running turn always
           // interrupts on the FIRST esc, the 3a invariant — outranks menu-close, so while a turn
           // runs this branch steps aside and esc falls through to the `onInterrupt` path.
-          setDismissedQuery(rawQuery);
+          setDismissedMenuKey(menuKey);
           return;
         }
         if (k === "up") {
           setSelected((sel) => {
-            const bounded = filtered.length > 0 ? Math.min(sel, filtered.length - 1) : 0;
+            const bounded = activeCount > 0 ? Math.min(sel, activeCount - 1) : 0;
             return Math.max(0, bounded - 1);
           });
           return;
         }
         if (k === "down") {
           setSelected((sel) => {
-            const bounded = filtered.length > 0 ? Math.min(sel, filtered.length - 1) : 0;
-            return filtered.length > 0 ? Math.min(filtered.length - 1, bounded + 1) : 0;
+            const bounded = activeCount > 0 ? Math.min(sel, activeCount - 1) : 0;
+            return activeCount > 0 ? Math.min(activeCount - 1, bounded + 1) : 0;
           });
           return;
         }
         if (key.tab && !key.shift) {
+          completeSelected();
+          return;
+        }
+        if (k === "enter" && fileOpen) {
           completeSelected();
           return;
         }
@@ -413,10 +549,11 @@ export function Composer({
 
   return (
     <>
-      {/* Phase 3d T2: the completion menu renders ABOVE the open-rule box, never inside it — it's
-       *  no part of the bordered composer's own single-root-Text layout (see the render note
-       *  below), just a sibling that appears/disappears above it. */}
-      {slashOpen ? <CompletionMenu items={menuItems} selected={boundedSelected} columns={columns} /> : null}
+      {/* Phase 3d T2/T3: the completion menu renders ABOVE the open-rule box, never inside it —
+       *  it's no part of the bordered composer's own single-root-Text layout (see the render note
+       *  below), just a sibling that appears/disappears above it. `menuVisible` (not `slashOpen`
+       *  alone) covers the T3 indexing placeholder, which renders with zero real matches. */}
+      {menuVisible ? <CompletionMenu items={menuItems} selected={boundedSelected} columns={columns} /> : null}
       <Box
         borderStyle="round"
         borderTop

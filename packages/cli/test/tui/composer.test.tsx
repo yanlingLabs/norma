@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { render } from "ink-testing-library";
-import { Composer, computeSlashQuery } from "../../src/tui/composer";
+import { Composer, computeFileQuery, computeFileToken, computeSlashQuery } from "../../src/tui/composer";
 import { appendHistory } from "../../src/tui/history-store";
 
 // useInput wires its stdin listener inside a React effect, which runs on the next tick after
@@ -1082,5 +1082,426 @@ describe("Composer — slash-command completion menu (Phase 3d T2)", () => {
     await wait();
 
     expect(stripAnsi(lastFrame() ?? "")).toContain("recall me");
+  });
+});
+
+describe("computeFileToken / computeFileQuery (pure predicates)", () => {
+  test("no '@' anywhere -> null", () => {
+    expect(computeFileToken({ text: "hello world", cursor: 5 })).toBeNull();
+    expect(computeFileQuery({ text: "", cursor: 0 })).toBeNull();
+  });
+
+  test("'@' at the very start of the buffer, cursor inside -> the in-progress query", () => {
+    expect(computeFileToken({ text: "@src", cursor: 4 })).toEqual({ start: 0, query: "src" });
+    expect(computeFileQuery({ text: "@src", cursor: 1 })).toBe("");
+  });
+
+  test("cursor before/at the '@' itself -> null (not 'inside' the token yet)", () => {
+    expect(computeFileToken({ text: "@src", cursor: 0 })).toBeNull();
+  });
+
+  test("'@' mid-text, after whitespace, still opens (this is the whole point of file mode)", () => {
+    // "look at @src/tui/ap" — cursor at the very end, sitting right after "ap".
+    const text = "look at @src/tui/ap";
+    expect(computeFileToken({ text, cursor: text.length })).toEqual({ start: 8, query: "src/tui/ap" });
+  });
+
+  test("a token NOT starting with '@' never opens file mode, even if '@' appears later in it", () => {
+    // "/foo@bar" starts with "/", not "@" — the token's FIRST character is what's checked (a token
+    // can only start with one trigger character — see the doc comment's mutual-exclusion note).
+    expect(computeFileToken({ text: "/foo@bar", cursor: 8 })).toBeNull();
+  });
+
+  test("a space after the '@token' closes it once the cursor is past it", () => {
+    // "@src foo": '@'=0 's'=1 'r'=2 'c'=3 ' '=4 'f'=5 ... — the space itself is at index 4.
+    expect(computeFileToken({ text: "@src foo", cursor: 4 })).toEqual({ start: 0, query: "src" }); // right before the space: still open
+    expect(computeFileToken({ text: "@src foo", cursor: 5 })).toBeNull(); // past the space: closed
+  });
+
+  test("mutual exclusion: for any given state, computeSlashQuery and computeFileToken are never both non-null", () => {
+    const samples: { text: string; cursor: number }[] = [
+      { text: "/help", cursor: 3 },
+      { text: "@src/tui", cursor: 5 },
+      { text: "look at @composer", cursor: 18 },
+      { text: "/model @weird", cursor: 13 },
+      { text: "plain text", cursor: 4 },
+      { text: "", cursor: 0 },
+    ];
+    for (const s of samples) {
+      const slash = computeSlashQuery(s);
+      const file = computeFileToken(s);
+      expect(slash !== null && file !== null).toBe(false);
+    }
+  });
+});
+
+describe("Composer — @-file mention menu (Phase 3d T3)", () => {
+  const FIXTURE_INDEX = ["src/tui/app.tsx", "src/tui/composer.tsx", "readme.md"];
+
+  test("(a) '@' opens the menu over the given fileIndex (label = path, no hint); plain text never opens it", async () => {
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        fileIndex={FIXTURE_INDEX}
+      />,
+    );
+    await wait();
+    stdin.write("hello");
+    await wait();
+    expect(stripAnsi(lastFrame() ?? "")).not.toContain("src/tui/composer.tsx");
+
+    stdin.write(" @");
+    await wait();
+
+    const frame = stripAnsi(lastFrame() ?? "");
+    expect(frame).toContain("src/tui/app.tsx");
+    expect(frame).toContain("src/tui/composer.tsx");
+    expect(frame).toContain("readme.md");
+  });
+
+  test("(b) the menu narrows via fuzzy matching as the query grows", async () => {
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        fileIndex={FIXTURE_INDEX}
+      />,
+    );
+    await wait();
+    stdin.write("@comp");
+    await wait();
+
+    const frame = stripAnsi(lastFrame() ?? "");
+    expect(frame).toContain("src/tui/composer.tsx");
+    expect(frame).not.toContain("src/tui/app.tsx");
+    expect(frame).not.toContain("readme.md");
+  });
+
+  test("(c) Tab inserts 'path ' replacing the '@query' token, cursor placed right after the space", async () => {
+    const seen: { text: string; cursor: number }[] = [];
+    const { stdin } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        fileIndex={FIXTURE_INDEX}
+        onStateChange={(s) => seen.push({ ...s })}
+      />,
+    );
+    await wait();
+    stdin.write("@comp"); // uniquely matches "src/tui/composer.tsx"
+    await wait();
+    stdin.write("\t");
+    await wait();
+
+    expect(seen.at(-1)).toEqual({ text: "src/tui/composer.tsx ", cursor: "src/tui/composer.tsx ".length });
+  });
+
+  test("(d) mid-text '@' completes IN PLACE, preserving text before and after the token", async () => {
+    const seen: { text: string; cursor: number }[] = [];
+    const { stdin } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        fileIndex={FIXTURE_INDEX}
+        onStateChange={(s) => seen.push({ ...s })}
+      />,
+    );
+    await wait();
+    stdin.write("look at @comp"); // "comp" uniquely matches "src/tui/composer.tsx"
+    await wait();
+    stdin.write("\t");
+    await wait();
+
+    expect(seen.at(-1)?.text).toBe("look at src/tui/composer.tsx ");
+  });
+
+  test("(e) mid-text '@' with trailing content preserves what's AFTER the cursor too", async () => {
+    const seen: { text: string; cursor: number }[] = [];
+    const { stdin } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        fileIndex={FIXTURE_INDEX}
+        onStateChange={(s) => seen.push({ ...s })}
+      />,
+    );
+    await wait();
+    stdin.write("before @app after"); // "app" uniquely matches "src/tui/app.tsx"
+    await wait();
+    // Move the cursor back to sit right after "@app" (before the following space + "after") — 6
+    // left-arrows walks back over " after" (6 chars).
+    for (let i = 0; i < 6; i++) {
+      stdin.write("\x1b[D");
+      // eslint-disable-next-line no-await-in-loop
+      await wait(3);
+    }
+    await wait();
+    stdin.write("\t");
+    await wait();
+
+    // The inserted "src/tui/app.tsx " plus the untouched " after" (which already had its own
+    // leading space) — nothing is stripped/collapsed on either side of the insertion point.
+    expect(seen.at(-1)?.text).toBe("before src/tui/app.tsx  after");
+  });
+
+  test("(f) Enter completes the selection when a real match exists — never submits/steers", async () => {
+    const submitted: string[] = [];
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={(t) => submitted.push(t)}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        fileIndex={FIXTURE_INDEX}
+      />,
+    );
+    await wait();
+    stdin.write("@comp"); // uniquely matches "src/tui/composer.tsx"
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    expect(submitted).toEqual([]);
+    expect(stripAnsi(lastFrame() ?? "")).toContain("❯ src/tui/composer.tsx ");
+  });
+
+  test("(g) Enter with ZERO fuzzy matches submits the literal text (passthrough, same as slash's unknown-command rule)", async () => {
+    const submitted: string[] = [];
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={(t) => submitted.push(t)}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        fileIndex={FIXTURE_INDEX}
+      />,
+    );
+    await wait();
+    stdin.write("@zzznomatch");
+    await wait();
+    expect(stripAnsi(lastFrame() ?? "")).not.toContain("indexing"); // index IS ready, just no matches
+    stdin.write("\r");
+    await wait();
+
+    expect(submitted).toEqual(["@zzznomatch"]);
+  });
+
+  test("(h) while the index is still building (fileIndex undefined): a disabled 'indexing…' row renders, and every key passes through", async () => {
+    const path = historyPath();
+    appendHistory(path, { display: "recall me", ts: 1, sessionId: "s1" });
+    const submitted: string[] = [];
+
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={(t) => submitted.push(t)}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={path}
+        sessionId="s1"
+        // fileIndex omitted -> still "building" from the composer's point of view
+      />,
+    );
+    await wait();
+    stdin.write("@zzz");
+    await wait();
+
+    expect(stripAnsi(lastFrame() ?? "")).toContain("indexing…");
+
+    stdin.write("\x1b[A"); // up while "indexing" -> history recall (zero-matches passthrough), NOT a selection move
+    await wait();
+    expect(stripAnsi(lastFrame() ?? "")).toContain("recall me");
+
+    stdin.write("\r"); // enter with no real match yet -> submits literally (passthrough)
+    await wait();
+    expect(submitted).toEqual(["recall me"]);
+  });
+
+  test("(i) onNeedFileIndex fires exactly ONCE per composer lifetime, on the first '@'-trigger", async () => {
+    let calls = 0;
+    const { stdin } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        onNeedFileIndex={() => { calls += 1; }}
+      />,
+    );
+    await wait();
+    expect(calls).toBe(0); // nothing triggered yet
+
+    stdin.write("@a");
+    await wait();
+    expect(calls).toBe(1);
+
+    stdin.write(" more @b"); // a SECOND "@"-trigger later in the same session
+    await wait();
+    expect(calls).toBe(1); // still just once
+  });
+
+  test("(j) Esc closes the file menu WITHOUT clearing the text and without arming the double-esc hint", async () => {
+    const hints: string[] = [];
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={1000}
+        historyPath={historyPath()}
+        fileIndex={FIXTURE_INDEX}
+        onHint={(h) => hints.push(h)}
+      />,
+    );
+    await wait();
+    stdin.write("@comp");
+    await wait();
+    expect(stripAnsi(lastFrame() ?? "")).toContain("src/tui/composer.tsx");
+
+    stdin.write("\x1b"); // esc — closes the menu ONLY
+    await wait();
+
+    expect(hints).toEqual([]); // no double-esc bookkeeping armed
+    const frame = stripAnsi(lastFrame() ?? "");
+    expect(frame).toContain("@comp"); // text untouched
+    expect(frame).not.toContain("src/tui/composer.tsx"); // menu gone
+
+    stdin.write("\x1b"); // a SECOND esc, menu already closed -> a fresh double-esc-clear first press
+    await wait();
+    expect(hints).toEqual(["Esc again to clear"]);
+  });
+
+  test("(k) Esc while RUNNING with the file menu open interrupts on the FIRST press (precedence #1 outranks menu-close)", async () => {
+    let interrupts = 0;
+    const { stdin, lastFrame } = render(
+      <Composer
+        running
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => { interrupts += 1; }}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        fileIndex={FIXTURE_INDEX}
+      />,
+    );
+    await wait();
+    stdin.write("@comp");
+    await wait();
+    expect(stripAnsi(lastFrame() ?? "")).toContain("src/tui/composer.tsx");
+
+    stdin.write("\x1b"); // FIRST esc while running — must interrupt, not just close the menu
+    await wait();
+
+    expect(interrupts).toBe(1);
+  });
+
+  test("(l) ↑/↓ move the bounded selection while the file menu is open, never recalling history", async () => {
+    const path = historyPath();
+    appendHistory(path, { display: "unrelated history entry", ts: 1, sessionId: "s1" });
+
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={path}
+        sessionId="s1"
+        fileIndex={FIXTURE_INDEX}
+      />,
+    );
+    await wait();
+    stdin.write("@"); // empty query -> all 3 candidates, in fileIndex order
+    await wait();
+
+    let lines = stripAnsi(lastFrame() ?? "").split("\n");
+    const appIdx = lines.findIndex((l) => l.includes("src/tui/app.tsx"));
+    expect((lastFrame() ?? "").split("\n")[appIdx]).toContain("\x1b[7m"); // first candidate selected
+
+    stdin.write("\x1b[B"); // down -> second candidate
+    await wait();
+    lines = stripAnsi(lastFrame() ?? "").split("\n");
+    const composerIdx = lines.findIndex((l) => l.includes("src/tui/composer.tsx"));
+    expect((lastFrame() ?? "").split("\n")[composerIdx]).toContain("\x1b[7m");
+    expect((lastFrame() ?? "").split("\n")[appIdx]).not.toContain("\x1b[7m");
+
+    expect(stripAnsi(lastFrame() ?? "")).not.toContain("unrelated history entry"); // never touched history
+  });
+
+  test("(m) slash-mode tests are unaffected: '/' still opens the slash menu, '@' never does for it", async () => {
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        fileIndex={FIXTURE_INDEX}
+      />,
+    );
+    await wait();
+    stdin.write("/mo");
+    await wait();
+
+    const frame = stripAnsi(lastFrame() ?? "");
+    expect(frame).toContain("/model ");
+    expect(frame).not.toContain("src/tui/app.tsx"); // file menu never overlaps slash's
   });
 });
