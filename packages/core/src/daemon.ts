@@ -28,6 +28,7 @@ import { registerWorktreeTools } from "./agent/tools/worktree";
 import { registerSpawnAgentTool } from "./agent/tools/spawn";
 import { registerSendMessageTool } from "./agent/tools/send-message";
 import { registerTaskStopTool } from "./agent/tools/task-stop";
+import { registerScheduleTool } from "./agent/tools/schedule";
 import { registerWebTools } from "./agent/tools/web";
 import { McpManager } from "./agent/mcp/manager";
 import { PermissionGate } from "./agent/gate";
@@ -296,6 +297,16 @@ export async function startDaemon(opts: {
   // line 135, and AuditLog's own constructor is cheap (mkdir is lazy, on first write — see audit.ts).
   const audit = new AuditLog(join(normaHome, "audit.jsonl"));
 
+  // Phase 5 routines T3: hoisted above the `if (agentProvider)` gate for the SAME reason as `audit`
+  // just above — the `schedule` tool (registered inside that gate, alongside every other built-in
+  // tool) needs the store, but the rest of the routines subsystem (audit log/runner/scheduler,
+  // below, past the gate's closing brace) needs `engine`, which isn't settled until the gate
+  // closes. Splitting the construction this way means there is still only ONE RoutineStore
+  // instance for the whole daemon (no risk of the tool and the scheduler racing on two separate
+  // sqlite handles to the same file) — see the "Scheduled routines" block below, which reuses this
+  // SAME `routineStore` rather than calling `openRoutineStore` a second time.
+  const routineStore = openRoutineStore(join(normaHome, "routines.db"));
+
   if (agentProvider) {
     const registry = new ToolRegistry();
     sharedRegistry = registry;
@@ -351,6 +362,11 @@ export async function startDaemon(opts: {
     // is a PLAIN TOOL (no engine bridge — see task-stop.ts's own doc comment), deferred like
     // bash_kill (registerBackgroundTools above).
     registerTaskStopTool(registry, { bgAgents, bgRegistry, deferred: true });
+    // Phase 5 routines T3 (design doc §4): the agent-facing management surface over the SAME
+    // `routineStore` instance the scheduler (below, past this gate's close) fires against —
+    // `routineStore` is hoisted above this gate for exactly this sharing (see its own doc comment).
+    // Deferred like worktree/notebook/plan above — a specialized tool, not needed in every turn.
+    registerScheduleTool(registry, { routines: routineStore }, { deferred: true });
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
     await mcp.startAll(settings?.mcpServers ?? {});
     // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled &&
@@ -469,17 +485,17 @@ export async function startDaemon(opts: {
     });
   }
 
-  // Scheduled routines (Phase 5 T2, design doc §2). Built unconditionally (same precedent as
-  // peripheral/hardware below) — a no-provider daemon still owns the store/audit so `routines.*`
-  // RPCs (T3) work and existing routines aren't silently dropped; `engine` being null just makes
-  // every fire fail cleanly via runHeadless's own "agent disabled" short-circuit (below `engine` is
-  // ALREADY its final value — this sits after the `if (agentProvider)` block closes, never
-  // reassigned again — so no thunk/live-read indirection is needed here, unlike hooksEnabledHot's
-  // mtime-cached settings re-read, which exists for a genuinely different reason: hot-reloading a
-  // boolean without a restart). `routines.maxConcurrent` is a boot-time settings snapshot (the SAME
-  // precedent as `subagents.maxConcurrent` above — not hot-reloaded; a live "no restart needed"
-  // override wasn't asked for here the way it was for `hooks.enabled`).
-  const routineStore = openRoutineStore(join(normaHome, "routines.db"));
+  // Scheduled routines (Phase 5 T2, design doc §2; `routineStore` itself hoisted above the
+  // `if (agentProvider)` gate in T3 — see its own doc comment). Built unconditionally (same
+  // precedent as peripheral/hardware below) — a no-provider daemon still owns the store/audit so
+  // `routines.*` RPCs (T3) work and existing routines aren't silently dropped; `engine` being null
+  // just makes every fire fail cleanly via runHeadless's own "agent disabled" short-circuit (below
+  // `engine` is ALREADY its final value — this sits after the `if (agentProvider)` block closes,
+  // never reassigned again — so no thunk/live-read indirection is needed here, unlike
+  // hooksEnabledHot's mtime-cached settings re-read, which exists for a genuinely different
+  // reason: hot-reloading a boolean without a restart). `routines.maxConcurrent` is a boot-time
+  // settings snapshot (the SAME precedent as `subagents.maxConcurrent` above — not hot-reloaded; a
+  // live "no restart needed" override wasn't asked for here the way it was for `hooks.enabled`).
   const routinesAudit = new RoutineAuditLog(join(normaHome, "routines-audit.jsonl"));
   const routineRunner = makeDaemonRoutineRunner({ store, hub, engine });
   const routineScheduler = makeRoutineScheduler({
@@ -566,6 +582,10 @@ export async function startDaemon(opts: {
     quota,
     providerInfo,
     startedAt,
+    // Phase 5 routines T3: same RoutineStore instance the `schedule` tool (inside the
+    // `if (agentProvider)` gate above) and the scheduler (constructed just above this call) both
+    // share — one sqlite handle for the whole daemon.
+    routines: routineStore,
     ...opts.server,
   });
 

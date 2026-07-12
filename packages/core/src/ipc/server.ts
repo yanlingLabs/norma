@@ -16,10 +16,12 @@ import {
   ProviderRegisterParams, PluginsContribParams, PluginToolResultParams, HardwareRequestParams, HardwareRespondParams,
   ShortcutInvokeParams, TileActionParams,
   PluginsInstallParams, PluginEnableParams, PluginDisableParams, PluginRemoveParams, PluginSetConsentParams,
+  RoutinesCreateParams, RoutinesListParams, RoutinesUpdateParams, RoutinesDeleteParams,
   SYSTEM_SESSION_ID,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
+import type { RoutineStore } from "../routines/store";
 import type { SessionStore } from "../sessions/store";
 import { SessionHub, type HubClient } from "../sessions/hub";
 import type { AgentEngine } from "../agent/engine";
@@ -122,6 +124,12 @@ export interface IpcServerOptions {
   // case below) rather than tracking its own.
   hardware?: HardwareBroker;
   quota?: QuotaManager;      // token/rate-limit snapshot; quota.state (dashboard read)
+  // Phase 5 routines T3 (design doc §3): the daemon-owned RoutineStore backing routines.*
+  // (create/list/update/delete). Optional — same "typed no-op, never a crash" precedent as
+  // `bg`/`skills`/`mcp` above: a server built without one (most existing tests) degrades
+  // routines.list to an empty list and routines.create/update to a typed INTERNAL RpcFailure,
+  // rather than throwing on construction.
+  routines?: RoutineStore;
   providerInfo?: { id: string; model: string } | null; // active LLM provider identity; daemon.status
   startedAt?: number;        // daemon process start time (Date.now()); daemon.status uptimeMs
   helloTimeoutMs?: number;   // default 5000
@@ -480,7 +488,7 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
     switch (method) {
       case METHODS.sessionCreate: {
         const p = parseParams(SessionCreateParams, params);
-        const sessionId = opts.store.createSession(p.scope, { cwd: p.cwd, approvalPolicy: p.approvalPolicy });
+        const sessionId = opts.store.createSession(p.scope, { cwd: p.cwd, approvalPolicy: p.approvalPolicy, origin: p.origin });
         const trusted = p.cwd ? (opts.trust?.isTrusted(p.cwd) ?? false) : false;
         // Broadcast the session_created event to every authed harness (not just attachments —
         // a brand-new session has none) so other harnesses can offer to follow (spec §4.4).
@@ -603,6 +611,50 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         }
         return { ok: true };
       }
+
+      // -----------------------------------------------------------------------------------------
+      // Scheduled routines (Phase 5 routines T3, design doc §3): the management surface over
+      // `RoutineStore`. Role-gated EXACTLY like session.create/session.list above — no additional
+      // role check here (harness AND admin may both call these; a plugin-role connection is
+      // rejected before dispatch ever reaches this switch, since none of these four are in
+      // PLUGIN_ALLOWED_METHODS above). Invalid input (a bad spec, `policy:"ask"`, an unknown id on
+      // update) is a thrown RpcFailure (INVALID_PARAMS/NOT_FOUND) — no typed result union, same
+      // precedent as session.setPolicy/session.setCwd just above, NOT the plugin-lifecycle verbs'
+      // typed-union style further down this file.
+      // -----------------------------------------------------------------------------------------
+      case METHODS.routinesCreate: {
+        const p = parseParams(RoutinesCreateParams, params);
+        if (!opts.routines) throw new RpcFailure(ERR.INTERNAL, "routines are not available on this server (no RoutineStore configured)");
+        let routine;
+        try {
+          routine = opts.routines.create({ spec: p.spec, prompt: p.prompt, policy: p.policy, cwd: p.cwd });
+        } catch (e) {
+          throw new RpcFailure(ERR.INVALID_PARAMS, (e as Error).message);
+        }
+        return { routine };
+      }
+      case METHODS.routinesList: {
+        parseParams(RoutinesListParams, params);
+        return { routines: opts.routines?.list() ?? [] };
+      }
+      case METHODS.routinesUpdate: {
+        const p = parseParams(RoutinesUpdateParams, params);
+        if (!opts.routines) throw new RpcFailure(ERR.INTERNAL, "routines are not available on this server (no RoutineStore configured)");
+        let routine;
+        try {
+          routine = opts.routines.update(p.id, p.patch);
+        } catch (e) {
+          throw new RpcFailure(ERR.INVALID_PARAMS, (e as Error).message);
+        }
+        if (!routine) throw new RpcFailure(ERR.NOT_FOUND, `unknown routine: ${p.id}`);
+        return { routine };
+      }
+      case METHODS.routinesDelete: {
+        const p = parseParams(RoutinesDeleteParams, params);
+        const removed = opts.routines?.delete(p.id) ?? false;
+        return { ok: true, removed };
+      }
+
       case METHODS.sessionAddDir: {
         const p = parseParams(SessionAddDirParams, params);
         let meta: ReturnType<SessionStore["meta"]>;

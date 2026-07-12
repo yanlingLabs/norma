@@ -14,6 +14,11 @@ export interface SessionRow {
   lastSeq: number;
   title?: string;
   cwd?: string;
+  /** Phase 5 routines T3 (design doc §3): a machine-readable "who/what created this session" tag
+   *  (e.g. `routine/<id>`) — set at createSession, index-only metadata (like `cwd`/approvalPolicy
+   *  below, NOT derived from the event log the way title/first_message are), so it resets to
+   *  undefined on a full index rebuild (see recoverAll's pass-2 INSERT). */
+  origin?: string;
 }
 
 /** Derives a fallback title from the first line of the session's first main-thread
@@ -49,6 +54,7 @@ export class SessionStore {
       "ALTER TABLE sessions ADD COLUMN approval_policy TEXT NOT NULL DEFAULT 'ask'",
       "ALTER TABLE sessions ADD COLUMN title TEXT",
       "ALTER TABLE sessions ADD COLUMN first_message TEXT",
+      "ALTER TABLE sessions ADD COLUMN origin TEXT",
     ]) {
       try { this.db.run(ddl); }
       catch (e) {
@@ -164,13 +170,13 @@ export class SessionStore {
     return join(this.homeDir, "sessions", scope, `${sessionId}.jsonl`);
   }
 
-  createSession(scope: string, opts: { cwd?: string; approvalPolicy?: "ask" | "auto" | "plan" } = {}): string {
+  createSession(scope: string, opts: { cwd?: string; approvalPolicy?: "ask" | "auto" | "plan"; origin?: string } = {}): string {
     if (!SCOPE_RE.test(scope)) throw new Error(`invalid scope: ${scope}`);
     const sessionId = `s_${randomBytes(6).toString("hex")}`;
     mkdirSync(join(this.homeDir, "sessions", scope), { recursive: true });
     this.db.run(
-      "INSERT INTO sessions (session_id, scope, created_at, last_seq, cwd, approval_policy) VALUES (?, ?, ?, 0, ?, ?)",
-      [sessionId, scope, Date.now(), opts.cwd ?? null, opts.approvalPolicy ?? "ask"],
+      "INSERT INTO sessions (session_id, scope, created_at, last_seq, cwd, approval_policy, origin) VALUES (?, ?, ?, 0, ?, ?, ?)",
+      [sessionId, scope, Date.now(), opts.cwd ?? null, opts.approvalPolicy ?? "ask", opts.origin ?? null],
     );
     this.append(sessionId, { type: "session_created", sessionId, scope });
     return sessionId;
@@ -213,8 +219,8 @@ export class SessionStore {
   }
 
   list(): SessionRow[] {
-    return (this.db.query("SELECT session_id, scope, created_at, last_seq, title, first_message, cwd FROM sessions ORDER BY created_at").all() as
-      { session_id: string; scope: string; created_at: number; last_seq: number; title: string | null; first_message: string | null; cwd: string | null }[])
+    return (this.db.query("SELECT session_id, scope, created_at, last_seq, title, first_message, cwd, origin FROM sessions ORDER BY created_at").all() as
+      { session_id: string; scope: string; created_at: number; last_seq: number; title: string | null; first_message: string | null; cwd: string | null; origin: string | null }[])
       .map((r) => ({
         sessionId: r.session_id,
         scope: r.scope,
@@ -222,6 +228,7 @@ export class SessionStore {
         lastSeq: r.last_seq,
         title: r.title ?? fallbackTitle(r.first_message),
         cwd: r.cwd ?? undefined,
+        origin: r.origin ?? undefined,
       }));
   }
 

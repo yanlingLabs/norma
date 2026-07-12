@@ -293,6 +293,22 @@ describe("daemon IPC", () => {
     c.close();
   });
 
+  // Phase 5 routines T3 (design doc §3): session.create's additive `origin` param round-trips
+  // through session.list; a session created without one still lists fine (origin undefined).
+  test("session.create origin round-trips through session.list; omitted origin is undefined", async () => {
+    await boot();
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "origin-lister");
+    const withOrigin = await c.request(METHODS.sessionCreate, { scope: "routine", origin: "routine/abc123" });
+    const plain = await c.request(METHODS.sessionCreate, { scope: "global" });
+    const { result } = await c.request(METHODS.sessionList);
+    const rowWith = result.sessions.find((s: any) => s.sessionId === withOrigin.result.sessionId);
+    const rowPlain = result.sessions.find((s: any) => s.sessionId === plain.result.sessionId);
+    expect(rowWith.origin).toBe("routine/abc123");
+    expect(rowPlain.origin).toBeUndefined();
+    c.close();
+  });
+
   test("bad params yield INVALID_PARAMS (-32602) with sanitized message", async () => {
     await boot();
     const c = await TestClient.connect(daemon.socketPath);
@@ -3202,6 +3218,112 @@ describe("daemon IPC", () => {
       expect(a.error?.code).toBe(ERR.UNAUTHORIZED);
       const b = await plugin.request(METHODS.tileAction, { pluginId: "p1", actionId: "reconnect" });
       expect(b.error?.code).toBe(ERR.UNAUTHORIZED);
+      plugin.close(); srv.stop();
+    });
+  });
+
+  // -----------------------------------------------------------------------------------------
+  // Scheduled routines (Phase 5 routines T3, design doc §3): the four routines.* RPCs over the
+  // daemon's real RoutineStore (wired unconditionally in daemon.ts, same precedent as peripheral/
+  // hardware — `boot()` above always constructs one, provider or not). Role-gated exactly like
+  // session.create/session.list — no additional harness-only check (see the "plugin role method
+  // allowlist" describe block above for the plugin-role rejection coverage of one of these four).
+  // -----------------------------------------------------------------------------------------
+  describe("routines.* RPCs (Phase 5 routines T3)", () => {
+    test("routines.create validates + persists; routines.list returns it", async () => {
+      await boot();
+      const c = await TestClient.connect(daemon.socketPath);
+      await c.hello(harnessToken, "routines-tester");
+
+      const created = await c.request(METHODS.routinesCreate, { spec: "every 30m", prompt: "check inbox" });
+      expect(created.error).toBeUndefined();
+      expect(created.result.routine).toMatchObject({ spec: "every 30m", prompt: "check inbox", policy: "auto", enabled: true });
+      expect(created.result.routine.id).toBeTruthy();
+
+      const listed = await c.request(METHODS.routinesList, {});
+      expect(listed.result.routines).toHaveLength(1);
+      expect(listed.result.routines[0].id).toBe(created.result.routine.id);
+      c.close();
+    });
+
+    test("routines.create rejects an invalid spec and policy \"ask\" with INVALID_PARAMS", async () => {
+      await boot();
+      const c = await TestClient.connect(daemon.socketPath);
+      await c.hello(harnessToken, "routines-tester");
+
+      const badSpec = await c.request(METHODS.routinesCreate, { spec: "not a spec", prompt: "x" });
+      expect(badSpec.error?.code).toBe(ERR.INVALID_PARAMS);
+
+      const askPolicy = await c.request(METHODS.routinesCreate, { spec: "every 1h", prompt: "x", policy: "ask" });
+      expect(askPolicy.error?.code).toBe(ERR.INVALID_PARAMS); // rejected at the wire zod schema, before ever reaching the store
+
+      const listed = await c.request(METHODS.routinesList, {});
+      expect(listed.result.routines).toHaveLength(0); // neither bad call left a row behind
+      c.close();
+    });
+
+    test("routines.update patches an existing routine and re-validates a changed spec", async () => {
+      await boot();
+      const c = await TestClient.connect(daemon.socketPath);
+      await c.hello(harnessToken, "routines-tester");
+      const created = (await c.request(METHODS.routinesCreate, { spec: "every 30m", prompt: "check inbox" })).result.routine;
+
+      const disabled = await c.request(METHODS.routinesUpdate, { id: created.id, patch: { enabled: false } });
+      expect(disabled.result.routine.enabled).toBe(false);
+
+      const respec = await c.request(METHODS.routinesUpdate, { id: created.id, patch: { spec: "every 2h" } });
+      expect(respec.result.routine.spec).toBe("every 2h");
+
+      const badSpec = await c.request(METHODS.routinesUpdate, { id: created.id, patch: { spec: "garbage" } });
+      expect(badSpec.error?.code).toBe(ERR.INVALID_PARAMS);
+      c.close();
+    });
+
+    test("routines.update on an unknown id is NOT_FOUND", async () => {
+      await boot();
+      const c = await TestClient.connect(daemon.socketPath);
+      await c.hello(harnessToken, "routines-tester");
+      const res = await c.request(METHODS.routinesUpdate, { id: "nope", patch: { enabled: false } });
+      expect(res.error?.code).toBe(ERR.NOT_FOUND);
+      c.close();
+    });
+
+    test("routines.delete removes a routine; deleting an unknown id reports removed:false, never errors", async () => {
+      await boot();
+      const c = await TestClient.connect(daemon.socketPath);
+      await c.hello(harnessToken, "routines-tester");
+      const created = (await c.request(METHODS.routinesCreate, { spec: "every 30m", prompt: "x" })).result.routine;
+
+      const deleted = await c.request(METHODS.routinesDelete, { id: created.id });
+      expect(deleted.result).toEqual({ ok: true, removed: true });
+
+      const again = await c.request(METHODS.routinesDelete, { id: created.id });
+      expect(again.result).toEqual({ ok: true, removed: false });
+
+      const listed = await c.request(METHODS.routinesList, {});
+      expect(listed.result.routines).toHaveLength(0);
+      c.close();
+    });
+
+    // A plugin-role connection is role-rejected before dispatch, same as sessionCreate/sessionList
+    // (see "plugin role method allowlist" describe block above — none of the four routines.* verbs
+    // are in PLUGIN_ALLOWED_METHODS).
+    test("routines.* verbs are role-rejected for a plugin connection, exactly like session.create/session.list", async () => {
+      const srv = await bootPluginTestServer();
+      const raw = srv.store.mintPluginToken("sample-echo");
+      const plugin = await TestClient.connect(srv.socketPath);
+      await plugin.request(METHODS.hello, {
+        protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: "sample-echo", pluginId: "sample-echo",
+      });
+      for (const [method, params] of [
+        [METHODS.routinesCreate, { spec: "every 30m", prompt: "x" }],
+        [METHODS.routinesList, {}],
+        [METHODS.routinesUpdate, { id: "r_1", patch: {} }],
+        [METHODS.routinesDelete, { id: "r_1" }],
+      ] as const) {
+        const res = await plugin.request(method, params);
+        expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+      }
       plugin.close(); srv.stop();
     });
   });

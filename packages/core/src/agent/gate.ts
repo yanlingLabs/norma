@@ -43,7 +43,16 @@ export type SessionApprovalPolicy = "ask" | "auto" | "plan";
 // task_stop's primary target is Norma's own subagent bookkeeping. Flagged here explicitly so a
 // whole-branch review adjudicates the split rather than silently accepting it.
 const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop"]);
-const MUTATING = new Set(["write", "edit", "bash", "bash_kill", "notebook_edit", "enter_worktree", "exit_worktree"]);
+// schedule (phase 5 routines T3, design doc §4) sits in MUTATING, not READ_ONLY: `schedule create`
+// stands up an unattended, headless-firing routine — a standing prompt-injection surface (the
+// design doc's own Security section calls this out explicitly) — so it must be gate-carded exactly
+// like write/edit/bash: ask under `ask`, allow under `auto`, and outright denied under `plan` (a
+// plan-mode session must not be able to SCHEDULE a future mutation any more than it can perform one
+// now). `list`/`enable`/`disable`/`delete` ride the same class as a deliberate simplification — one
+// tool, one gate decision, no op-dependent carve-out (list-only would arguably qualify as read-only,
+// but splitting the gate per-op inside a single tool call is more complexity than the read-only case
+// is worth here).
+const MUTATING = new Set(["write", "edit", "bash", "bash_kill", "notebook_edit", "enter_worktree", "exit_worktree", "schedule"]);
 const SELF_GATING = new Set(["request_directory"]);
 // web_fetch (4g Task 5, T6 adds web_search here) is Norma's ONLY network-capable tool — it does NOT
 // belong in READ_ONLY (it makes a live outbound request; the response bytes are DATA that could

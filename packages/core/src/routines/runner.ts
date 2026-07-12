@@ -12,12 +12,15 @@ export interface MinimalEngine {
 
 // Every rate-limit ProviderEvent (providers/openai-compatible.ts's mapHttpError, shared by both
 // the openai-compatible and codex-oauth providers — see providers/quota.ts's withQuota) carries
-// `code: "rate_limit"` and a message starting with this exact prefix. That `code` is NOT persisted
-// on the `agent_error` SessionEvent (engine.ts only carries `message` through) — adding it would be
-// a protocol/NormaKit-Swift ripple out of this task's scope (see routines/runner.ts's own report),
-// so quota detection here is a documented, deliberately narrow string match on the one place that
-// code is guaranteed to leave a fingerprint. If a provider's error message shape ever changes this
-// silently stops detecting quota — a comment at both ends (here and mapHttpError) is the tripwire.
+// `code: "rate_limit"` and a message starting with this exact prefix. Phase 5 routines T3 threads
+// that `code` through as an additive optional field on `agent_error` (protocol/src/events.ts's
+// AgentErrorEvent.code — engine.ts forwards `ev.code` when the error came from a live provider
+// stream), so quota detection below now PREFERS the structured `code === "rate_limit"` check.
+// This message-prefix match remains as the FALLBACK for an `agent_error` with no `code` at all
+// (an older log, or one of engine.ts's two synthetic agent_error emit sites — "no cwd" / context
+// cap — which have no provider code to carry). If a provider's error message shape ever changes,
+// the fallback silently stops detecting quota for code-less errors only — a comment at both ends
+// (here and mapHttpError) is the tripwire.
 const QUOTA_ERROR_PREFIX = "HTTP 429";
 
 /** Builds the RoutineRunner the daemon wires into makeRoutineScheduler — `runHeadless` reuses the
@@ -26,17 +29,15 @@ const QUOTA_ERROR_PREFIX = "HTTP 429";
  *  instead of over the IPC socket (the scheduler already lives inside the daemon).
  *
  *  Origin stamping (design doc §2/§3: "origin: routine/<id> stamped in session meta, visible in
- *  sessions list"): session meta has no free-form field yet — `origin` isn't part of
- *  SessionCreateParams or SessionStore's schema today, and adding one is genuine protocol surface
- *  (SessionCreateParams, the sqlite `sessions` table, SessionRow, meta()'s return shape) that
- *  belongs with T3's RPC work, not bundled into this scheduler task. This stamps `origin` as the
- *  session's TITLE instead, via a `session_titled` event appended immediately after creation — a
- *  documented fallback, not a new event/field. It satisfies the "visible in sessions list" intent
- *  (SessionStore.list()'s `title` column) at zero protocol cost, and titles.ts's SessionTitler
- *  never overwrites it (maybeTitle's very first check is `if (this.store.getTitle(sessionId))
- *  return`, and this stamp lands before the turn runs). If T3 later adds a real `origin` meta
- *  field, this title stamp can stay (or be demoted to a fallback-when-meta-absent) without a
- *  breaking change to any consumer of the title. */
+ *  sessions list") — T3 superseded T2's fallback: `origin` is now a real, additive session-meta
+ *  field (`SessionCreateParams.origin` → the sqlite `sessions.origin` column → `SessionStore.list()`
+ *  rows), passed straight through at `createSession`. The session-TITLE stamp T2 shipped stays —
+ *  belt-and-suspenders, not replaced: the title is what a human sees in `norma sessions`/`resume`
+ *  (`session_titled`), the `origin` meta field is the machine-readable record another program can
+ *  filter/query on (e.g. "list every session this routine ever fired"). Neither overwrites the
+ *  other — titles.ts's SessionTitler still never touches an already-titled session (`maybeTitle`'s
+ *  first check is `if (this.store.getTitle(sessionId)) return`), and `origin` is write-once at
+ *  create time, nothing else in the engine ever mutates it. */
 export function makeDaemonRoutineRunner(deps: {
   store: SessionStore;
   hub: SessionHub;
@@ -46,7 +47,7 @@ export function makeDaemonRoutineRunner(deps: {
     async runHeadless(opts): Promise<{ ok: boolean; quotaLimited?: boolean; resultText?: string; error?: string }> {
       if (!deps.engine) return { ok: false, error: "agent disabled: no provider configured" };
 
-      const sessionId = deps.store.createSession("routine", { cwd: opts.cwd, approvalPolicy: opts.policy });
+      const sessionId = deps.store.createSession("routine", { cwd: opts.cwd, approvalPolicy: opts.policy, origin: opts.origin });
       deps.hub.append(sessionId, { type: "session_titled", sessionId, threadId: "main", title: opts.origin });
       deps.hub.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: opts.prompt, clientName: "routine" });
 
@@ -63,10 +64,15 @@ export function makeDaemonRoutineRunner(deps: {
       const mainEvents = events.filter((e) => !("threadId" in e) || e.threadId === "main");
       const lastError = [...mainEvents].reverse().find((e) => e.type === "agent_error");
       if (lastError && lastError.type === "agent_error") {
+        // Prefer the structured code when present (see QUOTA_ERROR_PREFIX's doc comment above);
+        // fall back to the message-prefix match only for a code-less agent_error.
+        const isQuota = lastError.code !== undefined
+          ? lastError.code === "rate_limit"
+          : lastError.message.startsWith(QUOTA_ERROR_PREFIX);
         return {
           ok: false,
           error: lastError.message,
-          ...(lastError.message.startsWith(QUOTA_ERROR_PREFIX) ? { quotaLimited: true } : {}),
+          ...(isQuota ? { quotaLimited: true } : {}),
         };
       }
       const lastAssistant = [...mainEvents].reverse().find((e) => e.type === "assistant_message");

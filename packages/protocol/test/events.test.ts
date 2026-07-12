@@ -53,6 +53,19 @@ describe("SessionEvent discriminated union", () => {
     for (const e of events) expect(SessionEvent.parse(e).type).toBe(e.type);
   });
 
+  // Phase 5 routines T3: `code` is additive-optional on the EXISTING agent_error variant (no new
+  // SessionEvent variant, no NormaKit exhaustive-switch trap) — an older-shaped payload with no
+  // `code` still parses (the "agent event variants parse" test above already covers that), and a
+  // payload carrying one round-trips it losslessly.
+  test("agent_error.code is additive-optional: present round-trips, absent stays undefined", () => {
+    const t = { ...base, threadId: "main" };
+    const withCode = { ...t, type: "agent_error", message: "HTTP 429 — rate limited", code: "rate_limit" } as const;
+    expect(SessionEvent.parse(withCode)).toEqual(withCode);
+    const withoutCode = SessionEvent.parse({ ...t, type: "agent_error", message: "tool crashed" });
+    expect(withoutCode.type).toBe("agent_error");
+    expect((withoutCode as { code?: string }).code).toBeUndefined();
+  });
+
   test("assistant_delta parses; empty delta rejected", () => {
     const e = { ...base, threadId: "main", type: "assistant_delta", delta: "wor" } as const;
     expect(SessionEvent.parse(e)).toEqual(e);

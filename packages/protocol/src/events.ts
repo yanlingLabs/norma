@@ -71,7 +71,16 @@ export const TurnCompletedEvent = ThreadBase.extend({
   type: z.literal("turn_completed"), stopReason: z.enum(["end_turn", "aborted", "error"]),
   inputTokens: z.number().int().nonnegative(), outputTokens: z.number().int().nonnegative(),
 });
-export const AgentErrorEvent = ThreadBase.extend({ type: z.literal("agent_error"), message: z.string() });
+/** `code` (phase 5 routines T3, blocking concern carried from T2's runner.ts report): additive
+ *  optional field on this EXISTING variant (not a new SessionEvent variant — no NormaKit
+ *  exhaustive-switch trap) mirroring `ProviderEvent`'s own `{type:"error", code, message,
+ *  retryAfterMs?}` shape (providers/types.ts) — `engine.ts` forwards `ev.code` when the error came
+ *  from a live provider stream; the two synthetic `agent_error` emit sites (no cwd, context-cap)
+ *  have no provider code and simply omit it. Lets a consumer (routines/runner.ts's quota
+ *  detection) check `code === "rate_limit"` instead of string-matching the message's `"HTTP 429"`
+ *  prefix — see runner.ts's own doc comment for why that prefix match remains as a fallback for
+ *  older logs / synthetic errors that never carried a code. */
+export const AgentErrorEvent = ThreadBase.extend({ type: z.literal("agent_error"), message: z.string(), code: z.string().optional() });
 export const DirectoryAddedEvent = ThreadBase.extend({
   type: z.literal("directory_added"),
   path: z.string().min(1),

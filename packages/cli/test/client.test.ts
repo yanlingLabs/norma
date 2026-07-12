@@ -257,6 +257,37 @@ describe("NormaClient", () => {
     client.close();
   });
 
+  // Phase 5 routines T3: the four routines.* client methods, round-tripped against a real daemon
+  // (its RoutineStore is wired unconditionally, provider or not — daemon.ts's own precedent for
+  // peripheral/hardware). Mirrors the shape of the plugin-lifecycle round-trip tests above.
+  test("routines client methods round-trip: create, list, update, delete", async () => {
+    await boot(null);
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "routines", onEvent: () => {} });
+
+    const { routine } = await client.routinesCreate({ spec: "every 30m", prompt: "check inbox" });
+    expect(routine.spec).toBe("every 30m");
+    expect(routine.policy).toBe("auto");
+    expect(routine.enabled).toBe(true);
+
+    expect((await client.routinesList()).routines).toHaveLength(1);
+
+    const updated = await client.routinesUpdate({ id: routine.id, patch: { enabled: false } });
+    expect(updated.routine.enabled).toBe(false);
+
+    const deleted = await client.routinesDelete(routine.id);
+    expect(deleted).toEqual({ ok: true, removed: true });
+    expect((await client.routinesList()).routines).toHaveLength(0);
+
+    client.close();
+  });
+
+  test("routinesCreate rejects an invalid spec", async () => {
+    await boot(null);
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "routines-bad", onEvent: () => {} });
+    await expect(client.routinesCreate({ spec: "not a spec", prompt: "x" })).rejects.toThrow();
+    client.close();
+  });
+
   test("init prompt reaches the session (canned NORMA.md-generation prompt)", async () => {
     const { INIT_PROMPT } = await import("../src/main");
     expect(INIT_PROMPT).toMatch(/NORMA\.md/i);
