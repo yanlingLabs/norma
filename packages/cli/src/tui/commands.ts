@@ -20,6 +20,12 @@ export interface CommandCtx {
   sessionId: string;
   cwd: string;
   appendNote(text: string): void;
+  /** T2 review item 3: `/cd` calls this with the DAEMON-CONFIRMED new cwd (the resolved path
+   *  `client.setCwd` returns, not the raw arg), so a ctx builder that tracks the session's live
+   *  cwd (app.tsx holds it in a ref and constructs a fresh ctx per run) can feed the updated value
+   *  to LATER commands in the same session (`/skills`, `/mcp`). Optional: callers that don't track
+   *  a live cwd (tests, one-shot contexts) simply don't wire it. */
+  onCwdChanged?(newCwd: string): void;
 }
 
 export interface SlashCommand {
@@ -141,11 +147,14 @@ async function runAddDir(ctx: CommandCtx, argText: string): Promise<void> {
 }
 
 /** Mirrors main.ts `case "cd"` (~:1010): `client.setCwd(sessionId, path)`, reports the resolved
- *  cwd exactly as the route does. Missing path -> usage note, no RPC. */
+ *  cwd exactly as the route does. Missing path -> usage note, no RPC. On success, also announces
+ *  the daemon-confirmed cwd via `ctx.onCwdChanged` (see its doc on `CommandCtx`) so later commands
+ *  in the same session see the new value. */
 async function runCd(ctx: CommandCtx, argText: string): Promise<void> {
   const path = argText.trim();
   if (!path) { ctx.appendNote("usage: /cd <path>"); return; }
   const newCwd = await ctx.client.setCwd(ctx.sessionId, path);
+  ctx.onCwdChanged?.(newCwd);
   ctx.appendNote(`cwd → ${newCwd}`);
 }
 

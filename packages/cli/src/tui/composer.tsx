@@ -60,7 +60,7 @@ import {
 } from "./input-model";
 import { appendHistory, loadHistory, makeHistoryNav } from "./history-store";
 import { COMMANDS, filterCommands, parseSlashInput } from "./commands";
-import { CompletionMenu } from "./completion-menu";
+import { CompletionMenu, MAX_MENU_ROWS } from "./completion-menu";
 
 // The composer never has footer keyboard focus (that's a later task) — this is the one constant
 // FooterSelection it ever passes to footerKeyAction, selecting the "no footer focus" branch of its
@@ -213,7 +213,11 @@ export function Composer({
     if (selected !== 0) setSelected(0);
   }
   const filtered = useMemo(() => (rawQuery !== null ? filterCommands(rawQuery) : []), [rawQuery]);
-  const slashOpen = rawQuery !== null && dismissedQuery !== rawQuery;
+  // T2 review item 2: a zero-match query (e.g. "/zzz") renders no menu, so it must not act like an
+  // open one either — `filtered.length > 0` is part of the open condition itself, which makes the
+  // key gating below (↑/↓/tab/esc) fall straight through to history nav / normal esc / etc. exactly
+  // as if the user had never typed a slash.
+  const slashOpen = rawQuery !== null && dismissedQuery !== rawQuery && filtered.length > 0;
   const boundedSelected = filtered.length > 0 ? Math.min(selected, filtered.length - 1) : 0;
   const menuItems = useMemo(
     () => filtered.map((c) => ({ label: `/${c.name}${c.args ? ` ${c.args}` : ""}`, hint: c.description })),
@@ -224,7 +228,7 @@ export function Composer({
   // fires on mount too (same "T5" convention as the `onStateChange` effect above), including the
   // Esc-dismissed transition (which changes no `InputState` field app.tsx could otherwise observe).
   useEffect(() => {
-    onMenuRowsChange?.(slashOpen ? Math.min(6, filtered.length) : 0);
+    onMenuRowsChange?.(slashOpen ? Math.min(MAX_MENU_ROWS, filtered.length) : 0);
   }, [slashOpen, filtered.length, onMenuRowsChange]);
 
   // Tab AND the "enter completes a partial" case share this: fill the buffer with the selected
@@ -297,10 +301,11 @@ export function Composer({
       // deliberately falls through to the unified handler further down: it needs the exact same
       // known-command/partial-match decision whether or not the menu happens to still be open.
       if (slashOpen) {
-        if (k === "esc") {
-          // "esc closes the menu ONLY" — no double-esc bookkeeping (`lastEscMs`/`onHint`) runs at
-          // all, and this wins even over precedence #1 (running-interrupt) below: while the menu is
-          // open it owns Esc completely.
+        if (k === "esc" && !running) {
+          // "esc closes the menu ONLY" — no double-esc bookkeeping (`lastEscMs`/`onHint`) runs.
+          // Gated on `!running` (T2 review item 1): precedence #1 below — a running turn always
+          // interrupts on the FIRST esc, the 3a invariant — outranks menu-close, so while a turn
+          // runs this branch steps aside and esc falls through to the `onInterrupt` path.
           setDismissedQuery(rawQuery);
           return;
         }
@@ -354,9 +359,9 @@ export function Composer({
         const parsed = parseSlashInput(text);
         if (parsed !== null) {
           const isKnown = COMMANDS.some((c) => c.name === parsed.cmd);
-          if (!isKnown && slashOpen && filtered.length > 0) {
+          if (!isKnown && slashOpen) {
             // A "/partial" matching the currently-selected menu item -> complete it (exactly like
-            // Tab), never run.
+            // Tab), never run. (`slashOpen` already implies `filtered.length > 0` — review item 2.)
             completeSelected();
             return;
           }

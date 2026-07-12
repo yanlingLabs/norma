@@ -37,7 +37,11 @@ export interface CompletionMenuProps {
   columns?: number;
 }
 
-const DEFAULT_MAX_ROWS = 6;
+/** The phase's fixed "≤6 rows" contract, shared as ONE exported constant (T2 review item 4): this
+ *  component's default `maxRows` AND the composer's `onMenuRowsChange` math (`min(MAX_MENU_ROWS,
+ *  filteredCount)`, which feeds `bottomBarRows`' bar-height model) both read it, so the render
+ *  window and the JS-computed pinned-bar height can never drift apart. */
+export const MAX_MENU_ROWS = 6;
 const DEFAULT_COLUMNS = 80;
 
 /** The first visible index of a `rows`-tall window over `total` items that keeps `selected` inside
@@ -67,7 +71,7 @@ function truncateRow(label: string, hint: string | undefined, columns: number): 
   return { label, hint: available > 1 ? `${hint.slice(0, available - 1)}…` : "" };
 }
 
-export function CompletionMenu({ items, selected, maxRows = DEFAULT_MAX_ROWS, columns = DEFAULT_COLUMNS }: CompletionMenuProps) {
+export function CompletionMenu({ items, selected, maxRows = MAX_MENU_ROWS, columns = DEFAULT_COLUMNS }: CompletionMenuProps) {
   if (items.length === 0) return null;
   const rows = Math.min(maxRows, items.length);
   const start = windowStart(selected, items.length, rows);

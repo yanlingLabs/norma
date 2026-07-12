@@ -588,6 +588,31 @@ describe("App — slash-command wiring (Phase 3d T2: onRunCommand + local_note)"
     expect(frame).toContain("Show or switch the active model/effort"); // /model row visible
     expect(frame).toContain(COMPOSER_CURSOR); // composer (with its "/mo" buffer) still rendered below it
   });
+
+  test("(v5) /cd propagates its daemon-confirmed cwd to later commands in the same session (T2 review item 3)", async () => {
+    const bridge = makeEventBridge();
+    const skillsCalls: unknown[][] = [];
+    const client = {
+      ...fakeClient(),
+      setCwd: async (_sessionId: string, _path: string) => "/resolved/newdir",
+      listSkills: async (...args: unknown[]) => { skillsCalls.push(args); return []; },
+    };
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    stdin.write("/cd ../x");
+    await wait();
+    stdin.write("\r");
+    await wait();
+    expect(lastFrame() ?? "").toContain("cwd → /resolved/newdir"); // runCd's note landed
+
+    stdin.write("/skills");
+    await wait();
+    stdin.write("\r");
+    await wait();
+
+    // The DAEMON-CONFIRMED cwd from /cd — not baseProps' mount-time "/tmp" — reaches /skills.
+    expect(skillsCalls).toEqual([["/resolved/newdir"]]);
+  });
 });
 
 describe("bottomBarRows (pinned-bar line-count model)", () => {

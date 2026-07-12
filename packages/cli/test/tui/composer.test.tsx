@@ -1032,4 +1032,55 @@ describe("Composer — slash-command completion menu (Phase 3d T2)", () => {
     await wait();
     expect(stripAnsi(lastFrame() ?? "")).not.toContain("Show or switch the active model/effort");
   });
+
+  test("(ac) Esc while RUNNING with the menu open interrupts on the FIRST press (precedence #1 outranks menu-close — T2 review item 1)", async () => {
+    let interrupts = 0;
+    const { stdin, lastFrame } = render(
+      <Composer
+        running
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => { interrupts += 1; }}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+      />,
+    );
+    await wait();
+    stdin.write("/mo"); // menu open (matches /model)
+    await wait();
+    expect(stripAnsi(lastFrame() ?? "")).toContain("Show or switch the active model/effort");
+
+    stdin.write("\x1b"); // FIRST esc while running — must interrupt, not just close the menu
+    await wait();
+
+    expect(interrupts).toBe(1);
+  });
+
+  test("(ad) a zero-match query ('/zzz') never gates keys: ↑ recalls history as if no menu existed (T2 review item 2)", async () => {
+    const path = historyPath();
+    appendHistory(path, { display: "recall me", ts: 1, sessionId: "s1" });
+
+    const { stdin, lastFrame } = render(
+      <Composer
+        running={false}
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => {}}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={path}
+        sessionId="s1"
+      />,
+    );
+    await wait();
+    stdin.write("/zzz"); // zero matches — no menu rendered, and it must not swallow keys either
+    await wait();
+    stdin.write("\x1b[A"); // up -> history recall, NOT an (invisible) selection move
+    await wait();
+
+    expect(stripAnsi(lastFrame() ?? "")).toContain("recall me");
+  });
 });

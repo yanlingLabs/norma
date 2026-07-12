@@ -258,6 +258,15 @@ describe("runners — mirror main.ts's routes", () => {
     expect(notes[0]).toContain("usage:");
   });
 
+  test("/cd — fires onCwdChanged with the DAEMON-CONFIRMED cwd (T2 review item 3)", async () => {
+    const { client } = makeClient({ setCwd: () => "/resolved/path" });
+    const { ctx } = makeCtx(client);
+    const seen: string[] = [];
+    ctx.onCwdChanged = (newCwd: string) => seen.push(newCwd);
+    await runCommand(ctx, "/cd ../elsewhere");
+    expect(seen).toEqual(["/resolved/path"]); // the resolved path, never the raw "../elsewhere" arg
+  });
+
   test("/skills — mirrors `case \"skills\"`: uses ctx.cwd, lists name/source/description", async () => {
     const { client, calls } = makeClient({ listSkills: () => [{ name: "brainstorm", description: "Explore ideas", source: "user", path: "/x" }] });
     const { ctx, notes } = makeCtx(client, { cwd: "/my/proj" });

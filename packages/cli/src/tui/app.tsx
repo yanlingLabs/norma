@@ -265,12 +265,24 @@ export function App({
   // cast to the full `NormaClient` the runners need (`CommandCtx.client`) — `AppClient` above is
   // deliberately only the subset App itself calls; the real production `client` prop (main.ts) is
   // always a genuine `NormaClient`, which satisfies both shapes.
+  //
+  // T2 review item 3: the SESSION'S live cwd lives in a ref, seeded from the mount-time prop (the
+  // welcome banner keeps the original value on purpose), and every run builds a FRESH ctx reading
+  // it at run time — so a `/cd`'s daemon-confirmed new cwd (delivered back through `onCwdChanged`,
+  // commands.ts's runCd) is what LATER commands in the same session (`/skills`, `/mcp`) receive as
+  // `ctx.cwd`.
   const appendNote = useCallback((text: string) => dispatch({ type: "local_note", text }), []);
-  const commandCtx = useMemo(
-    (): CommandCtx => ({ client: client as unknown as NormaClient, sessionId, cwd, appendNote }),
-    [client, sessionId, cwd, appendNote],
-  );
-  const onRunCommand = useCallback((text: string) => { void runCommand(commandCtx, text); }, [commandCtx]);
+  const cwdRef = useRef(cwd);
+  const onRunCommand = useCallback((text: string) => {
+    const ctx: CommandCtx = {
+      client: client as unknown as NormaClient,
+      sessionId,
+      cwd: cwdRef.current,
+      appendNote,
+      onCwdChanged: (newCwd: string) => { cwdRef.current = newCwd; },
+    };
+    void runCommand(ctx, text);
+  }, [client, sessionId, appendNote]);
 
   // T5 double-press ctrl+C/ctrl+D exit-armed state (see the file-top doc comment's KEY ROUTING #2).
   // Carries WHICH key armed it (whole-branch review item 3) so the footer hint names the right key;
