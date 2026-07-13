@@ -3,12 +3,19 @@ import { join, dirname, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { TrustStore } from "./trust";
 
-export interface SkillMeta { name: string; description: string; source: "project" | "user" | "self" | "plugin" | "builtin"; path: string; claudeFormat?: boolean }
-interface ParsedSkill { name: string; description: string; body: string }
+// Phase 5c Task 3: `author?` mirrors T1's `author: norma` frontmatter stamp (writeSelf below) back
+// out through list()/load() — additive on every interface (undefined for any skill written before
+// this parse existed, or one that never carried the field, e.g. a project/user/plugin/builtin
+// skill nobody stamped).
+export interface SkillMeta { name: string; description: string; source: "project" | "user" | "self" | "plugin" | "builtin"; path: string; claudeFormat?: boolean; author?: string }
+interface ParsedSkill { name: string; description: string; body: string; author?: string }
 interface ScannedSkill extends ParsedSkill { source: SkillMeta["source"]; path: string; claudeFormat?: boolean }
-/** Structural failure class, mirroring memory.ts's `MemoryResult` — no "trust" kind here: self-write
- *  is always against the local user's own store, never gated by project trust. */
-export type SkillResult<T = void> = { ok: true; value: T } | { ok: false; error: string; kind?: "not_found" | "invalid" };
+/** Structural failure class, mirroring memory.ts's `MemoryErrorKind`/`MemoryResult` — no "trust"
+ *  kind here: self-write is always against the local user's own store, never gated by project
+ *  trust. Named (not inline) so ipc/server.ts's `skillErrorCode` can import it by type, same
+ *  precedent as `MemoryErrorKind`. */
+export type SkillErrorKind = "not_found" | "invalid";
+export type SkillResult<T = void> = { ok: true; value: T } | { ok: false; error: string; kind?: SkillErrorKind };
 
 const TRUNC = "\n[…truncated]";
 
@@ -46,16 +53,17 @@ function parseSkill(path: string, fallbackName: string): ParsedSkill | null {
   const body = raw.slice(end + 4).replace(/^\r?\n/, "");
   let name = "";
   let description = "";
+  let author = "";
   for (const line of fm.split("\n")) {
-    const m = /^\s*(name|description)\s*:\s*(.*)$/.exec(line);
+    const m = /^\s*(name|description|author)\s*:\s*(.*)$/.exec(line);
     if (!m) continue;
     let v = m[2]!.trim();
     if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
-    if (m[1] === "name") name = v; else description = v;
+    if (m[1] === "name") name = v; else if (m[1] === "description") description = v; else author = v;
   }
   if (!name) name = fallbackName;
   if (!name || !description) return null; // both required
-  return { name, description, body };
+  return { name, description, body, ...(author ? { author } : {}) };
 }
 
 /** Cap `s` to `maxBytes` UTF-8 bytes on a byte boundary, appending a truncation marker when cut. Mirrors context.ts's capBytes. */
@@ -164,7 +172,11 @@ export class SkillStore {
     for (const s of this.discover(input.cwd)) {
       if (seen.has(s.name)) continue;
       seen.add(s.name);
-      out.push({ name: s.name, description: s.description, source: s.source, path: s.path, ...(s.claudeFormat ? { claudeFormat: s.claudeFormat } : {}) });
+      out.push({
+        name: s.name, description: s.description, source: s.source, path: s.path,
+        ...(s.claudeFormat ? { claudeFormat: s.claudeFormat } : {}),
+        ...(s.author ? { author: s.author } : {}),
+      });
     }
     return out;
   }

@@ -34,6 +34,12 @@ import {
   SkillMetaSchema,
   SkillsListParams,
   SkillsListResult,
+  SkillsReadParams,
+  SkillsReadResult,
+  SkillsWriteParams,
+  SkillsWriteResult,
+  SkillsDeleteParams,
+  SkillsDeleteResult,
   McpServerStatusSchema,
   PluginInfoSchema,
   PluginsListParams,
@@ -278,6 +284,43 @@ describe("skills.list schema", () => {
     const r = SkillsListResult.parse({ ok: true, skills: [meta] });
     expect(r.skills).toHaveLength(1);
     expect(METHODS.skillsList).toBe("skills.list");
+  });
+
+  test("SkillMetaSchema.author is optional, round-trips when present (phase 5c Task 3)", () => {
+    const meta = SkillMetaSchema.parse({ name: "greet", description: "Say hi", source: "self", path: "/x/SKILL.md" });
+    expect(meta.author).toBeUndefined();
+    const stamped = SkillMetaSchema.parse({ name: "greet", description: "Say hi", source: "self", path: "/x", author: "norma" });
+    expect(stamped.author).toBe("norma");
+  });
+});
+
+describe("skills.read/write/delete schemas (Phase 5c Task 3)", () => {
+  test("METHODS carries all three verbs", () => {
+    expect(METHODS.skillsRead).toBe("skills.read");
+    expect(METHODS.skillsWrite).toBe("skills.write");
+    expect(METHODS.skillsDelete).toBe("skills.delete");
+  });
+
+  test("skills.read params: name required, cwd optional; result is {skill} with body", () => {
+    expect(SkillsReadParams.parse({ name: "my-skill" })).toEqual({ name: "my-skill" });
+    expect(SkillsReadParams.parse({ name: "my-skill", cwd: "/tmp/proj" })).toEqual({ name: "my-skill", cwd: "/tmp/proj" });
+    expect(() => SkillsReadParams.parse({ name: "" })).toThrow();
+    const skill = { name: "my-skill", description: "d", source: "self" as const, path: "/x/SKILL.md", author: "norma", body: "BODY" };
+    expect(SkillsReadResult.parse({ skill })).toEqual({ skill });
+  });
+
+  test("skills.write params require name/description/body, no cwd/scope; result is empty", () => {
+    const p = SkillsWriteParams.parse({ name: "my-skill", description: "d", body: "b" });
+    expect(p).toEqual({ name: "my-skill", description: "d", body: "b" });
+    expect(() => SkillsWriteParams.parse({ name: "my-skill", description: "d", body: "" })).toThrow();
+    expect(() => SkillsWriteParams.parse({ name: "", description: "d", body: "b" })).toThrow();
+    expect(SkillsWriteResult.parse({})).toEqual({});
+  });
+
+  test("skills.delete params: name only, no cwd/scope; result is empty", () => {
+    expect(SkillsDeleteParams.parse({ name: "my-skill" })).toEqual({ name: "my-skill" });
+    expect(() => SkillsDeleteParams.parse({ name: "" })).toThrow();
+    expect(SkillsDeleteResult.parse({})).toEqual({});
   });
 });
 

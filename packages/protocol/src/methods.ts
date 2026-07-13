@@ -117,9 +117,46 @@ export const SkillMetaSchema = z.object({
   description: z.string(),
   source: z.enum(["project", "user", "self", "plugin"]),
   path: z.string(),
+  // Phase 5c Task 3: mirrors SkillStore's `author?` (agent/skills.ts) — set for a self-authored
+  // skill (T1 stamps `author: norma` in the frontmatter, T3's list()/load() parse it back out),
+  // undefined for every other source. Additive/optional: an older server that never sends it still
+  // parses.
+  author: z.string().optional(),
 });
 export const SkillsListParams = z.object({ cwd: z.string().optional() });
 export const SkillsListResult = z.object({ ok: z.literal(true), skills: z.array(SkillMetaSchema) });
+
+// ---------------------------------------------------------------------------------------------
+// Skills read/write/delete (Phase 5c Task 3, spec: self-authored skills) — the management surface
+// over the daemon's `SkillStore` (core/src/agent/skills.ts), same precedent as the memory.* block
+// below (5b Task 3): a store `ok:false` becomes a thrown RpcFailure (never a typed result union),
+// mapped from the store's structural `kind` by ipc/server.ts's `skillErrorCode` — the SAME
+// structural switch as `memoryErrorCode`, over `SkillResult.kind` instead of `MemoryResult.kind`.
+//
+// Unlike memory.*, there is no `scope` param to abuse: `skills.write`/`skills.delete` are confined
+// SERVER-SIDE to `SkillStore.writeSelf`/`deleteSelf` — a caller can never write/delete a
+// project/user/plugin/builtin skill through this RPC, only ever its own self-authored one.
+// `skills.read`, by contrast, reads ANY source by the store's normal precedence (project > user >
+// self > plugin > builtin) — same `{name, cwd?}` shape as `skills.list`'s per-name lookup would be.
+// ---------------------------------------------------------------------------------------------
+
+export const SkillsReadParams = z.object({ name: z.string().min(1), cwd: z.string().optional() });
+/** Mirrors `MemoryReadResult`'s `{fact}` pattern: `SkillMetaSchema` plus the full body. */
+export const SkillsReadResult = z.object({ skill: SkillMetaSchema.extend({ body: z.string() }) });
+
+/** No `cwd`/scope: `writeSelf` always targets `~/.norma/skills/self`, independent of caller cwd. */
+export const SkillsWriteParams = z.object({
+  name: z.string().min(1),
+  description: z.string().min(1),
+  body: z.string().min(1),
+});
+export const SkillsWriteResult = z.object({});
+
+/** No `cwd`: same self-confinement as `skills.write` — the store resolves the name against ALL
+ *  sources only to check the "must be self" precondition (ipc/server.ts), never to gate deletion
+ *  itself. */
+export const SkillsDeleteParams = z.object({ name: z.string().min(1) });
+export const SkillsDeleteResult = z.object({});
 
 export const McpServerStatusSchema = z.object({
   name: z.string(),
@@ -664,6 +701,9 @@ export const METHODS = {
   sessionInterrupt: "session.interrupt",
   sessionCompact: "session.compact",
   skillsList: "skills.list",
+  skillsRead: "skills.read",
+  skillsWrite: "skills.write",
+  skillsDelete: "skills.delete",
   mcpList: "mcp.list",
   pluginsList: "plugins.list",
   askUserRespond: "ask_user.respond",
