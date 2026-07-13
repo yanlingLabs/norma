@@ -44,6 +44,10 @@ targets:
           ( cd "${SRCROOT}/../../packages/cli" && bun run compile:core )
           cp "${SRCROOT}/../../dist/norma-core" "${DEST_RES}/norma-core"
           chmod +x "${DEST_RES}/norma-core"
+          # Stable code identity: bun's ad-hoc signature changes every rebuild, which would re-prompt
+          # Keychain access for com.norma.core secrets on each update; the app's team identity is
+          # stable, and the outer app signature runs last, leaving this nested signature intact.
+          codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" "${DEST_RES}/norma-core"
     info:
       path: Support/Info.plist
       properties:
