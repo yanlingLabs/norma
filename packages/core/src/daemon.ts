@@ -438,13 +438,22 @@ export async function startDaemon(opts: {
     // (stopAll, alongside mcp?.stopAll()/pluginSupervisor.stopAll()). `cwdOf`/`rootsOf`/`tmpDirOf`
     // are the SAME session-meta sources registerMemoryTools's `cwdOf` / fs-read.ts's roots+tmpDir
     // already read: `store.meta(sid).cwd`, `sessionDirs.roots(sid)`, `sessionTmpDir(sid)`.
-    lspManager = new LspManager();
-    registerLspTools(registry, {
-      lsp: lspManager,
-      cwdOf: (sid) => store.meta(sid).cwd ?? undefined,
-      rootsOf: (sid) => sessionDirs.roots(sid),
-      tmpDirOf: (sid) => sessionTmpDir(sid),
-    });
+    //
+    // Phase 5f Task 4: default ON, same boot-snapshot `cfg?.enabled === false` shape as
+    // reviewer/titles above — an explicit `settings.lsp.enabled: false` is the only way to skip
+    // this whole block, so when off the three lsp_* tools are simply never registered (a query for
+    // one becomes the registry's ordinary "unknown tool" error, no special-cased denial).
+    // `idleShutdownMs` threads straight from settings into the SAME LspManager constructor call.
+    const lspCfg = settings?.lsp;
+    if (lspCfg?.enabled !== false) {
+      lspManager = new LspManager({ idleShutdownMs: lspCfg?.idleShutdownMs });
+      registerLspTools(registry, {
+        lsp: lspManager,
+        cwdOf: (sid) => store.meta(sid).cwd ?? undefined,
+        rootsOf: (sid) => sessionDirs.roots(sid),
+        tmpDirOf: (sid) => sessionTmpDir(sid),
+      });
+    }
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
     await mcp.startAll(settings?.mcpServers ?? {});
     // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled &&
