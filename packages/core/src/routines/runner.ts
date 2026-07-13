@@ -37,7 +37,18 @@ const QUOTA_ERROR_PREFIX = "HTTP 429";
  *  filter/query on (e.g. "list every session this routine ever fired"). Neither overwrites the
  *  other — titles.ts's SessionTitler still never touches an already-titled session (`maybeTitle`'s
  *  first check is `if (this.store.getTitle(sessionId)) return`), and `origin` is write-once at
- *  create time, nothing else in the engine ever mutates it. */
+ *  create time, nothing else in the engine ever mutates it.
+ *
+ *  Known v1 limitation (phase 5a §7, document-don't-special-case): a routine turn runs at depth 0,
+ *  so any `spawn_agent` it makes now defaults to BACKGROUND (phase 5a's flip) — the single
+ *  `engine.runTurn` above returns as soon as the spawn's immediate `{agentId,status:"running"}`
+ *  tool_result comes back, not once the delegate actually finishes. `resultText` above then reads
+ *  whatever the main thread said BEFORE the delegate's own completion notification lands (that
+ *  notification instead triggers its own separate idle-wake turn later, invisible to this
+ *  particular runHeadless call/return). A routine prompt whose read-back must include a
+ *  delegate's result should instruct the model to wait for it — i.e. have the model pass
+ *  `run_in_background: false` on that spawn_agent call — rather than this runner special-casing
+ *  routine-origin sessions to a different spawn default. */
 export function makeDaemonRoutineRunner(deps: {
   store: SessionStore;
   hub: SessionHub;

@@ -1874,3 +1874,58 @@ describe("AgentEngine: spawn_agent name (4h-ii-b Task 2)", () => {
 // notifyBgCompletion) and replayed user-role. Its coverage migrated, test-for-test, to
 // test/agent/bg-retrigger.test.ts.
 // -------------------------------------------------------------------------------------------
+
+// -------------------------------------------------------------------------------------------
+// Phase 5a Task 4 (T3-review finding, controller-approved additional deliverable): a regression
+// pin for the dispatch loop's per-call event ORDERING, not new behavior — it passes today without
+// any implementation change. engine.ts's `for (const call of calls)` loop (~:1666) emits, per call
+// in the MODEL's OWN original order, `tool_call(call)` then THAT SAME call's `tool_result` before
+// ever emitting the next call's `tool_call` — strict alternation — even though the underlying
+// children this dispatches EXECUTE concurrently (the bridge's own `Promise.all(spawnCalls.map(...))`
+// runs above this loop and has already resolved every call's outcome by the time the loop below
+// even starts). The TUI's name→row pairing (phase 5a T3, tui/state.ts's `bgSpawnNameMapping` +
+// its `activeTools[0]` pop-the-front pairing) leans on this exact invariant — it pairs a
+// background spawn's `name` onto the row for whichever tool_call is CURRENTLY at the front of
+// `activeTools`, trusting that its very next tool_result is that SAME call's own. A future refactor
+// that instead drained results in Promise.all SETTLEMENT order (fastest-finishing child first)
+// rather than replaying them in call order would silently mispair names onto the wrong rows,
+// without ever touching this loop's code shape — this test exists so that regression fails loudly
+// here first.
+// -------------------------------------------------------------------------------------------
+describe("AgentEngine: dispatch loop preserves strict per-call tool_call/tool_result alternation for N concurrent spawns (5a T4 regression pin)", () => {
+  test("two named background spawns in one assistant message: tool_call(cA) -> tool_result(cA) -> tool_call(cB) -> tool_result(cB), in the model's original call order — and each result's agentId matches ITS OWN call's name, not the other's", async () => {
+    const { engine, sessionId, events, bgAgents } = setup([
+      [
+        spawnCall("cA", "task A", { run_in_background: true, name: "alpha" }),
+        spawnCall("cB", "task B", { run_in_background: true, name: "beta" }),
+        done("tool_calls"),
+      ],
+      text("parent wrap-up"), // parent's own continuation round, after both immediate tool_results
+    ]);
+    await engine.runTurn(sessionId);
+
+    // Strict alternation, main-thread only, restricted to these two callIds (a child's OWN
+    // thread-tagged tool events, if any, are excluded by the threadId==="main" filter — not the
+    // subject here).
+    const mainToolEvents = events.filter((e): e is Extract<SessionEvent, { type: "tool_call" | "tool_result" }> =>
+      (e.type === "tool_call" || e.type === "tool_result") && e.threadId === "main" && (e.callId === "cA" || e.callId === "cB"));
+    expect(mainToolEvents.map((e) => `${e.type}:${e.callId}`)).toEqual([
+      "tool_call:cA", "tool_result:cA", "tool_call:cB", "tool_result:cB",
+    ]);
+
+    const resultA = mainToolEvents[1] as Extract<SessionEvent, { type: "tool_result" }>;
+    const resultB = mainToolEvents[3] as Extract<SessionEvent, { type: "tool_result" }>;
+    const agentIdA = (JSON.parse(resultA.output) as { agentId: string }).agentId;
+    const agentIdB = (JSON.parse(resultB.output) as { agentId: string }).agentId;
+    expect(agentIdA).not.toBe(agentIdB);
+
+    // thread_started carries no `name` field (per the T4 brief), so the pairing ground truth comes
+    // from the registry instead: `name` lives only on each call's OWN argsJson (spawnCall's
+    // `extra.name` above) and on the registry entry the spawn bridge registered FOR that same call
+    // — independent of event order. A pairing bug (e.g. a Promise.all-settlement-order refactor)
+    // would scramble these two lines against each other without ever breaking the alternation
+    // assertion above, which is why both are asserted here.
+    expect(bgAgents.get("alpha", sessionId)?.agentId).toBe(agentIdA);
+    expect(bgAgents.get("beta", sessionId)?.agentId).toBe(agentIdB);
+  });
+});
