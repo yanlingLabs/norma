@@ -31,6 +31,15 @@ export const Settings = z.object({
     enabled: z.boolean().optional(),
     model: z.string().optional(),
     allow: z.array(z.string()).optional(),
+    // Phase 5e T4: per-class on/off, subordinate to `enabled` — an `enabled:false` reviewer
+    // never runs regardless of what's set here (engine.ts ANDs reviewerEnabled with
+    // reviewClassEnabled at every call site). Absent block OR an absent per-class key means
+    // enabled — same optional-means-default-true shape as engine.ts's own reviewClassEnabled.
+    classes: z.object({
+      bash: z.boolean().optional(),
+      fs: z.boolean().optional(),
+      external: z.boolean().optional(),
+    }).optional(),
   }).optional(),
   titles: z.object({
     enabled: z.boolean().optional(),

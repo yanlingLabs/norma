@@ -747,3 +747,28 @@ describe("engine + safety reviewer (bash class-off, phase 5e T3)", () => {
     expect(calls.length).toBe(1); // ran directly
   });
 });
+
+// Phase 5e T4: back-compat — reviewerEnabled:false is the master switch; reviewerClasses is
+// subordinate to it and can never re-enable a class it turns off. Bash/fs/external all share the
+// SAME `this.cfg.reviewerEnabled !== false && ... && this.reviewClassEnabled(cls)` gate (engine.ts),
+// so one representative class is enough to pin the precedence.
+describe("engine + safety reviewer (reviewerEnabled:false wins over reviewerClasses, phase 5e T4)", () => {
+  test("reviewerEnabled:false with reviewerClasses:{bash:true,fs:true,external:true} explicitly ON → bash still runs unreviewed", async () => {
+    const { registry, calls } = stubRegistry();
+    const reviewer = stubReviewer({ verdict: "unsafe", reason: "should never be asked" });
+    const provider = new FakeProvider(bashTurn("rm -rf x"));
+    const { engine, store, sessionId } = setupEngine(provider, {
+      registry, reviewer: reviewer as any,
+      reviewerEnabled: false,
+      reviewerClasses: { bash: true, fs: true, external: true }, // explicit ON — must NOT override the master switch
+    });
+
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(reviewer.seen.length).toBe(0);
+    expect(events.some((e) => e.type === "tool_review")).toBe(false);
+    expect(events.some((e) => e.type === "approval_requested")).toBe(false);
+    expect(calls.length).toBe(1); // ran directly, unreviewed
+  });
+});

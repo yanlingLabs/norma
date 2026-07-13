@@ -89,6 +89,46 @@ describe("loadSettings", () => {
     expect(s.reviewer).toBeUndefined();
   });
 
+  // Phase 5e T4: reviewer.classes — additive per-class on/off, subordinate to reviewer.enabled.
+  const base54 = { schemaVersion: 2 as const, provider: { type: "codex-oauth" as const, model: "gpt-5.4" } };
+
+  test("reviewer.classes parses all three booleans; absent block/field → undefined", () => {
+    const s = Settings.parse({ ...base54, reviewer: { classes: { bash: false, fs: true, external: false } } });
+    expect(s.reviewer?.classes).toEqual({ bash: false, fs: true, external: false });
+    expect(Settings.parse({ ...base54, reviewer: {} }).reviewer?.classes).toBeUndefined();
+    expect(Settings.parse(base54).reviewer).toBeUndefined();
+  });
+
+  test("reviewer.classes: a partial object (one key set) round-trips exactly — the other two keys stay absent, not defaulted-in at the settings layer", () => {
+    const s = Settings.parse({ ...base54, reviewer: { classes: { fs: false } } });
+    expect(s.reviewer?.classes).toEqual({ fs: false });
+    expect(s.reviewer?.classes).not.toHaveProperty("bash");
+    expect(s.reviewer?.classes).not.toHaveProperty("external");
+  });
+
+  test("reviewer.classes coexists with enabled:false — the settings layer stores both independently; precedence (enabled:false wins regardless of classes) is the engine's job, not the parser's", () => {
+    const s = Settings.parse({ ...base54, reviewer: { enabled: false, classes: { bash: true, fs: true, external: true } } });
+    expect(s.reviewer).toEqual({ enabled: false, classes: { bash: true, fs: true, external: true } });
+  });
+
+  test("reviewer.classes: an unrecognized key inside the block is tolerated — stripped like every other zod object here, never rejects the whole settings file", () => {
+    const s = Settings.parse({ ...base54, reviewer: { classes: { bash: false, network: true } } });
+    expect(s.reviewer?.classes).toEqual({ bash: false });
+    expect(s.reviewer?.classes).not.toHaveProperty("network");
+  });
+
+  test("reviewer.classes: a non-boolean class value is rejected (same throw-on-bad-shape idiom as worktree.baseRef / toolSearch.deferExternals / subagents.maxDepth)", () => {
+    expect(() => Settings.parse({ ...base54, reviewer: { classes: { bash: "nope" } } })).toThrow();
+    expect(() => Settings.parse({ ...base54, reviewer: { classes: "everything" } })).toThrow();
+  });
+
+  test("legacy migration keeps working with reviewer.classes absent", () => {
+    const p = tmpSettings({ legacyCustom: { provider: "disabled" } });
+    const s = loadSettings(p);
+    expect(s.schemaVersion).toBe(2);
+    expect(s.reviewer?.classes).toBeUndefined();
+  });
+
   test("plugins config parses; absent → undefined", () => {
     const s = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, plugins: { enabled: ["a"], disabled: ["b"] } });
     expect(s.plugins).toEqual({ enabled: ["a"], disabled: ["b"] });

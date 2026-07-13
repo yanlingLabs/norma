@@ -612,6 +612,34 @@ describe("daemon IPC", () => {
     c.close();
   });
 
+  // Phase 5e T4: settings.reviewer.classes → EngineConfig.reviewerClasses, threaded through the
+  // REAL daemon (loadSettings → startDaemon → AgentEngine), not a stubbed cfg. The reviewer stays
+  // ON overall (no `reviewer.enabled:false`) but `classes.fs:false` turns off just the fs class —
+  // a dotfile write (normally "unusual" and reviewed under auto policy, per 5e T3) must instead
+  // execute directly. Only ONE script entry is needed: if the wiring were broken, the write would
+  // route to reviewAndDispatch and consume this same single-track FakeProvider queue for a review
+  // call instead, which would fail to find a JSON verdict and escalate to a human approval that
+  // times out well past bun's default per-test timeout — i.e. a broken wire fails this test loudly.
+  test("settings reviewer.classes.fs:false threads through the real daemon: dotfile write bypasses the AI reviewer and executes directly", async () => {
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    const { existsSync, readFileSync: rf } = await import("node:fs");
+    const fake = new FakeProvider([
+      [{ type: "tool_call", callId: "w1", name: "write", argsJson: JSON.stringify({ path: ".env", content: "SECRET=1" }) }, { type: "done", stopReason: "tool_calls" }],
+      [{ type: "text_delta", delta: "done" }, { type: "done", stopReason: "end_turn" }],
+    ]);
+    await boot({}, fake, { reviewer: { classes: { fs: false } } }); // reviewer stays ON overall; only the fs class is off
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "fs-class-off");
+    const cwd = mkdtempSync(join(tmpdir(), "norma-fsclassoff-"));
+    const { result: created } = await c.request(METHODS.sessionCreate, { scope: "global", cwd, approvalPolicy: "auto" });
+    await c.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
+    await c.request(METHODS.sessionSend, { sessionId: created.sessionId, text: "write .env" });
+    await c.waitForNotification((n) => n.method === METHODS.event && n.params.type === "turn_completed");
+    expect(existsSync(join(cwd, ".env"))).toBe(true);
+    expect(rf(join(cwd, ".env"), "utf8")).toBe("SECRET=1");
+    c.close();
+  });
+
   test("session.addDir widens roots; bash can then write the added dir", async () => {
     const { FakeProvider } = await import("../src/agent/fake-provider");
     if (process.platform !== "darwin") return; // sandbox-exec required

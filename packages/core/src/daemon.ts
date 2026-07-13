@@ -538,6 +538,10 @@ export async function startDaemon(opts: {
       reviewer,
       reviewerEnabled: reviewerCfg?.enabled,
       reviewerAllow: reviewerCfg?.allow ?? [],
+      // Phase 5e T4: raw pass-through — engine.ts's reviewClassEnabled already treats an absent
+      // object/key as enabled, and reviewerEnabled:false already short-circuits before this is
+      // ever consulted (see its own doc comment), so no extra defaulting belongs here.
+      reviewerClasses: reviewerCfg?.classes,
       titler,
       computerUse,
       toolSearch: {
