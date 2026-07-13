@@ -65,9 +65,16 @@ describe("engine + safety reviewer (auto-policy bash)", () => {
     await engine.runTurn(sessionId);
     const events = store.read(sessionId);
 
-    expect(types(events)).toEqual(expect.arrayContaining(["approval_requested", "approval_resolved", "tool_result"]));
+    expect(types(events)).toEqual(expect.arrayContaining(["tool_review", "approval_requested", "approval_resolved", "tool_result"]));
+    // phase 5e T2: the reason moves to reviewerReason; the generic summary no longer smuggles it.
     const requested = events.find((e) => e.type === "approval_requested") as any;
-    expect(requested.summary).toContain("REASON_SENTINEL");
+    expect(requested.reviewerReason).toBe("REASON_SENTINEL");
+    expect(requested.summary).not.toContain("REASON_SENTINEL");
+    expect(requested.summary).not.toContain("safety reviewer");
+
+    const review = events.find((e) => e.type === "tool_review") as any;
+    expect(review).toMatchObject({ toolName: "bash", verdict: "unsafe", reason: "REASON_SENTINEL" });
+    expect(review.summary).toContain("rm -rf x");
 
     const result = events.find((e) => e.type === "tool_result") as any;
     expect(result.isError).toBe(true);
@@ -102,9 +109,15 @@ describe("engine + safety reviewer (auto-policy bash)", () => {
       expect(elapsed).toBeLessThan(2000); // nowhere near the 5-min ask-path default or the 60s reviewer default
       const events = store.read(sessionId);
       expect(events.find((e) => e.type === "approval_resolved")).toMatchObject({ approved: false, by: "timeout" });
+      const requested = events.find((e) => e.type === "approval_requested") as any;
+      expect(requested.reviewerReason).toBe("REASON_TIMEOUT");
       const result = events.find((e) => e.type === "tool_result") as any;
       expect(result.isError).toBe(true);
-      expect(result.output).toContain("REASON_TIMEOUT");
+      // denialMessage stays BYTE-IDENTICAL to pre-T2 (the one deliberate reviewer->model channel) —
+      // exact match, not just toContain, so any accidental sanitization/reshaping fails loudly.
+      expect(result.output).toBe(
+        'blocked by the safety reviewer: REASON_TIMEOUT. No approval within 60s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.',
+      );
       expect(calls.length).toBe(0);
     } finally {
       if (prev === undefined) delete process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS;
@@ -112,7 +125,7 @@ describe("engine + safety reviewer (auto-policy bash)", () => {
     }
   });
 
-  test("safe verdict → bash runs, no approval_requested", async () => {
+  test("safe verdict → bash runs, no approval_requested, but tool_review(safe) is persisted", async () => {
     const { registry, calls } = stubRegistry();
     const reviewer = stubReviewer({ verdict: "safe", reason: "looks fine" });
     const provider = new FakeProvider(bashTurn("rm -rf x"));
@@ -125,9 +138,12 @@ describe("engine + safety reviewer (auto-policy bash)", () => {
     expect(calls).toEqual([{ command: "rm -rf x", justification: undefined }]);
     const result = events.find((e) => e.type === "tool_result") as any;
     expect(result.isError).toBe(false);
+    const review = events.find((e) => e.type === "tool_review") as any;
+    expect(review).toMatchObject({ toolName: "bash", verdict: "safe", reason: "looks fine" });
+    expect(review.summary).toContain("rm -rf x");
   });
 
-  test("allowlisted `ls` → bash runs, reviewer.review NOT called, no approval", async () => {
+  test("allowlisted `ls` → bash runs, reviewer.review NOT called, no approval, NO tool_review (bashLooksSafe bypass)", async () => {
     const { registry, calls } = stubRegistry();
     const reviewer = stubReviewer({ verdict: "unsafe", reason: "should never be asked" });
     const provider = new FakeProvider(bashTurn("ls -la"));
@@ -137,11 +153,12 @@ describe("engine + safety reviewer (auto-policy bash)", () => {
     const events = store.read(sessionId);
 
     expect(events.some((e) => e.type === "approval_requested")).toBe(false);
+    expect(events.some((e) => e.type === "tool_review")).toBe(false);
     expect(reviewer.seen.length).toBe(0);
     expect(calls).toEqual([{ command: "ls -la", justification: undefined }]);
   });
 
-  test("reviewer throws → escalates (approval_requested fires, summary notes manual approval)", async () => {
+  test("reviewer throws → tool_review(error) + escalates (approval_requested carries reviewerReason, NOT the smashed-in summary)", async () => {
     const { registry, calls } = stubRegistry();
     const reviewer = stubReviewer("throw");
     const provider = new FakeProvider(bashTurn("curl http://example.com"));
@@ -156,9 +173,14 @@ describe("engine + safety reviewer (auto-policy bash)", () => {
     await engine.runTurn(sessionId);
     const events = store.read(sessionId);
 
+    const review = events.find((e) => e.type === "tool_review") as any;
+    expect(review).toMatchObject({ toolName: "bash", verdict: "error" });
+    expect(review.reason.toLowerCase()).toContain("manual approval");
+
     const requested = events.find((e) => e.type === "approval_requested") as any;
     expect(requested).toBeDefined();
-    expect(requested.summary.toLowerCase()).toContain("manual approval");
+    expect(requested.summary.toLowerCase()).not.toContain("manual approval");
+    expect(requested.reviewerReason.toLowerCase()).toContain("manual approval");
     expect(calls.length).toBe(0);
   });
 
@@ -181,6 +203,8 @@ describe("engine + safety reviewer (auto-policy bash)", () => {
     const requested = events.find((e) => e.type === "approval_requested") as any;
     expect(requested).toBeDefined();
     expect(requested.summary).not.toContain("safety reviewer");
+    expect(requested.reviewerReason).toBeUndefined(); // non-reviewer ask-path card carries no reviewerReason
+    expect(events.some((e) => e.type === "tool_review")).toBe(false); // reviewer never consulted under ASK
     expect(calls.length).toBe(1); // approved → ran
   });
 
@@ -195,6 +219,7 @@ describe("engine + safety reviewer (auto-policy bash)", () => {
 
     expect(reviewer.seen.length).toBe(0);
     expect(events.some((e) => e.type === "approval_requested")).toBe(false);
+    expect(events.some((e) => e.type === "tool_review")).toBe(false);
     expect(calls.length).toBe(1);
   });
 
@@ -230,5 +255,34 @@ describe("engine + safety reviewer (auto-policy bash)", () => {
       if (prev === undefined) delete process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS;
       else process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS = prev;
     }
+  });
+
+  test("sanitization: a multiline/oversized reason is single-lined and capped (300) on both tool_review.reason and approval_requested.reviewerReason; tool_review.summary is capped (160)", async () => {
+    const { registry } = stubRegistry();
+    const multilineReason = "line one\nline two\r\nline three " + "x".repeat(400); // > 300 after joining
+    const reviewer = stubReviewer({ verdict: "unsafe", reason: multilineReason });
+    const longCommand = "rm -rf " + "y".repeat(300); // NOT in SAFE_ARGV0 → forces a real review; > 160 once prefixed
+    const provider = new FakeProvider(bashTurn(longCommand));
+    const { engine, store, hub, broker, sessionId } = setupEngine(provider, { registry, reviewer: reviewer as any });
+
+    const watcher: HubClient = {
+      clientName: "auto-denier",
+      deliver(e) { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, false, "auto-denier"); return true; },
+    };
+    hub.attach(watcher, sessionId, 0);
+
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const review = events.find((e) => e.type === "tool_review") as any;
+    expect(review.reason).not.toContain("\n");
+    expect(review.reason).not.toContain("\r");
+    expect(review.reason.length).toBeLessThanOrEqual(300);
+    expect(review.summary.length).toBeLessThanOrEqual(160);
+    expect(review.summary).not.toContain("\n");
+
+    const requested = events.find((e) => e.type === "approval_requested") as any;
+    expect(requested.reviewerReason).not.toContain("\n");
+    expect(requested.reviewerReason.length).toBeLessThanOrEqual(300);
   });
 });

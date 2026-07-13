@@ -115,6 +115,16 @@ function approvalCardSummary(call: { name: string; argsJson: string }): string {
   return `${call.name} ${call.argsJson.slice(0, 160)}`;
 }
 
+/** Sanitize+cap a reviewer-authored free-text field (`tool_review.reason`/`.summary`,
+ *  `approval_requested.reviewerReason`) before it goes on the wire (phase 5e T2). Deliberately NOT
+ *  `sanitizeForReminder` (below): that helper also neutralizes literal `<system-reminder>` tags,
+ *  a concern specific to text embedded in a reminder block re-fed to the model — these fields
+ *  never enter `eventToInput` (client-observability only, per the injection-containment invariant),
+ *  so only newline-stripping + a length cap apply here. */
+function sanitizeReviewText(s: string, maxLen: number): string {
+  return s.replace(/\r?\n/g, " ").slice(0, maxLen);
+}
+
 export const SYSTEM_PROMPT = [
   "You are Norma, an agentic assistant running on the user's Mac.",
   "You operate inside a session working directory; file tool paths are relative to it.",
@@ -1831,18 +1841,37 @@ export class AgentEngine {
             justification = typeof a.justification === "string" ? a.justification : undefined;
           } catch { /* fall through to review of "" → likely unsafe */ }
           if (command && bashLooksSafe(command, this.cfg.reviewerAllow ?? [])) {
+            // Static bypass — reviewer.review() never runs, so NO tool_review event (phase 5e T2:
+            // observability covers actual reviewer invocations, not every gate decision).
             outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
           } else {
-            let v: { verdict: "safe" | "unsafe"; reason: string };
+            // "error" (phase 5e T2): review() THREW (fail-closed) — distinct from a genuine
+            // "unsafe" verdict for tool_review observability, though both escalate identically.
+            let v: { verdict: "safe" | "unsafe" | "error"; reason: string };
             try {
               v = await this.cfg.reviewer.review({ command, justification }, signal);
             } catch {
-              v = { verdict: "unsafe", reason: "reviewer unavailable — manual approval required" };
+              v = { verdict: "error", reason: "reviewer unavailable — manual approval required" };
             }
-            if (v.verdict === "unsafe") {
+            // Exactly one tool_review per ACTUAL review() invocation (this branch only), for every
+            // verdict — sanitized+capped at emission (reason<=300, summary<=160 per Global
+            // Constraints), never the raw client-observability-only fields eventToInput ignores.
+            this.emit(sessionId, {
+              type: "tool_review", sessionId, threadId, toolName: call.name, verdict: v.verdict,
+              reason: sanitizeReviewText(v.reason, 300),
+              summary: sanitizeReviewText(`${call.name} ${command}`, 160),
+            });
+            if (v.verdict !== "safe") {
               outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
                 timeoutMs: Number(process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS ?? 60_000),
-                summary: `⚠ safety reviewer: ${v.reason} — ${call.name} ${command.slice(0, 120)}`,
+                // Plain call summary (approvalCardSummary, same as every other card) — the old
+                // smashed-in "⚠ safety reviewer: ${reason} — " prefix is dropped; `reviewerReason`
+                // below carries the reason for clients to render distinctly (framing is a client
+                // concern, not baked into the wire string).
+                summary: approvalCardSummary(call),
+                reviewerReason: sanitizeReviewText(v.reason, 300),
+                // Byte-identical to pre-T2 (the one deliberate reviewer->model channel) — uses the
+                // RAW v.reason, not the sanitized/capped copy above, so this text never changes.
                 denialMessage: `blocked by the safety reviewer: ${v.reason}. No approval within 60s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.`,
               }, loaded, undefined, pins, rootsOverride, visionCapable);
             } else {
@@ -2141,7 +2170,10 @@ export class AgentEngine {
     sessionId: string,
     threadId: string,
     signal: AbortSignal,
-    opts: { timeoutMs: number; summary: string; denialMessage?: string },
+    // reviewerReason (phase 5e T2): populated ONLY by the reviewer-escalation call site — an
+    // ask-policy or reviewer-less card omits it, matching the protocol field's additive-optional
+    // shape (older-shaped events, and every non-reviewer caller here, still parse/behave unchanged).
+    opts: { timeoutMs: number; summary: string; denialMessage?: string; reviewerReason?: string },
     loaded: Set<string>,
     onApprove?: () => Promise<{ output: string; isError: boolean }>,
     pins: Set<string> = new Set(),
@@ -2154,7 +2186,7 @@ export class AgentEngine {
     try {
       this.emit(sessionId, {
         type: "approval_requested", sessionId, threadId, callId: call.callId, toolName: call.name,
-        summary: opts.summary,
+        summary: opts.summary, reviewerReason: opts.reviewerReason,
       });
     } catch (err) {
       // emit failed (e.g. disk): resolve the registered waiter now so it doesn't linger until timeout

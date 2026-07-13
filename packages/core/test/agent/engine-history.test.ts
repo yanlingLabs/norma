@@ -134,6 +134,31 @@ describe("engine historyInput replays tool_call/tool_result (CC parity, history-
     ]);
   });
 
+  // phase 5e T2: tool_review is client-observability only (reviewer maturity's `eventToInput`
+  // requirement) — a history containing it must replay IDENTICALLY to one without, proving the
+  // if-chain's bare `return null` fallthrough (no explicit case needed) actually holds in practice.
+  test("(g) tool_review events are invisible to historyInput — replay identical to a history without them", async () => {
+    const provider = okProvider();
+    const { engine, store, sessionId } = setupEngine(provider);
+
+    store.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: "u1", clientName: "test" });
+    store.append(sessionId, { type: "assistant_message", sessionId, threadId: "main", text: "a1" });
+    store.append(sessionId, { type: "tool_review", sessionId, threadId: "main", toolName: "bash", verdict: "safe", reason: "looks fine", summary: "bash ls -la" });
+    store.append(sessionId, { type: "tool_review", sessionId, threadId: "main", toolName: "bash", verdict: "unsafe", reason: "risky", summary: "bash rm -rf x" });
+    store.append(sessionId, { type: "tool_review", sessionId, threadId: "main", toolName: "bash", verdict: "error", reason: "reviewer unavailable", summary: "bash curl x" });
+    store.append(sessionId, { type: "user_message", sessionId, threadId: "main", text: "u2", clientName: "test" });
+
+    await engine.runTurn(sessionId);
+
+    // Same shape as test (c) ("history with no tool events") — the three tool_review events
+    // contribute nothing, regardless of verdict.
+    expect(provider.requests[0]!.input).toEqual([
+      M("user", "u1"),
+      M("assistant", "a1"),
+      M("user", "u2"),
+    ]);
+  });
+
   test("(d) child-thread tool events never leak into main input (existing invariant, re-pinned)", async () => {
     const provider = okProvider();
     const { engine, store, sessionId } = setupEngine(provider);
