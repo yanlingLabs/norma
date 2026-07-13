@@ -15,6 +15,7 @@ import {
   type CommandCtx,
 } from "../../src/tui/commands";
 import { formatRoutineLine } from "../../src/routines-cli";
+import { formatMemoryList } from "../../src/memory-cli";
 import type { NormaClient } from "../../src/client";
 
 // ---- fake client (mirrors test/tui/app.test.tsx's fakeClient — recorded calls, canned results) ----
@@ -384,6 +385,30 @@ describe("runners — mirror main.ts's routes", () => {
     const { ctx, notes } = makeCtx(client);
     await runCommand(ctx, "/routines");
     expect(notes).toEqual([[formatRoutineLine(r1), formatRoutineLine(r2)].join("\n")]);
+  });
+
+  // Phase 5b Task 4: /memory is list-only, "user" scope (design doc §4 — write/delete stay
+  // CLI/tool-only in v1, same precedent as /routines above). Mirrors main.ts `case "memory"`'s
+  // default (no --project → "user" scope) list branch: client.memoryList("user"), formatted via
+  // formatMemoryList (memory-cli.ts) — the exact plain content the CLI's colored list wraps
+  // AQUA/DIM around.
+  test("/memory — one line per fact, via formatMemoryList", async () => {
+    const facts = [
+      { name: "captain", description: "prefers concise replies", type: "user" },
+      { name: "stack", description: "monorepo, bun workspaces", type: "project" },
+    ];
+    const { client, calls } = makeClient({ memoryList: () => ({ facts }) });
+    const { ctx, notes } = makeCtx(client);
+    await runCommand(ctx, "/memory");
+    expect(calls).toEqual([{ method: "memoryList", args: ["user"] }]);
+    expect(notes).toEqual([formatMemoryList(facts).join("\n")]);
+  });
+
+  test("/memory — empty list note", async () => {
+    const { client } = makeClient({ memoryList: () => ({ facts: [] }) });
+    const { ctx, notes } = makeCtx(client);
+    await runCommand(ctx, "/memory");
+    expect(notes).toEqual(["(no memory facts)"]);
   });
 });
 

@@ -16,10 +16,11 @@ import NormaKit
 final class DashboardTests: XCTestCase {
     // MARK: - dashboardPaneOrder / defaultDashboardPane (PURE)
 
-    func testDashboardPaneOrderContainsAllSixPanesInSpecOrder() {
+    func testDashboardPaneOrderContainsAllSevenPanesInSpecOrder() {
         // Phase 4d-iii Task 2: `.pluginManager` appended at the END, every pre-existing pane keeps
-        // its position (see `dashboardPaneOrder`'s own doc comment).
-        XCTAssertEqual(dashboardPaneOrder, [.sessions, .daemonStatus, .quota, .trust, .peripheral, .pluginManager])
+        // its position (see `dashboardPaneOrder`'s own doc comment). Phase 5b Task 5: `.memory`
+        // appended the same way.
+        XCTAssertEqual(dashboardPaneOrder, [.sessions, .daemonStatus, .quota, .trust, .peripheral, .pluginManager, .memory])
         XCTAssertEqual(Set(dashboardPaneOrder), Set(DashboardPane.allCases), "every case must appear exactly once")
     }
 
@@ -157,6 +158,21 @@ final class DashboardTests: XCTestCase {
     /// `expiredLeases`/`shouldServe`'s inclusive-expired convention (`nowMs < lease.expiresAt`).
     func testPeripheralLeaseAgeTextExactlyAtExpiryReadsExpired() {
         XCTAssertEqual(peripheralLeaseAgeText(expiresAt: 10_000, nowMs: 10_000), "expired")
+    }
+
+    // MARK: - memoryTypeBadge (PURE, MemoryPane.swift)
+
+    func testMemoryTypeBadgeMapsAllFourWireTypes() {
+        XCTAssertEqual(memoryTypeBadge("user"), "User")
+        XCTAssertEqual(memoryTypeBadge("feedback"), "Feedback")
+        XCTAssertEqual(memoryTypeBadge("project"), "Project")
+        XCTAssertEqual(memoryTypeBadge("reference"), "Reference")
+    }
+
+    /// An unrecognized type (a future server-side addition this client predates) falls back to a
+    /// capitalized rendering of the raw string rather than crashing or showing blank.
+    func testMemoryTypeBadgeUnrecognizedTypeFallsBackToCapitalized() {
+        XCTAssertEqual(memoryTypeBadge("archived"), "Archived")
     }
 
     // MARK: - DashboardSelectionModel (PURE — Phase 4d-cleanup Task 3 fix 1)

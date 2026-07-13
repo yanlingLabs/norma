@@ -43,6 +43,7 @@ import {
 import { parseModelArgs, validateEffort, validateModelSlug } from "./model-cli";
 import { formatElapsed, formatTokens } from "./task-display";
 import { formatRoutineDetail } from "./routines-cli";
+import { MEMORY_USAGE, formatDeleted, formatFactDetail, parseMemoryArgs, runMemoryRoute } from "./memory-cli";
 import { formatOptionLines, isOtherChoice, parseQuestionAnswer } from "./questions";
 import { parsePlanResponse } from "./plan-response";
 import { makeEventBridge, type EventBridge } from "./tui/event-bridge";
@@ -1312,6 +1313,33 @@ if (import.meta.main) {
     console.error(routinesUsage);
     process.exit(1);
   }
+  case "memory": {
+    // usage: norma memory [list] [--project] | show <name> [--project] | rm <name> [--project]
+    // Argument validation (parseMemoryArgs) happens BEFORE connecting — mirrors `routines`' own
+    // fail-fast usage check just above: a bad invocation never opens a daemon socket.
+    const route = parseMemoryArgs(process.argv.slice(3), process.cwd());
+    if (route.kind === "usage") { console.error(MEMORY_USAGE); process.exit(1); }
+
+    const c = await connect("cli-memory");
+    try {
+      const result = await runMemoryRoute(c, route);
+      if (result.kind === "list") {
+        if (result.facts.length === 0) console.log(`${DIM}(no memory facts)${RESET}`);
+        for (const f of result.facts) console.log(`${AQUA}${f.name}${RESET} ${DIM}${formatFactDetail(f)}${RESET}`);
+      } else if (result.kind === "show") {
+        console.log(`${AQUA}${result.fact.name}${RESET} ${DIM}${formatFactDetail(result.fact)}${RESET}`);
+        console.log(result.fact.body);
+      } else {
+        console.log(`${AQUA}${formatDeleted(result.name, result.scope)}${RESET}`);
+      }
+    } catch (err) {
+      console.error((err as Error).message);
+      c.close();
+      process.exit(1);
+    }
+    c.close();
+    break;
+  }
   case "watch": {
     const sessionId = process.argv[3];
     if (!sessionId) { console.error("usage: norma watch <sessionId>"); process.exit(1); }
@@ -1509,6 +1537,7 @@ if (import.meta.main) {
   bg list <session> | bg peek <session> <taskId> | bg kill <session> <taskId>
   routines [list] | routines create "<spec>" [--policy auto|plan] -- <prompt>
     | routines delete <id> | routines enable <id> | routines disable <id>       manage scheduled routines
+  memory [list] [--project] | show <name> [--project] | rm <name> [--project]  manage saved memory facts
   login [--api-key] [--web-search-key] | logout | provider | provider-smoke [--prompt <text>]
   init                                            generate/update NORMA.md by surveying the project
   -p "<prompt>" [--auto|--plan] [--trust|--no-trust]   headless agent turn (asks for tool approval unless --auto/--plan)`);

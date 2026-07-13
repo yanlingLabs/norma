@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startDaemon, FileSecretStore, FakeProvider, type RunningDaemon } from "@norma/core";
+import { startDaemon, FileSecretStore, FakeProvider, MemoryStore, type RunningDaemon } from "@norma/core";
 import { NormaClient } from "../src/client";
 import { encodeLine, METHODS, PROTOCOL_VERSION } from "@norma/protocol";
 
@@ -285,6 +285,41 @@ describe("NormaClient", () => {
     await boot(null);
     const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "routines-bad", onEvent: () => {} });
     await expect(client.routinesCreate({ spec: "not a spec", prompt: "x" })).rejects.toThrow();
+    client.close();
+  });
+
+  // Phase 5b Task 4: memoryList/memoryRead/memoryDelete round-tripped against a real daemon
+  // (its MemoryStore is wired unconditionally, same daemon.ts precedent as RoutineStore above).
+  // No `memoryWrite` client method exists (write is tool-only, per the brief — CLI/slash only
+  // list/show/rm), so this seeds the fact directly through a second `MemoryStore` instance
+  // pointed at the SAME normaHome: both are stateless fact-file readers/writers over the same
+  // directory, no in-process cache to desync (memory.ts's own `list`/`read` re-read from disk on
+  // every call) — the daemon's own instance sees whatever this one writes.
+  test("memoryList/memoryRead/memoryDelete round-trip against a real daemon", async () => {
+    const home = await boot(null);
+    const seed = new MemoryStore({ normaHome: home, trust: { isTrusted: () => true } });
+    const wrote = await seed.write("user", { name: "captain", description: "prefers concise replies", type: "user", body: "Sam prefers short answers." }, { source: "rpc" });
+    expect(wrote.ok).toBe(true);
+
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "memory", onEvent: () => {} });
+
+    const { facts } = await client.memoryList("user");
+    expect(facts).toEqual([{ name: "captain", description: "prefers concise replies", type: "user" }]);
+
+    const { fact } = await client.memoryRead("user", "captain");
+    expect(fact).toEqual({ name: "captain", description: "prefers concise replies", type: "user", body: "Sam prefers short answers." });
+
+    await client.memoryDelete("user", "captain");
+    expect((await client.memoryList("user")).facts).toEqual([]);
+    await expect(client.memoryRead("user", "captain")).rejects.toThrow(/not found/);
+
+    client.close();
+  });
+
+  test("memoryRead rejects an invalid name", async () => {
+    await boot(null);
+    const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "memory-bad", onEvent: () => {} });
+    await expect(client.memoryRead("user", "Not A Valid Slug")).rejects.toThrow();
     client.close();
   });
 

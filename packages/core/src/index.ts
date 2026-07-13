@@ -51,6 +51,15 @@ export { sessionTmpDir } from "./agent/session-tmp";
 export { TrustStore } from "./agent/trust";
 export { ContextAssembler, BASE_PROMPT } from "./agent/context";
 export { SkillStore, type SkillMeta } from "./agent/skills";
+export {
+  MemoryStore,
+  type MemoryScope,
+  type MemoryType,
+  type MemoryFactMeta,
+  type MemoryFact,
+  type MemoryAuditLine,
+  type MemoryResult,
+} from "./agent/memory";
 export { AgentStore, GENERAL_OVERLAY, type ResolvedAgent, type AgentMeta } from "./agent/agents";
 export { PluginStore, PluginManifest, type PluginInfo } from "./agent/plugins";
 export { BackgroundTaskRegistry, type BgDeps } from "./agent/bg-registry";

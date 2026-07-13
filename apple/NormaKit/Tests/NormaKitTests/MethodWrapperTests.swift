@@ -466,4 +466,71 @@ final class MethodWrapperTests: XCTestCase {
         XCTAssertEqual(tiles.count, 1)
         XCTAssertEqual(tiles["battery-limiter"]?["value"], .string("80%"))
     }
+
+    // MARK: - Phase 5b Task 5: memory.* wrappers (Dashboard MemoryPane)
+
+    func testMemoryListAndReadDecodeFacts() async throws {
+        let (client, t) = try await connected()
+
+        let (listReq, facts) = try await roundTrip(t, sentIndex: 1,
+            result: #"{"ok":true,"facts":[{"name":"likes-dark-mode","description":"UI preference","type":"user"},{"name":"onboarding-note","description":"first-session context","type":"feedback"}]}"#
+        ) { try await client.memoryList(scope: "user") }
+        XCTAssertEqual(listReq["method"] as? String, "memory.list")
+        XCTAssertEqual((listReq["params"] as? [String: Any])?["scope"] as? String, "user")
+        XCTAssertNil((listReq["params"] as? [String: Any])?["cwd"]) // omitted cwd dropped, not sent as null
+        XCTAssertEqual(facts.count, 2)
+        XCTAssertEqual(facts[0].name, "likes-dark-mode")
+        XCTAssertEqual(facts[0].type, "user")
+        XCTAssertEqual(facts[1].description, "first-session context")
+
+        let (readReq, fact) = try await roundTrip(t, sentIndex: 2,
+            result: #"{"ok":true,"fact":{"name":"likes-dark-mode","description":"UI preference","type":"user","body":"Prefers dark mode everywhere."}}"#
+        ) { try await client.memoryRead(scope: "user", name: "likes-dark-mode") }
+        XCTAssertEqual(readReq["method"] as? String, "memory.read")
+        XCTAssertEqual((readReq["params"] as? [String: Any])?["name"] as? String, "likes-dark-mode")
+        XCTAssertEqual(fact.body, "Prefers dark mode everywhere.")
+        XCTAssertEqual(fact.type, "user")
+    }
+
+    func testMemoryWriteAndDeleteEncodeParamsAndSucceedOnEmptyResult() async throws {
+        let (client, t) = try await connected()
+
+        let (writeReq, _) = try await roundTrip(t, sentIndex: 1, result: #"{"ok":true}"#) {
+            try await client.memoryWrite(scope: "user", name: "likes-dark-mode", description: "UI preference", type: "user", body: "Prefers dark mode.")
+        }
+        XCTAssertEqual(writeReq["method"] as? String, "memory.write")
+        let writeParams = writeReq["params"] as? [String: Any]
+        XCTAssertEqual(writeParams?["scope"] as? String, "user")
+        XCTAssertEqual(writeParams?["name"] as? String, "likes-dark-mode")
+        XCTAssertEqual(writeParams?["description"] as? String, "UI preference")
+        XCTAssertEqual(writeParams?["type"] as? String, "user")
+        XCTAssertEqual(writeParams?["body"] as? String, "Prefers dark mode.")
+        XCTAssertNil(writeParams?["cwd"])
+
+        let (deleteReq, _) = try await roundTrip(t, sentIndex: 2, result: #"{"ok":true}"#) {
+            try await client.memoryDelete(scope: "user", name: "likes-dark-mode")
+        }
+        XCTAssertEqual(deleteReq["method"] as? String, "memory.delete")
+        XCTAssertEqual((deleteReq["params"] as? [String: Any])?["name"] as? String, "likes-dark-mode")
+    }
+
+    /// `memory.audit`'s wire contract is newest-first; the wrapper decodes the array verbatim
+    /// (no client-side reversal) — this fixture's ordering (newest fact write first) round-trips
+    /// unchanged.
+    func testMemoryAuditDecodesNewestFirstAndOmitsOptionalFields() async throws {
+        let (client, t) = try await connected()
+
+        let (req, lines) = try await roundTrip(t, sentIndex: 1,
+            result: #"{"ok":true,"lines":[{"ts":2000,"source":"rpc","scope":"user","action":"delete","name":"stale-fact"},{"ts":1000,"sessionId":"s_1","source":"tool","scope":"user","action":"write","name":"likes-dark-mode","description":"UI preference"}]}"#
+        ) { try await client.memoryAudit(limit: 10) }
+        XCTAssertEqual(req["method"] as? String, "memory.audit")
+        XCTAssertEqual((req["params"] as? [String: Any])?["limit"] as? Int, 10)
+        XCTAssertEqual(lines.count, 2)
+        XCTAssertEqual(lines[0].ts, 2000)
+        XCTAssertEqual(lines[0].action, "delete")
+        XCTAssertNil(lines[0].sessionId)
+        XCTAssertNil(lines[0].description)
+        XCTAssertEqual(lines[1].sessionId, "s_1")
+        XCTAssertEqual(lines[1].description, "UI preference")
+    }
 }

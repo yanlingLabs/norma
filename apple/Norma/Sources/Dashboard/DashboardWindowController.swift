@@ -102,6 +102,10 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
         // app's lifetime either, and both re-seed themselves (`.task`) on every appearance.
         let tilesModel = TilesStripModel(client: client)
         let shortcutsModel = ShortcutBindingEditorModel(client: client, shortcutRegistry: shortcutRegistry)
+        // Phase 5b Task 5: same "constructed fresh here, per window-open" posture as
+        // `pluginManager`/`tilesModel`/`shortcutsModel` above — the Memory pane has no other owner
+        // across the app's lifetime, and `MemoryPane.task` refreshes it on every appearance anyway.
+        let memoryModel = MemoryPaneModel(client: client)
         let wiring = DashboardWiring(
             directory: directory,
             onOpenSessionDetached: onOpenSessionDetached,
@@ -113,7 +117,8 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
             helperClient: helperClient,
             pluginManager: pluginManager,
             tilesModel: tilesModel,
-            shortcutsModel: shortcutsModel
+            shortcutsModel: shortcutsModel,
+            memoryModel: memoryModel
         )
         window.contentView = NSHostingView(rootView: DashboardView(wiring: wiring, selectionModel: selectionModel))
         window.setFrame(frame, display: true)

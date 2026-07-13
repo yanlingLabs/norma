@@ -47,7 +47,11 @@ export type SessionApprovalPolicy = "ask" | "auto" | "plan";
 // read BackgroundAgentRegistry/SessionStore state (agent_output never flips `notified`) — same
 // class as task_get/task_list, and must stay allowed under `plan` so a planning session can still
 // check on its background agents.
-const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output"]);
+// memory_read (phase 5b Task 2, design doc §4.8) is read-only too: it only reads a fact file off
+// MemoryStore, same class as task_get — must stay allowed under `plan` so a planning session can
+// still recall saved facts. Contrast with memory_write/memory_delete below (MUTATING) — reading a
+// fact never needs the human's attention, writing/deleting one does.
+const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output", "memory_read"]);
 // `computer` (Phase 5 CU) is MUTATING: a computer-use action drives real mouse/keyboard/screen, so
 // it must pass the gate on EVERY call (spec §4.6: "every CU action passes the permission gate") —
 // ask → per-action approval card, auto → allow, plan → deny (CU makes changes). Note this is the
@@ -60,7 +64,17 @@ const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill",
 // plan-mode session must not be able to SCHEDULE a future mutation any more than it can perform one
 // now). `list`/`enable`/`disable`/`delete` ride the same class as a deliberate simplification — one
 // tool, one gate decision, no op-dependent carve-out.
-const MUTATING = new Set(["write", "edit", "bash", "bash_kill", "notebook_edit", "enter_worktree", "exit_worktree", "computer", "schedule"]);
+// memory_write/memory_delete (phase 5b Task 2) sit in MUTATING too — but PLAIN MUTATING, ridden
+// the exact same way write/edit/bash/computer/schedule already are: ask under `ask` (a card),
+// allow under `auto`, deny under `plan`. THE USER PIN (design doc §"Status", 2026-07-08 sketch
+// §5b): "the model writes user-scope facts on its own judgment; no card under auto policy; every
+// write audit-logged + reviewable in the dashboard memory editor." That pin is exactly what riding
+// the standard MUTATING branch already gives us — under `auto` a memory write proceeds silently
+// (MemoryStore.write's own audit.jsonl line is the record, not a card) — so this does NOT get a
+// new, stricter "always ask regardless of policy" class of its own; it must be classified
+// identically to computer/schedule above, not more cautiously. Project-scope trust is still a hard
+// gate (untrusted cwd → typed store error), independent of and prior to this policy gate.
+const MUTATING = new Set(["write", "edit", "bash", "bash_kill", "notebook_edit", "enter_worktree", "exit_worktree", "computer", "schedule", "memory_write", "memory_delete"]);
 const SELF_GATING = new Set(["request_directory"]);
 // web_fetch (4g Task 5, T6 adds web_search here) is Norma's ONLY network-capable tool — it does NOT
 // belong in READ_ONLY (it makes a live outbound request; the response bytes are DATA that could
