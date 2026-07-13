@@ -150,6 +150,25 @@ describe("PermissionGate v1", () => {
   // 4g Task 6: web_search joins web_fetch in the NETWORK class — same live-network-call posture
   // (read-only research, no arbitrary fs/process mutation, but still a real outbound HTTP call to
   // a third party), so it gets the IDENTICAL plan/ask/auto answer as web_fetch above.
+  // Phase 5b Task 2 (THE USER PIN): memory_write/memory_delete are PLAIN MUTATING — no card under
+  // `auto` (proceeds silently, audit-logged instead), a card under `ask`, denied under `plan` —
+  // exactly mirroring computer/schedule above, deliberately NOT some stricter always-ask class.
+  test("memory_write/memory_delete are mutating: ask under ask-policy, allow under auto-policy, denied under plan (mirrors computer/schedule)", () => {
+    for (const name of ["memory_write", "memory_delete"]) {
+      expect(gate.evaluate(name, "ask")).toBe("ask");
+      expect(gate.evaluate(name, "auto")).toBe("allow");
+      expect(gate.evaluate(name, "plan")).toBe("deny");
+    }
+  });
+
+  // memory_read is read-only: allowed unconditionally, including under `plan` (recalling a saved
+  // fact is research, not a mutation) — same class as task_get/agent_list.
+  test("memory_read is read-only: allowed under ask/auto/plan", () => {
+    expect(gate.evaluate("memory_read", "ask")).toBe("allow");
+    expect(gate.evaluate("memory_read", "auto")).toBe("allow");
+    expect(gate.evaluate("memory_read", "plan")).toBe("allow");
+  });
+
   test("web_search is gate-classed NETWORK: allow under plan and auto, ask under ask", () => {
     const g = new PermissionGate();
     expect(g.evaluate("web_search", "plan")).toBe("allow");

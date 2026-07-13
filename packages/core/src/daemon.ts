@@ -29,6 +29,8 @@ import { registerSpawnAgentTool } from "./agent/tools/spawn";
 import { registerSendMessageTool } from "./agent/tools/send-message";
 import { registerTaskStopTool } from "./agent/tools/task-stop";
 import { registerAgentQueryTools } from "./agent/tools/agent-query";
+import { registerMemoryTools } from "./agent/tools/memory";
+import { MemoryStore } from "./agent/memory";
 import { registerScheduleTool } from "./agent/tools/schedule";
 import { registerWebTools } from "./agent/tools/web";
 import { registerComputerTool } from "./agent/tools/computer";
@@ -192,6 +194,12 @@ export async function startDaemon(opts: {
   const hookRegistry = new HookRegistry();
   const skillStore = new SkillStore({ normaHome, trust: trustStore, plugins: { disabled: settings?.plugins?.disabled ?? [] } });
   const assembler = new ContextAssembler({ normaHome, trust: trustStore, skills: skillStore });
+  // Phase 5b Task 2: ONE MemoryStore for the whole daemon (fact-file CRUD is the single-writer
+  // contract §4.8 requires — tool calls below and T3's daemon RPCs must share this exact instance,
+  // never open a second one). Built unconditionally, same "needs only normaHome/trust, no
+  // provider" precedent as skillStore/assembler just above — a provider-disabled daemon (or a
+  // future read-only RPC) can still serve memory state.
+  const memoryStore = new MemoryStore({ normaHome, trust: trustStore });
   // Built unconditionally (needs only store, no provider) so the server's session.addDir /
   // setCwd handlers always have live roots to work with, even when the agent is disabled.
   const sessionDirs = new SessionDirectories((sid) => {
@@ -396,6 +404,12 @@ export async function startDaemon(opts: {
     // true` is hardcoded inside registerAgentQueryTools itself (unlike task_stop's caller-supplied
     // flag), so no `deferred` option is passed here.
     registerAgentQueryTools(registry, { bgAgents, store });
+    // Phase 5b Task 2: memory_read/memory_write/memory_delete over the SAME `memoryStore`
+    // instance T3's RPCs will share. `cwdOf` resolves the SESSION's cwd (store.meta(sid).cwd —
+    // the identical source registerRequestDirTool's `projectDir` dep uses below), not `ctx.cwd`:
+    // project-scope memory must gate on the session's real project directory even mid-turn inside
+    // an isolated worktree child, where ctx.cwd is the worktree's own transient path.
+    registerMemoryTools(registry, { memory: memoryStore, cwdOf: (sid) => store.meta(sid).cwd ?? undefined });
     // Computer use (Phase 5 CU): opt-in via settings.computerUse.enabled (the strongest reading of
     // "full-auto CU requires explicit opt-in" — absent/false, the `computer` tool does not exist).
     // The service holds leases on the SAME `peripheral` broker (hoisted above this gate) that
