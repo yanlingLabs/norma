@@ -132,10 +132,16 @@ describe("history-parity e2e (Task 4)", () => {
   // via childHistoryInput — extending engine-resume.test.ts's 4h-ii-b resume harness to a child that
   // also used a tool (the (d) test there only covered reasoning+text, no tool call).
   test("(c) resume: a bg-spawned child's reasoning->tool_call->result->final replays in order on resume, reasoning before its function_call", async () => {
+    // 5a: run_in_background:false — depth 0 now backgrounds by default; this test needs the child
+    // to finish synchronously in turn 1 so it's a FINISHED, resumable agent by turn 2 (its own
+    // reasoning/tool-call replay ordering on resume is the actual subject, not the bg default).
     const spawnNamed = (callId: string, prompt: string, name: string): ProviderEvent =>
-      ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "task", name }) });
+      ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "task", name, run_in_background: false }) });
+    // 5a: run_in_background:false — a resume is itself a spawn and follows the same depth-0
+    // default; this test inspects the resumed run's own provider request synchronously (no poll
+    // loop), so it needs the resume pinned to the synchronous path.
     const resumeCall = (callId: string, resume: string, prompt: string): ProviderEvent =>
-      ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ resume, prompt }) });
+      ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ resume, prompt, run_in_background: false }) });
     const isChildRun = (input: readonly unknown[], opening: string): boolean => {
       const first = input[0] as { type?: string; role?: string; content?: unknown } | undefined;
       return first?.type === "message" && first.role === "user" && first.content === opening;

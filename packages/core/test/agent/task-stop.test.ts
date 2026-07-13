@@ -326,8 +326,11 @@ describe("AgentEngine: task_stop E2E (4h-ii-c Task 2)", () => {
   // (f) v1 depth-0 only: task_stop is excluded from a depth-1 child's tool set (a child must not
   // be able to kill its siblings/parent's agents) — same unconditional exclusion as send_message.
   test("(f) task_stop is excluded from a depth-1 child's tool set (v1 depth-0 only)", async () => {
+    // 5a: run_in_background:false — this test's subject is tool-set filtering, not the bg
+    // default; the child must run synchronously so its own provider request is deterministically
+    // recorded before the assertions below run.
     const provider = new FakeProvider([
-      [{ type: "tool_call", callId: "s1", name: "spawn_agent", argsJson: JSON.stringify({ prompt: "child-task", description: "task" }) }, done("tool_calls")],
+      [{ type: "tool_call", callId: "s1", name: "spawn_agent", argsJson: JSON.stringify({ prompt: "child-task", description: "task", run_in_background: false }) }, done("tool_calls")],
       text("child done"),
       text("parent done"),
     ]);

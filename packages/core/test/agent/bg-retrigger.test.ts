@@ -18,8 +18,13 @@ import { setup } from "./engine-spawn.test";
 
 const done = (reason: "end_turn" | "tool_calls" | "aborted"): ProviderEvent => ({ type: "done", stopReason: reason });
 const text = (t: string): ProviderEvent[] => [{ type: "text_delta", delta: t }, done("end_turn")];
+// 5a: `run_in_background: false` defaulted (before `...extra`, so an explicit override still
+// wins) — depth 0 now backgrounds by default, and the two "SYNC spawn" contrast tests below
+// (c2)/(e) specifically need the OLD synchronous path to prove their negative (no notification /
+// no wake); every other call site here already passes `run_in_background: true` explicitly via
+// `extra`, unaffected by this default.
 const spawnCall = (callId: string, prompt: string, extra?: Record<string, unknown>): ProviderEvent =>
-  ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "test task", ...extra }) });
+  ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "test task", run_in_background: false, ...extra }) });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // Poll idiom used throughout this file (both Task 1's original tests and Task 2's below): real
 // async settlement (a detached child's own async chain, a fire-and-forget `void runTurn(...)`

@@ -110,8 +110,11 @@ function setup(
 const done = (reason: "end_turn" | "tool_calls" | "aborted"): ProviderEvent => ({ type: "done", stopReason: reason });
 const text = (t: string): ProviderEvent[] => [{ type: "text_delta", delta: t }, done("end_turn")];
 const probeCall = (callId: string): ProviderEvent => ({ type: "tool_call", callId, name: "probe", argsJson: JSON.stringify({ note: "hi" }) });
+// 5a: run_in_background:false — depth 0 now backgrounds by default (this file's setup() always
+// wires bgAgents); none of the tests below are testing that default, they need the child to run
+// synchronously so its hook calls / thread events are deterministically recorded in-turn.
 const spawnCall = (callId: string, prompt: string): ProviderEvent =>
-  ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "test task" }) });
+  ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "test task", run_in_background: false }) });
 
 const ok = (stdout = ""): HookOutcome[] => [{ pluginId: "ctx", result: { status: "ok", stdout } }];
 const blocked = (pluginId: string, reason?: string): HookOutcome[] => [{ pluginId, result: { status: "blocked", reason, stdout: "" } }];

@@ -420,6 +420,10 @@ export class AgentEngine {
     // task_stop is ALSO pinned whenever a bg AGENT is running (independent of any bg bash task) —
     // that's its primary target (CC TaskStop parity: stop a running background agent).
     if (this.cfg.bgAgents?.list(sessionId).some((e) => e.status === "running")) pins.add("task_stop");
+    // phase 5a Task 1: agent_list/agent_output are pinned whenever ANY bg agent entry exists for
+    // this session — running OR terminal (unlike task_stop's running-only pin above), since a
+    // FINISHED agent must stay collectable via agent_output without a ToolSearch load.
+    if (this.cfg.bgAgents?.list(sessionId).length) { pins.add("agent_list"); pins.add("agent_output"); }
     return pins;
   }
 
@@ -1115,11 +1119,12 @@ export class AgentEngine {
           // omitting the arg entirely (no isolation, child runs in the parent's own cwd — today's
           // unchanged behavior).
           const wantsWorktreeIsolation = parsed.isolation === "worktree";
-          // 4h-ii-a (CC parity: Agent.run_in_background) — same hand-parse-before-zod reasoning as
-          // isolation/mode/max_turns/model/description above: only the literal boolean `true` is
-          // recognized; anything else (wrong type, absent, false) → false, same as omitting the arg
-          // entirely (the synchronous, awaited path — today's unchanged behavior).
-          const runInBackground = parsed.run_in_background === true;
+          // 5a (USER pin: background children, CC parity): at depth 0 with a registry wired, omitted now
+          // means DETACHED — `false` opts into the synchronous await. Depth>0 and registry-less sessions
+          // keep the sync default (children need their delegate's answer in-report; notifications are
+          // main-thread-only; an omitted flag must never hit the "not available" typed error).
+          const bgDefault = opts.depth === 0 && !!this.cfg.bgAgents;
+          const runInBackground = bgDefault ? parsed.run_in_background !== false : parsed.run_in_background === true;
           // 4h-ii-b Task 3 (D7): a resume takes over the WHOLE callback for this call — it sits
           // EARLY, before any fresh-spawn machinery (childId gen, description/model checks,
           // worktree, register). resumeThread does its own typed-error guards (no prompt / unknown
@@ -1284,8 +1289,11 @@ export class AgentEngine {
           // 4h-ii-c Task 2: task_stop is excluded from EVERY child UNCONDITIONALLY too, same
           // rationale — v1 depth-0-only: a child must not be able to kill its siblings' or its
           // parent's OWN background agents/tasks, only the main thread orchestrates.
+          // phase 5a Task 1: agent_list/agent_output are excluded from EVERY child for the SAME
+          // depth-0-only reason — a child must not enumerate or read its siblings'/parent's OWN
+          // background agents, only the main thread orchestrates.
           const childDepth = opts.depth + 1;
-          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode", "send_message", "task_stop"]);
+          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode", "send_message", "task_stop", "agent_list", "agent_output"]);
           if (childDepth >= maxDepth) childExcludeTools.add("spawn_agent");
           // 4h-ii-b Task 1: instructionsFull is computed ONCE here — hoisted out of the bg and
           // sync closures below, which used to each build their own copy independently — so it
