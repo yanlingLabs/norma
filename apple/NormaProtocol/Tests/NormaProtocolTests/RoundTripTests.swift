@@ -4,7 +4,7 @@ import XCTest
 final class RoundTripTests: XCTestCase {
     func fixtureURLs() throws -> [URL] {
         let urls = Bundle.module.urls(forResourcesWithExtension: "json", subdirectory: "Fixtures") ?? []
-        XCTAssertEqual(urls.count, 40, "expected 40 fixtures — regenerate via pnpm protocol:generate")
+        XCTAssertEqual(urls.count, 42, "expected 42 fixtures — regenerate via pnpm protocol:generate")
         return urls
     }
 
@@ -67,5 +67,40 @@ final class RoundTripTests: XCTestCase {
         XCTAssertNil(without.task.blocks)
         XCTAssertNil(without.task.blockedBy)
         XCTAssertNil(without.task.metadata)
+    }
+
+    /// Phase 5e T1 (reviewer maturity — the NormaKit-trap task): the NEW `tool_review` variant
+    /// decodes with its verdict/toolName/reason/summary intact — this is what proves the exhaustive
+    /// switches + codec were actually synced, not just that the union compiles.
+    func testToolReviewDecodes() throws {
+        guard let url = Bundle.module.url(forResource: "tool_review", withExtension: "json", subdirectory: "Fixtures") else {
+            return XCTFail("missing tool_review.json fixture")
+        }
+        let data = try Data(contentsOf: url)
+        guard case .toolReview(let v) = try JSONDecoder().decode(SessionEvent.self, from: data) else { return XCTFail() }
+        XCTAssertEqual(v.toolName, "bash")
+        XCTAssertEqual(v.verdict, "unsafe")
+        XCTAssertFalse(v.reason.isEmpty)
+        XCTAssertFalse(v.summary.isEmpty)
+    }
+
+    /// Phase 5e T1: `approval_requested.reviewerReason` is additive/optional — mirrors
+    /// `testThreadStartedDescriptionOptional`/`testTaskGraphFieldsOptional`'s with/without pattern,
+    /// via the TS-generated `approval_requested_with_reviewer_reason.json` fixture (present) vs the
+    /// pre-existing `approval_requested.json` (predates this field, absent).
+    func testApprovalRequestedReviewerReasonOptional() throws {
+        guard let withURL = Bundle.module.url(forResource: "approval_requested_with_reviewer_reason", withExtension: "json", subdirectory: "Fixtures") else {
+            return XCTFail("missing approval_requested_with_reviewer_reason.json fixture")
+        }
+        let withData = try Data(contentsOf: withURL)
+        guard case .approvalRequested(let with) = try JSONDecoder().decode(SessionEvent.self, from: withData) else { return XCTFail() }
+        XCTAssertEqual(with.reviewerReason, "recursive delete outside the session cwd")
+
+        guard let withoutURL = Bundle.module.url(forResource: "approval_requested", withExtension: "json", subdirectory: "Fixtures") else {
+            return XCTFail("missing approval_requested.json fixture")
+        }
+        let withoutData = try Data(contentsOf: withoutURL)
+        guard case .approvalRequested(let without) = try JSONDecoder().decode(SessionEvent.self, from: withoutData) else { return XCTFail() }
+        XCTAssertNil(without.reviewerReason)
     }
 }

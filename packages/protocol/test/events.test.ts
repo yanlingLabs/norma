@@ -396,6 +396,40 @@ describe("SessionEvent discriminated union", () => {
     expect(parsed.type).toBe("task_notification" as SessionEvent["type"]);
     expect(SessionEvent.safeParse({ ...base, threadId: "main", type: "task_notification", content: "" }).success).toBe(false);
   });
+
+  // Phase 5e T1 (reviewer maturity, the NormaKit-trap task): a NEW SessionEvent variant, persisted
+  // once per actual reviewer.review() invocation (engine.ts, T2) — observability only, never
+  // replayed into the model (eventToInput ignores it, unchanged in this task).
+  test("tool_review round-trips for all three verdicts", () => {
+    for (const verdict of ["safe", "unsafe", "error"] as const) {
+      const e = {
+        ...base, threadId: "main", type: "tool_review", toolName: "bash", verdict,
+        reason: "flagged: recursive delete outside cwd", summary: "bash rm -rf /tmp/scratch",
+      } as const;
+      expect(SessionEvent.parse(e)).toEqual(e);
+    }
+  });
+
+  test("tool_review rejects an unknown verdict and an empty toolName", () => {
+    const t = { ...base, threadId: "main" };
+    expect(SessionEvent.safeParse({ ...t, type: "tool_review", toolName: "bash", verdict: "maybe", reason: "x", summary: "y" }).success).toBe(false);
+    expect(SessionEvent.safeParse({ ...t, type: "tool_review", toolName: "", verdict: "safe", reason: "x", summary: "y" }).success).toBe(false);
+  });
+
+  // approval_requested.reviewerReason is additive/optional (5e T1) — an older-shaped event with no
+  // reviewerReason still parses (the "agent event variants parse" test above already covers the
+  // bare shape), and a reviewer-escalated one carrying it round-trips losslessly.
+  test("approval_requested.reviewerReason is additive-optional: present round-trips, absent stays undefined", () => {
+    const t = { ...base, threadId: "main" };
+    const withReason = {
+      ...t, type: "approval_requested", callId: "c3", toolName: "bash", summary: "run rm -rf /tmp/scratch",
+      reviewerReason: "recursive delete outside the session cwd",
+    } as const;
+    expect(SessionEvent.parse(withReason)).toEqual(withReason);
+    const withoutReason = SessionEvent.parse({ ...t, type: "approval_requested", callId: "c3", toolName: "bash", summary: "run rm -rf /tmp/scratch" });
+    expect(withoutReason.type).toBe("approval_requested");
+    expect((withoutReason as { reviewerReason?: string }).reviewerReason).toBeUndefined();
+  });
 });
 
 describe("hello method schemas", () => {

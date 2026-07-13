@@ -432,6 +432,20 @@ describe("state.ts — note one-liners match main.ts's wording (bg-task/worktree
     expect(s.turnRunning).toBe(false);
     expect(s.pending).toBeNull();
   });
+
+  // Phase 5e T1 (reviewer maturity, the wire-vocabulary/5c lesson): `tool_review` is a NEW
+  // SessionEvent variant this reducer has no dedicated case for — confirms the existing `default:
+  // return s` (no exhaustive switch on `e.type` here, unlike NormaKit's Swift accessor switches)
+  // already no-ops gracefully, so no reducer change was needed for this task. A later task (T5)
+  // may add a dedicated rendering; this only pins today's safe-by-construction behavior.
+  test("tool_review (unknown to this reducer) is a no-op: state is byte-identical", () => {
+    const s = initialState();
+    const next = reduce(s, {
+      type: "tool_review", threadId: "main", toolName: "bash", verdict: "unsafe",
+      reason: "recursive delete outside cwd", summary: "bash rm -rf /tmp/x",
+    }, T0);
+    expect(next).toEqual(s);
+  });
 });
 
 describe("state.ts — purity", () => {
