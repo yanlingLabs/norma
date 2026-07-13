@@ -165,8 +165,9 @@ describe.if(isMac)("lsp tools: happy-path formatting + position conversion (real
         const out = await r.execute("lsp_definition", { path: "usage.ts", line: 10, character: 5 }, ctx("s1"));
         expect(out.isError).toBe(false);
         expect(defSpy).toHaveBeenCalledTimes(1);
-        const [uriArg, lineArg, charArg] = defSpy.mock.calls[0]!;
+        const [uriArg, textArg, lineArg, charArg] = defSpy.mock.calls[0]!;
         expect(uriArg).toBe(toFileUri(join(root, "usage.ts")));
+        expect(typeof textArg).toBe("string"); // file text — the client opens the doc before querying
         expect(lineArg).toBe(9); // 10 (model, 1-based) - 1
         expect(charArg).toBe(4); // 5 (model, 1-based) - 1
         expect(out.output).toBe(`${targetPath}:4:3  function target() {}`);
@@ -242,7 +243,7 @@ describe.if(isMac)("lsp tools: happy-path formatting + position conversion (real
         const out = await r.execute("lsp_references", { path: "usage.ts", line: 2, character: 1 }, ctx("s1"));
         expect(out.isError).toBe(false);
         expect(refSpy).toHaveBeenCalledTimes(1);
-        const [, lineArg, charArg] = refSpy.mock.calls[0]!;
+        const [, , lineArg, charArg] = refSpy.mock.calls[0]!; // [uri, text, line, char]
         expect(lineArg).toBe(1);
         expect(charArg).toBe(0);
         expect(out.output).toBe(`${join(root, "a.ts")}:2:1\n${join(root, "b.ts")}:6:4`);

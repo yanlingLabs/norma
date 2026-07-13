@@ -99,7 +99,7 @@ describe.if(isMac)("LspClient", () => {
     ]) }, async () => {
       const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
       await c.start();
-      const locs = await c.definition("file:///workspace/a.ts", 4, 6);
+      const locs = await c.definition("file:///workspace/a.ts", "const x = 1;", 4, 6);
       expect(locs).toEqual([{ path: "/workspace/def.ts", line: 9, character: 2 }]);
       await c.stop();
     });
@@ -112,7 +112,7 @@ describe.if(isMac)("LspClient", () => {
     ]) }, async () => {
       const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
       await c.start();
-      const locs = await c.references("file:///workspace/a.ts", 1, 0);
+      const locs = await c.references("file:///workspace/a.ts", "const x = 1;", 1, 0);
       expect(locs).toEqual([
         { path: "/workspace/a.ts", line: 1, character: 0 },
         { path: "/workspace/b.ts", line: 5, character: 3 },
@@ -121,11 +121,30 @@ describe.if(isMac)("LspClient", () => {
     });
   });
 
+  test("definition()/references(): the target document is didOpen'd before the query — a server that only answers for open docs still resolves", async () => {
+    // Real servers (tsserver, sourcekit-lsp) return null for a position query on a document they
+    // were never handed. The old code never opened the doc for definition/references, so this
+    // returned nothing live even though the fake server (which answered regardless) stayed green.
+    await withEnv({
+      NORMA_LSP_FAKE_REQUIRE_OPEN: "1",
+      NORMA_LSP_FAKE_DEFINITION: JSON.stringify([{ uri: "file:///workspace/target.ts", range: { start: { line: 7, character: 0 }, end: { line: 7, character: 4 } } }]),
+      NORMA_LSP_FAKE_REFERENCES: JSON.stringify([{ uri: "file:///workspace/ref.ts", range: { start: { line: 2, character: 1 }, end: { line: 2, character: 5 } } }]),
+    }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI, diagSettleMs: 100 });
+      await c.start();
+      const def = await c.definition("file:///workspace/src.ts", "const y = 1;", 0, 6);
+      expect(def).toEqual([{ path: "/workspace/target.ts", line: 7, character: 0 }]);
+      const refs = await c.references("file:///workspace/src2.ts", "const z = 2;", 0, 6);
+      expect(refs).toEqual([{ path: "/workspace/ref.ts", line: 2, character: 1 }]);
+      await c.stop();
+    });
+  });
+
   test("split-write: a response body split across two stdout writes reassembles correctly", async () => {
     await withEnv({ NORMA_LSP_FAKE_SPLIT: "1" }, async () => {
       const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
       await c.start();
-      const locs = await c.definition("file:///workspace/a.ts", 0, 0);
+      const locs = await c.definition("file:///workspace/a.ts", "x", 0, 0);
       expect(locs).toEqual([{ path: "/workspace/def.ts", line: 9, character: 2 }]);
       await c.stop();
     });
@@ -133,13 +152,16 @@ describe.if(isMac)("LspClient", () => {
 
   test("merged frames: two complete frames delivered in one chunk both dispatch", async () => {
     await withEnv({ NORMA_LSP_FAKE_MERGE: "1" }, async () => {
-      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI, diagSettleMs: 50 });
       await c.start();
+      // Prime the doc first so both position queries skip the ensure-open gate and issue their
+      // requests in order (definition then references) — the ordering the fake's merge relies on.
+      await c.diagnostics("file:///workspace/a.ts", "x", 2000);
       // The fake server holds the definition response until references arrives, then writes
       // BOTH frames concatenated in a single stdout.write() — both promises must still resolve.
       const [defs, refs] = await Promise.all([
-        c.definition("file:///workspace/a.ts", 0, 0),
-        c.references("file:///workspace/a.ts", 1, 0),
+        c.definition("file:///workspace/a.ts", "x", 0, 0),
+        c.references("file:///workspace/a.ts", "x", 1, 0),
       ]);
       expect(defs).toEqual([{ path: "/workspace/def.ts", line: 9, character: 2 }]);
       expect(refs).toEqual([
@@ -154,7 +176,7 @@ describe.if(isMac)("LspClient", () => {
     await withEnv({ NORMA_LSP_FAKE_DIE_ON: "textDocument/definition" }, async () => {
       const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
       await c.start();
-      await expect(c.definition("file:///workspace/a.ts", 0, 0)).rejects.toThrow(LspServerExitedError);
+      await expect(c.definition("file:///workspace/a.ts", "x", 0, 0)).rejects.toThrow(LspServerExitedError);
       expect(c.alive).toBe(false);
       await c.stop(); // must not hang/throw even though the child is already gone
     });

@@ -113,6 +113,11 @@ export class LspClient {
   // finish, not on first publish: real servers publish repeatedly per didOpen. There is deliberately
   // NO cross-call cache: each diagnostics() re-opens the on-disk content and settles fresh.
   private diagWaiters = new Map<string, DiagWaiter[]>();
+  // ensureParsed() calls awaiting the FIRST publish for a just-opened URI — the server's
+  // "I've parsed this document" signal. Position queries (definition/references) return null (or a
+  // self-referential garbage location) against a document the server hasn't parsed, so they gate on
+  // this before issuing the request. Distinct from diagWaiters (which settle for the LATEST publish).
+  private readyWaiters = new Map<string, Settler<void>[]>();
   private openUris = new Set<string>();
   private stderrTail = "";
   private _dead = false;
@@ -178,18 +183,52 @@ export class LspClient {
     else w.reject(outcome.error);
   }
 
-  async definition(fileUri: string, line: number, character: number): Promise<LspLocation[]> {
+  async definition(fileUri: string, text: string, line: number, character: number): Promise<LspLocation[]> {
+    await this.ensureParsed(fileUri, text); // real servers only answer position queries for OPEN, parsed docs
     const res = await this.request("textDocument/definition", { textDocument: { uri: fileUri }, position: { line, character } }, DEFAULT_REQUEST_TIMEOUT_MS);
     return toLocations(res);
   }
 
-  async references(fileUri: string, line: number, character: number): Promise<LspLocation[]> {
+  async references(fileUri: string, text: string, line: number, character: number): Promise<LspLocation[]> {
+    await this.ensureParsed(fileUri, text);
     const res = await this.request(
       "textDocument/references",
       { textDocument: { uri: fileUri }, position: { line, character }, context: { includeDeclaration: true } },
       DEFAULT_REQUEST_TIMEOUT_MS,
     );
     return toLocations(res);
+  }
+
+  /** Guarantees the server has `fileUri` OPEN and PARSED before a position query. If it's already
+   *  open in this warm client, returns at once. Otherwise sends didOpen and awaits the first
+   *  publishDiagnostics for it (the parse-complete signal — empirically required: without it,
+   *  tsserver/sourcekit-lsp return null or the cursor's own location for a cross-file definition).
+   *  Best-effort: if no publish arrives within the diagnostics deadline, proceeds anyway rather than
+   *  hang a turn — the subsequent request has its own timeout. */
+  private ensureParsed(fileUri: string, text: string): Promise<void> {
+    if (this._dead) return Promise.reject(new LspNotRunningError());
+    if (this.openUris.has(fileUri)) return Promise.resolve();
+    const timeoutMs = this.cfg.diagTimeoutMs ?? DEFAULT_DIAG_TIMEOUT_MS;
+    return new Promise<void>((resolve, reject) => {
+      let done = false;
+      const settle: Settler<void> = {
+        resolve: () => { if (done) return; done = true; clearTimeout(timer); this.removeReadyWaiter(fileUri, settle); resolve(); },
+        reject: (e) => { if (done) return; done = true; clearTimeout(timer); this.removeReadyWaiter(fileUri, settle); reject(e); },
+      };
+      const timer = setTimeout(() => settle.resolve(), timeoutMs); // no publish in time → proceed best-effort
+      const arr = this.readyWaiters.get(fileUri) ?? [];
+      arr.push(settle);
+      this.readyWaiters.set(fileUri, arr);
+      this.sendDidOpen(fileUri, text); // adds to openUris + notifies; the server publishes once parsed
+    });
+  }
+
+  private removeReadyWaiter(uri: string, settle: Settler<void>): void {
+    const arr = this.readyWaiters.get(uri);
+    if (!arr) return;
+    const i = arr.indexOf(settle);
+    if (i >= 0) arr.splice(i, 1);
+    if (arr.length === 0) this.readyWaiters.delete(uri);
   }
 
   async stop(): Promise<void> {
@@ -293,6 +332,9 @@ export class LspClient {
     if (method !== "textDocument/publishDiagnostics") return; // v1 scope: no other server-push methods consumed
     const uri = String(params?.uri ?? "");
     const diags = toDiagnostics(params?.diagnostics);
+    // A publish means the server has parsed this doc — release any ensureParsed() readiness waiters.
+    const ready = this.readyWaiters.get(uri);
+    if (ready && ready.length) { for (const w of [...ready]) w.resolve(); }
     const waiters = this.diagWaiters.get(uri);
     if (!waiters || waiters.length === 0) return; // late publish after every waiter finished — drop
     const settleMs = this.cfg.diagSettleMs ?? DEFAULT_DIAG_SETTLE_MS;
@@ -321,5 +363,7 @@ export class LspClient {
       for (const w of [...arr]) this.finishDiag(uri, w, { ok: false, error: err });
     }
     this.diagWaiters.clear();
+    for (const arr of [...this.readyWaiters.values()]) for (const w of [...arr]) w.reject(err);
+    this.readyWaiters.clear();
   }
 }

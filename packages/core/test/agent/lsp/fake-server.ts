@@ -23,6 +23,10 @@
 //   NORMA_LSP_FAKE_DIE_ON=<method>    process.exit(1) the instant that method is received,
 //                                     before any response is written — simulates a crash
 //                                     mid-request
+//   NORMA_LSP_FAKE_REQUIRE_OPEN=1     answer textDocument/definition & references with `null`
+//                                     unless the target uri was didOpen'd first — mirrors real
+//                                     servers (tsserver/sourcekit-lsp) that only resolve positions
+//                                     for open documents. Exercises the client's ensure-open gate.
 
 export {}; // force module scope — a top-level script here would collide with fake-mcp-server.ts's
 // own global `buf`/`send`/`handle` bindings under tsc (both are otherwise-import-free scripts).
@@ -45,6 +49,7 @@ function sendSplitBody(msg: unknown): void {
 }
 
 let heldDefinitionFrame: Buffer | null = null;
+const openUris = new Set<string>(); // tracks didOpen'd docs for NORMA_LSP_FAKE_REQUIRE_OPEN
 
 function canned<T>(envVar: string, fallback: T): T {
   const raw = process.env[envVar];
@@ -64,6 +69,8 @@ function handle(msg: any): void {
     case "textDocument/didClose":
       break; // notifications, no reply
     case "textDocument/didOpen": {
+      const openedUri = params?.textDocument?.uri;
+      if (openedUri) openUris.add(openedUri);
       if (process.env.NORMA_LSP_FAKE_NO_DIAGNOSTICS === "1") break;
       const uri = params?.textDocument?.uri;
       const diagnostics = canned("NORMA_LSP_FAKE_DIAGS", [
@@ -80,6 +87,9 @@ function handle(msg: any): void {
       break;
     }
     case "textDocument/definition": {
+      if (process.env.NORMA_LSP_FAKE_REQUIRE_OPEN === "1" && !openUris.has(params?.textDocument?.uri)) {
+        send({ jsonrpc: "2.0", id, result: null }); break; // real servers: no answer for an unopened doc
+      }
       const result = canned("NORMA_LSP_FAKE_DEFINITION", [
         { uri: "file:///workspace/def.ts", range: { start: { line: 9, character: 2 }, end: { line: 9, character: 8 } } },
       ]);
@@ -90,6 +100,9 @@ function handle(msg: any): void {
       break;
     }
     case "textDocument/references": {
+      if (process.env.NORMA_LSP_FAKE_REQUIRE_OPEN === "1" && !openUris.has(params?.textDocument?.uri)) {
+        send({ jsonrpc: "2.0", id, result: null }); break;
+      }
       const result = canned("NORMA_LSP_FAKE_REFERENCES", [
         { uri: "file:///workspace/a.ts", range: { start: { line: 1, character: 0 }, end: { line: 1, character: 5 } } },
         { uri: "file:///workspace/b.ts", range: { start: { line: 5, character: 3 }, end: { line: 5, character: 9 } } },
