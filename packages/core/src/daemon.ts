@@ -434,8 +434,10 @@ export async function startDaemon(opts: {
     // Deferred like worktree/notebook/plan above — a specialized tool, not needed in every turn.
     registerScheduleTool(registry, { routines: routineStore }, { deferred: true });
     // Phase 5f Task 3: lsp_diagnostics/lsp_definition/lsp_references — ONE LspManager for the whole
-    // daemon (mirrors the ONE-MemoryStore/ONE-McpManager precedent above), reaped on shutdown below
-    // (stopAll, alongside mcp?.stopAll()/pluginSupervisor.stopAll()). `cwdOf`/`rootsOf`/`tmpDirOf`
+    // daemon (mirrors the ONE-MemoryStore/ONE-McpManager precedent above), reaped on shutdown below.
+    // NOTE: unlike the SYNCHRONOUS mcp?.stopAll()/pluginSupervisor.stopAll() kills, LspClient's stop
+    // is async — so shutdown uses lspManager.killAllNow() (synchronous SIGTERM backstop) BEFORE the
+    // graceful `void stopAll()`; see the daemon.stop() body. `cwdOf`/`rootsOf`/`tmpDirOf`
     // are the SAME session-meta sources registerMemoryTools's `cwdOf` / fs-read.ts's roots+tmpDir
     // already read: `store.meta(sid).cwd`, `sessionDirs.roots(sid)`, `sessionTmpDir(sid)`.
     //
@@ -669,7 +671,12 @@ export async function startDaemon(opts: {
     socketPath: dirs.socketPath,
     tokens,
     stop() {
-      server.stop(); mcp?.stopAll(); void lspManager?.stopAll(); pluginSupervisor.stopAll(); bgRegistry.killAll();
+      // lspManager: killAllNow() FIRST delivers a synchronous SIGTERM to every warm child (the real
+      // shutdown protection — mcp/pluginSupervisor's stopAll are likewise synchronous kills), since
+      // the `void stopAll()` graceful path below is async and process.exit(0) (direct-run path) drops
+      // its shutdown-request/.then + SIGKILL-timer before they can fire. stopAll still runs to drain
+      // any in-flight spawn on the in-process (awaited) path.
+      server.stop(); mcp?.stopAll(); lspManager?.killAllNow(); void lspManager?.stopAll(); pluginSupervisor.stopAll(); bgRegistry.killAll();
       routineScheduler.stop(); routineStore.close(); // no orphan tick timer past drain
       store.close(); lock.release();
     },

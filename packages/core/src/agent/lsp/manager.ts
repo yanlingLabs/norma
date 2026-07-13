@@ -172,6 +172,27 @@ export class LspManager {
     }
   }
 
+  /** SYNCHRONOUS daemon-shutdown backstop (5f whole-branch review). `stopAll()` is the graceful,
+   *  awaitable in-process path — but `daemon.stop()` runs `void lspManager?.stopAll()`
+   *  fire-and-forget and then `process.exit(0)` synchronously, and LspClient.stop()'s graceful
+   *  shutdown + SIGKILL fallback are BOTH async, so `process.exit` drops them and a warm
+   *  typescript-language-server/sourcekit-lsp child is orphaned on `kill <daemon-pid>`. This
+   *  delivers a REAL synchronous `child.kill("SIGTERM")` to every warm child before `process.exit`,
+   *  exactly as `mcp.stopAll()` + `pluginSupervisor.stopAll()` already do on that same line.
+   *
+   *  Only tracked `clients` are killable synchronously: an `inFlight` spawn hasn't yet produced a
+   *  child reference we can reach without awaiting its promise, so a STILL-SPAWNING child on SIGTERM
+   *  relies on its own LSP `processId` self-exit (LspClient.start hands the server our `process.pid`
+   *  in `initialize`; a well-behaved server exits when that pid dies). Idempotent + safe with zero
+   *  clients (every kill/clear is a no-op the second time). */
+  killAllNow(): void {
+    for (const e of this.clients.values()) {
+      this.scheduler.clearTimeout(e.timer);
+      e.client.killNow();
+    }
+    this.clients.clear();
+  }
+
   private async spawn(key: string, workspaceRoot: string, language: LspLanguage): Promise<LspClient> {
     const cmd = this.serverCommands[language];
     const client = new LspClient({

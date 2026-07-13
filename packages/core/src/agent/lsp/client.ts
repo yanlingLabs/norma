@@ -83,9 +83,9 @@ export class LspClient {
   private nextId = 1;
   private buf: Buffer = Buffer.alloc(0);
   private pending = new Map<number, Settler<any>>();
-  // Per-URI last published diagnostics (last-write-wins) and any diagnostics() calls currently
-  // awaiting the NEXT publish for that URI — a publish wakes every waiter and updates the store.
-  private diagStore = new Map<string, LspDiagnostic[]>();
+  // diagnostics() calls currently awaiting the NEXT publish for their URI — a publish wakes every
+  // waiter for that URI. There is deliberately NO last-write cache: diagnostics() always awaits the
+  // next publish (re-opening the on-disk content), so a stored "last diagnostics" would never be read.
   private diagWaiters = new Map<string, Settler<LspDiagnostic[]>[]>();
   private openUris = new Set<string>();
   private stderrTail = "";
@@ -170,6 +170,20 @@ export class LspClient {
     this.die(new LspServerExitedError("stopped"));
   }
 
+  /** SYNCHRONOUS best-effort kill — the daemon-SIGTERM backstop (5f whole-branch review). Unlike
+   *  `stop()` (whose graceful shutdown request AND SIGKILL fallback are BOTH async — a `.then()`
+   *  exit notification and a `STOP_TIMEOUT_MS` timer callback), this delivers a REAL `SIGTERM` to
+   *  the child in the SAME synchronous tick, so it survives a `process.exit(0)` that runs
+   *  immediately after (mirrors `mcp/client.ts`'s synchronous `stop()`). `die()` rejects every
+   *  pending request/diagnostics waiter, which clears their per-request timeout timers. Idempotent
+   *  and safe on an already-dead/never-started client (`die()` guards on `_dead`; `kill` on a gone
+   *  child is caught). */
+  killNow(): void {
+    try { this.child?.stdin?.end(); } catch { /* ignore */ }
+    try { this.child?.kill("SIGTERM"); } catch { /* already gone */ }
+    this.die(new LspServerExitedError("killed"));
+  }
+
   private sendDidOpen(uri: string, text: string): void {
     // LSP forbids re-opening an already-open document; close first so repeat diagnostics()
     // calls for the same uri (e.g. re-checking after an edit) stay protocol-legal.
@@ -236,7 +250,6 @@ export class LspClient {
     if (method !== "textDocument/publishDiagnostics") return; // v1 scope: no other server-push methods consumed
     const uri = String(params?.uri ?? "");
     const diags = toDiagnostics(params?.diagnostics);
-    this.diagStore.set(uri, diags);
     const waiters = this.diagWaiters.get(uri);
     if (waiters && waiters.length) {
       this.diagWaiters.delete(uri);

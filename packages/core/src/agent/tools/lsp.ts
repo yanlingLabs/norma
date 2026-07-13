@@ -49,6 +49,10 @@ const SUPPORTED_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".sw
 
 const DIAGNOSTICS_CAP = 100;
 const REFERENCES_CAP = 200;
+// Definitions are capped lower than references (50 vs 200) because each shown definition does a
+// fenced readFileSync for its one-line preview — an unbounded pathological server returning many
+// locations would otherwise force one disk read apiece. Parity with the diagnostics/references caps.
+const DEFINITIONS_CAP = 50;
 const PREVIEW_MAX = 200; // one-line preview text is length-capped, not just line-capped
 
 function severityWord(sev: 1 | 2 | 3 | 4): "error" | "warn" | "info" | "hint" {
@@ -102,14 +106,15 @@ function formatDiagnostics(diags: LspDiagnostic[]): string {
 // held to (see FENCE DISCIPLINE above) — a location outside it is still listed, just never read.
 function formatDefinition(locs: LspLocation[], readRoots: string[]): string {
   if (locs.length === 0) return "no definition found";
-  const lines = locs.map((loc) => {
+  const lines = locs.slice(0, DEFINITIONS_CAP).map((loc) => {
     const base = `${loc.path}:${loc.line + 1}:${loc.character + 1}`;
     let safe: string | undefined;
     try { safe = resolveWithinAny(readRoots, loc.path); } catch { /* outside the fence: no preview, location still shown */ }
     const prev = safe ? oneLinePreview(safe, loc.line) : undefined;
     return prev ? `${base}  ${prev}` : base;
   });
-  return lines.join("\n");
+  const extra = locs.length - DEFINITIONS_CAP;
+  return extra > 0 ? `${lines.join("\n")}\n+${extra} more` : lines.join("\n");
 }
 
 function formatReferences(locs: LspLocation[]): string {

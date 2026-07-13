@@ -1,5 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { join } from "node:path";
+import { ChildProcess } from "node:child_process";
 import { LspClient } from "../../../src/agent/lsp/client";
 import { LspManager, LspSpawnError, languageForPath, type LspLanguage, type LspScheduler } from "../../../src/agent/lsp/manager";
 
@@ -130,6 +131,40 @@ describe.if(isMac)("LspManager", () => {
     } finally {
       stopSpy.mockRestore();
       await mgr.stopAll(); // idempotent belt-and-suspenders
+    }
+  });
+
+  test("killAllNow: synchronous SIGTERM to every tracked child; no client left alive; idempotent; zero-safe", async () => {
+    const { scheduler, liveCount } = manualScheduler();
+    const mgr = new LspManager({ serverCommands: { typescript: FAKE, swift: FAKE }, scheduler });
+
+    mgr.killAllNow(); // zero clients: safe no-op
+    expect(liveCount()).toBe(0);
+
+    const a = await mgr.clientFor("/ws-kill-a", "typescript");
+    const b = await mgr.clientFor("/ws-kill-b", "swift");
+    expect(a.alive).toBe(true);
+    expect(b.alive).toBe(true);
+    expect(liveCount()).toBe(2);
+
+    const killSpy = spyOn(ChildProcess.prototype, "kill");
+    try {
+      mgr.killAllNow(); // SYNCHRONOUS — deliberately not awaited
+      // Asserted BEFORE any await/microtask yield: proves the SIGTERM reached each real child in
+      // the SAME synchronous tick (the daemon.stop()-then-process.exit(0) shutdown property that
+      // the async stopAll() cannot guarantee).
+      const sigterms = killSpy.mock.calls.filter((c) => c[0] === "SIGTERM").length;
+      expect(sigterms).toBe(2); // exactly one SIGTERM per warm child, synchronously
+      expect(a.alive).toBe(false); // killNow() -> die() ran synchronously
+      expect(b.alive).toBe(false);
+      expect(liveCount()).toBe(0); // every idle timer cleared — no dangler
+
+      const before = killSpy.mock.calls.length;
+      mgr.killAllNow(); // idempotent: clients already cleared, no further kills
+      expect(killSpy.mock.calls.length).toBe(before);
+    } finally {
+      killSpy.mockRestore();
+      await mgr.stopAll();
     }
   });
 

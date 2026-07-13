@@ -194,6 +194,29 @@ describe.if(isMac)("lsp tools: happy-path formatting + position conversion (real
     }
   });
 
+  test("lsp_definition: caps at 50 + \"+N more\" (parity with diagnostics/references caps)", async () => {
+    const { outside, lsp, r } = setup();
+    try {
+      // Point every location at an OFF-FENCE path so no per-location preview readFileSync runs —
+      // the cap's slice+summary is what's under test, not preview formatting.
+      const offFence = join(outside, "secret.ts");
+      const defs = Array.from({ length: 55 }, (_, i) => ({
+        uri: toFileUri(offFence), range: { start: { line: i, character: 0 } },
+      }));
+      await withEnv({ NORMA_LSP_FAKE_DEFINITION: JSON.stringify(defs) }, async () => {
+        const out = await r.execute("lsp_definition", { path: "usage.ts", line: 1, character: 1 }, ctx("s1"));
+        expect(out.isError).toBe(false);
+        const lines = out.output.split("\n");
+        expect(lines).toHaveLength(51); // 50 shown + 1 summary line
+        expect(lines[0]).toBe(`${offFence}:1:1`);
+        expect(lines[49]).toBe(`${offFence}:50:1`);
+        expect(lines[50]).toBe("+5 more");
+      });
+    } finally {
+      await lsp.stopAll();
+    }
+  });
+
   test("lsp_definition: empty result -> \"no definition found\"", async () => {
     const { lsp, r } = setup();
     try {
