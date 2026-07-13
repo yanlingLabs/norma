@@ -342,6 +342,34 @@ describe("engine + safety reviewer (auto-policy bash)", () => {
     expect(requested.reviewerReason).not.toContain("\n");
     expect(requested.reviewerReason.length).toBeLessThanOrEqual(300);
   });
+
+  test("sanitization strips C0 controls (ESC/BEL), not just newlines — reviewer text lands on terminal cards, where raw control bytes could perturb the terminal (5e whole-branch hardening)", async () => {
+    const { registry } = stubRegistry();
+    // An ANSI color escape + a BEL: pre-hardening these survived sanitizeReviewText verbatim and
+    // reached the wire (and Ink Text) raw.
+    const controlReason = "danger \x1b[31mX\x07 here";
+    const reviewer = stubReviewer({ verdict: "unsafe", reason: controlReason });
+    const provider = new FakeProvider(bashTurn("rm -rf x"));
+    const { engine, store, hub, broker, sessionId } = setupEngine(provider, { registry, reviewer: reviewer as any });
+
+    const watcher: HubClient = {
+      clientName: "auto-denier",
+      deliver(e) { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, false, "auto-denier"); return true; },
+    };
+    hub.attach(watcher, sessionId, 0);
+
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    // Each control byte becomes one space; surrounding plain text (including the now-inert "[31m"
+    // that followed the ESC) is untouched.
+    const review = events.find((e) => e.type === "tool_review") as any;
+    expect(review.reason).toBe("danger  [31mX  here");
+    expect(review.reason).not.toContain("\x1b");
+    expect(review.reason).not.toContain("\x07");
+    const requested = events.find((e) => e.type === "approval_requested") as any;
+    expect(requested.reviewerReason).toBe("danger  [31mX  here");
+  });
 });
 
 // phase 5e T3: coverage generalization — fs-unusual writes/edits + external (mcp__/plugin__)

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { render } from "ink-testing-library";
 import { Text } from "ink";
-import { PendingCards } from "../../src/tui/pending-cards";
+import { PendingCards, capReviewerReason } from "../../src/tui/pending-cards";
 import type { PendingCard } from "../../src/tui/state";
 import { theme } from "../../src/tui/theme";
 
@@ -126,6 +126,29 @@ describe("PendingCards — approval", () => {
     stdin.write("\r");
     await wait();
     expect(calls).toEqual([["c10", true]]);
+  });
+});
+
+// 5e whole-branch hardening: the newline/boundary cases the Swift twin (PendingCardsTests's four
+// capReviewerReason tests) already pins — unit-level on the exported pure helper, because the
+// exact 100/101 boundary can't be asserted through a rendered frame (Ink wraps at terminal width).
+describe("capReviewerReason (pure helper — Swift-twin parity)", () => {
+  test("short reason passes through unchanged", () => {
+    expect(capReviewerReason("looks risky")).toBe("looks risky");
+  });
+
+  test("newlines (\\n and \\r\\n) are stripped to single spaces", () => {
+    expect(capReviewerReason("line one\nline two\r\nline three")).toBe("line one line two line three");
+  });
+
+  test("exactly at the 100-char threshold -> unchanged, no ellipsis", () => {
+    const exact = "x".repeat(100);
+    expect(capReviewerReason(exact)).toBe(exact);
+  });
+
+  test("one past the threshold (101) -> capped at 100 + trailing ellipsis", () => {
+    const over = "x".repeat(101);
+    expect(capReviewerReason(over)).toBe("x".repeat(100) + "…");
   });
 });
 

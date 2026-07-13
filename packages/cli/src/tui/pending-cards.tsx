@@ -63,9 +63,11 @@ function useBufferedInput(onEnter: (line: string) => void) {
 // newline-stripped + capped at 300 on the wire (engine.ts's sanitizeReviewText), but treated as
 // tainted for LAYOUT here too: a defensive second newline-strip plus a much tighter single-line cap
 // (the wire limit is a payload cap, not a terminal-width one) — same "cap + trailing ellipsis on
-// truncation" convention as format.ts's `formatArgsHead`.
+// truncation" convention as format.ts's `formatArgsHead`. Exported for the pure-helper unit tests
+// (pending-cards.test.tsx) — the exact-boundary cases can't be pinned through a rendered frame
+// (Ink wraps at terminal width), matching the Swift twin's unit-tested capReviewerReason.
 const REVIEWER_REASON_MAX_CHARS = 100;
-function capReviewerReason(reason: string): string {
+export function capReviewerReason(reason: string): string {
   const oneLine = reason.replace(/\r?\n/g, " ");
   return oneLine.length > REVIEWER_REASON_MAX_CHARS ? `${oneLine.slice(0, REVIEWER_REASON_MAX_CHARS)}…` : oneLine;
 }

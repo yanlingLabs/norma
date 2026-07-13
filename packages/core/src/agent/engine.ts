@@ -141,9 +141,12 @@ function approvalCardSummary(call: { name: string; argsJson: string }): string {
  *  `sanitizeForReminder` (below): that helper also neutralizes literal `<system-reminder>` tags,
  *  a concern specific to text embedded in a reminder block re-fed to the model — these fields
  *  never enter `eventToInput` (client-observability only, per the injection-containment invariant),
- *  so only newline-stripping + a length cap apply here. */
+ *  so control-stripping + a length cap apply here. C0 controls (ESC/BEL/BS/...) and DEL are
+ *  stripped alongside newlines (5e whole-branch hardening): reviewer output lands verbatim on
+ *  terminal cards, and raw control bytes could perturb the terminal (ANSI escapes, bell, cursor
+ *  moves), not just wrap badly. */
 function sanitizeReviewText(s: string, maxLen: number): string {
-  return s.replace(/\r?\n/g, " ").slice(0, maxLen);
+  return s.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, maxLen);
 }
 
 /** phase 5e T3 (fs coverage): resolves a write/edit call's target against the review-time fence —
