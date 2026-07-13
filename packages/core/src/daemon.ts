@@ -30,6 +30,7 @@ import { registerSendMessageTool } from "./agent/tools/send-message";
 import { registerTaskStopTool } from "./agent/tools/task-stop";
 import { registerAgentQueryTools } from "./agent/tools/agent-query";
 import { registerMemoryTools } from "./agent/tools/memory";
+import { registerSkillWriteTool } from "./agent/tools/skill-write";
 import { MemoryStore } from "./agent/memory";
 import { registerScheduleTool } from "./agent/tools/schedule";
 import { registerWebTools } from "./agent/tools/web";
@@ -410,6 +411,11 @@ export async function startDaemon(opts: {
     // project-scope memory must gate on the session's real project directory even mid-turn inside
     // an isolated worktree child, where ctx.cwd is the worktree's own transient path.
     registerMemoryTools(registry, { memory: memoryStore, cwdOf: (sid) => store.meta(sid).cwd ?? undefined });
+    // Phase 5c Task 2: skill_write over the SAME `skillStore` instance registerSkillTools above
+    // reads from — one store, so a skill written here is immediately loadable via Skill with no
+    // second handle to keep in sync. ALWAYS_ASK-gated (gate.ts): a card under BOTH ask and auto,
+    // and excluded from every child's tool set (engine.ts childExcludeTools).
+    registerSkillWriteTool(registry, { skills: skillStore });
     // Computer use (Phase 5 CU): opt-in via settings.computerUse.enabled (the strongest reading of
     // "full-auto CU requires explicit opt-in" — absent/false, the `computer` tool does not exist).
     // The service holds leases on the SAME `peripheral` broker (hoisted above this gate) that

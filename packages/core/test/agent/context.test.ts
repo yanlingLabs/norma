@@ -149,10 +149,24 @@ describe("ContextAssembler", () => {
 
   test("no skills → 'No skills are installed.'; unresolved loadedSkills silently dropped", () => {
     const { home, trust } = setup();
-    const a = new ContextAssembler({ normaHome: home, trust, skills: new SkillStore({ normaHome: home, trust }) });
+    // A real SkillStore always discovers the shipped `writing-skills` builtin (phase 5c), so this
+    // exercises context.ts's empty branch directly via a stub reporting zero skills, the same way
+    // scheduler.test.ts stubs RoutineStore methods — the real-store + builtin case is covered by
+    // "capability index lists discovered skills" above and the builtin-specific test below.
+    const emptySkills = { list: () => [], load: () => null } as unknown as SkillStore;
+    const a = new ContextAssembler({ normaHome: home, trust, skills: emptySkills });
     expect(a.assemble({ cwd: null })).toContain("No skills are installed.");
     expect(() => a.assemble({ cwd: null, loadedSkills: ["ghost"] })).not.toThrow();
     expect(a.assemble({ cwd: null, loadedSkills: ["ghost"] })).not.toMatch(/Loaded skills/); // nothing resolved
+  });
+
+  test("real SkillStore with zero configured skills still lists the shipped writing-skills builtin", () => {
+    const { home, trust } = setup();
+    const a = new ContextAssembler({ normaHome: home, trust, skills: new SkillStore({ normaHome: home, trust }) });
+    const idx = a.assemble({ cwd: null });
+    expect(idx).toContain("Available capabilities");
+    expect(idx).toContain("writing-skills");
+    expect(idx).not.toContain("No skills are installed.");
   });
 
   test("mixed resolution: resolved skills injected, unresolved dropped (no empty header)", () => {

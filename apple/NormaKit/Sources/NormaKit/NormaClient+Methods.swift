@@ -360,14 +360,6 @@ extension NormaClient {
         try await request("bg.killAll", params: obj(["sessionId": .string(sessionId)]))["killed"]?.intValue ?? 0
     }
 
-    public func skillsList(cwd: String? = nil) async throws -> [(name: String, description: String, source: String)] {
-        let r = try await request("skills.list", params: obj(["cwd": cwd.map { .string($0) }]))
-        return (r["skills"]?.arrayValue ?? []).compactMap { s in
-            guard let n = s["name"]?.stringValue, let d = s["description"]?.stringValue, let src = s["source"]?.stringValue else { return nil }
-            return (n, d, src)
-        }
-    }
-
     public func mcpList(cwd: String? = nil) async throws -> [(name: String, status: String, toolNames: [String], source: String)] {
         let r = try await request("mcp.list", params: obj(["cwd": cwd.map { .string($0) }]))
         return (r["servers"]?.arrayValue ?? []).compactMap { s in
@@ -567,5 +559,113 @@ extension NormaClient {
                   let action = l["action"]?.stringValue, let n = l["name"]?.stringValue else { return nil }
             return MemoryAuditLine(ts: ts, sessionId: l["sessionId"]?.stringValue, source: source, scope: scope, action: action, name: n, description: l["description"]?.stringValue)
         }
+    }
+}
+
+// MARK: - Skills (Phase 5c Task 4 Dashboard SkillsPane)
+//
+// Mirrors `SkillMetaSchema`/`SkillsReadResult`'s `{skill}` pattern (protocol/src/methods.ts), same
+// precedent as the Memory section above. Replaces the earlier bare-tuple `skillsList` (which
+// dropped `path`/`claudeFormat`/`author` on the floor) with a struct decode carrying every wire
+// field — grepped first: nothing else in this module called the old wrapper, so this is a clean
+// swap, not a second overload.
+//
+// `skills.write`/`skills.delete` are confined SERVER-SIDE to the self source (no `scope`/`cwd`
+// param to abuse, unlike `memory.write` — methods.ts's own header comment above
+// `SkillsReadParams`): a caller can never write/delete a project/user/plugin/builtin skill through
+// these RPCs, only ever its own self-authored one. `skills.read`, by contrast, reads ANY source by
+// the store's normal precedence (project > user > self > plugin > builtin). Like `memory.write`/
+// `memory.delete`, `skills.write`/`skills.delete` have an EMPTY result on success — an
+// invalid-name/non-self-delete failure is a thrown `RpcError` (server `RpcFailure`), never a soft
+// boolean, so these two wrappers return `Void`.
+
+/// Mirrors `SkillMetaSchema` — one `skills.list`/`skills.read` entry's metadata (no body).
+public struct SkillMeta: Equatable, Sendable, Identifiable {
+    public var id: String { name }
+    public let name: String
+    public let description: String
+    public let source: String
+    public let path: String
+    /// Set only on claude-format plugin skills (methods.ts's own comment) — `nil` otherwise.
+    public let claudeFormat: Bool?
+    /// Set for a self-authored skill (`SkillStore.writeSelf` always stamps `author: norma`);
+    /// `nil` for every other source. The Dashboard pane's "author: norma" row marker.
+    public let author: String?
+
+    /// Explicit memberwise init: a `public` struct's SYNTHESIZED memberwise init is only
+    /// `internal` — the Dashboard-side pure helper tests (`DashboardTests.swift`, cross-module)
+    /// construct `SkillMeta` values directly (no `NormaClient` round-trip needed for pure display
+    /// helpers), so this needs to be public explicitly.
+    public init(name: String, description: String, source: String, path: String, claudeFormat: Bool?, author: String?) {
+        self.name = name
+        self.description = description
+        self.source = source
+        self.path = path
+        self.claudeFormat = claudeFormat
+        self.author = author
+    }
+}
+
+/// Mirrors `SkillsReadResult`'s `{skill}` shape — `SkillMeta` plus the full body.
+public struct Skill: Equatable, Sendable {
+    public let name: String
+    public let description: String
+    public let source: String
+    public let path: String
+    public let claudeFormat: Bool?
+    public let author: String?
+    public let body: String
+
+    /// Explicit memberwise init — same reasoning as `SkillMeta.init` above.
+    public init(name: String, description: String, source: String, path: String, claudeFormat: Bool?, author: String?, body: String) {
+        self.name = name
+        self.description = description
+        self.source = source
+        self.path = path
+        self.claudeFormat = claudeFormat
+        self.author = author
+        self.body = body
+    }
+}
+
+extension NormaClient {
+    /// Shared metadata decode for `skills.list`'s per-entry shape and `skills.read`'s `skill`
+    /// object (which is `SkillMetaSchema.extend({body})` — same fields plus `body`).
+    private func decodeSkillMeta(_ s: JSONValue) -> SkillMeta? {
+        guard let n = s["name"]?.stringValue, let d = s["description"]?.stringValue,
+              let src = s["source"]?.stringValue, let p = s["path"]?.stringValue else { return nil }
+        return SkillMeta(name: n, description: d, source: src, path: p, claudeFormat: s["claudeFormat"]?.boolValue, author: s["author"]?.stringValue)
+    }
+
+    /// `skills.list {cwd?}` — skill metadata only (no body).
+    public func skillsList(cwd: String? = nil) async throws -> [SkillMeta] {
+        let r = try await request("skills.list", params: obj(["cwd": cwd.map { .string($0) }]))
+        return (r["skills"]?.arrayValue ?? []).compactMap { decodeSkillMeta($0) }
+    }
+
+    /// `skills.read {name, cwd?}` — full skill including body, resolved against ANY source by the
+    /// store's normal precedence (see this section's header comment).
+    public func skillsRead(name: String, cwd: String? = nil) async throws -> Skill {
+        let r = try await request("skills.read", params: obj(["name": .string(name), "cwd": cwd.map { .string($0) }]))
+        guard let skillObj = r["skill"], let meta = decodeSkillMeta(skillObj), let body = skillObj["body"]?.stringValue else {
+            throw RpcError(code: -3, message: "invalid result from server for skills.read")
+        }
+        return Skill(name: meta.name, description: meta.description, source: meta.source, path: meta.path, claudeFormat: meta.claudeFormat, author: meta.author, body: body)
+    }
+
+    /// `skills.write {name, description, body}` — empty result on success. ALWAYS writes the SELF
+    /// source server-side, regardless of what source a same-named skill elsewhere resolves to — a
+    /// caller must only ever offer this for a skill already known to be self-sourced (this
+    /// section's header comment).
+    public func skillsWrite(name: String, description: String, body: String) async throws {
+        _ = try await request("skills.write", params: obj([
+            "name": .string(name), "description": .string(description), "body": .string(body),
+        ]))
+    }
+
+    /// `skills.delete {name}` — empty result on success; the server throws if `name` resolves to a
+    /// non-self source (this section's header comment).
+    public func skillsDelete(name: String) async throws {
+        _ = try await request("skills.delete", params: obj(["name": .string(name)]))
     }
 }

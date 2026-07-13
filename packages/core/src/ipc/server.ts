@@ -7,6 +7,7 @@ import {
   SessionAddDirParams, SessionSetCwdParams, TrustDirParams,
   BgListParams, BgPeekParams, BgKillParams, BgKillAllParams,
   SessionSteerParams, SessionInterruptParams, SessionCompactParams, SkillsListParams, McpListParams,
+  SkillsReadParams, SkillsWriteParams, SkillsDeleteParams,
   PluginsListParams, AskUserRespondParams, TaskListParams, PlanRespondParams, SessionSetPolicyParams,
   ThreadListParams,
   PeripheralLeaseParams, PeripheralRenewParams, PeripheralReleaseParams, PeripheralAdvertiseParams,
@@ -34,7 +35,7 @@ import type { PlanBroker } from "../agent/plans";
 import type { SessionDirectories } from "../agent/dirs";
 import type { TrustStore } from "../agent/trust";
 import type { BackgroundTaskRegistry } from "../agent/bg-registry";
-import type { SkillStore } from "../agent/skills";
+import type { SkillStore, SkillErrorKind } from "../agent/skills";
 import type { McpManager } from "../agent/mcp/manager";
 import { PluginStore, type PluginInfo } from "../agent/plugins";
 import { pluginSpawnEligible, hookRegistryPlugins } from "../agent/plugins";
@@ -78,7 +79,7 @@ export interface IpcServerOptions {
   dirs?: SessionDirectories; // live allowed-roots per session; addDir/setCwd need it
   trust?: TrustStore;        // per-directory trust; session.create result + daemon.trustDir
   bg?: BackgroundTaskRegistry; // background bash tasks; bg.list/peek/kill/killAll
-  skills?: SkillStore;       // discovered SKILL.md skills; skills.list
+  skills?: SkillStore;       // discovered SKILL.md skills; skills.list/read/write/delete (5c T3)
   mcp?: McpManager;          // MCP servers started at boot; mcp.list
   plugins?: PluginStore;     // discovered ~/.norma/plugins/*; plugins.list
   // Phase 4d-ii Task 2: `<normaHome>/settings.json` + `<normaHome>/plugins/` — the SAME
@@ -161,6 +162,16 @@ class RpcFailure extends Error { constructor(public code: number, message: strin
  *  maps to INVALID_PARAMS. Structural on purpose: `error` text embeds caller input verbatim (a
  *  name like "why is this not found" is an INVALID name), so it must never be string-matched. */
 function memoryErrorCode(failure: { kind?: MemoryErrorKind }): number {
+  return failure.kind === "not_found" ? ERR.NOT_FOUND : ERR.INVALID_PARAMS;
+}
+
+/** Maps a `SkillStore` failure's structural `kind` to a JSON-RPC code, for the skills.* handlers
+ *  below — the SAME structural switch as `memoryErrorCode` above, over `SkillResult.kind` instead
+ *  of `MemoryResult.kind`. Only two buckets (no "trust" bucket: SkillStore's write/delete are
+ *  never project-trust-gated, see agent/skills.ts's own `SkillErrorKind` doc comment): `"not_found"`
+ *  is the only "no such resource" case; `"invalid"` or an ABSENT kind (an unclassified wrapped fs
+ *  failure) is a caller-facing input problem from this RPC boundary's point of view. */
+function skillErrorCode(failure: { kind?: SkillErrorKind }): number {
   return failure.kind === "not_found" ? ERR.NOT_FOUND : ERR.INVALID_PARAMS;
 }
 
@@ -575,6 +586,50 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         const p = parseParams(SkillsListParams, params);
         if (!opts.skills) return { ok: true, skills: [] };
         return { ok: true, skills: opts.skills.list({ cwd: p.cwd ?? null }) };
+      }
+
+      // -----------------------------------------------------------------------------------------
+      // Skills read/write/delete (Phase 5c Task 3): the management surface over the SAME SkillStore
+      // instance `skills.list` above and T2's `skill_write` tool run against (daemon.ts hoists ONE
+      // SkillStore). Role-gated exactly like memory.* below (harness AND admin; PLUGIN_ALLOWED_METHODS
+      // omits all three, so a plugin connection never reaches this switch for any of them). Degraded
+      // split mirrors memory's exactly: `skills.list` above already degrades to an empty list with no
+      // store; `skills.read` (a single-fact read, like `memory.read`) and the two mutations fail hard
+      // with a typed INTERNAL RpcFailure rather than silently no-oping.
+      // -----------------------------------------------------------------------------------------
+      case METHODS.skillsRead: {
+        const p = parseParams(SkillsReadParams, params);
+        if (!opts.skills) throw new RpcFailure(ERR.INTERNAL, "skills are not available on this server (no SkillStore configured)");
+        const cwd = p.cwd ?? null;
+        const meta = opts.skills.list({ cwd }).find((s) => s.name === p.name);
+        const loaded = meta ? opts.skills.load(p.name, { cwd }) : null;
+        if (!meta || !loaded) throw new RpcFailure(ERR.NOT_FOUND, `skill not found: "${p.name}"`);
+        return { skill: { ...meta, body: loaded.body } };
+      }
+      case METHODS.skillsWrite: {
+        const p = parseParams(SkillsWriteParams, params);
+        if (!opts.skills) throw new RpcFailure(ERR.INTERNAL, "skills are not available on this server (no SkillStore configured)");
+        // Server-side self-confinement (no scope param to abuse, unlike memory.write): ALWAYS
+        // writeSelf, never any other source.
+        const res = await opts.skills.writeSelf({ name: p.name, description: p.description, body: p.body });
+        if (!res.ok) throw new RpcFailure(skillErrorCode(res), res.error);
+        return {};
+      }
+      case METHODS.skillsDelete: {
+        const p = parseParams(SkillsDeleteParams, params);
+        if (!opts.skills) throw new RpcFailure(ERR.INTERNAL, "skills are not available on this server (no SkillStore configured)");
+        // A name that resolves (by the store's normal precedence) to a NON-self source is refused
+        // BEFORE ever calling deleteSelf — deleteSelf only ever touches self/<name>, so without this
+        // check a project/user/plugin/builtin skill of that name would silently survive while the
+        // caller got back a confusing "not found" (there being no self/<name> to delete) instead of
+        // the actual reason: this isn't a self-authored skill at all.
+        const meta = opts.skills.list({ cwd: null }).find((s) => s.name === p.name);
+        if (meta && meta.source !== "self") {
+          throw new RpcFailure(ERR.INVALID_PARAMS, `only self-authored skills can be deleted: "${p.name}" resolves to source "${meta.source}"`);
+        }
+        const res = await opts.skills.deleteSelf(p.name);
+        if (!res.ok) throw new RpcFailure(skillErrorCode(res), res.error);
+        return {};
       }
       case METHODS.mcpList: {
         const p = parseParams(McpListParams, params);
