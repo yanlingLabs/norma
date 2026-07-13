@@ -92,16 +92,20 @@ describe.if(isMac)("lsp e2e (phase 5f Task 4): real engine + registerLspTools + 
     }
   });
 
-  test("idleShutdownMs, read exactly as daemon.ts reads settings.lsp.idleShutdownMs, threads into LspManager's own reap timing", async () => {
-    // Manual scheduler (T2's manager.test.ts idiom): captures every armed timer so the test fires
-    // it deterministically, with no real waiting.
-    const fns = new Map<number, () => unknown>();
+  test("idleShutdownMs, read exactly as daemon.ts reads settings.lsp.idleShutdownMs, is the NUMERIC value LspManager arms its reap timer with", async () => {
+    // Manual scheduler that CAPTURES the `ms` argument LspManager.touch() arms the reap timer with
+    // (T2's manager.test.ts fires timers deterministically; this variant additionally records the
+    // duration). Capturing `ms` is the whole point of this test: a scheduler that discarded it
+    // would pass IDENTICALLY whether idleShutdownMs threaded through as our 50 or defaulted to the
+    // manager's built-in 300_000 — the numeric assertion below is what actually discriminates the
+    // two, proving the settings value governs the timer, not merely that reaping fires.
+    const captured: Array<{ fn: () => unknown; ms: number }> = [];
+    const byHandle = new Map<number, number>(); // handle -> index into `captured`
     let seq = 0;
     const scheduler: LspScheduler = {
-      setTimeout(fn) { const id = seq++; fns.set(id, fn); return id; },
-      clearTimeout(handle) { fns.delete(handle as number); },
+      setTimeout(fn, ms) { const id = seq++; byHandle.set(id, captured.length); captured.push({ fn, ms }); return id; },
+      clearTimeout(handle) { byHandle.delete(handle as number); },
     };
-    const tick = async () => { await Promise.all([...fns.values()].map((fn) => fn())); };
 
     const parsed = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, lsp: { idleShutdownMs: 50 } });
     // The EXACT read daemon.ts performs (`lspCfg?.idleShutdownMs`) feeding the EXACT constructor
@@ -110,8 +114,19 @@ describe.if(isMac)("lsp e2e (phase 5f Task 4): real engine + registerLspTools + 
     try {
       const a = await mgr.clientFor("/workspace-settings-idle", "typescript");
       expect(a.alive).toBe(true);
-      await tick(); // the custom 50ms window elapsing (not the manager's own 300_000ms default)
-      expect(a.alive).toBe(false); // reaped — proves the settings value, not the built-in default, governed this timer
+
+      // THE discriminating assertion: the reap timer was armed with 50 (our threaded settings
+      // value), NOT 300_000 (the manager's built-in default). Goes RED if daemon's threading is
+      // omitted/wrong (idleShutdownMs would fall back to 300_000). One live timer at this point.
+      const live = [...byHandle.values()].map((i) => captured[i]!);
+      expect(live).toHaveLength(1);
+      expect(live[0]!.ms).toBe(50);
+      expect(live[0]!.ms).not.toBe(300_000);
+
+      // And firing that captured callback actually reaps — the arming value is a real reap timer,
+      // not some unrelated timer that merely happened to carry the right duration.
+      await live[0]!.fn();
+      expect(a.alive).toBe(false);
     } finally {
       await mgr.stopAll();
     }
