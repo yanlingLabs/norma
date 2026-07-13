@@ -118,6 +118,11 @@ export class LspManager {
    * (mirrors mcp/manager.ts's `ensureProject`) — an `async` method always wraps its return value
    * in a brand-new promise, which would defeat the `inFlight` guard: concurrent callers must get
    * back the LITERAL same promise object for 5 simultaneous calls to collapse to one spawn.
+   *
+   * CALLER CONTRACT: the idle-reap timer rearms on THIS call, not on each query issued against the
+   * returned client. Reacquire via `clientFor` immediately before each operation rather than
+   * caching a client across long gaps — a client held idle past `idleShutdownMs` will be reaped
+   * (its `alive` flips false) out from under a stale reference.
    */
   clientFor(workspaceRoot: string, language: LspLanguage): Promise<LspClient> {
     // NUL-separated (KEY_SEP, not a literal control char pasted into this source file):
@@ -133,13 +138,38 @@ export class LspManager {
     return p;
   }
 
-  /** Daemon shutdown: reap every warm client and clear every idle timer — no dangling armed
-   *  timer and no live child may survive this call. */
+  /** Daemon shutdown: reap every client — SETTLED (in `clients`) AND IN-FLIGHT (in `inFlight`) —
+   *  and clear every idle timer, so no dangling timer and no live child survives this call.
+   *
+   *  Draining `inFlight` too is the whole point (5f T2 review): a spawn that is mid-flight when
+   *  shutdown begins is in `inFlight`, NOT yet in `clients`. If stopAll only swept `clients`, that
+   *  spawn would complete AFTER stopAll resolved, land in `clients` with an armed idle timer, and
+   *  then the host process would exit — leaking the real language-server child. So we await each
+   *  in-flight promise and stop whatever it produces (a spawn that FAILS is swallowed — its own
+   *  catch already stopped any partial child).
+   *
+   *  The loop makes this robust to interleaving: awaiting an in-flight promise lets its `spawn()`
+   *  insert a fresh `clients` entry (with a newly armed timer) between our snapshot and drain — the
+   *  NEXT iteration finds and disarms that entry (client.stop() is idempotent, so the double stop
+   *  is a no-op). It terminates because no `clientFor` runs during shutdown, so no NEW spawns
+   *  start: `inFlight` strictly drains and `clients` grows by at most one entry per drained
+   *  in-flight promise. Idempotent + safe under two concurrent stopAll calls (every delete/clear/
+   *  stop is a no-op the second time). A wedged in-flight spawn is bounded by its own
+   *  `startTimeoutMs` (LspClient.start rejects), so this can't hang shutdown indefinitely. */
   async stopAll(): Promise<void> {
-    const entries = [...this.clients.values()];
-    this.clients.clear();
-    for (const e of entries) this.scheduler.clearTimeout(e.timer);
-    await Promise.all(entries.map((e) => e.client.stop()));
+    for (;;) {
+      const pending = [...this.inFlight.values()];
+      const entries = [...this.clients.entries()];
+      if (pending.length === 0 && entries.length === 0) return;
+      for (const [key, e] of entries) {
+        this.scheduler.clearTimeout(e.timer);
+        this.clients.delete(key);
+      }
+      await Promise.all([
+        ...entries.map((e) => e[1].client.stop()),
+        ...pending.map((p) => p.then((c) => c.stop(), () => { /* failed spawn: its own catch already stopped any partial child */ })),
+      ]);
+    }
   }
 
   private async spawn(key: string, workspaceRoot: string, language: LspLanguage): Promise<LspClient> {

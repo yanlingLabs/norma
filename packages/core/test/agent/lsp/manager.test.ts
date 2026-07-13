@@ -111,6 +111,28 @@ describe.if(isMac)("LspManager", () => {
     await mgr.stopAll(); // a second shutdown call is a safe no-op
   });
 
+  test("stopAll drains an IN-FLIGHT spawn (shutdown race) — the mid-flight product is stopped, not orphaned", async () => {
+    const { scheduler, liveCount } = manualScheduler();
+    const mgr = new LspManager({ serverCommands: { typescript: FAKE }, scheduler });
+    const stopSpy = spyOn(LspClient.prototype, "stop");
+    try {
+      // Kick off a spawn and, WITHOUT yielding to the event loop, call stopAll. JS is
+      // single-threaded: no microtask runs between these two synchronous lines, so the spawn is
+      // guaranteed to be in `inFlight` and NOT yet in `clients` when stopAll snapshots — exactly
+      // the shutdown race. WITHOUT the fix, stopAll sees the key nowhere, stops nothing, resolves;
+      // the spawn then completes into a live, timer-armed orphan (this assertion goes RED).
+      const spawnP = mgr.clientFor("/ws-race", "typescript");
+      const stopP = mgr.stopAll();
+      const [client] = await Promise.all([spawnP, stopP]);
+      expect(client.alive).toBe(false); // the in-flight product was actually reaped by stopAll
+      expect(stopSpy).toHaveBeenCalled();
+      expect(liveCount()).toBe(0); // the timer the completing spawn armed was cleared too — no dangler
+    } finally {
+      stopSpy.mockRestore();
+      await mgr.stopAll(); // idempotent belt-and-suspenders
+    }
+  });
+
   test("missing binary → typed LspSpawnError naming the language, command, and install hint", async () => {
     const mgr = new LspManager({ serverCommands: { typescript: { command: "this-command-does-not-exist-xyz" } } });
     let caught: unknown;
