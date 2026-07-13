@@ -1533,7 +1533,7 @@ func cardKeyAction(
     guard composerDraft.isEmpty else { return nil }
     guard let topmost, let chars, let ch = chars.lowercased().first else { return nil }
     switch topmost {
-    case .approval(let callId, _, _):
+    case .approval(let callId, _, _, _):
         if ch == "y" { return .approve(callId) }
         if ch == "n" { return .deny(callId) }
         return nil

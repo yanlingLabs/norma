@@ -18,6 +18,11 @@ final class PendingInteractionTests: XCTestCase {
     func approvalRequested(callId: String, toolName: String = "bash", summary: String = "rm x", seq: Int = 4) -> SessionEvent {
         ev(#"{"type":"approval_requested","seq":\#(seq),"sessionId":"s","ts":0,"threadId":"main","callId":"\#(callId)","toolName":"\#(toolName)","summary":"\#(summary)"}"#)
     }
+    /// Phase 5e T5: same wire shape, plus the additive `reviewerReason` field (T1's protocol
+    /// addition) — used to test that the reducer threads it through into `PendingInteraction`.
+    func approvalRequestedWithReviewerReason(callId: String, reviewerReason: String, toolName: String = "bash", summary: String = "rm x", seq: Int = 4) -> SessionEvent {
+        ev(#"{"type":"approval_requested","seq":\#(seq),"sessionId":"s","ts":0,"threadId":"main","callId":"\#(callId)","toolName":"\#(toolName)","summary":"\#(summary)","reviewerReason":"\#(reviewerReason)"}"#)
+    }
     func approvalResolved(callId: String, seq: Int = 5) -> SessionEvent {
         ev(#"{"type":"approval_resolved","seq":\#(seq),"sessionId":"s","ts":0,"threadId":"main","callId":"\#(callId)","approved":true,"by":"cli"}"#)
     }
@@ -45,6 +50,22 @@ final class PendingInteractionTests: XCTestCase {
         s = SessionReducer.reduce(s, turnStarted())
         s = SessionReducer.reduce(s, approvalRequested(callId: "a1", toolName: "bash", summary: "rm -rf x"))
         XCTAssertEqual(s.pendingInteractions, [.approval(callId: "a1", toolName: "bash", summary: "rm -rf x")])
+        // No reviewerReason on the wire event -> nil (default), matching a pre-5e-T5 event shape.
+        guard case .approval(_, _, _, let reviewerReason) = s.pendingInteractions[0] else { return XCTFail("expected .approval") }
+        XCTAssertNil(reviewerReason)
+    }
+
+    /// Phase 5e T5: the reducer threads `approval_requested.reviewerReason` through into
+    /// `PendingInteraction.approval`'s 4th associated value — the app-side twin of the CLI's
+    /// state.test.ts "approval_requested threads reviewerReason through" test.
+    func testApprovalRequestThreadsReviewerReason() {
+        var s = OrbSessionState()
+        s = SessionReducer.reduce(s, turnStarted())
+        s = SessionReducer.reduce(s, approvalRequestedWithReviewerReason(callId: "a1", reviewerReason: "recursive delete outside the session cwd"))
+        XCTAssertEqual(
+            s.pendingInteractions,
+            [.approval(callId: "a1", toolName: "bash", summary: "rm x", reviewerReason: "recursive delete outside the session cwd")]
+        )
     }
 
     func testQuestionAskedAppendsWithQuestions() {

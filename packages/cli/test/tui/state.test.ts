@@ -305,9 +305,28 @@ describe("state.ts — pending cards (f)", () => {
     let s = initialState();
     s = reduce(s, { type: "approval_requested", threadId: "main", callId: "call1", toolName: "bash", summary: "rm -rf tmp/" }, T0);
     expect(s.pending).toEqual({ kind: "approval", callId: "call1", toolName: "bash", summary: "rm -rf tmp/" });
+    // reviewerReason (phase 5e T5) must be OMITTED, not set to `undefined`, when the wire event
+    // carries none — matches the `notes` omission convention pending-cards.test.tsx (b1) pins.
+    expect(Object.prototype.hasOwnProperty.call(s.pending!, "reviewerReason")).toBe(false);
     s = reduce(s, { type: "approval_resolved", threadId: "main", callId: "call1", approved: true, by: "user" }, T0 + 5);
     expect(s.pending).toBeNull();
     expect(s.committed).toContainEqual({ kind: "note", text: "approved bash" });
+  });
+
+  test("approval_requested threads reviewerReason through when the wire event carries one (phase 5e T5)", () => {
+    let s = initialState();
+    s = reduce(
+      s,
+      { type: "approval_requested", threadId: "main", callId: "call2", toolName: "bash", summary: "rm -rf tmp/", reviewerReason: "recursive delete outside the session cwd" },
+      T0,
+    );
+    expect(s.pending).toEqual({
+      kind: "approval",
+      callId: "call2",
+      toolName: "bash",
+      summary: "rm -rf tmp/",
+      reviewerReason: "recursive delete outside the session cwd",
+    });
   });
 
   test("approval_resolved(denied) commits a denied note", () => {

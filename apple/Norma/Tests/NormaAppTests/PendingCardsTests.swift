@@ -158,4 +158,41 @@ final class PendingCardsTests: XCTestCase {
         let plan = PendingInteraction.plan(callId: "p1", plan: "the plan")
         XCTAssertEqual(cardTitle(plan), "Plan for approval")
     }
+
+    // MARK: - capReviewerReason (Phase 5e T5: reviewer-rationale card line)
+
+    func testCapReviewerReasonPassesShortReasonThrough() {
+        XCTAssertEqual(capReviewerReason("recursive delete outside the session cwd"), "recursive delete outside the session cwd")
+    }
+
+    func testCapReviewerReasonStripsNewlines() {
+        // Defensive second pass: the wire value is already newline-stripped at emission
+        // (engine.ts's sanitizeReviewText), but this must not trust that blindly.
+        XCTAssertEqual(capReviewerReason("line one\nline two\r\nline three"), "line one line two line three")
+    }
+
+    func testCapReviewerReasonTruncatesLongReasonWithEllipsis() {
+        let longReason = String(repeating: "x", count: 250)
+        let capped = capReviewerReason(longReason)
+        XCTAssertTrue(capped.count <= 101, "capped text (100 chars + ellipsis) must not carry the full 250-char reason")
+        XCTAssertTrue(capped.hasSuffix("…"))
+        XCTAssertFalse(capped.contains(longReason))
+    }
+
+    func testCapReviewerReasonExactlyAtThresholdIsUnchanged() {
+        let atThreshold = String(repeating: "y", count: 100)
+        XCTAssertEqual(capReviewerReason(atThreshold), atThreshold, "exactly at the cap must not gain a trailing ellipsis")
+    }
+
+    // MARK: - PendingInteraction.approval reviewerReason threading (enum shape)
+
+    func testApprovalReviewerReasonDefaultsNilAndIsPreservedWhenSet() {
+        let withoutReason = PendingInteraction.approval(callId: "a1", toolName: "bash", summary: "rm x")
+        guard case .approval(_, _, _, let reviewerReason) = withoutReason else { return XCTFail("expected .approval") }
+        XCTAssertNil(reviewerReason)
+
+        let withReason = PendingInteraction.approval(callId: "a1", toolName: "bash", summary: "rm x", reviewerReason: "reviewer says no")
+        guard case .approval(_, _, _, let reviewerReason2) = withReason else { return XCTFail("expected .approval") }
+        XCTAssertEqual(reviewerReason2, "reviewer says no")
+    }
 }
