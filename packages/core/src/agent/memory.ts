@@ -26,6 +26,21 @@ function isValidSlug(name: string): boolean {
   return /^[a-z0-9][a-z0-9-]{0,63}$/.test(name);
 }
 
+/** Full name validation: slug jail + reserved names. Returns the error string, or null when valid.
+ *
+ *  `memory` is reserved because macOS's default APFS is case-insensitive/case-preserving:
+ *  `memory.md` and the `MEMORY.md` index are the SAME file there, so an accepted fact named
+ *  "memory" would be silently clobbered by the index rewrite (write reports ok but read fails,
+ *  and every indexed fact vanishes from the index) — and delete("memory") would unlink the index
+ *  itself. Compared case-insensitively even though the slug regex only admits lowercase, as
+ *  defense against future regex loosening. (`audit` is NOT reserved: `audit.md` never collides
+ *  with `audit.jsonl` — extensions differ even on a case-insensitive fs.) */
+function nameError(name: string): string | null {
+  if (!isValidSlug(name)) return `invalid memory name "${name}"`;
+  if (name.toLowerCase() === "memory") return `"memory" is a reserved name (collides with the MEMORY.md index on case-insensitive filesystems)`;
+  return null;
+}
+
 interface IndexEntry { name: string; description: string }
 
 /** Parses a fact file's frontmatter + body. Tolerant: any missing/malformed piece → null (caller
@@ -125,7 +140,7 @@ export class MemoryStore {
     for (const entry of entries) {
       if (!entry.endsWith(".md")) continue;
       const name = entry.slice(0, -3);
-      if (!isValidSlug(name)) continue; // e.g. MEMORY.md itself (uppercase → never a valid slug)
+      if (nameError(name)) continue; // e.g. MEMORY.md itself (uppercase fails the slug; a stray reserved-name file on a case-SENSITIVE fs is also skipped)
       const parsed = parseFactFile(join(root.value, entry));
       if (!parsed) continue; // corrupt → skip, never throw
       out.push({ name: parsed.name, description: parsed.description, type: parsed.type });
@@ -134,7 +149,8 @@ export class MemoryStore {
   }
 
   read(scope: MemoryScope, name: string, cwd?: string): MemoryResult<MemoryFact> {
-    if (!isValidSlug(name)) return { ok: false, error: `invalid memory name "${name}"` };
+    const invalid = nameError(name);
+    if (invalid) return { ok: false, error: invalid };
     const root = this.resolveRoot(scope, cwd);
     if (!root.ok) return root;
     const parsed = parseFactFile(join(root.value, `${name}.md`));
@@ -148,9 +164,10 @@ export class MemoryStore {
     // project directory.
     const auditPath = join(this.normaHome, "memory", "audit.jsonl");
     mkdirSync(dirname(auditPath), { recursive: true });
-    // Built field-by-field (not a spread of `line`) so an absent sessionId/description is OMITTED
-    // from the JSON rather than serialized as `null` — and so fact bodies can never leak in here,
-    // structurally, no matter what a future caller passes.
+    // Built field-by-field (not a spread of `line`) so fact bodies can never leak in here,
+    // structurally, no matter what a future caller passes. This is the SINGLE point of truth for
+    // optional-field handling: callers pass sessionId/description as-is (possibly undefined), and
+    // only here is an absent value OMITTED from the JSON rather than serialized as `null`.
     const obj: MemoryAuditLine = { ts: line.ts, source: line.source, scope: line.scope, action: line.action, name: line.name };
     if (line.sessionId !== undefined) obj.sessionId = line.sessionId;
     if (line.description !== undefined) obj.description = line.description;
@@ -158,16 +175,15 @@ export class MemoryStore {
   }
 
   private doWrite(scope: MemoryScope, fact: MemoryFact, meta: { sessionId?: string; source: "tool" | "rpc" }, cwd?: string): MemoryResult {
-    if (!isValidSlug(fact.name)) return { ok: false, error: `invalid memory name "${fact.name}"` };
+    const invalid = nameError(fact.name);
+    if (invalid) return { ok: false, error: invalid };
     const root = this.resolveRoot(scope, cwd);
     if (!root.ok) return root;
 
     const description = fact.description.split(/\r?\n/).join(" ").trim();
-    // Wrapped: a genuine fs error (permission denied, disk full, ...) must become a typed
-    // ok:false, not a thrown exception — an uncaught throw here would reject the promise this
-    // op runs under, and since the NEXT queued op chains off `this.queue` via a bare `.then`
-    // (no onRejected), that rejection would propagate forever and silently skip every
-    // subsequent write/delete for the rest of the process's lifetime.
+    // Wrapped: a genuine fs error (permission denied, disk full, root path colliding with a
+    // plain file, ...) must become a typed ok:false — "never throws" is the store's contract,
+    // and an uncaught throw would surface to the caller as a rejected write() promise.
     try {
       mkdirSync(root.value, { recursive: true });
       writeFileSync(join(root.value, `${fact.name}.md`), factFileContent(fact, description), "utf8");
@@ -179,7 +195,7 @@ export class MemoryStore {
       else entries.push({ name: fact.name, description }); // new fact appends
       writeFileSync(indexPath, serializeIndex(entries), "utf8");
 
-      this.appendAudit({ ts: this.nowMs(), ...(meta.sessionId !== undefined ? { sessionId: meta.sessionId } : {}), source: meta.source, scope, action: "write", name: fact.name, description });
+      this.appendAudit({ ts: this.nowMs(), sessionId: meta.sessionId, source: meta.source, scope, action: "write", name: fact.name, description });
       return { ok: true, value: undefined };
     } catch (err) {
       return { ok: false, error: `failed to write memory fact "${fact.name}": ${err instanceof Error ? err.message : String(err)}` };
@@ -187,7 +203,8 @@ export class MemoryStore {
   }
 
   private doDelete(scope: MemoryScope, name: string, meta: { sessionId?: string; source: "tool" | "rpc" }, cwd?: string): MemoryResult {
-    if (!isValidSlug(name)) return { ok: false, error: `invalid memory name "${name}"` };
+    const invalid = nameError(name);
+    if (invalid) return { ok: false, error: invalid };
     const root = this.resolveRoot(scope, cwd);
     if (!root.ok) return root;
 
@@ -200,7 +217,7 @@ export class MemoryStore {
       const entries = parseIndexEntries(indexPath).filter((e) => e.name !== name);
       writeFileSync(indexPath, serializeIndex(entries), "utf8");
 
-      this.appendAudit({ ts: this.nowMs(), ...(meta.sessionId !== undefined ? { sessionId: meta.sessionId } : {}), source: meta.source, scope, action: "delete", name });
+      this.appendAudit({ ts: this.nowMs(), sessionId: meta.sessionId, source: meta.source, scope, action: "delete", name });
       return { ok: true, value: undefined };
     } catch (err) {
       return { ok: false, error: `failed to delete memory fact "${name}": ${err instanceof Error ? err.message : String(err)}` };
@@ -208,9 +225,13 @@ export class MemoryStore {
   }
 
   /** Queues `op` behind every previously-queued mutation so reads/writes of the same MEMORY.md
-   *  never interleave, then returns that specific op's result. `op` itself never throws
-   *  (doWrite/doDelete catch every fs error into a typed result) — the `.catch` below is
-   *  defense-in-depth so an unforeseen throw can never permanently wedge the queue for later ops. */
+   *  never interleave, then returns that specific op's result. doWrite/doDelete's own try/catch
+   *  converts every fs error into a typed result, so the `.catch` below is NOT reachable via fs
+   *  failures — it guards the code that runs BEFORE those try blocks (nameError/resolveRoot,
+   *  including a caller-supplied `trust.isTrusted` that throws): without it, one such throw would
+   *  poison `this.queue` and every later mutation would inherit the rejection and silently no-op.
+   *  Note the caller-facing `result` is deliberately NOT the caught promise — an escaped throw
+   *  still rejects that one call loudly instead of being swallowed. */
   private enqueue(op: () => MemoryResult): Promise<MemoryResult> {
     const result = this.queue.then(op);
     this.queue = result.catch(() => undefined);

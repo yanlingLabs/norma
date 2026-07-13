@@ -123,6 +123,41 @@ describe("MemoryStore", () => {
     });
   });
 
+  describe("reserved name: memory", () => {
+    // On macOS's default case-insensitive/case-preserving APFS, `memory.md` and the `MEMORY.md`
+    // index are the SAME file — an accepted fact named "memory" would clobber the index (and a
+    // delete would unlink it). Reserved at validation time, BEFORE any fs op.
+    test('write(name:"memory") → ok:false, fs untouched', async () => {
+      const { home, store } = setup();
+      const res = await store.write("user", fact({ name: "memory" }), { source: "tool" });
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.error).toContain("reserved");
+      expect(existsSync(join(home, "memory"))).toBe(false); // no scope dir created at all
+    });
+
+    test("write/delete/read of 'memory' rejected; pre-existing fact + index unharmed", async () => {
+      const { home, store } = setup();
+      await store.write("user", fact({ name: "keep-me", description: "survivor" }), { source: "tool" });
+      const indexBefore = readFileSync(join(home, "memory", "MEMORY.md"), "utf8");
+
+      const w = await store.write("user", fact({ name: "memory" }), { source: "tool" });
+      expect(w.ok).toBe(false);
+      const d = await store.delete("user", "memory", { source: "tool" }); // would unlink the INDEX on APFS
+      expect(d.ok).toBe(false);
+      const r = store.read("user", "memory");
+      expect(r.ok).toBe(false);
+
+      // index byte-identical, pre-existing fact still lists and reads
+      expect(readFileSync(join(home, "memory", "MEMORY.md"), "utf8")).toBe(indexBefore);
+      const list = store.list("user");
+      expect(list.ok).toBe(true);
+      if (list.ok) expect(list.value.map((m) => m.name)).toEqual(["keep-me"]);
+      const keep = store.read("user", "keep-me");
+      expect(keep.ok).toBe(true);
+      if (keep.ok) expect(keep.value.description).toBe("survivor");
+    });
+  });
+
   test("project scope: untrusted → ok:false with exact message", () => {
     const { store } = setup(neverTrusted);
     const cwd = realDir();
@@ -184,22 +219,34 @@ describe("MemoryStore", () => {
     }
   });
 
-  test("fs error during write → typed ok:false, never throws, queue not wedged for later ops", async () => {
+  test("fs error during write → typed ok:false, never throws, later ops unaffected", async () => {
     const home = realDir();
     // Force the scope root path to collide with a plain file, so mkdirSync(recursive) throws.
+    // This exercises doWrite's own try/catch (fs error → typed result); it does NOT exercise
+    // enqueue's rejection isolation — no rejection ever reaches the queue on this path.
     writeFileSync(join(home, "memory"), "not a directory");
     const store = new MemoryStore({ normaHome: home, trust: alwaysTrusted });
 
     const first = await store.write("user", fact({ name: "a" }), { source: "tool" });
     expect(first.ok).toBe(false);
 
-    // Fix the collision, then confirm the queue still processes subsequent ops normally —
-    // a naive `this.queue = this.queue.then(op)` with no rejection isolation would permanently
-    // skip every later write once one op rejects.
     const { statSync, unlinkSync } = await import("node:fs");
     if (statSync(join(home, "memory")).isFile()) unlinkSync(join(home, "memory"));
     const second = await store.write("user", fact({ name: "b" }), { source: "tool" });
     expect(second.ok).toBe(true);
+  });
+
+  test("throwing trust.isTrusted (outside doWrite's try) rejects that ONE call, queue not wedged", async () => {
+    // The one path where an op can genuinely throw: caller-supplied deps invoked BEFORE the fs
+    // try block. enqueue's `.catch` must isolate the queue so later mutations still run, while
+    // the failing call itself still rejects loudly rather than being swallowed.
+    const home = realDir();
+    const bombTrust = { isTrusted: (_dir: string): boolean => { throw new Error("trust store exploded"); } };
+    const store = new MemoryStore({ normaHome: home, trust: bombTrust });
+
+    await expect(store.write("project", fact(), { source: "tool" }, realDir())).rejects.toThrow("trust store exploded");
+    const after = await store.write("user", fact({ name: "b" }), { source: "tool" }); // user scope never consults trust
+    expect(after.ok).toBe(true);
   });
 
   test("audit: line shape, order, corrupt-line skip", async () => {
