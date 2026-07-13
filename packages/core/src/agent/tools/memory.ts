@@ -73,7 +73,7 @@ export function registerMemoryTools(r: ToolRegistry, deps: { memory: MemoryStore
 
   r.register({
     name: "memory_delete",
-    description: 'Delete a saved memory fact by name. scope defaults to "user"; "project" deletes from the current project\'s memory.',
+    description: 'Delete a saved memory fact by name. scope defaults to "user"; "project" deletes from the current project\'s memory (requires a trusted directory).',
     args: z.object({ scope: SCOPE, name: z.string().min(1) }),
     deferred: true,
     async run({ scope, name }, { sessionId }) {
