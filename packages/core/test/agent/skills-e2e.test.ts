@@ -82,6 +82,11 @@ describe("self-authored skill e2e (phase 5c Task 5 — the phase gate)", () => {
     expect(events.some((e) => e.type === "approval_requested")).toBe(true);
     expect(events.find((e) => e.type === "approval_resolved")).toMatchObject({ approved: true, by: "auto-approver" });
 
+    // 5c whole-branch review: the card is HONEST — skill name + full description + explicit
+    // body-NOT-shown size marker; the body text itself never appears on the card.
+    const card = events.find((e) => e.type === "approval_requested") as Extract<SessionEvent, { type: "approval_requested" }>;
+    expect(card.summary).toBe(`skill_write "self-demo" — Demonstrates self-authored reuse [body: ${AUTHORED_BODY.length} chars — not shown; review in dashboard after approving]`);
+
     // ORDERING (closes 5b T6's gap): resolution must precede the tool_result in event order, not
     // merely both be present somewhere in the stream.
     const resolvedIdx = events.findIndex((e) => e.type === "approval_resolved");

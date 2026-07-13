@@ -87,6 +87,34 @@ function isTurnCompleted(e: SessionEvent): e is TurnCompleted {
   return e.type === "turn_completed";
 }
 
+/** Approval-card summary for a gated call. The ONE construction site for both ask-branch callers
+ *  (worktree + generic) — they must not drift apart (5c whole-branch review).
+ *
+ *  skill_write gets a bespoke HONEST card instead of the generic `argsJson.slice(0,160)`: on a
+ *  skill_write card that slice is mostly name+description, so a malicious body instruction past
+ *  char ~160 would ride in on a benign-looking prefix while the card creates the ILLUSION the
+ *  body was reviewed — and for skill_write the card IS the control (ALWAYS_ASK, gate.ts: standing
+ *  instructions for future sessions get a card no policy can silence). The bespoke card therefore
+ *  shows the skill name + FULL description (newline-stripped, capped) and says explicitly that
+ *  the body is NOT shown, with its size — an honest "you have not reviewed this" instead of a
+ *  false "you have". Constraints:
+ *  - body text NEVER appears here, however short — a body could inject fake card lines;
+ *  - every interpolated field is newline-stripped for the same reason;
+ *  - malformed or mis-shaped argsJson falls back to the generic slice (honest raw JSON beats a
+ *    fabricated pretty card; zod rejects the call at execute time anyway). */
+function approvalCardSummary(call: { name: string; argsJson: string }): string {
+  if (call.name === "skill_write") {
+    try {
+      const a = JSON.parse(call.argsJson || "{}") as { name?: unknown; description?: unknown; body?: unknown };
+      if (typeof a.name === "string" && typeof a.description === "string" && typeof a.body === "string") {
+        const oneLine = (s: string) => s.split(/\r?\n/).join(" ").trim();
+        return `skill_write "${oneLine(a.name)}" — ${oneLine(a.description).slice(0, 200)} [body: ${a.body.length} chars — not shown; review in dashboard after approving]`;
+      }
+    } catch { /* malformed argsJson → generic slice below */ }
+  }
+  return `${call.name} ${call.argsJson.slice(0, 160)}`;
+}
+
 export const SYSTEM_PROMPT = [
   "You are Norma, an agentic assistant running on the user's Mac.",
   "You operate inside a session working directory; file tool paths are relative to it.",
@@ -1771,7 +1799,7 @@ export class AgentEngine {
           if (decision === "ask") {
             outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
               timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
-              summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
+              summary: approvalCardSummary(call),
               // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
             }, loaded, async () => this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd), pins, rootsOverride, visionCapable);
           } else {
@@ -1781,7 +1809,7 @@ export class AgentEngine {
         } else if (decision === "ask") {
           outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
             timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
-            summary: `${call.name} ${call.argsJson.slice(0, 160)}`,
+            summary: approvalCardSummary(call),
             // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
           }, loaded, undefined, pins, rootsOverride, visionCapable);
         } else if (call.name === "exit_plan_mode" && this.cfg.plans && meta.approvalPolicy === "plan") {
