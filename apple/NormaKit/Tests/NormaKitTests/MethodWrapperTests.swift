@@ -533,4 +533,64 @@ final class MethodWrapperTests: XCTestCase {
         XCTAssertEqual(lines[1].sessionId, "s_1")
         XCTAssertEqual(lines[1].description, "UI preference")
     }
+
+    // MARK: - Phase 5c Task 4: skills.* wrappers (Dashboard SkillsPane)
+
+    /// `skills.list` now decodes every `SkillMetaSchema` field (methods.ts) — the prior wrapper
+    /// dropped `path`/`claudeFormat`/`author` on the floor; this proves all five are round-tripped,
+    /// including the "author: norma" self-authored marker and a claude-format plugin skill.
+    func testSkillsListDecodesEveryMetaField() async throws {
+        let (client, t) = try await connected()
+
+        let (req, skills) = try await roundTrip(t, sentIndex: 1,
+            result: #"{"ok":true,"skills":[{"name":"writing-skills","description":"how to write a skill","source":"builtin","path":"/norma/skills/writing-skills"},{"name":"my-note","description":"a self-authored skill","source":"self","path":"/home/u/.norma/skills/self/my-note","author":"norma"},{"name":"pdf-helper","description":"plugin skill","source":"plugin","path":"/plugins/x/skills/pdf","claudeFormat":true}]}"#
+        ) { try await client.skillsList() }
+        XCTAssertEqual(req["method"] as? String, "skills.list")
+        XCTAssertNil((req["params"] as? [String: Any])?["cwd"]) // omitted cwd dropped, not sent as null
+        XCTAssertEqual(skills.count, 3)
+        XCTAssertEqual(skills[0].source, "builtin")
+        XCTAssertNil(skills[0].author)
+        XCTAssertNil(skills[0].claudeFormat)
+        XCTAssertEqual(skills[1].source, "self")
+        XCTAssertEqual(skills[1].author, "norma")
+        XCTAssertEqual(skills[2].claudeFormat, true)
+    }
+
+    func testSkillsReadDecodesFullBody() async throws {
+        let (client, t) = try await connected()
+
+        let (req, skill) = try await roundTrip(t, sentIndex: 1,
+            result: ##"{"ok":true,"skill":{"name":"my-note","description":"a self-authored skill","source":"self","path":"/home/u/.norma/skills/self/my-note","author":"norma","body":"# My Note\n\nSome body text."}}"##
+        ) { try await client.skillsRead(name: "my-note") }
+        XCTAssertEqual(req["method"] as? String, "skills.read")
+        XCTAssertEqual((req["params"] as? [String: Any])?["name"] as? String, "my-note")
+        XCTAssertNil((req["params"] as? [String: Any])?["cwd"])
+        XCTAssertEqual(skill.source, "self")
+        XCTAssertEqual(skill.author, "norma")
+        XCTAssertEqual(skill.body, "# My Note\n\nSome body text.")
+    }
+
+    /// `skills.write`/`skills.delete` take no `scope`/`cwd` param to abuse (methods.ts: always
+    /// self-confined server-side) — proves the wrapper sends exactly `{name, description, body}`/
+    /// `{name}` and succeeds on the empty result, same posture as `memoryWrite`/`memoryDelete`.
+    func testSkillsWriteAndDeleteEncodeParamsAndSucceedOnEmptyResult() async throws {
+        let (client, t) = try await connected()
+
+        let (writeReq, _) = try await roundTrip(t, sentIndex: 1, result: #"{"ok":true}"#) {
+            try await client.skillsWrite(name: "my-note", description: "a self-authored skill", body: "# My Note")
+        }
+        XCTAssertEqual(writeReq["method"] as? String, "skills.write")
+        let writeParams = writeReq["params"] as? [String: Any]
+        XCTAssertEqual(writeParams?["name"] as? String, "my-note")
+        XCTAssertEqual(writeParams?["description"] as? String, "a self-authored skill")
+        XCTAssertEqual(writeParams?["body"] as? String, "# My Note")
+        XCTAssertNil(writeParams?["scope"])
+        XCTAssertNil(writeParams?["cwd"])
+
+        let (deleteReq, _) = try await roundTrip(t, sentIndex: 2, result: #"{"ok":true}"#) {
+            try await client.skillsDelete(name: "my-note")
+        }
+        XCTAssertEqual(deleteReq["method"] as? String, "skills.delete")
+        XCTAssertEqual((deleteReq["params"] as? [String: Any])?["name"] as? String, "my-note")
+    }
 }

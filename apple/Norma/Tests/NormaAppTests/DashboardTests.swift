@@ -16,11 +16,11 @@ import NormaKit
 final class DashboardTests: XCTestCase {
     // MARK: - dashboardPaneOrder / defaultDashboardPane (PURE)
 
-    func testDashboardPaneOrderContainsAllSevenPanesInSpecOrder() {
+    func testDashboardPaneOrderContainsAllEightPanesInSpecOrder() {
         // Phase 4d-iii Task 2: `.pluginManager` appended at the END, every pre-existing pane keeps
         // its position (see `dashboardPaneOrder`'s own doc comment). Phase 5b Task 5: `.memory`
-        // appended the same way.
-        XCTAssertEqual(dashboardPaneOrder, [.sessions, .daemonStatus, .quota, .trust, .peripheral, .pluginManager, .memory])
+        // appended the same way. Phase 5c Task 4: `.skills` appended the same way again.
+        XCTAssertEqual(dashboardPaneOrder, [.sessions, .daemonStatus, .quota, .trust, .peripheral, .pluginManager, .memory, .skills])
         XCTAssertEqual(Set(dashboardPaneOrder), Set(DashboardPane.allCases), "every case must appear exactly once")
     }
 
@@ -173,6 +173,56 @@ final class DashboardTests: XCTestCase {
     /// capitalized rendering of the raw string rather than crashing or showing blank.
     func testMemoryTypeBadgeUnrecognizedTypeFallsBackToCapitalized() {
         XCTAssertEqual(memoryTypeBadge("archived"), "Archived")
+    }
+
+    // MARK: - skillSourceBadge / skillsGroupedBySource (PURE, SkillsPane.swift)
+
+    func testSkillSourceBadgeMapsAllFiveWireSources() {
+        XCTAssertEqual(skillSourceBadge("project"), "Project")
+        XCTAssertEqual(skillSourceBadge("user"), "User")
+        XCTAssertEqual(skillSourceBadge("self"), "Self")
+        XCTAssertEqual(skillSourceBadge("plugin"), "Plugin")
+        XCTAssertEqual(skillSourceBadge("builtin"), "Builtin")
+    }
+
+    /// An unrecognized source (a future server-side addition this client predates) falls back to a
+    /// capitalized rendering of the raw string rather than crashing or showing blank — same
+    /// posture as `memoryTypeBadge`'s own fallback.
+    func testSkillSourceBadgeUnrecognizedSourceFallsBackToCapitalized() {
+        XCTAssertEqual(skillSourceBadge("mystery"), "Mystery")
+    }
+
+    private func skill(_ name: String, source: String, author: String? = nil) -> SkillMeta {
+        SkillMeta(name: name, description: "d", source: source, path: "/tmp/\(name)", claudeFormat: nil, author: author)
+    }
+
+    /// Groups land in the fixed `skillSourceOrder` (project > user > self > plugin > builtin) —
+    /// the store's own resolution precedence — REGARDLESS of the input array's order, and a
+    /// source with zero skills produces no group at all.
+    func testSkillsGroupedBySourceOrdersGroupsAndOmitsEmptyOnes() {
+        let skills = [
+            skill("b-skill", source: "builtin"),
+            skill("self-skill", source: "self", author: "norma"),
+            skill("proj-skill", source: "project"),
+        ]
+        let groups = skillsGroupedBySource(skills)
+        XCTAssertEqual(groups.map(\.source), ["project", "self", "builtin"], "user/plugin have no skills — no empty groups")
+        XCTAssertEqual(groups[0].skills.map(\.name), ["proj-skill"])
+        XCTAssertEqual(groups[1].skills.map(\.name), ["self-skill"])
+        XCTAssertEqual(groups[1].skills[0].author, "norma")
+        XCTAssertEqual(groups[2].skills.map(\.name), ["b-skill"])
+    }
+
+    /// A source outside the known five (a future server addition) still gets its own trailing
+    /// group instead of silently vanishing from the pane.
+    func testSkillsGroupedBySourceUnknownSourceGetsATrailingGroup() {
+        let skills = [skill("mystery-skill", source: "mystery"), skill("proj-skill", source: "project")]
+        let groups = skillsGroupedBySource(skills)
+        XCTAssertEqual(groups.map(\.source), ["project", "mystery"])
+    }
+
+    func testSkillsGroupedBySourceEmptyInputProducesNoGroups() {
+        XCTAssertTrue(skillsGroupedBySource([]).isEmpty)
     }
 
     // MARK: - DashboardSelectionModel (PURE — Phase 4d-cleanup Task 3 fix 1)
