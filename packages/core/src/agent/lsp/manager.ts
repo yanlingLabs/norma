@@ -59,6 +59,21 @@ const DEFAULT_SERVER_COMMANDS: Record<LspLanguage, { command: string; args?: str
   swift: { command: "sourcekit-lsp" },
 };
 
+// Per-language diagnostics tuning. Real servers PUBLISH MORE THAN ONCE per didOpen and the first
+// publish is often an empty/interim result — `diagnostics()` returns the LATEST publish after a
+// quiet `settleMs`, bounded by `timeoutMs`. The settle window MUST exceed a server's inter-publish
+// gap or it fires mid-gap and returns the stale interim set. Measured on this platform:
+//   - typescript-language-server: usually a single merged publish within ~100ms → a short settle.
+//   - sourcekit-lsp (SwiftPM package file): an interim publish, then the real one ~2s later after
+//     it builds/indexes → the settle must bridge that ~2s, and the deadline must clear a cold build.
+// These are correctness floors, not latency budgets: a Swift diagnostics call inherently waits for
+// sourcekit-lsp's build. Pull diagnostics (textDocument/diagnostic) would remove the guesswork —
+// tracked as the proper follow-up.
+export const DIAG_TUNING: Record<LspLanguage, { settleMs: number; timeoutMs: number }> = {
+  typescript: { settleMs: 500, timeoutMs: 8000 },
+  swift: { settleMs: 2500, timeoutMs: 30000 },
+};
+
 /** How a human fixes a missing-binary/spawn-failure LspSpawnError, per language — surfaced
  *  verbatim in the error message. */
 const INSTALL_HINTS: Record<LspLanguage, string> = {
@@ -195,11 +210,14 @@ export class LspManager {
 
   private async spawn(key: string, workspaceRoot: string, language: LspLanguage): Promise<LspClient> {
     const cmd = this.serverCommands[language];
+    const tuning = DIAG_TUNING[language];
     const client = new LspClient({
       command: cmd.command,
       args: cmd.args,
       rootUri: pathToFileUri(workspaceRoot),
       startTimeoutMs: cmd.startTimeoutMs,
+      diagSettleMs: tuning.settleMs,
+      diagTimeoutMs: tuning.timeoutMs,
     });
     try {
       await client.start();

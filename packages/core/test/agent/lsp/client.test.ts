@@ -35,7 +35,7 @@ describe.if(isMac)("LspClient", () => {
     await withEnv({ NORMA_LSP_FAKE_DIAGS: JSON.stringify([
       { range: { start: { line: 3, character: 1 }, end: { line: 3, character: 5 } }, severity: 2, message: "unused var", source: "fake-lsp" },
     ]) }, async () => {
-      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI, diagSettleMs: 50 });
       await c.start();
       const diags = await c.diagnostics("file:///workspace/a.ts", "const x = 1;", 2000);
       expect(diags).toEqual([{ line: 3, character: 1, severity: 2, message: "unused var", source: "fake-lsp" }]);
@@ -45,10 +45,41 @@ describe.if(isMac)("LspClient", () => {
 
   test("diagnostics(): an empty publish resolves to [] — a valid answer, not a timeout", async () => {
     await withEnv({ NORMA_LSP_FAKE_DIAGS: "[]" }, async () => {
-      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI, diagSettleMs: 50 });
       await c.start();
       const diags = await c.diagnostics("file:///workspace/clean.ts", "const y = 1;", 2000);
       expect(diags).toEqual([]);
+      await c.stop();
+    });
+  });
+
+  test("diagnostics(): staged publishes (empty syntactic pass, then the semantic pass) resolve with the SETTLED result, not the first publish", async () => {
+    // Real tsserver shape: a fast (often empty) syntactic publish lands first; the semantic pass
+    // follows ~100ms later as a SECOND publish for the same uri. Resolve-on-first-publish returns
+    // "no diagnostics" for a file whose only problem is a TYPE error — the exact live failure this
+    // settle window exists to prevent.
+    await withEnv({ NORMA_LSP_FAKE_STAGED_DIAGS: "1", NORMA_LSP_FAKE_DIAGS: JSON.stringify([
+      { range: { start: { line: 0, character: 6 }, end: { line: 0, character: 9 } }, severity: 1, message: "Type 'string' is not assignable to type 'number'.", source: "fake-lsp" },
+    ]) }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI, diagSettleMs: 250 });
+      await c.start();
+      const diags = await c.diagnostics("file:///workspace/typed.ts", "const n: number = \"s\";", 3000);
+      expect(diags).toEqual([{ line: 0, character: 6, severity: 1, message: "Type 'string' is not assignable to type 'number'.", source: "fake-lsp" }]);
+      await c.stop();
+    });
+  });
+
+  test("diagnostics(): the overall deadline returns the LATEST publish when the settle window can't elapse in time", async () => {
+    // settle window (5s) deliberately larger than the overall timeout (600ms): both staged
+    // publishes land (~0ms and ~100ms), the settle timer never gets to fire, and the deadline
+    // must resolve with the latest data rather than throwing — data beats a timeout error.
+    await withEnv({ NORMA_LSP_FAKE_STAGED_DIAGS: "1", NORMA_LSP_FAKE_DIAGS: JSON.stringify([
+      { range: { start: { line: 1, character: 0 }, end: { line: 1, character: 4 } }, severity: 1, message: "late but real", source: "fake-lsp" },
+    ]) }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI, diagSettleMs: 5000 });
+      await c.start();
+      const diags = await c.diagnostics("file:///workspace/churn.ts", "x", 600);
+      expect(diags).toEqual([{ line: 1, character: 0, severity: 1, message: "late but real", source: "fake-lsp" }]);
       await c.stop();
     });
   });

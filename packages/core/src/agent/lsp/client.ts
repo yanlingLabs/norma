@@ -11,10 +11,22 @@ import { spawn, type ChildProcess } from "node:child_process";
 export interface LspLocation { path: string; line: number; character: number } // 0-based, as LSP returns
 export interface LspDiagnostic { line: number; character: number; severity: 1 | 2 | 3 | 4; message: string; source?: string } // 0-based
 
-const DEFAULT_START_TIMEOUT_MS = Number(process.env.NORMA_LSP_START_TIMEOUT_MS ?? 10000);
-const DEFAULT_REQUEST_TIMEOUT_MS = Number(process.env.NORMA_LSP_REQUEST_TIMEOUT_MS ?? 10000);
-const DEFAULT_DIAG_TIMEOUT_MS = Number(process.env.NORMA_LSP_DIAG_TIMEOUT_MS ?? 5000);
-const STOP_TIMEOUT_MS = Number(process.env.NORMA_LSP_STOP_TIMEOUT_MS ?? 5000);
+// A junk env value must fall back to the default, not become NaN — setTimeout(fn, NaN) fires
+// immediately, which would silently zero every bound below.
+function envNum(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+const DEFAULT_START_TIMEOUT_MS = envNum("NORMA_LSP_START_TIMEOUT_MS", 10000);
+const DEFAULT_REQUEST_TIMEOUT_MS = envNum("NORMA_LSP_REQUEST_TIMEOUT_MS", 10000);
+const DEFAULT_DIAG_TIMEOUT_MS = envNum("NORMA_LSP_DIAG_TIMEOUT_MS", 5000);
+// Diagnostics settle window: real servers publish MORE THAN ONCE per didOpen (tsserver runs a fast
+// syntactic pass first and the semantic pass later, as separate publishes — the first is often
+// empty even when the file has a type error). diagnostics() therefore resolves with the LATEST
+// publish once no further publish has arrived for this long — never with the first one blindly.
+const DEFAULT_DIAG_SETTLE_MS = envNum("NORMA_LSP_DIAG_SETTLE_MS", 400);
+const STOP_TIMEOUT_MS = envNum("NORMA_LSP_STOP_TIMEOUT_MS", 5000);
 const STDERR_TAIL_MAX = 2000; // cap so a chatty server can't grow this unbounded across a long session
 
 /** A request/diagnostics-wait didn't settle within its bound. Distinguishes "still waiting" from
@@ -78,20 +90,34 @@ function toDiagnostics(raw: unknown): LspDiagnostic[] {
 
 interface Settler<T> { resolve: (v: T) => void; reject: (e: Error) => void }
 
+/** One diagnostics() call awaiting a SETTLED result for its URI. `latest` accumulates across
+ *  publishes; `settle` is the quiet-period timer (re-armed on every publish); `deadline` is the
+ *  overall bound. Exactly one of the three finish paths runs (guarded by `done`): settle elapsed →
+ *  resolve(latest); deadline with data → resolve(latest); deadline with no data → reject(timeout). */
+interface DiagWaiter {
+  resolve: (v: LspDiagnostic[]) => void;
+  reject: (e: Error) => void;
+  latest: LspDiagnostic[] | null;
+  settle: ReturnType<typeof setTimeout> | null;
+  deadline: ReturnType<typeof setTimeout> | null;
+  done: boolean;
+}
+
 export class LspClient {
   private child: ChildProcess | null = null;
   private nextId = 1;
   private buf: Buffer = Buffer.alloc(0);
   private pending = new Map<number, Settler<any>>();
-  // diagnostics() calls currently awaiting the NEXT publish for their URI — a publish wakes every
-  // waiter for that URI. There is deliberately NO last-write cache: diagnostics() always awaits the
-  // next publish (re-opening the on-disk content), so a stored "last diagnostics" would never be read.
-  private diagWaiters = new Map<string, Settler<LspDiagnostic[]>[]>();
+  // diagnostics() calls currently awaiting a SETTLED result for their URI — each publish updates
+  // every waiter's `latest` and re-arms its settle timer (see DiagWaiter). Waiters are removed on
+  // finish, not on first publish: real servers publish repeatedly per didOpen. There is deliberately
+  // NO cross-call cache: each diagnostics() re-opens the on-disk content and settles fresh.
+  private diagWaiters = new Map<string, DiagWaiter[]>();
   private openUris = new Set<string>();
   private stderrTail = "";
   private _dead = false;
 
-  constructor(private readonly cfg: { command: string; args?: string[]; rootUri: string; startTimeoutMs?: number }) {}
+  constructor(private readonly cfg: { command: string; args?: string[]; rootUri: string; startTimeoutMs?: number; diagSettleMs?: number; diagTimeoutMs?: number }) {}
 
   get alive(): boolean { return !this._dead; }
 
@@ -116,23 +142,40 @@ export class LspClient {
     this.notify("initialized", {});
   }
 
-  async diagnostics(fileUri: string, text: string, timeoutMs = DEFAULT_DIAG_TIMEOUT_MS): Promise<LspDiagnostic[]> {
+  async diagnostics(fileUri: string, text: string, timeoutMs = this.cfg.diagTimeoutMs ?? DEFAULT_DIAG_TIMEOUT_MS): Promise<LspDiagnostic[]> {
     if (this._dead) return Promise.reject(new LspNotRunningError());
-    let entry!: Settler<LspDiagnostic[]>;
-    const raw = new Promise<LspDiagnostic[]>((resolve, reject) => { entry = { resolve, reject }; });
-    const waiters = this.diagWaiters.get(fileUri) ?? [];
-    waiters.push(entry);
-    this.diagWaiters.set(fileUri, waiters);
-    this.sendDidOpen(fileUri, text);
-    return withTimeout(raw, timeoutMs, () => {
-      const list = this.diagWaiters.get(fileUri);
-      if (list) {
-        const i = list.indexOf(entry);
-        if (i >= 0) list.splice(i, 1);
-        if (list.length === 0) this.diagWaiters.delete(fileUri);
-      }
-      return new LspTimeoutError(`diagnostics for ${fileUri} timed out after ${timeoutMs}ms`);
+    const settleMs = this.cfg.diagSettleMs ?? DEFAULT_DIAG_SETTLE_MS;
+    return new Promise<LspDiagnostic[]>((resolve, reject) => {
+      const w: DiagWaiter = { resolve, reject, latest: null, settle: null, deadline: null, done: false };
+      // Overall bound: with at least one publish in hand, resolve with it — interim data beats a
+      // timeout error; a server still churning past the deadline gave us its best answer so far.
+      // With NOTHING in hand, this is the genuine "server never published" hang → typed timeout.
+      w.deadline = setTimeout(() => {
+        if (w.latest !== null) this.finishDiag(fileUri, w, { ok: true, value: w.latest });
+        else this.finishDiag(fileUri, w, { ok: false, error: new LspTimeoutError(`diagnostics for ${fileUri} timed out after ${timeoutMs}ms`) });
+      }, timeoutMs);
+      const waiters = this.diagWaiters.get(fileUri) ?? [];
+      waiters.push(w);
+      this.diagWaiters.set(fileUri, waiters);
+      this.sendDidOpen(fileUri, text);
     });
+  }
+
+  /** Exactly-once finish for a diagnostics waiter: clears BOTH timers, removes it from the map,
+   *  and settles its promise. Every path (settle elapsed, deadline, die()) funnels through here. */
+  private finishDiag(uri: string, w: DiagWaiter, outcome: { ok: true; value: LspDiagnostic[] } | { ok: false; error: Error }): void {
+    if (w.done) return;
+    w.done = true;
+    if (w.settle !== null) clearTimeout(w.settle);
+    if (w.deadline !== null) clearTimeout(w.deadline);
+    const list = this.diagWaiters.get(uri);
+    if (list) {
+      const i = list.indexOf(w);
+      if (i >= 0) list.splice(i, 1);
+      if (list.length === 0) this.diagWaiters.delete(uri);
+    }
+    if (outcome.ok) w.resolve(outcome.value);
+    else w.reject(outcome.error);
   }
 
   async definition(fileUri: string, line: number, character: number): Promise<LspLocation[]> {
@@ -251,9 +294,16 @@ export class LspClient {
     const uri = String(params?.uri ?? "");
     const diags = toDiagnostics(params?.diagnostics);
     const waiters = this.diagWaiters.get(uri);
-    if (waiters && waiters.length) {
-      this.diagWaiters.delete(uri);
-      for (const w of waiters) w.resolve(diags);
+    if (!waiters || waiters.length === 0) return; // late publish after every waiter finished — drop
+    const settleMs = this.cfg.diagSettleMs ?? DEFAULT_DIAG_SETTLE_MS;
+    // Do NOT resolve on this publish: real servers publish more than once per didOpen (tsserver's
+    // syntactic pass lands first and is often empty even when a type error follows). Record it as
+    // the latest answer and (re)arm the quiet-period timer; the waiter resolves only once no
+    // further publish has arrived for settleMs (or its overall deadline fires with data in hand).
+    for (const w of [...waiters]) {
+      w.latest = diags;
+      if (w.settle !== null) clearTimeout(w.settle);
+      w.settle = setTimeout(() => this.finishDiag(uri, w, { ok: true, value: w.latest! }), settleMs);
     }
   }
 
@@ -266,7 +316,10 @@ export class LspClient {
     this._dead = true;
     for (const { reject } of this.pending.values()) reject(err);
     this.pending.clear();
-    for (const arr of this.diagWaiters.values()) for (const w of arr) w.reject(err);
+    // Snapshot per-URI lists: finishDiag splices the live arrays as it settles each waiter.
+    for (const [uri, arr] of [...this.diagWaiters.entries()]) {
+      for (const w of [...arr]) this.finishDiag(uri, w, { ok: false, error: err });
+    }
     this.diagWaiters.clear();
   }
 }
