@@ -101,14 +101,32 @@ function isTurnCompleted(e: SessionEvent): e is TurnCompleted {
  *  - body text NEVER appears here, however short — a body could inject fake card lines;
  *  - every interpolated field is newline-stripped for the same reason;
  *  - malformed or mis-shaped argsJson falls back to the generic slice (honest raw JSON beats a
- *    fabricated pretty card; zod rejects the call at execute time anyway). */
+ *    fabricated pretty card; zod rejects the call at execute time anyway).
+ *
+ *  bash gets a humanized card (5e T2 review): the card must show what EXECUTES — the command —
+ *  not a raw-JSON slice whose escaping/field-noise buries it, on the highest-stakes card in the
+ *  system (the reviewer-escalation site feeds it too). The raw-JSON-honesty rationale above does
+ *  not apply: `command` is the sole executed payload and is shown as-is (newline-stripped,
+ *  capped). Constraints:
+ *  - `justification` NEVER appears — it's model-authored persuasion text, not what executes; on
+ *    the card it could dress a hostile command up as reviewed-and-fine;
+ *  - empty/whitespace command or mis-shaped argsJson → generic slice (an empty "bash " card would
+ *    hide the actual args; raw JSON is the honest degenerate-case fallback). */
 function approvalCardSummary(call: { name: string; argsJson: string }): string {
+  const oneLine = (s: string) => s.split(/\r?\n/).join(" ").trim();
   if (call.name === "skill_write") {
     try {
       const a = JSON.parse(call.argsJson || "{}") as { name?: unknown; description?: unknown; body?: unknown };
       if (typeof a.name === "string" && typeof a.description === "string" && typeof a.body === "string") {
-        const oneLine = (s: string) => s.split(/\r?\n/).join(" ").trim();
         return `skill_write "${oneLine(a.name)}" — ${oneLine(a.description).slice(0, 200)} [body: ${a.body.length} chars — not shown; review in dashboard after approving]`;
+      }
+    } catch { /* malformed argsJson → generic slice below */ }
+  }
+  if (call.name === "bash") {
+    try {
+      const a = JSON.parse(call.argsJson || "{}") as { command?: unknown };
+      if (typeof a.command === "string" && oneLine(a.command) !== "") {
+        return `bash ${oneLine(a.command).slice(0, 120)}`;
       }
     } catch { /* malformed argsJson → generic slice below */ }
   }

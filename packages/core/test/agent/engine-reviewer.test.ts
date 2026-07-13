@@ -66,11 +66,13 @@ describe("engine + safety reviewer (auto-policy bash)", () => {
     const events = store.read(sessionId);
 
     expect(types(events)).toEqual(expect.arrayContaining(["tool_review", "approval_requested", "approval_resolved", "tool_result"]));
-    // phase 5e T2: the reason moves to reviewerReason; the generic summary no longer smuggles it.
+    // phase 5e T2 (+review fix): the reason moves to reviewerReason; the summary is the humanized
+    // bash card (approvalCardSummary's bash branch) — command only, no reason prefix, and no
+    // justification (model-authored persuasion text stays off the card).
     const requested = events.find((e) => e.type === "approval_requested") as any;
     expect(requested.reviewerReason).toBe("REASON_SENTINEL");
-    expect(requested.summary).not.toContain("REASON_SENTINEL");
-    expect(requested.summary).not.toContain("safety reviewer");
+    expect(requested.summary).toBe("bash rm -rf x");
+    expect(requested.summary).not.toContain("JUST_SENTINEL");
 
     const review = events.find((e) => e.type === "tool_review") as any;
     expect(review).toMatchObject({ toolName: "bash", verdict: "unsafe", reason: "REASON_SENTINEL" });
@@ -179,7 +181,7 @@ describe("engine + safety reviewer (auto-policy bash)", () => {
 
     const requested = events.find((e) => e.type === "approval_requested") as any;
     expect(requested).toBeDefined();
-    expect(requested.summary.toLowerCase()).not.toContain("manual approval");
+    expect(requested.summary).toBe("bash curl http://example.com"); // humanized card, no fail-closed text smuggled in
     expect(requested.reviewerReason.toLowerCase()).toContain("manual approval");
     expect(calls.length).toBe(0);
   });
