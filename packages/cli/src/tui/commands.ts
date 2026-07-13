@@ -14,6 +14,7 @@ import type { Settings } from "@norma/core";
 import { parseModelArgs, validateEffort, validateModelSlug } from "../model-cli";
 import { formatElapsed, formatTokens } from "../task-display";
 import { formatRoutineLine } from "../routines-cli";
+import { formatMemoryList } from "../memory-cli";
 import type { NormaClient } from "../client";
 
 export interface CommandCtx {
@@ -220,6 +221,16 @@ async function runRoutines(ctx: CommandCtx): Promise<void> {
   ctx.appendNote(routines.map((r) => formatRoutineLine(r)).join("\n"));
 }
 
+/** Phase 5b Task 4: list-only, "user" scope (design doc §4 — write/delete stay CLI/tool-only,
+ *  same precedent as /routines above). Mirrors main.ts `case "memory"`'s default (no --project →
+ *  "user" scope) list branch: `client.memoryList("user")`, one line per fact via
+ *  `formatMemoryList` (memory-cli.ts) — the exact plain content the CLI's colored list wraps
+ *  AQUA/DIM around, same shared-formatter precedent as `formatRoutineLine` above. */
+async function runMemory(ctx: CommandCtx): Promise<void> {
+  const { facts } = await ctx.client.memoryList("user");
+  ctx.appendNote(formatMemoryList(facts).join("\n"));
+}
+
 // ---- registry -------------------------------------------------------------------------------
 
 export const COMMANDS: SlashCommand[] = [
@@ -235,6 +246,7 @@ export const COMMANDS: SlashCommand[] = [
   { name: "mcp", description: "List configured MCP servers", run: (ctx) => runMcp(ctx) },
   { name: "bg", args: "[list|peek|kill] [taskId]", description: "List/peek/kill background tasks", run: (ctx, argText) => runBg(ctx, argText) },
   { name: "routines", description: "List scheduled routines", run: (ctx) => runRoutines(ctx) },
+  { name: "memory", description: "List saved memory facts (user scope)", run: (ctx) => runMemory(ctx) },
 ];
 
 // ---- parse / filter / dispatch ---------------------------------------------------------------

@@ -9,6 +9,7 @@ import {
   DaemonStatusResult, QuotaStateResult, TrustListResult, TrustRemoveResult,
   PluginRevokeTokenResult, PluginRestartResult,
   RoutinesCreateResult, RoutinesListResult, RoutinesUpdateResult, RoutinesDeleteResult,
+  MemoryListResult, MemoryReadResult, MemoryDeleteResult,
   ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 
@@ -242,6 +243,20 @@ export class NormaClient {
   }
   async routinesDelete(id: string): Promise<{ ok: true; removed: boolean }> {
     return this.validated(RoutinesDeleteResult, await this.request(METHODS.routinesDelete, { id }), METHODS.routinesDelete);
+  }
+  /** Phase 5b T4: the CLI/slash surface over T3's `memory.*` RPCs — list/read/delete only (write
+   *  stays tool-only, per the brief: `norma memory list|show <name>|rm <name>`, no `write`/`add`
+   *  subcommand; audit has no CLI surface yet either). Mirrors the routines.* quartet above:
+   *  harness/admin role, no special gating, a store failure is a thrown RpcFailure (never a typed
+   *  result union) for read/delete exactly like routines.create/update. */
+  async memoryList(scope: "user" | "project", cwd?: string): Promise<{ facts: Array<{ name: string; description: string; type: string }> }> {
+    return this.validated(MemoryListResult, await this.request(METHODS.memoryList, { scope, cwd }), METHODS.memoryList);
+  }
+  async memoryRead(scope: "user" | "project", name: string, cwd?: string): Promise<{ fact: { name: string; description: string; type: string; body: string } }> {
+    return this.validated(MemoryReadResult, await this.request(METHODS.memoryRead, { scope, name, cwd }), METHODS.memoryRead);
+  }
+  async memoryDelete(scope: "user" | "project", name: string, cwd?: string): Promise<void> {
+    await this.validated(MemoryDeleteResult, await this.request(METHODS.memoryDelete, { scope, name, cwd }), METHODS.memoryDelete);
   }
   close(): void { this.socket.end(); }
 }
