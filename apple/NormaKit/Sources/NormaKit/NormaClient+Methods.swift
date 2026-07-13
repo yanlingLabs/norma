@@ -484,3 +484,88 @@ extension NormaClient {
         try await request("trust.remove", params: obj(["path": .string(path)]))["removed"]?.boolValue ?? false
     }
 }
+
+// MARK: - Memory (Phase 5b Task 3 RPC / Task 5 Dashboard pane)
+//
+// Mirrors `MemoryFactMetaSchema`/`MemoryFactSchema`/`MemoryAuditLineSchema` (protocol/src/
+// methods.ts) field-for-field, same precedent as `PluginContribEntry` above. `memory.write`/
+// `memory.delete` have an EMPTY result on success (methods.ts's own doc comment) — an
+// unknown-name/untrusted-cwd failure is a thrown `RpcError` (server `RpcFailure`), never a soft
+// boolean, so these two wrappers return `Void`, not a decoded outcome.
+
+/// Mirrors `MemoryFactMetaSchema` — one `memory.list` entry (no body).
+public struct MemoryFactMeta: Equatable, Sendable, Identifiable {
+    public var id: String { name }
+    public let name: String
+    public let description: String
+    public let type: String
+}
+
+/// Mirrors `MemoryFactSchema` — `MemoryFactMeta` plus the full body (`memory.read`'s result).
+public struct MemoryFact: Equatable, Sendable {
+    public let name: String
+    public let description: String
+    public let type: String
+    public let body: String
+}
+
+/// Mirrors `MemoryAuditLineSchema` — one `memory.audit` entry. `memory.audit`'s wire contract is
+/// newest-FIRST (the daemon reverses `MemoryStore.auditTail`'s own newest-LAST slice before
+/// replying), so callers never need to reverse this array themselves.
+public struct MemoryAuditLine: Equatable, Sendable {
+    public let ts: Int
+    public let sessionId: String?
+    public let source: String
+    public let scope: String
+    public let action: String
+    public let name: String
+    public let description: String?
+}
+
+extension NormaClient {
+    /// `memory.list {scope, cwd?}` — fact metadata only. The Dashboard pane is user-scope only (no
+    /// cwd context to source a project scope from), so its own call site omits `cwd`.
+    public func memoryList(scope: String, cwd: String? = nil) async throws -> [MemoryFactMeta] {
+        let r = try await request("memory.list", params: obj(["scope": .string(scope), "cwd": cwd.map { .string($0) }]))
+        return (r["facts"]?.arrayValue ?? []).compactMap { f in
+            guard let n = f["name"]?.stringValue, let d = f["description"]?.stringValue, let t = f["type"]?.stringValue else { return nil }
+            return MemoryFactMeta(name: n, description: d, type: t)
+        }
+    }
+
+    /// `memory.read {scope, name, cwd?}` — full fact including body.
+    public func memoryRead(scope: String, name: String, cwd: String? = nil) async throws -> MemoryFact {
+        let r = try await request("memory.read", params: obj([
+            "scope": .string(scope), "name": .string(name), "cwd": cwd.map { .string($0) },
+        ]))
+        guard let fact = r["fact"], let n = fact["name"]?.stringValue, let d = fact["description"]?.stringValue,
+              let t = fact["type"]?.stringValue, let body = fact["body"]?.stringValue else {
+            throw RpcError(code: -3, message: "invalid result from server for memory.read")
+        }
+        return MemoryFact(name: n, description: d, type: t, body: body)
+    }
+
+    /// `memory.write {scope, name, description, type, body, cwd?}` — empty result on success (see
+    /// this section's header comment).
+    public func memoryWrite(scope: String, name: String, description: String, type: String, body: String, cwd: String? = nil) async throws {
+        _ = try await request("memory.write", params: obj([
+            "scope": .string(scope), "name": .string(name), "description": .string(description),
+            "type": .string(type), "body": .string(body), "cwd": cwd.map { .string($0) },
+        ]))
+    }
+
+    /// `memory.delete {scope, name, cwd?}` — empty result on success, same as `memoryWrite`.
+    public func memoryDelete(scope: String, name: String, cwd: String? = nil) async throws {
+        _ = try await request("memory.delete", params: obj(["scope": .string(scope), "name": .string(name), "cwd": cwd.map { .string($0) }]))
+    }
+
+    /// `memory.audit {limit?}` — newest-first (see `MemoryAuditLine`'s own doc comment).
+    public func memoryAudit(limit: Int? = nil) async throws -> [MemoryAuditLine] {
+        let r = try await request("memory.audit", params: obj(["limit": limit.map { .number(Double($0)) }]))
+        return (r["lines"]?.arrayValue ?? []).compactMap { l in
+            guard let ts = l["ts"]?.intValue, let source = l["source"]?.stringValue, let scope = l["scope"]?.stringValue,
+                  let action = l["action"]?.stringValue, let n = l["name"]?.stringValue else { return nil }
+            return MemoryAuditLine(ts: ts, sessionId: l["sessionId"]?.stringValue, source: source, scope: scope, action: action, name: n, description: l["description"]?.stringValue)
+        }
+    }
+}

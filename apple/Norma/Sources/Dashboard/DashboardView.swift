@@ -6,7 +6,7 @@ import SwiftUI
 /// future pane — Phase 4's `PluginManagerView`, per spec §B's "the same mountable-pane contract"
 /// — is a plain new case, never a renumbering of existing ones.
 enum DashboardPane: String, CaseIterable, Identifiable, Equatable {
-    case sessions, daemonStatus, quota, trust, peripheral, pluginManager
+    case sessions, daemonStatus, quota, trust, peripheral, pluginManager, memory
     var id: String { rawValue }
 }
 
@@ -14,8 +14,9 @@ enum DashboardPane: String, CaseIterable, Identifiable, Equatable {
 /// adding a pane later is a one-line change here, not a restructuring of `DashboardView.body`.
 /// Phase 4d-iii Task 2: `.pluginManager` appended at the END — every existing pane keeps its
 /// position, so this is purely additive (no renumbering of `dashboardSidebarWidth`/selection math,
-/// which reads this array, not the enum's raw ordinal).
-let dashboardPaneOrder: [DashboardPane] = [.sessions, .daemonStatus, .quota, .trust, .peripheral, .pluginManager]
+/// which reads this array, not the enum's raw ordinal). Phase 5b Task 5: `.memory` appended at the
+/// END the same way.
+let dashboardPaneOrder: [DashboardPane] = [.sessions, .daemonStatus, .quota, .trust, .peripheral, .pluginManager, .memory]
 
 /// The window's default/initial selection — always the FIRST pane in `dashboardPaneOrder`, so a
 /// pane appended to the end of that list never silently becomes the landing pane just by being
@@ -30,6 +31,7 @@ func dashboardPaneTitle(_ pane: DashboardPane) -> String {
     case .trust: return "Trust"
     case .peripheral: return "Peripheral"
     case .pluginManager: return "Plugins"
+    case .memory: return "Memory"
     }
 }
 
@@ -41,6 +43,7 @@ func dashboardPaneSystemImage(_ pane: DashboardPane) -> String {
     case .trust: return "checkmark.shield"
     case .peripheral: return "keyboard"
     case .pluginManager: return "puzzlepiece.extension"
+    case .memory: return "brain"
     }
 }
 
@@ -94,6 +97,9 @@ struct DashboardWiring {
     /// Phase 4d-iii Task 4: the shortcut binding editor's own view-model — same posture as
     /// `pluginManager`/`tilesModel`.
     let shortcutsModel: ShortcutBindingEditorModel
+    /// Phase 5b Task 5: the Memory pane's own view-model — same "constructed fresh per dashboard
+    /// window, injected here" posture as `pluginManager`/`tilesModel`/`shortcutsModel` above.
+    let memoryModel: MemoryPaneModel
 }
 
 /// The Dashboard window's root content: a fixed-width left pane list + the selected pane's
@@ -178,6 +184,8 @@ struct DashboardView: View {
                 shortcutsModel: wiring.shortcutsModel,
                 helperClient: wiring.helperClient
             )
+        case .memory:
+            MemoryPane(model: wiring.memoryModel)
         }
     }
 }
