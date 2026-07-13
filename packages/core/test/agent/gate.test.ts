@@ -176,6 +176,17 @@ describe("PermissionGate v1", () => {
     expect(g.evaluate("web_search", "ask")).toBe("ask");
   });
 
+  // Phase 5f Task 3: lsp_diagnostics/lsp_definition/lsp_references only ever query a language
+  // server or read a fence-checked disk preview — same READ_ONLY class as memory_read/task_get,
+  // and must stay allowed under `plan` so a planning session can still look things up.
+  test("lsp_diagnostics/lsp_definition/lsp_references are read-only: allowed under ask/auto/plan", () => {
+    for (const name of ["lsp_diagnostics", "lsp_definition", "lsp_references"]) {
+      expect(gate.evaluate(name, "ask")).toBe("allow");
+      expect(gate.evaluate(name, "auto")).toBe("allow");
+      expect(gate.evaluate(name, "plan")).toBe("allow");
+    }
+  });
+
   // Phase 5c Task 2 (THE SKETCH PIN, phase-5-intelligence-design-sketch.md §5c): skill_write is
   // the first member of a NEW gate class, ALWAYS_ASK — "a skill is standing instructions, i.e.
   // durable prompt injection into future sessions" — so it is approval-carded under BOTH `ask`
@@ -196,7 +207,7 @@ describe("PermissionGate v1", () => {
   test("guard: no existing tool joined ALWAYS_ASK — every previously classified tool still allows under auto", () => {
     const classified = [
       // READ_ONLY
-      "read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output", "memory_read",
+      "read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output", "memory_read", "lsp_diagnostics", "lsp_definition", "lsp_references",
       // MUTATING
       "write", "edit", "bash", "bash_kill", "notebook_edit", "enter_worktree", "exit_worktree", "computer", "schedule", "memory_write", "memory_delete",
       // SELF_GATING + NETWORK + externals

@@ -51,7 +51,12 @@ export type SessionApprovalPolicy = "ask" | "auto" | "plan";
 // MemoryStore, same class as task_get — must stay allowed under `plan` so a planning session can
 // still recall saved facts. Contrast with memory_write/memory_delete below (MUTATING) — reading a
 // fact never needs the human's attention, writing/deleting one does.
-const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output", "memory_read"]);
+// lsp_diagnostics/lsp_definition/lsp_references (phase 5f Task 3) are read-only too: each only
+// queries a language server (spawned/reused via LspManager) or reads a one-line disk preview
+// through the SAME read fence the tool's own `path` arg is held to — no fs/process mutation, same
+// class as read/glob/grep. Must stay allowed under `plan` so a planning session can still look up
+// diagnostics/definitions/references while researching.
+const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output", "memory_read", "lsp_diagnostics", "lsp_definition", "lsp_references"]);
 // `computer` (Phase 5 CU) is MUTATING: a computer-use action drives real mouse/keyboard/screen, so
 // it must pass the gate on EVERY call (spec §4.6: "every CU action passes the permission gate") —
 // ask → per-action approval card, auto → allow, plan → deny (CU makes changes). Note this is the

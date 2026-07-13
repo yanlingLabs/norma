@@ -37,6 +37,8 @@ import { registerWebTools } from "./agent/tools/web";
 import { registerComputerTool } from "./agent/tools/computer";
 import { ComputerUseService } from "./agent/computer-use";
 import { McpManager } from "./agent/mcp/manager";
+import { registerLspTools } from "./agent/tools/lsp";
+import { LspManager } from "./agent/lsp/manager";
 import { PermissionGate } from "./agent/gate";
 import { ApprovalBroker } from "./agent/approvals";
 import { QuestionBroker } from "./agent/questions";
@@ -257,6 +259,7 @@ export async function startDaemon(opts: {
 
   let engine: AgentEngine | null = null;
   let mcp: McpManager | null = null;
+  let lspManager: LspManager | null = null;
   let questions: QuestionBroker | null = null;
   let taskStore: TaskStore | null = null;
   let plans: PlanBroker | null = null;
@@ -430,6 +433,18 @@ export async function startDaemon(opts: {
     // `routineStore` is hoisted above this gate for exactly this sharing (see its own doc comment).
     // Deferred like worktree/notebook/plan above — a specialized tool, not needed in every turn.
     registerScheduleTool(registry, { routines: routineStore }, { deferred: true });
+    // Phase 5f Task 3: lsp_diagnostics/lsp_definition/lsp_references — ONE LspManager for the whole
+    // daemon (mirrors the ONE-MemoryStore/ONE-McpManager precedent above), reaped on shutdown below
+    // (stopAll, alongside mcp?.stopAll()/pluginSupervisor.stopAll()). `cwdOf`/`rootsOf`/`tmpDirOf`
+    // are the SAME session-meta sources registerMemoryTools's `cwdOf` / fs-read.ts's roots+tmpDir
+    // already read: `store.meta(sid).cwd`, `sessionDirs.roots(sid)`, `sessionTmpDir(sid)`.
+    lspManager = new LspManager();
+    registerLspTools(registry, {
+      lsp: lspManager,
+      cwdOf: (sid) => store.meta(sid).cwd ?? undefined,
+      rootsOf: (sid) => sessionDirs.roots(sid),
+      tmpDirOf: (sid) => sessionTmpDir(sid),
+    });
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
     await mcp.startAll(settings?.mcpServers ?? {});
     // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled &&
@@ -645,7 +660,7 @@ export async function startDaemon(opts: {
     socketPath: dirs.socketPath,
     tokens,
     stop() {
-      server.stop(); mcp?.stopAll(); pluginSupervisor.stopAll(); bgRegistry.killAll();
+      server.stop(); mcp?.stopAll(); void lspManager?.stopAll(); pluginSupervisor.stopAll(); bgRegistry.killAll();
       routineScheduler.stop(); routineStore.close(); // no orphan tick timer past drain
       store.close(); lock.release();
     },
