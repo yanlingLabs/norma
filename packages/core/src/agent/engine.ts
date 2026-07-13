@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { relative, sep } from "node:path";
 import type { NewSessionEvent, Question, SessionEvent, Task } from "@norma/protocol";
 import type { SessionStore } from "../sessions/store";
@@ -18,7 +18,7 @@ import type { ContextAssembler } from "./context";
 import type { Compactor } from "./compactor";
 import type { McpManager } from "./mcp/manager";
 import { bashLooksSafe, type BashReviewer, type ReviewInput } from "./reviewer";
-import { resolveWithinAny, isWithin } from "./paths";
+import { resolveWithinAny, isWithin, canonicalizeForWrite } from "./paths";
 import type { WorktreeManager } from "./worktree";
 import type { SubagentManager } from "./subagents";
 import type { AgentStore } from "./agents";
@@ -153,23 +153,35 @@ function sanitizeReviewText(s: string, maxLen: number): string {
  *  (paths.ts) — the fence's own resolution logic — rather than reimplementing containment. A path
  *  outside even this broader set is a guaranteed fence violation the tool will reject on its own
  *  (fs-write.ts's own resolveWithinAny throws first) — reviewing a call that can never execute
- *  buys nothing, so this returns null and the call falls through to executeCall's normal error. */
+ *  buys nothing, so this returns null and the call falls through to executeCall's normal error.
+ *
+ *  5e T3 review fix: the vetted target is CANONICALIZED (canonicalizeForWrite) before being
+ *  classified or shown. resolveWithinAny returns the RAW pre-symlink text (its canonAncestor walk
+ *  is containment-only), and for a NEW file realpath throws → isWithin fell back to that raw text
+ *  — so `write("link/new.txt")` through an in-cwd symlink into an added root classified as
+ *  "within cwd" and SKIPPED review while the bytes landed in the added root. Classification AND
+ *  the précis must both see where the write actually lands. */
 function resolveFsReviewTarget(path: string, roots: string[], tmpDir: string): string | null {
   try {
-    return resolveWithinAny([...roots, tmpDir], path);
+    return canonicalizeForWrite(resolveWithinAny([...roots, tmpDir], path));
   } catch {
     return null;
   }
 }
 
-/** phase 5e T3 (fs coverage): true if an already-fence-resolved write/edit target is unusual
- *  enough to review — (a) outside the PRIMARY cwd subtree (roots[0]: an added root or the session
- *  tmp dir), reusing paths.ts's own isWithin, or (b) a dotfile/dot-directory path segment anywhere
- *  inside cwd (.ssh/, .git/hooks/, a .zshrc-class file). A plain in-cwd, non-dotted write is NOT
- *  reviewed — this is the "unusual", not "every write", trigger the brief specifies. */
+/** phase 5e T3 (fs coverage): true if a fence-vetted, CANONICALIZED (resolveFsReviewTarget)
+ *  write/edit target is unusual enough to review — (a) outside the PRIMARY cwd subtree (roots[0]:
+ *  an added root or the session tmp dir), reusing paths.ts's own isWithin, or (b) a dotfile/
+ *  dot-directory path segment anywhere inside cwd (.ssh/, .git/hooks/, a .zshrc-class file). A
+ *  plain in-cwd, non-dotted write is NOT reviewed — this is the "unusual", not "every write",
+ *  trigger the brief specifies. primaryCwd is realpathed here too: `resolved` is canonical, so a
+ *  non-canonical root (possible via rootsOverride) would make relative() emit spurious ".."
+ *  segments — a false-positive review, never a bypass, but still wrong. */
 function fsWriteIsUnusual(resolved: string, primaryCwd: string): boolean {
-  if (!isWithin(resolved, primaryCwd)) return true;
-  return relative(primaryCwd, resolved).split(sep).some((seg) => seg.startsWith("."));
+  let cwd = primaryCwd;
+  try { cwd = realpathSync(primaryCwd); } catch { /* vanished root — raw comparison is all there is */ }
+  if (!isWithin(resolved, cwd)) return true;
+  return relative(cwd, resolved).split(sep).some((seg) => seg.startsWith("."));
 }
 
 /** phase 5e T3 (fs coverage): the précis shown to the reviewer AND persisted as tool_review.summary

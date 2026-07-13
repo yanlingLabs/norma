@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, existsSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, writeFileSync, realpathSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -532,6 +532,72 @@ describe("engine + safety reviewer (auto-policy fs coverage, phase 5e T3)", () =
     expect(review.reason.toLowerCase()).toContain("manual approval");
     const requested = events.find((e) => e.type === "approval_requested") as any;
     expect(requested.reviewerReason.toLowerCase()).toContain("manual approval");
+  });
+
+  // 5e T3 review fix (bypass): a NEW file written through a pre-existing in-cwd symlink into an
+  // added root used to classify off the RAW pre-symlink path (textually under cwd — realpath
+  // throws on the not-yet-existing file, so isWithin fell back to the raw text) and SKIP review,
+  // while the write itself landed in the added root. Classification and précis must both see the
+  // CANONICALIZED (post-symlink) location — where the bytes actually land.
+  test("write of a NEW file through an in-cwd symlink into an added root → REVIEWED; précis/summary show the true added-root path, not the cwd-relative symlink text", async () => {
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-fs-symlink-cwd-")));
+    const addedDir = realpathSync(mkdtempSync(join(tmpdir(), "norma-fs-symlink-added-")));
+    symlinkSync(addedDir, join(cwd, "link"));
+    const reviewer = stubReviewer({ verdict: "safe", reason: "escape noted, fine" });
+    const provider = new FakeProvider(writeTurn("link/newfile.txt", "escaped content"));
+    const { engine, store, sessionId, dirs } = setupEngine(provider, { reviewer: reviewer as any, cwd });
+    dirs.add(sessionId, addedDir);
+
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(reviewer.seen.length).toBe(1); // the bypass: pre-fix this was 0
+    const seen = reviewer.seen[0] as { class: "fs"; precis: string };
+    expect(seen.class).toBe("fs");
+    expect(seen.precis).toContain(join(addedDir, "newfile.txt")); // true post-symlink location
+    expect(seen.precis).not.toContain(join(cwd, "link"));         // never the misleading raw text
+    const review = events.find((e) => e.type === "tool_review") as any;
+    expect(review).toMatchObject({ toolName: "write", verdict: "safe" });
+    expect(review.summary).toContain(join(addedDir, "newfile.txt"));
+    // safe verdict → the write executed, through the symlink, into the added root:
+    expect(readFileSync(join(addedDir, "newfile.txt"), "utf8")).toBe("escaped content");
+  });
+
+  test("write of a NEW file through an in-cwd symlink to an in-cwd subdir → NOT reviewed (canonicalization causes no false positive)", async () => {
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-fs-symlink-incwd-")));
+    mkdirSync(join(cwd, "subdir"));
+    symlinkSync(join(cwd, "subdir"), join(cwd, "link"));
+    const reviewer = stubReviewer({ verdict: "unsafe", reason: "should never be asked" });
+    const provider = new FakeProvider(writeTurn("link/new.txt", "in-cwd content"));
+    const { engine, store, sessionId } = setupEngine(provider, { reviewer: reviewer as any, cwd });
+
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(reviewer.seen.length).toBe(0);
+    expect(events.some((e) => e.type === "tool_review")).toBe(false);
+    expect(events.some((e) => e.type === "approval_requested")).toBe(false);
+    expect(readFileSync(join(cwd, "subdir", "new.txt"), "utf8")).toBe("in-cwd content");
+  });
+
+  test("edit of an EXISTING file through an in-cwd symlink into an added root → reviewed (was already caught pre-fix — the existing-file realpath worked; pinned so the fix doesn't regress it)", async () => {
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-fs-symlink-edit-")));
+    const addedDir = realpathSync(mkdtempSync(join(tmpdir(), "norma-fs-symlink-edit-added-")));
+    writeFileSync(join(addedDir, "cfg.txt"), "value = old");
+    symlinkSync(addedDir, join(cwd, "link"));
+    const reviewer = stubReviewer({ verdict: "safe", reason: "fine" });
+    const provider = new FakeProvider(editTurn("link/cfg.txt", "old", "new"));
+    const { engine, store, sessionId, dirs } = setupEngine(provider, { reviewer: reviewer as any, cwd });
+    dirs.add(sessionId, addedDir);
+
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(reviewer.seen.length).toBe(1);
+    const review = events.find((e) => e.type === "tool_review") as any;
+    expect(review).toMatchObject({ toolName: "edit", verdict: "safe" });
+    expect(review.summary).toContain(join(addedDir, "cfg.txt"));
+    expect(readFileSync(join(addedDir, "cfg.txt"), "utf8")).toBe("value = new");
   });
 });
 

@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, realpathSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveWithinAny, resolveWithin } from "../../src/agent/paths";
+import { resolveWithinAny, resolveWithin, canonicalizeForWrite } from "../../src/agent/paths";
 
 function realDir(): string { return realpathSync(mkdtempSync(join(tmpdir(), "norma-paths-"))); }
 
@@ -48,5 +48,37 @@ describe("resolveWithinAny", () => {
     expect(resolveWithinAny([a, ghost], join(a, "x.txt"))).toBe(join(a, "x.txt"));
     // order shouldn't matter — the ghost root can be first too
     expect(resolveWithinAny([ghost, a], join(a, "x.txt"))).toBe(join(a, "x.txt"));
+  });
+});
+
+// 5e T3 review fix: canonical location for a possibly-not-yet-existing WRITE target. A bare
+// realpathSync throws on a missing file; a raw fallback keeps the PRE-symlink text — this must
+// return where the bytes would actually land.
+describe("canonicalizeForWrite", () => {
+  test("existing file → plain realpath", () => {
+    const a = realDir();
+    writeFileSync(join(a, "x.txt"), "");
+    expect(canonicalizeForWrite(join(a, "x.txt"))).toBe(join(a, "x.txt"));
+  });
+
+  test("new file under an existing dir → realpathed dir + raw tail", () => {
+    const a = realDir();
+    expect(canonicalizeForWrite(join(a, "new.txt"))).toBe(join(a, "new.txt"));
+    // multiple missing tail segments re-appended in order:
+    expect(canonicalizeForWrite(join(a, "sub", "deeper", "new.txt"))).toBe(join(a, "sub", "deeper", "new.txt"));
+  });
+
+  test("new file through a symlinked dir → symlink RESOLVED, tail re-appended (the review-bypass case)", () => {
+    const a = realDir(); const b = realDir();
+    symlinkSync(b, join(a, "link"));
+    expect(canonicalizeForWrite(join(a, "link", "new.txt"))).toBe(join(b, "new.txt"));
+    expect(canonicalizeForWrite(join(a, "link", "sub", "new.txt"))).toBe(join(b, "sub", "new.txt"));
+  });
+
+  test("existing file through a symlinked dir → fully resolved", () => {
+    const a = realDir(); const b = realDir();
+    writeFileSync(join(b, "cfg.txt"), "");
+    symlinkSync(b, join(a, "link"));
+    expect(canonicalizeForWrite(join(a, "link", "cfg.txt"))).toBe(join(b, "cfg.txt"));
   });
 });
