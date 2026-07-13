@@ -26,7 +26,7 @@ export function registerAgentQueryTools(
   r.register({
     name: "agent_list",
     description:
-      "List your background subagents (spawned with spawn_agent's run_in_background:true) in this session — status, elapsed time, and description. " +
+      "List your background subagents in this session — status, elapsed time, and description. " +
       "Message or re-task one with send_message; fetch its output with agent_output; stop it with task_stop.",
     args: z.object({}),
     deferred: true,
