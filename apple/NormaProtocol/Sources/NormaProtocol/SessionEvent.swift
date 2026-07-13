@@ -37,6 +37,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
     case pluginTileUpdated(PluginTileUpdated)
     case shortcutInvoke(ShortcutInvoke)
     case tileAction(TileAction)
+    case toolReview(ToolReview)
 
     public struct SessionCreated: Codable, Equatable, Sendable {
         public let seq: Int
@@ -121,6 +122,10 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         public let callId: String
         public let toolName: String
         public let summary: String
+        /// Phase 5e T1: populated when this escalation came from the safety reviewer — the
+        /// reviewer's own sentence, distinct from `summary`. Optional/additive — decode only,
+        /// absent for ask-policy/reviewer-less escalations and older-shaped payloads.
+        public let reviewerReason: String?
     }
 
     public struct ApprovalResolved: Codable, Equatable, Sendable {
@@ -480,6 +485,22 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         public let actionId: String
     }
 
+    /// Reviewer observability (phase 5e T1) — persisted once per actual reviewer.review()
+    /// invocation, never for the bashLooksSafe static bypass. `verdict` is a plain String (like
+    /// `TurnCompleted.stopReason`/`WorktreeExited.action` above) — validation of its 3 allowed
+    /// values lives on the TS producer side, mirrored here only as decode-shape. NOT sensitive (no
+    /// encrypted content), unlike ReasoningItem — this extends ThreadBase's usual shape directly.
+    public struct ToolReview: Codable, Equatable, Sendable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let toolName: String
+        public let verdict: String
+        public let reason: String
+        public let summary: String
+    }
+
     private enum Discriminator: String, Codable {
         case session_created
         case harness_attached
@@ -517,6 +538,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         case plugin_tile_updated
         case shortcut_invoke
         case tile_action
+        case tool_review
     }
 
     private enum TypeKey: String, CodingKey { case type }
@@ -560,6 +582,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         case .plugin_tile_updated:  self = .pluginTileUpdated(try PluginTileUpdated(from: decoder))
         case .shortcut_invoke:      self = .shortcutInvoke(try ShortcutInvoke(from: decoder))
         case .tile_action:          self = .tileAction(try TileAction(from: decoder))
+        case .tool_review:          self = .toolReview(try ToolReview(from: decoder))
         }
     }
 
@@ -709,6 +732,10 @@ public enum SessionEvent: Codable, Equatable, Sendable {
             try v.encode(to: encoder)
             var c = encoder.container(keyedBy: TypeKey.self)
             try c.encode(Discriminator.tile_action.rawValue, forKey: .type)
+        case .toolReview(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.tool_review.rawValue, forKey: .type)
         }
     }
 }

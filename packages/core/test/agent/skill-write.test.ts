@@ -190,3 +190,54 @@ describe("AgentEngine: honest skill_write approval card (5c whole-branch review)
     expect(card.summary).toBe(`write ${argsJson.slice(0, 160)}`);
   });
 });
+
+// -------------------------------------------------------------------------------------------
+// 5e T2 review: bash cards show the COMMAND (the executed payload), never the raw-JSON slice
+// that buries it in escaping — and never the justification (model-authored persuasion text
+// that could dress a hostile command up as reviewed-and-fine). Same helper as skill_write's
+// bespoke card (approvalCardSummary — the one construction site), so both the ask-policy card
+// and the reviewer-escalation card get the same humanized shape.
+// -------------------------------------------------------------------------------------------
+describe("AgentEngine: humanized bash approval card (5e T2 review)", () => {
+  test("bash card: command newline-stripped + capped at 120; justification ABSENT even when present in args", async () => {
+    const command = "rm -rf /tmp/scratch\nls -la";
+    const longCommand = "y".repeat(300);
+    const { engine, sessionId, events, hub, broker } = setup(
+      [
+        [{ type: "tool_call", callId: "b1", name: "bash", argsJson: JSON.stringify({ command, justification: "JUST_MARKER routine cleanup" }) }, done("tool_calls")],
+        [{ type: "tool_call", callId: "b2", name: "bash", argsJson: JSON.stringify({ command: longCommand }) }, done("tool_calls")],
+      ],
+      { approvalPolicy: "ask" },
+    );
+    hub.attach(denier(broker, sessionId), sessionId, 0);
+
+    await engine.runTurn(sessionId); // turn 1: multiline command + justification
+    await engine.runTurn(sessionId); // turn 2: oversized command
+
+    const cards = events.filter((e) => e.type === "approval_requested") as ApprovalCard[];
+    expect(cards).toHaveLength(2);
+    expect(cards[0]!.summary).toBe("bash rm -rf /tmp/scratch ls -la");
+    expect(cards[0]!.summary).not.toContain("JUST_MARKER");
+    expect(cards[1]!.summary).toBe(`bash ${"y".repeat(120)}`);
+  });
+
+  test("malformed bash argsJson and empty/whitespace command fall back to the generic slice", async () => {
+    const emptyArgs = JSON.stringify({ command: "   ", justification: "still nothing executes" });
+    const { engine, sessionId, events, hub, broker } = setup(
+      [
+        [{ type: "tool_call", callId: "b1", name: "bash", argsJson: "{not-json" }, done("tool_calls")],
+        [{ type: "tool_call", callId: "b2", name: "bash", argsJson: emptyArgs }, done("tool_calls")],
+      ],
+      { approvalPolicy: "ask" },
+    );
+    hub.attach(denier(broker, sessionId), sessionId, 0);
+
+    await engine.runTurn(sessionId); // turn 1: malformed JSON
+    await engine.runTurn(sessionId); // turn 2: whitespace-only command — "bash " would hide the args
+
+    const cards = events.filter((e) => e.type === "approval_requested") as ApprovalCard[];
+    expect(cards).toHaveLength(2);
+    expect(cards[0]!.summary).toBe("bash {not-json");
+    expect(cards[1]!.summary).toBe(`bash ${emptyArgs.slice(0, 160)}`);
+  });
+});

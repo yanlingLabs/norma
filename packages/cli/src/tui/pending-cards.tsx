@@ -59,6 +59,19 @@ function useBufferedInput(onEnter: (line: string) => void) {
   return [buffer, setBuffer] as const;
 }
 
+// Phase 5e T5: reviewer text is model-summarized input riding a NEW client-facing surface — already
+// newline-stripped + capped at 300 on the wire (engine.ts's sanitizeReviewText), but treated as
+// tainted for LAYOUT here too: a defensive second newline-strip plus a much tighter single-line cap
+// (the wire limit is a payload cap, not a terminal-width one) — same "cap + trailing ellipsis on
+// truncation" convention as format.ts's `formatArgsHead`. Exported for the pure-helper unit tests
+// (pending-cards.test.tsx) — the exact-boundary cases can't be pinned through a rendered frame
+// (Ink wraps at terminal width), matching the Swift twin's unit-tested capReviewerReason.
+const REVIEWER_REASON_MAX_CHARS = 100;
+export function capReviewerReason(reason: string): string {
+  const oneLine = reason.replace(/\r?\n/g, " ");
+  return oneLine.length > REVIEWER_REASON_MAX_CHARS ? `${oneLine.slice(0, REVIEWER_REASON_MAX_CHARS)}…` : oneLine;
+}
+
 function ApprovalCard({ pending, onApprove }: { pending: Extract<PendingCard, { kind: "approval" }>; onApprove: PendingCardsProps["onApprove"] }) {
   const [buffer, setBuffer] = useBufferedInput((line) => {
     onApprove(pending.callId, line.trim().toLowerCase() === "y");
@@ -67,10 +80,22 @@ function ApprovalCard({ pending, onApprove }: { pending: Extract<PendingCard, { 
 
   // Phase 3b T7 restyle (theme colors only — no behavior/parse change): the approval prompt line is
   // rendered in `theme.permission` (CC's approval-request hue); the summary keeps its dim de-emphasis.
-  return (
+  const actionRow = (
     <Text color={theme.permission}>
       approve {pending.toolName}? <Text dimColor>{pending.summary}</Text> [y/N] {buffer}
     </Text>
+  );
+
+  // Phase 5e T5: reviewerReason absent → the EXACT SAME single <Text> returned before this field
+  // existed (no wrapping Box) — byte-identical regression pin (pending-cards.test.tsx). Present →
+  // one distinct dim `⚠ reviewer: …` line ABOVE the action row.
+  if (pending.reviewerReason === undefined) return actionRow;
+
+  return (
+    <Box flexDirection="column">
+      <Text dimColor>⚠ reviewer: {capReviewerReason(pending.reviewerReason)}</Text>
+      {actionRow}
+    </Box>
   );
 }
 

@@ -154,6 +154,28 @@ final class NormaClientTests: XCTestCase {
         XCTAssertTrue(raw.contains("future_thing"))
     }
 
+    /// Phase 5e T1 (reviewer maturity — the NormaKit-trap task): the NEW `tool_review` variant
+    /// must decode as a REAL case (not fall back to `.unknown`, the way `testEventsFlowToTheStream
+    /// AndUnknownWraps`'s `future_thing` does above) and both exhaustive accessor switches
+    /// (`var seq`/`var sessionId`, NormaClient.swift) must return its values — this is what would
+    /// have failed to compile before this task's switch sync.
+    func testToolReviewEventDecodesAndAccessorsWork() async throws {
+        let t = ScriptedTransport()
+        let client = makeClient(t)
+        async let connected: Void = client.connect()
+        let hello = try await waitForSent(t, count: 1)[0]
+        t.feed(#"{"jsonrpc":"2.0","id":\#(decodeLine(hello)["id"] as! Int),"result":{"ok":true}}"#)
+        try await connected
+
+        var iter = client.events.makeAsyncIterator()
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"tool_review","seq":9,"sessionId":"s_1","ts":5,"threadId":"main","toolName":"bash","verdict":"unsafe","reason":"recursive delete outside cwd","summary":"bash rm -rf /tmp/x"}}"#)
+        guard case .session(.toolReview(let v)) = await iter.next() else { return XCTFail() }
+        XCTAssertEqual(v.toolName, "bash")
+        XCTAssertEqual(v.verdict, "unsafe")
+        XCTAssertEqual(SessionEvent.toolReview(v).seq, 9)
+        XCTAssertEqual(SessionEvent.toolReview(v).sessionId, "s_1")
+    }
+
     func testConnectionDropFailsPendingAndYieldsDisconnected() async throws {
         let t = ScriptedTransport()
         let client = makeClient(t)

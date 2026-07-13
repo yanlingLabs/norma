@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { bashLooksSafe, BashReviewer } from "../../src/agent/reviewer";
+import { bashLooksSafe, BashReviewer, REVIEW_INSTRUCTION, FS_REVIEW_INSTRUCTION, EXTERNAL_REVIEW_INSTRUCTION } from "../../src/agent/reviewer";
 import { FakeProvider } from "../../src/agent/fake-provider";
 import type { ProviderEvent } from "../../src/providers/types";
 
@@ -75,5 +75,46 @@ describe("BashReviewer", () => {
     );
     ac.abort();
     await expect(p).rejects.toThrow();
+  });
+
+  // phase 5e T3: ONE review() entry point serves bash/fs/external — `class` selects the
+  // per-class prompt clause + content shape. Omitting `class` (every pre-T3 call site/test above)
+  // still means "bash" — verified here rather than assumed, since that's the whole back-compat claim.
+  test("class omitted defaults to bash: same instructions as an explicit class:\"bash\"", async () => {
+    const p = new FakeProvider(verdict("safe", "ok"));
+    await new BashReviewer({ provider: { provider: p, model: "fake" } } as any).review({ command: "ls" });
+    expect(p.requests[0]!.instructions).toBe(REVIEW_INSTRUCTION);
+
+    const p2 = new FakeProvider(verdict("safe", "ok"));
+    await new BashReviewer({ provider: { provider: p2, model: "fake" } } as any).review({ class: "bash", command: "ls" } as any);
+    expect(p2.requests[0]!.instructions).toBe(REVIEW_INSTRUCTION);
+  });
+
+  test("class:\"fs\" sends FS_REVIEW_INSTRUCTION + the précis only — no COMMAND/JUSTIFICATION framing", async () => {
+    const p = new FakeProvider(verdict("safe", "ok"));
+    await new BashReviewer({ provider: { provider: p, model: "fake" } } as any).review({
+      class: "fs",
+      precis: "write /tmp/x/.ssh/config (42 chars)",
+    } as any);
+    expect(p.requests[0]!.instructions).toBe(FS_REVIEW_INSTRUCTION);
+    expect(p.requests[0]!.instructions).not.toBe(REVIEW_INSTRUCTION);
+    const content = JSON.stringify(p.requests[0]!.input);
+    expect(content).toContain("write /tmp/x/.ssh/config (42 chars)");
+    expect(content).not.toContain("JUSTIFICATION");
+  });
+
+  test("class:\"external\" sends EXTERNAL_REVIEW_INSTRUCTION + the précis only", async () => {
+    const p = new FakeProvider(verdict("unsafe", "risky"));
+    const v = await new BashReviewer({ provider: { provider: p, model: "fake" } } as any).review({
+      class: "external",
+      precis: 'mcp__fs__delete {"path":"/etc/passwd"}',
+    } as any);
+    expect(v).toEqual({ verdict: "unsafe", reason: "risky" });
+    expect(p.requests[0]!.instructions).toBe(EXTERNAL_REVIEW_INSTRUCTION);
+    expect(p.requests[0]!.instructions).not.toBe(REVIEW_INSTRUCTION);
+    expect(p.requests[0]!.instructions).not.toBe(FS_REVIEW_INSTRUCTION);
+    const content = (p.requests[0]!.input[0] as any).content as string;
+    expect(content).toContain('mcp__fs__delete {"path":"/etc/passwd"}');
+    expect(content).not.toContain("COMMAND:");
   });
 });

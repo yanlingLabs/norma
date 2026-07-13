@@ -39,13 +39,15 @@ struct SubagentItem: Equatable {
 /// the wire event carried (toolName/summary/questions/plan). `Equatable` (not `Identifiable`) so
 /// reducer tests can assert on values directly, same convention as `ActivityItem`/`TaskItem`.
 enum PendingInteraction: Equatable {
-    case approval(callId: String, toolName: String, summary: String)
+    /// `reviewerReason` (phase 5e T5): additive, mirrors `SessionEvent.ApprovalRequested.reviewerReason`
+    /// — set only when this escalation came from the safety reviewer, `nil` for an ask-policy card.
+    case approval(callId: String, toolName: String, summary: String, reviewerReason: String? = nil)
     case question(callId: String, questions: [SessionEvent.Question])
     case plan(callId: String, plan: String)
 
     var callId: String {
         switch self {
-        case .approval(let callId, _, _): return callId
+        case .approval(let callId, _, _, _): return callId
         case .question(let callId, _): return callId
         case .plan(let callId, _): return callId
         }
@@ -214,7 +216,7 @@ enum SessionReducer {
         case .toolResult(let v) where v.threadId == mainThread:
             if s.pendingInteractions.isEmpty { s.status = .thinking }
         case .approvalRequested(let v) where v.threadId == mainThread:
-            appendPending(.approval(callId: v.callId, toolName: v.toolName, summary: v.summary), to: &s)
+            appendPending(.approval(callId: v.callId, toolName: v.toolName, summary: v.summary, reviewerReason: v.reviewerReason), to: &s)
             appendActivity(.interaction(v.summary), to: &s)
         case .questionAsked(let v) where v.threadId == mainThread:
             appendPending(.question(callId: v.callId, questions: v.questions), to: &s)

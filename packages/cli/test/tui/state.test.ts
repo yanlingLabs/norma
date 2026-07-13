@@ -305,9 +305,28 @@ describe("state.ts — pending cards (f)", () => {
     let s = initialState();
     s = reduce(s, { type: "approval_requested", threadId: "main", callId: "call1", toolName: "bash", summary: "rm -rf tmp/" }, T0);
     expect(s.pending).toEqual({ kind: "approval", callId: "call1", toolName: "bash", summary: "rm -rf tmp/" });
+    // reviewerReason (phase 5e T5) must be OMITTED, not set to `undefined`, when the wire event
+    // carries none — matches the `notes` omission convention pending-cards.test.tsx (b1) pins.
+    expect(Object.prototype.hasOwnProperty.call(s.pending!, "reviewerReason")).toBe(false);
     s = reduce(s, { type: "approval_resolved", threadId: "main", callId: "call1", approved: true, by: "user" }, T0 + 5);
     expect(s.pending).toBeNull();
     expect(s.committed).toContainEqual({ kind: "note", text: "approved bash" });
+  });
+
+  test("approval_requested threads reviewerReason through when the wire event carries one (phase 5e T5)", () => {
+    let s = initialState();
+    s = reduce(
+      s,
+      { type: "approval_requested", threadId: "main", callId: "call2", toolName: "bash", summary: "rm -rf tmp/", reviewerReason: "recursive delete outside the session cwd" },
+      T0,
+    );
+    expect(s.pending).toEqual({
+      kind: "approval",
+      callId: "call2",
+      toolName: "bash",
+      summary: "rm -rf tmp/",
+      reviewerReason: "recursive delete outside the session cwd",
+    });
   });
 
   test("approval_resolved(denied) commits a denied note", () => {
@@ -431,6 +450,20 @@ describe("state.ts — note one-liners match main.ts's wording (bg-task/worktree
     // Purely additive: every other field is untouched.
     expect(s.turnRunning).toBe(false);
     expect(s.pending).toBeNull();
+  });
+
+  // Phase 5e T1 (reviewer maturity, the wire-vocabulary/5c lesson): `tool_review` is a NEW
+  // SessionEvent variant this reducer has no dedicated case for — confirms the existing `default:
+  // return s` (no exhaustive switch on `e.type` here, unlike NormaKit's Swift accessor switches)
+  // already no-ops gracefully, so no reducer change was needed for this task. A later task (T5)
+  // may add a dedicated rendering; this only pins today's safe-by-construction behavior.
+  test("tool_review (unknown to this reducer) is a no-op: state is byte-identical", () => {
+    const s = initialState();
+    const next = reduce(s, {
+      type: "tool_review", threadId: "main", toolName: "bash", verdict: "unsafe",
+      reason: "recursive delete outside cwd", summary: "bash rm -rf /tmp/x",
+    }, T0);
+    expect(next).toEqual(s);
   });
 });
 

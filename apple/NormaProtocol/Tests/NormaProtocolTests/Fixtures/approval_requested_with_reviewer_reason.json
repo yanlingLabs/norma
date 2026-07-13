@@ -1,0 +1,11 @@
+{
+  "seq": 7,
+  "sessionId": "s_fixture",
+  "ts": 1781270000000,
+  "threadId": "main",
+  "type": "approval_requested",
+  "callId": "call_31",
+  "toolName": "bash",
+  "summary": "run rm -rf /tmp/scratch",
+  "reviewerReason": "recursive delete outside the session cwd"
+}

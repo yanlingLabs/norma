@@ -59,7 +59,11 @@ export type LocalEvent = { type: "local_note"; text: string };
 export type AgentRow = CliSubagent & { name?: string };
 
 export type PendingCard =
-  | { kind: "approval"; callId: string; toolName: string; summary: string }
+  // reviewerReason (phase 5e T5): additive/optional, mirroring `approval_requested.reviewerReason`
+  // on the wire (protocol/events.ts) — set only when this escalation came from the safety reviewer.
+  // Omitted (never `reviewerReason: undefined`) when absent, so a non-reviewer card's shape is
+  // exactly what it was before this field existed (byte-identical regression pin, state.test.ts).
+  | { kind: "approval"; callId: string; toolName: string; summary: string; reviewerReason?: string }
   | { kind: "question"; callId: string; questions: unknown[] }
   | { kind: "plan"; callId: string; plan: string };
 
@@ -274,8 +278,21 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
     case "task_updated":
       return { ...s, tasks: upsertTask(s.tasks as Task[], e.task as Task) };
 
-    case "approval_requested":
-      return { ...s, pending: { kind: "approval", callId: str(e.callId), toolName: str(e.toolName), summary: str(e.summary) } };
+    case "approval_requested": {
+      // phase 5e T5: thread reviewerReason through if present (spread-omitted, not `undefined`-set,
+      // when absent — see the PendingCard doc comment above).
+      const reviewerReason = typeof e.reviewerReason === "string" ? e.reviewerReason : undefined;
+      return {
+        ...s,
+        pending: {
+          kind: "approval",
+          callId: str(e.callId),
+          toolName: str(e.toolName),
+          summary: str(e.summary),
+          ...(reviewerReason !== undefined ? { reviewerReason } : {}),
+        },
+      };
+    }
 
     case "approval_resolved": {
       const pending = s.pending;

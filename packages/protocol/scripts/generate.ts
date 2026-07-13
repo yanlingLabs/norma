@@ -24,6 +24,10 @@ const fixtures: Record<string, unknown> = {
   "tool_call": { ...base, threadId: "main", type: "tool_call", callId: "call_1", name: "read", argsJson: '{"path":"a.txt"}' },
   "tool_result": { ...base, threadId: "main", type: "tool_result", callId: "call_1", output: "line1\nline2", isError: false },
   "approval_requested": { ...base, threadId: "main", type: "approval_requested", callId: "call_2", toolName: "write", summary: "write a.txt" },
+  // Phase 5e T1: reviewerReason is additive/optional on the EXISTING approval_requested shape — a
+  // dedicated fixture (distinct from approval_requested.json above) so Swift round-trips one
+  // carrying it, mirroring task_with_graph_fields/question_with_preview's with/without pattern.
+  "approval_requested_with_reviewer_reason": { ...base, threadId: "main", type: "approval_requested", callId: "call_31", toolName: "bash", summary: "run rm -rf /tmp/scratch", reviewerReason: "recursive delete outside the session cwd" },
   "approval_resolved": { ...base, threadId: "main", type: "approval_resolved", callId: "call_2", approved: true, by: "orb" },
   "turn_completed": { ...base, threadId: "main", type: "turn_completed", stopReason: "end_turn", inputTokens: 12, outputTokens: 3 },
   "agent_error": { ...base, threadId: "main", type: "agent_error", message: "provider unavailable" },
@@ -73,6 +77,10 @@ const fixtures: Record<string, unknown> = {
   plugin_tile_updated: { type: "plugin_tile_updated", sessionId: "$system", seq: 24, ts: 1700000000014, pluginId: "sample-echo", tile: { title: "Sample", value: "1", enabled: true } },
   shortcut_invoke: { type: "shortcut_invoke", sessionId: "$system", seq: 25, ts: 1700000000015, shortcutId: "toggle-mute" },
   tile_action: { type: "tile_action", sessionId: "$system", seq: 26, ts: 1700000000016, actionId: "reconnect" },
+  // Phase 5e T1 (reviewer maturity — the NormaKit-trap task): a NEW SessionEvent variant, unlike
+  // reasoning_item/task_notification above — NOT sensitive (no encrypted_content), so a normal
+  // fixture is correct here (see this variant's own doc comment in events.ts).
+  tool_review: { type: "tool_review", sessionId: "s_1", threadId: "t_1", seq: 31, ts: 1700000000021, toolName: "bash", verdict: "unsafe", reason: "recursive delete outside the session cwd", summary: "bash rm -rf /tmp/scratch" },
 };
 for (const [name, value] of Object.entries(fixtures)) {
   SessionEvent.parse(value); // fixtures must be valid by construction

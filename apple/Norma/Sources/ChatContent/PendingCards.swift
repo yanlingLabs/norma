@@ -126,13 +126,27 @@ func questionFocusedPreview(_ question: SessionEvent.Question, selected: Set<Int
 /// itself, not a header field, is the body).
 func cardTitle(_ interaction: PendingInteraction) -> String {
     switch interaction {
-    case .approval(_, let toolName, _):
+    case .approval(_, let toolName, _, _):
         return "Approval needed — \(toolName)"
     case .question(_, let questions):
         return questions.first?.header ?? ""
     case .plan:
         return "Plan for approval"
     }
+}
+
+/// Phase 5e T5: reviewer text is model-summarized input riding a NEW client-facing surface —
+/// already newline-stripped + capped at 300 on the wire (engine.ts's `sanitizeReviewText`), but
+/// treated as tainted for LAYOUT here too: a defensive second newline-strip plus a much tighter
+/// single-line cap than the wire limit (a payload cap, not a card-width one). Mirrors the CLI's
+/// `pending-cards.tsx` `capReviewerReason` (same 100-char threshold, trailing "…" on truncation)
+/// so the two clients read the same rationale at roughly the same length.
+private let reviewerReasonMaxChars = 100
+
+func capReviewerReason(_ reason: String) -> String {
+    let oneLine = reason.replacingOccurrences(of: "\r\n", with: " ").replacingOccurrences(of: "\n", with: " ")
+    guard oneLine.count > reviewerReasonMaxChars else { return oneLine }
+    return String(oneLine.prefix(reviewerReasonMaxChars)) + "…"
 }
 
 /// The kind glyph shown in every card's header — ⚠ approval, ? question, ☰ plan.
@@ -182,8 +196,8 @@ private struct PendingCard: View {
     @ViewBuilder
     private var cardBody: some View {
         switch interaction {
-        case .approval(let callId, _, let summary):
-            PendingApprovalBody(callId: callId, summary: summary, isInFlight: isInFlight, onApproval: onApproval)
+        case .approval(let callId, _, let summary, let reviewerReason):
+            PendingApprovalBody(callId: callId, summary: summary, reviewerReason: reviewerReason, isInFlight: isInFlight, onApproval: onApproval)
         case .question(let callId, let questions):
             PendingQuestionBody(callId: callId, questions: questions, isInFlight: isInFlight, onQuestion: onQuestion)
         case .plan(let callId, let plan):
@@ -201,6 +215,9 @@ private struct PendingCard: View {
 private struct PendingApprovalBody: View {
     let callId: String
     let summary: String
+    /// Phase 5e T5: additive/optional — set only when this escalation came from the safety
+    /// reviewer (`PendingInteraction.approval`'s 4th associated value).
+    let reviewerReason: String?
     let isInFlight: Bool
     let onApproval: (String, Bool) -> Void
 
@@ -226,6 +243,15 @@ private struct PendingApprovalBody: View {
                 .buttonStyle(.plain)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
+            }
+
+            // Phase 5e T5: one distinct dim line ABOVE the approve/deny row, present only when
+            // this escalation came from the safety reviewer — absent `reviewerReason` renders
+            // nothing extra (byte-identical to the pre-5e-T5 body).
+            if let reviewerReason {
+                Text("⚠ reviewer: \(capReviewerReason(reviewerReason))")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
             }
 
             HStack(spacing: 8) {

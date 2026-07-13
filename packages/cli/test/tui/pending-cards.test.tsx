@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { render } from "ink-testing-library";
-import { PendingCards } from "../../src/tui/pending-cards";
+import { Text } from "ink";
+import { PendingCards, capReviewerReason } from "../../src/tui/pending-cards";
 import type { PendingCard } from "../../src/tui/state";
+import { theme } from "../../src/tui/theme";
 
 // Same caveat as composer.test.tsx: useInput wires its stdin listener inside a React effect,
 // which runs on the next tick after render() returns — a short wait after render() and after
@@ -62,6 +64,91 @@ describe("PendingCards — approval", () => {
     expect(frame).toContain("approve bash?");
     expect(frame).toContain("rm -rf /tmp/x");
     expect(frame).toContain("[y/N]");
+  });
+
+  // Phase 5e T5: reviewer-rationale line above the action row.
+  test("(d1a) no reviewerReason -> byte-identical to the plain single-line approval render (regression pin)", async () => {
+    // The exact JSX ApprovalCard rendered before reviewerReason existed — a real (not remembered)
+    // reference render, so this fails if the no-reviewerReason path ever grows a wrapping Box, an
+    // extra line, or a color/spacing change, not just if the literal substrings disappear.
+    const reference = (
+      <Text color={theme.permission}>
+        approve {card.toolName}? <Text dimColor>{card.summary}</Text> [y/N] {""}
+      </Text>
+    );
+    const { lastFrame: refFrame } = render(reference);
+    await wait();
+    const { lastFrame } = render(<PendingCards pending={card} onApprove={() => {}} onAnswer={() => {}} onPlan={() => {}} />);
+    await wait();
+    expect(lastFrame()).toBe(refFrame());
+    expect(lastFrame()).not.toContain("⚠ reviewer");
+  });
+
+  test("(d1b) reviewerReason present -> distinct dim line rendered above the action row", async () => {
+    const cardWithReason: PendingCard = {
+      kind: "approval",
+      callId: "c8",
+      toolName: "bash",
+      summary: "rm -rf /tmp/z",
+      reviewerReason: "recursive delete outside the session cwd",
+    };
+    const { lastFrame } = render(<PendingCards pending={cardWithReason} onApprove={() => {}} onAnswer={() => {}} onPlan={() => {}} />);
+    await wait();
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("⚠ reviewer: recursive delete outside the session cwd");
+    expect(frame.indexOf("⚠ reviewer:")).toBeLessThan(frame.indexOf("approve bash?"));
+  });
+
+  test("(d1c) a long reviewerReason is capped for layout", async () => {
+    const longReason = "x".repeat(250);
+    const cardWithReason: PendingCard = { kind: "approval", callId: "c9", toolName: "bash", summary: "rm -rf /tmp/y", reviewerReason: longReason };
+    const { lastFrame } = render(<PendingCards pending={cardWithReason} onApprove={() => {}} onAnswer={() => {}} onPlan={() => {}} />);
+    await wait();
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("⚠ reviewer:");
+    expect(frame).not.toContain(longReason); // full 250-char string never appears verbatim
+    expect(frame).toContain("…"); // truncation marker present
+  });
+
+  test("(d1d) approve/deny keystrokes still work when reviewerReason is present", async () => {
+    const calls: [string, boolean][] = [];
+    const cardWithReason: PendingCard = {
+      kind: "approval",
+      callId: "c10",
+      toolName: "bash",
+      summary: "rm -rf /tmp/w",
+      reviewerReason: "recursive delete outside the session cwd",
+    };
+    const { stdin } = render(<PendingCards pending={cardWithReason} onApprove={(id, yes) => calls.push([id, yes])} onAnswer={() => {}} onPlan={() => {}} />);
+    await wait();
+    stdin.write("y");
+    await wait();
+    stdin.write("\r");
+    await wait();
+    expect(calls).toEqual([["c10", true]]);
+  });
+});
+
+// 5e whole-branch hardening: the newline/boundary cases the Swift twin (PendingCardsTests's four
+// capReviewerReason tests) already pins — unit-level on the exported pure helper, because the
+// exact 100/101 boundary can't be asserted through a rendered frame (Ink wraps at terminal width).
+describe("capReviewerReason (pure helper — Swift-twin parity)", () => {
+  test("short reason passes through unchanged", () => {
+    expect(capReviewerReason("looks risky")).toBe("looks risky");
+  });
+
+  test("newlines (\\n and \\r\\n) are stripped to single spaces", () => {
+    expect(capReviewerReason("line one\nline two\r\nline three")).toBe("line one line two line three");
+  });
+
+  test("exactly at the 100-char threshold -> unchanged, no ellipsis", () => {
+    const exact = "x".repeat(100);
+    expect(capReviewerReason(exact)).toBe(exact);
+  });
+
+  test("one past the threshold (101) -> capped at 100 + trailing ellipsis", () => {
+    const over = "x".repeat(101);
+    expect(capReviewerReason(over)).toBe("x".repeat(100) + "…");
   });
 });
 

@@ -1,0 +1,11 @@
+{
+  "type": "tool_review",
+  "sessionId": "s_1",
+  "threadId": "t_1",
+  "seq": 31,
+  "ts": 1700000000021,
+  "toolName": "bash",
+  "verdict": "unsafe",
+  "reason": "recursive delete outside the session cwd",
+  "summary": "bash rm -rf /tmp/scratch"
+}

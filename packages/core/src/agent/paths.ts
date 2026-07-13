@@ -1,5 +1,5 @@
 import { realpathSync } from "node:fs";
-import { isAbsolute, resolve, sep, dirname } from "node:path";
+import { isAbsolute, resolve, sep, dirname, basename, join } from "node:path";
 
 function canonAncestor(target: string): string {
   let probe = target;
@@ -46,4 +46,28 @@ export function isWithin(child: string, parent: string): boolean {
   const canon = (p: string) => { try { return realpathSync(p); } catch { return p; } };
   const c = canon(child), t = canon(parent);
   return c === t || c.startsWith(t + sep);
+}
+
+/** Canonical location of a possibly-NOT-YET-EXISTING write target: realpath the deepest existing
+ *  ancestor (same walk as canonAncestor above — resolves any symlinked directory on the way),
+ *  then re-append the missing tail verbatim. Exists because neither existing primitive can answer
+ *  "where would a write to `p` actually land": a bare `realpathSync(p)` THROWS on a missing file,
+ *  and `isWithin`'s raw-text fallback then keeps the PRE-symlink spelling — which let a new file
+ *  written through an in-cwd symlink into an added root classify as "within cwd" and skip the fs
+ *  safety review (5e T3 review finding). Read-only: never creates anything on disk. */
+export function canonicalizeForWrite(p: string): string {
+  const target = resolve(p);
+  let probe = target;
+  const missing: string[] = [];
+  while (true) {
+    try {
+      const real = realpathSync(probe);
+      return missing.length ? join(real, ...missing.reverse()) : real;
+    } catch {
+      const parent = dirname(probe);
+      if (parent === probe) return target; // nothing on the path exists at all — raw is all there is
+      missing.push(basename(probe));
+      probe = parent;
+    }
+  }
 }

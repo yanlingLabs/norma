@@ -63,6 +63,12 @@ export const ToolResultEvent = ThreadBase.extend({
 export const ReasoningItemEvent = ThreadBase.extend({ type: z.literal("reasoning_item"), itemJson: z.string().min(1) });
 export const ApprovalRequestedEvent = ThreadBase.extend({
   type: z.literal("approval_requested"), callId: z.string().min(1), toolName: z.string().min(1), summary: z.string(),
+  // Phase 5e T1 (reviewer maturity, spec §"reviewerReason? on approval_requested"): populated when
+  // this escalation came from the safety reviewer (engine.ts's review hook) — the reviewer's own
+  // sentence, sanitized+capped at EMISSION (engine side), so clients can render it distinctly from
+  // `summary` instead of the old smashed-in "⚠ safety reviewer: ..." prefix. Additive/optional — an
+  // ask-policy or reviewer-less escalation omits it, and older-shaped events still parse.
+  reviewerReason: z.string().optional(),
 });
 export const ApprovalResolvedEvent = ThreadBase.extend({
   type: z.literal("approval_resolved"), callId: z.string().min(1), approved: z.boolean(), by: z.string().min(1),
@@ -274,6 +280,28 @@ export const TileActionEvent = Base.extend({
   actionId: z.string().min(1),
 });
 
+/** Reviewer observability (phase 5e T1, spec §1 — full NormaKit switch-trap discipline: this is a
+ *  NEW variant, unlike `agent_error.code` above). Persisted once per ACTUAL `reviewer.review()`
+ *  invocation (engine.ts's review hook) — NEVER for the `bashLooksSafe` static bypass, so this
+ *  observes model-invocations of the reviewer, not every gate decision. `summary` is the capped,
+ *  newline-stripped call précis (command/path/tool id — NEVER full args/bodies); `reason` is the
+ *  reviewer's sentence, same sanitization. Both are sanitized+capped at EMISSION (engine side,
+ *  reason<=300/summary<=160) — deliberately no zod max() here, matching sibling free-text fields
+ *  (`approval_requested.summary`, `agent_error.message`) that also cap at the writer, not the
+ *  schema. NOT sensitive (no `encrypted_content`) — a normal generator fixture exists (unlike
+ *  `reasoning_item`/`task_notification` above). Injection containment: this event reaches CLIENTS
+ *  ONLY — engine.ts's `eventToInput` never maps it back into the model's turn context (the
+ *  reviewer's one deliberate channel to the model stays the pre-existing denial `tool_result`
+ *  text). Engine replay: ignored (falls through `eventToInput`'s if-chain to its `null` default —
+ *  no code change needed there for this to hold). */
+export const ToolReviewEvent = ThreadBase.extend({
+  type: z.literal("tool_review"),
+  toolName: z.string().min(1),
+  verdict: z.enum(["safe", "unsafe", "error"]),
+  reason: z.string(),
+  summary: z.string(),
+});
+
 export const SessionEvent = z.discriminatedUnion("type", [
   SessionCreatedEvent,
   HarnessAttachedEvent,
@@ -313,6 +341,7 @@ export const SessionEvent = z.discriminatedUnion("type", [
   PluginTileUpdatedEvent,
   ShortcutInvokeEvent,
   TileActionEvent,
+  ToolReviewEvent,
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 

@@ -264,6 +264,7 @@ extension SessionEvent {
         case .pluginTileUpdated(let v): return v.seq
         case .shortcutInvoke(let v): return v.seq
         case .tileAction(let v): return v.seq
+        case .toolReview(let v): return v.seq
         }
     }
 
@@ -306,6 +307,7 @@ extension SessionEvent {
         case .pluginTileUpdated(let v): return v.sessionId
         case .shortcutInvoke(let v): return v.sessionId
         case .tileAction(let v): return v.sessionId
+        case .toolReview(let v): return v.sessionId
         }
     }
 }
