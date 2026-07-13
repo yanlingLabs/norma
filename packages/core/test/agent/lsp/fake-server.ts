@@ -8,6 +8,11 @@
 //                                     (default: one canned error diagnostic)
 //   NORMA_LSP_FAKE_NO_DIAGNOSTICS=1   never publish on didOpen — exercises the client's
 //                                     diagnostics() timeout path
+//   NORMA_LSP_FAKE_STAGED_DIAGS=1     publish EMPTY diagnostics immediately on didOpen, then the
+//                                     real NORMA_LSP_FAKE_DIAGS set ~100ms later — the shape real
+//                                     tsserver produces (fast syntactic pass first, semantic pass
+//                                     later as a SECOND publish). Exercises the client's settle
+//                                     window: resolve-on-first-publish would wrongly return [].
 //   NORMA_LSP_FAKE_DEFINITION         JSON array/object result for textDocument/definition
 //   NORMA_LSP_FAKE_REFERENCES         JSON array result for textDocument/references
 //   NORMA_LSP_FAKE_SPLIT=1            split the NEXT definition response body across two
@@ -64,7 +69,14 @@ function handle(msg: any): void {
       const diagnostics = canned("NORMA_LSP_FAKE_DIAGS", [
         { range: { start: { line: 2, character: 4 }, end: { line: 2, character: 10 } }, severity: 1, message: "canned error", source: "fake-lsp" },
       ]);
-      send({ jsonrpc: "2.0", method: "textDocument/publishDiagnostics", params: { uri, diagnostics } });
+      if (process.env.NORMA_LSP_FAKE_STAGED_DIAGS === "1") {
+        // Real-tsserver shape: an (often empty) syntactic publish lands first, the semantic pass
+        // follows as a SECOND publish for the same uri. The client must return the settled result.
+        send({ jsonrpc: "2.0", method: "textDocument/publishDiagnostics", params: { uri, diagnostics: [] } });
+        setTimeout(() => send({ jsonrpc: "2.0", method: "textDocument/publishDiagnostics", params: { uri, diagnostics } }), 100);
+      } else {
+        send({ jsonrpc: "2.0", method: "textDocument/publishDiagnostics", params: { uri, diagnostics } });
+      }
       break;
     }
     case "textDocument/definition": {

@@ -2,7 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { join } from "node:path";
 import { ChildProcess } from "node:child_process";
 import { LspClient } from "../../../src/agent/lsp/client";
-import { LspManager, LspSpawnError, languageForPath, type LspLanguage, type LspScheduler } from "../../../src/agent/lsp/manager";
+import { LspManager, LspSpawnError, languageForPath, DIAG_TUNING, type LspLanguage, type LspScheduler } from "../../../src/agent/lsp/manager";
 
 const FIXTURE = join(import.meta.dir, "fake-server.ts");
 const FAKE = { command: "bun", args: ["run", FIXTURE] };
@@ -32,6 +32,17 @@ describe("languageForPath", () => {
       ["a.py", null], ["a.md", null], ["noext", null], ["/dir/only.dotfile.", null],
     ];
     for (const [p, expected] of cases) expect(languageForPath(p)).toBe(expected);
+  });
+
+  test("diagnostics tuning: swift's settle window bridges sourcekit-lsp's ~2s build republish", () => {
+    // Empirically, sourcekit-lsp on a SwiftPM-package file publishes an interim result, then the
+    // real diagnostics ~1.9s later after building. The settle window must exceed that gap or it
+    // fires mid-gap and returns the stale interim set. typescript-language-server merges within
+    // ~100ms, so it settles far faster — and both deadlines must clear their server's real latency.
+    expect(DIAG_TUNING.swift.settleMs).toBeGreaterThan(2000);
+    expect(DIAG_TUNING.typescript.settleMs).toBeLessThan(DIAG_TUNING.swift.settleMs);
+    expect(DIAG_TUNING.swift.timeoutMs).toBeGreaterThan(DIAG_TUNING.swift.settleMs);
+    expect(DIAG_TUNING.typescript.timeoutMs).toBeGreaterThan(DIAG_TUNING.typescript.settleMs);
   });
 });
 
