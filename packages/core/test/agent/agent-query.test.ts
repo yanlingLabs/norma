@@ -145,8 +145,11 @@ describe("agent_output (phase 5a Task 1)", () => {
 // -------------------------------------------------------------------------------------------
 describe("AgentEngine: agent_list/agent_output E2E (phase 5a Task 1)", () => {
   test("both tools are excluded from a depth-1 child's tool set (v1 depth-0 only, same rationale as send_message/task_stop)", async () => {
+    // 5a: run_in_background:false — this test's subject is tool-set filtering, not the bg
+    // default; the child must run synchronously so its own provider request is deterministically
+    // recorded before the assertions below run.
     const provider = new FakeProvider([
-      [{ type: "tool_call", callId: "s1", name: "spawn_agent", argsJson: JSON.stringify({ prompt: "child-task", description: "task" }) }, done("tool_calls")],
+      [{ type: "tool_call", callId: "s1", name: "spawn_agent", argsJson: JSON.stringify({ prompt: "child-task", description: "task", run_in_background: false }) }, done("tool_calls")],
       text("child done"),
       text("parent done"),
     ]);

@@ -15,8 +15,12 @@ const done = (reason: "end_turn" | "tool_calls" | "aborted"): ProviderEvent => (
 const text = (t: string): ProviderEvent[] => [{ type: "text_delta", delta: t }, done("end_turn")];
 // A fresh spawn with a stable `name` so a later turn can address it (the model can't know the
 // generated agentId; `name` is the stable handle).
+// 5a: `run_in_background: false` defaulted (before `...extra`) — depth 0 now backgrounds by
+// default, and test (b) below needs this spawn to finish synchronously so the child is actually
+// FINISHED before it's messaged (send_message's own background-resume is the thing under test,
+// not this setup spawn).
 const spawnNamed = (callId: string, prompt: string, name: string, extra?: Record<string, unknown>): ProviderEvent =>
-  ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "task", name, ...extra }) });
+  ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "task", name, run_in_background: false, ...extra }) });
 const sendMessage = (callId: string, to: string, message: string): ProviderEvent =>
   ({ type: "tool_call", callId, name: "send_message", argsJson: JSON.stringify({ to, message }) });
 
@@ -213,8 +217,11 @@ describe("AgentEngine: send_message (4h-ii-b Task 4 — CC SendMessage parity)",
   // agent-to-agent messaging). A depth-1 child's specs()-derived tool set (after excludeTools
   // filtering) does NOT contain send_message, while the MAIN thread's DOES.
   test("(d) send_message is excluded from a child thread's tool set (depth-0 only)", async () => {
+    // 5a: run_in_background:false — this test's subject is tool-set filtering, not the bg
+    // default; the child must run synchronously so its own provider request is deterministically
+    // recorded before the assertions below run.
     const { engine, sessionId, provider } = setupSend([
-      [{ type: "tool_call", callId: "s1", name: "spawn_agent", argsJson: JSON.stringify({ prompt: "child-task", description: "task" }) }, done("tool_calls")],
+      [{ type: "tool_call", callId: "s1", name: "spawn_agent", argsJson: JSON.stringify({ prompt: "child-task", description: "task", run_in_background: false }) }, done("tool_calls")],
       text("child done"),
       text("parent done"),
     ]);

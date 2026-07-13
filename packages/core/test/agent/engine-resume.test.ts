@@ -9,12 +9,22 @@ const done = (reason: "end_turn" | "tool_calls" | "aborted"): ProviderEvent => (
 const text = (t: string): ProviderEvent[] => [{ type: "text_delta", delta: t }, done("end_turn")];
 // A fresh spawn with a stable `name` so a later turn can address it by name for resume (the model
 // can't know the generated agentId in advance; `name` is the stable handle — 4h-ii-b Task 2).
+// 5a: `run_in_background: false` defaulted (before `...extra`, so an explicit override still
+// wins) — depth 0 now backgrounds by default (this file's `setup()`, imported from
+// engine-spawn.test.ts, always wires `bgAgents`), and every test below needs this FIRST spawn to
+// complete synchronously so the resulting agent is actually FINISHED and resumable in the turn
+// that follows; none of them are testing the default itself.
 const spawnNamed = (callId: string, prompt: string, name: string, extra?: Record<string, unknown>): ProviderEvent =>
-  ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "task", name, ...extra }) });
+  ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "task", name, run_in_background: false, ...extra }) });
 // A resume: `resume` + a NEW `prompt`, and DELIBERATELY no `description` — resume sits before the
 // bridge's description check (D7), so it must succeed without one.
+// 5a: `run_in_background: false` — a resume is itself a spawn and follows the SAME depth-0 default
+// flip (the brief: "a resume is a spawn and follows the same default"), so every test below that
+// resumes and then inspects the resumed run's OWN provider request/history SYNCHRONOUSLY (no poll
+// loop) needs this pinned false; the dedicated default-matrix test below omits the key by hand to
+// pin the true default instead.
 const resumeCall = (callId: string, resume: string, prompt: string): ProviderEvent =>
-  ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ resume, prompt }) });
+  ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ resume, prompt, run_in_background: false }) });
 
 const M = (role: "user" | "assistant", content: string): { type: "message"; role: "user" | "assistant"; content: string } =>
   ({ type: "message", role, content });
@@ -391,6 +401,38 @@ describe("AgentEngine: spawn_agent resume (4h-ii-b Task 3)", () => {
     expect(notes).toHaveLength(1);
     expect((notes[0] as Extract<SessionEvent, { type: "task_notification" }>).content)
       .toContain("<result>child-out-2</result>");
+  });
+
+  // 5a matrix case 7 (USER pin: background children, CC parity — phase 5a T2): a resume is itself
+  // a spawn (the SAME hand-parsed `runInBackground` the bridge computes for a fresh spawn feeds
+  // resumeThread too — see engine.ts's spawn bridge), so it follows the identical depth-0 default:
+  // omitting run_in_background on a `resume` at depth 0 with the registry wired now means
+  // DETACHED, exactly like (D6) above (which pins the SAME behavior via an EXPLICIT `true`).
+  // Constructs its own tool_call, omitting the key entirely, to prove the engine's own default
+  // rather than resumeCall's test-helper default (`false`, added above for every OTHER test here).
+  test("(5a matrix #7) resume + run_in_background OMITTED at depth 0 → detached reopen, same as an explicit true", async () => {
+    const { engine, store, sessionId, bgAgents } = setup([
+      [spawnNamed("s1", "do the task", "worker"), done("tool_calls")], // turn 1: sync spawn (helper default)
+      text("child-out-1"),
+      text("parent turn1"),
+      [{ type: "tool_call", callId: "r1", name: "spawn_agent", argsJson: JSON.stringify({ resume: "worker", prompt: "keep going" }) }, done("tool_calls")],
+      text("child-out-2"), // the resumed (detached) child's run
+      text("parent turn2"),
+    ]);
+    await engine.runTurn(sessionId);
+    await engine.runTurn(sessionId);
+
+    // the tool_result is set SYNCHRONOUSLY in-turn (the bg resume returns immediately) — asserted
+    // before waiting on the detached run, exactly like (D6)
+    const result = store.read(sessionId).find((e) => e.type === "tool_result" && e.callId === "r1");
+    expect(result).toMatchObject({ isError: false });
+    const worker = bgAgents.get("worker", sessionId)!;
+    expect((result as Extract<SessionEvent, { type: "tool_result" }>).output).toBe(JSON.stringify({ agentId: worker.threadId, status: "running" }));
+
+    for (let i = 0; i < 200 && bgAgents.get("worker", sessionId)?.status === "running"; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(bgAgents.get("worker", sessionId)).toMatchObject({ status: "completed", result: "child-out-2" });
   });
 
   // 4h-ii-c (T1 follow-up): a RESUMED bg run is just as detached as a fresh bg spawn — a

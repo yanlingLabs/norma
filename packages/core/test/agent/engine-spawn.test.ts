@@ -116,8 +116,14 @@ const text = (t: string): ProviderEvent[] => [{ type: "text_delta", delta: t }, 
 // don't all need individual edits; `extra.description` still overrides it (see the "description
 // rides thread_started" test below). The dedicated "without description" test constructs its
 // tool_call by hand, bypassing this default, to pin the required-arg behavior itself.
+// 5a: `run_in_background: false` is ALSO defaulted here (before the `...extra` spread, so
+// `extra.run_in_background` still overrides it) — depth 0 now backgrounds by default (this
+// harness's `setup()` always wires `bgAgents`), and none of the pre-existing call sites below are
+// testing that default itself; they need the OLD synchronous-completion behavior as scaffolding
+// for whatever else they're pinning. The dedicated default-matrix tests below construct their own
+// tool_call by hand, omitting the key entirely, to pin the true default.
 const spawnCall = (callId: string, prompt: string, extra?: { agentType?: string; model?: string; description?: string; max_turns?: number; mode?: string; isolation?: string; run_in_background?: boolean; name?: string }): ProviderEvent =>
-  ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "test task", ...extra }) });
+  ({ type: "tool_call", callId, name: "spawn_agent", argsJson: JSON.stringify({ prompt, description: "test task", run_in_background: false, ...extra }) });
 
 describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
   test("spawn_agent without description → invalid args tool_result, no thread_started/completed (schema-required, bridge path)", async () => {
@@ -1517,9 +1523,56 @@ describe("AgentEngine: spawn_agent run_in_background (4h-ii-a)", () => {
     expect(entry?.resume?.instructions).toContain("subagent");
   });
 
-  test("no run_in_background (default false/absent) → unchanged, fully-awaited synchronous behavior; parent's tool_result is the child's final text, not a running-JSON", async () => {
+  // 5a matrix case 1 (USER pin: background children, CC parity — phase 5a T2): depth 0, WITH the
+  // bg registry wired, run_in_background OMITTED entirely → detached by default. This is the
+  // flip itself: before 5a this omission meant synchronous (this test used to pin exactly that,
+  // titled "no run_in_background (default false/absent) → unchanged..."); now it's re-pointed at
+  // the NEW default. Constructs its own tool_call BYPASSING spawnCall's own `run_in_background:
+  // false` default (added to that helper for the OTHER tests in this file, which need sync
+  // scaffolding for whatever else they're pinning) so this one actually omits the key end to end,
+  // proving the ENGINE's own default, not the test helper's.
+  test("(5a matrix #1) depth 0 + registry wired + run_in_background OMITTED → detached by default (tool_result is {agentId,status:'running'} immediately, turn continues, child still finishes on its own)", async () => {
     const { engine, store, sessionId, bgAgents } = setup([
-      [spawnCall("s1", "do X"), done("tool_calls")],
+      [{ type: "tool_call", callId: "s1", name: "spawn_agent", argsJson: JSON.stringify({ prompt: "do X", description: "test task" }) }, done("tool_calls")],
+      text("child final report"),
+    ]);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const started = events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>;
+    expect(started).toBeDefined();
+    const childId = started.threadId;
+
+    // the tool_result is the immediate running-JSON, not the child's final text — the
+    // strongest single proof of detachment reachable WITHOUT gating the child's own provider
+    // call (this simple, ungated script has no real delay, so the child's own trivial round can
+    // race to completion within the same microtask flush as the parent's turn — the sibling
+    // "run_in_background:true" test above proves genuine non-blocking via an explicit gate; this
+    // test's job is only to prove OMISSION reaches the same detached path, not to re-prove that).
+    const toolResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(toolResult).toMatchObject({ isError: false });
+    expect(JSON.parse((toolResult as Extract<SessionEvent, { type: "tool_result" }>).output)).toEqual({ agentId: childId, status: "running" });
+
+    // the parent's own turn completed normally — it never awaited the child's own result to get
+    // its tool_result (a sync spawn's tool_result IS the child's final text, never this JSON)
+    const mainTurnCompleted = events.find((e) => e.type === "turn_completed" && e.threadId === "main");
+    expect(mainTurnCompleted).toMatchObject({ stopReason: "end_turn" });
+
+    // the detached child DOES finish on its own — poll rather than a fixed sleep
+    for (let i = 0; i < 200 && bgAgents.get(childId)?.status === "running"; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(bgAgents.get(childId)).toMatchObject({ status: "completed", result: "child final report" });
+  });
+
+  // 5a matrix case 2: depth 0 + registry wired + run_in_background EXPLICITLY false → the
+  // synchronous, awaited path is still available on request (an explicit opt-out of the new
+  // default) — parent's tool_result is the child's final text directly, not a running-JSON. Also
+  // pins 4h-ii-b Task 1's "a sync spawn also registers (and completes) in the bg registry, already
+  // notified" contract, now reached via explicit `false` rather than omission.
+  test("(5a matrix #2) depth 0 + registry wired + run_in_background:false → synchronous, fully-awaited; parent's tool_result is the child's final text, not a running-JSON", async () => {
+    const { engine, store, sessionId, bgAgents } = setup([
+      [spawnCall("s1", "do X", { run_in_background: false }), done("tool_calls")],
       text("child final report"),
     ]);
     await engine.runTurn(sessionId);
@@ -1540,6 +1593,57 @@ describe("AgentEngine: spawn_agent run_in_background (4h-ii-a)", () => {
     const entry = bgAgents.list(sessionId).find((e) => e.agentId === started.threadId);
     expect(entry).toMatchObject({ status: "completed", result: "child final report", notified: true });
     expect(entry?.resume).toMatchObject({ agentType: "general-purpose", approvalPolicy: "auto" });
+  });
+
+  // 5a matrix case 3: depth 0 + NO registry wired + run_in_background OMITTED → still synchronous
+  // (NOT the "not available" typed error) — the new default only ever applies where there's
+  // somewhere to land a detached entry; a registry-less session must never have spawn_agent's
+  // baseline behavior flip out from under it just because the flag was left out.
+  test("(5a matrix #3) depth 0 + NO registry wired + run_in_background OMITTED → still synchronous, not the not-available error", async () => {
+    const { engine, store, sessionId } = setup(
+      [
+        [{ type: "tool_call", callId: "s1", name: "spawn_agent", argsJson: JSON.stringify({ prompt: "do X", description: "test task" }) }, done("tool_calls")],
+        text("child final report"),
+      ],
+      { withBgAgents: false },
+    );
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const completed = events.find((e) => e.type === "thread_completed");
+    expect(completed).toMatchObject({ stopReason: "end_turn" });
+
+    const toolResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(toolResult).toMatchObject({ isError: false, output: "child final report" });
+  });
+
+  // 5a matrix case 5: depth 1 (a spawn issued FROM WITHIN a child) + run_in_background OMITTED →
+  // still synchronous — only depth 0 flips to background by default; a nested spawn keeps waiting
+  // by default (the grandchild's report needs to land in the CHILD's own in-report context, and
+  // completion notifications are main-thread-only, so an unreachable-by-default detached
+  // grandchild would be a footgun, not a convenience).
+  test("(5a matrix #5) depth 1 (spawn issued from within a child) + run_in_background OMITTED → still synchronous, not detached", async () => {
+    const script: ProviderEvent[][] = [
+      [spawnCall("s1", "do X", { run_in_background: false }), done("tool_calls")], // parent (depth 0): sync-spawns the child — scaffolding, not the subject
+      [{ type: "tool_call", callId: "s2", name: "spawn_agent", argsJson: JSON.stringify({ prompt: "grandchild", description: "task" }) }, done("tool_calls")], // child (depth 1): omits run_in_background
+      text("grandchild final report"), // grandchild (depth 2) round 0
+      text("child wrapped up after grandchild"), // child's own continuation, after the grandchild bridge returns SYNCHRONOUSLY
+      text("parent final report"), // parent's continuation
+    ];
+    const { engine, store, sessionId } = setup(script);
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    // the grandchild's result bubbles up as the CHILD's own tool_result for s2 — only possible if
+    // the depth-1 spawn was awaited synchronously (a detached s2 would have returned an immediate
+    // {agentId,status:"running"} tool_result instead of the grandchild's actual report)
+    const s2Result = events.find((e) => e.type === "tool_result" && e.callId === "s2");
+    expect(s2Result).toMatchObject({ isError: false, output: "grandchild final report" });
+
+    // and the child's own final text (after the grandchild returns) bubbles up as the PARENT's
+    // tool_result for s1, proving the child kept running its OWN loop after the nested spawn
+    const s1Result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(s1Result).toMatchObject({ isError: false, output: "child wrapped up after grandchild" });
   });
 
   test("run_in_background:true whose child provider ERRORS → registry.complete records isError-shaped failure text, thread_completed stopReason 'error'", async () => {

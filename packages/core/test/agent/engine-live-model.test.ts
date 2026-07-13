@@ -78,7 +78,10 @@ describe("engine live model resolution (no daemon restart)", () => {
   });
 
   test("subagents inherit the PARENT thread's live-resolved reasoningEffort (no per-agent-def override)", async () => {
-    const spawnCall: ProviderEvent = { type: "tool_call", callId: "s1", name: "spawn_agent", argsJson: JSON.stringify({ prompt: "do X", description: "test task" }) };
+    // 5a: run_in_background:false — this test relies on fp.requests[1] being the CHILD's own
+    // (synchronous) round; depth 0 now backgrounds by default, which would make requests[1] the
+    // parent's own continuation instead.
+    const spawnCall: ProviderEvent = { type: "tool_call", callId: "s1", name: "spawn_agent", argsJson: JSON.stringify({ prompt: "do X", description: "test task", run_in_background: false }) };
     const provider = new FakeProvider([
       [spawnCall, done("tool_calls")],
       text("child report"),

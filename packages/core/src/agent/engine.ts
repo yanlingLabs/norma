@@ -1119,11 +1119,12 @@ export class AgentEngine {
           // omitting the arg entirely (no isolation, child runs in the parent's own cwd — today's
           // unchanged behavior).
           const wantsWorktreeIsolation = parsed.isolation === "worktree";
-          // 4h-ii-a (CC parity: Agent.run_in_background) — same hand-parse-before-zod reasoning as
-          // isolation/mode/max_turns/model/description above: only the literal boolean `true` is
-          // recognized; anything else (wrong type, absent, false) → false, same as omitting the arg
-          // entirely (the synchronous, awaited path — today's unchanged behavior).
-          const runInBackground = parsed.run_in_background === true;
+          // 5a (USER pin: background children, CC parity): at depth 0 with a registry wired, omitted now
+          // means DETACHED — `false` opts into the synchronous await. Depth>0 and registry-less sessions
+          // keep the sync default (children need their delegate's answer in-report; notifications are
+          // main-thread-only; an omitted flag must never hit the "not available" typed error).
+          const bgDefault = opts.depth === 0 && !!this.cfg.bgAgents;
+          const runInBackground = bgDefault ? parsed.run_in_background !== false : parsed.run_in_background === true;
           // 4h-ii-b Task 3 (D7): a resume takes over the WHOLE callback for this call — it sits
           // EARLY, before any fresh-spawn machinery (childId gen, description/model checks,
           // worktree, register). resumeThread does its own typed-error guards (no prompt / unknown
