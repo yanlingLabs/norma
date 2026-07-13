@@ -292,6 +292,20 @@ describe("skills.list schema", () => {
     const stamped = SkillMetaSchema.parse({ name: "greet", description: "Say hi", source: "self", path: "/x", author: "norma" });
     expect(stamped.author).toBe("norma");
   });
+
+  // 5c T3 review regression: source:"builtin" (always present since T1's shipped writing-skills)
+  // and claudeFormat (set on claude-format plugin skills) existed on core's SkillMeta but not this
+  // wire schema — one unparseable element fails z.array() wholesale, so the CLI's validated
+  // listSkills threw on EVERY skills.list response. Pin both fields at the schema layer.
+  test("SkillMetaSchema admits source 'builtin' and optional claudeFormat; SkillsListResult parses a mixed list", () => {
+    const builtin = SkillMetaSchema.parse({ name: "writing-skills", description: "d", source: "builtin", path: "/repo/packages/core/skills/writing-skills/SKILL.md" });
+    expect(builtin.source).toBe("builtin");
+    expect(builtin.claudeFormat).toBeUndefined();
+    const ccPlugin = SkillMetaSchema.parse({ name: "cc-plug:greet", description: "d", source: "plugin", path: "/x", claudeFormat: true });
+    expect(ccPlugin.claudeFormat).toBe(true);
+    const r = SkillsListResult.parse({ ok: true, skills: [ccPlugin, builtin] });
+    expect(r.skills).toHaveLength(2);
+  });
 });
 
 describe("skills.read/write/delete schemas (Phase 5c Task 3)", () => {

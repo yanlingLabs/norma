@@ -112,11 +112,20 @@ export const SessionCompactResult = z.object({
   summaryChars: z.number().int().nonnegative(),
 });
 
+/** Mirrors `SkillMeta` (core/src/agent/skills.ts) field-for-field — this schema drifting behind
+ *  that interface is a LIVE break, not cosmetic: the CLI's `listSkills` (cli/src/client.ts)
+ *  validates every `skills.list` response through `SkillsListResult.safeParse` and throws on
+ *  failure, and `z.array()` fails the whole array on one bad element. Phase 5c T1's always-present
+ *  `writing-skills` builtin did exactly that (`source:"builtin"` wasn't in this enum), breaking
+ *  `norma skills` on every invocation until the 5c T3 review fix admitted it here. */
 export const SkillMetaSchema = z.object({
   name: z.string(),
   description: z.string(),
-  source: z.enum(["project", "user", "self", "plugin"]),
+  source: z.enum(["project", "user", "self", "plugin", "builtin"]),
   path: z.string(),
+  // Set only on claude-format plugin skills (SkillStore.discover, agent/skills.ts) — omitted
+  // (never false) otherwise.
+  claudeFormat: z.boolean().optional(),
   // Phase 5c Task 3: mirrors SkillStore's `author?` (agent/skills.ts) — set for a self-authored
   // skill (T1 stamps `author: norma` in the frontmatter, T3's list()/load() parse it back out),
   // undefined for every other source. Additive/optional: an older server that never sends it still

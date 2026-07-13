@@ -105,10 +105,16 @@ describe("NormaClient", () => {
     client.close();
   });
 
-  test("listSkills client method round-trip (no skills installed)", async () => {
+  // 5c T3 review regression: since T1, EVERY skills.list response carries the shipped
+  // writing-skills builtin (source:"builtin") — this must survive listSkills' SkillsListResult
+  // validation (client.ts throws "invalid result from server" on any unparseable element, and
+  // z.array() fails wholesale on one), which is exactly how `norma skills` and /skills broke when
+  // the wire schema's source enum lagged behind core's SkillMeta.
+  test("listSkills client method round-trip: the always-present builtin passes the VALIDATED client path", async () => {
     await boot();
     const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "sk", onEvent: () => {} });
-    expect(await client.listSkills(process.cwd())).toEqual([]);
+    const skills = await client.listSkills(process.cwd()); // throws if any element fails schema validation
+    expect(skills).toEqual([{ name: "writing-skills", description: expect.any(String), source: "builtin", path: expect.any(String) }]);
     client.close();
   });
 
