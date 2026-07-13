@@ -21,7 +21,12 @@
  *  per-status glyph column, and elapsed time moved to the finish note. `.activity` (already
  *  computed onto the row by `subagent-state.ts`'s `tool_call` case via `extractToolDetail`) is read
  *  directly, same "row already carries the derived field, don't re-derive it" discipline as 3a's
- *  `.label` resolution note. Pure — no client, no side effects. */
+ *  `.label` resolution note. Pure — no client, no side effects.
+ *
+ *  Phase 5a Task 3: `agent.name` (a background child's re-taskable handle, mapped by state.ts's
+ *  spawn_agent tool_call/tool_result pairing — see `AgentRow`'s own doc comment in state.ts) takes
+ *  `.label`'s place in the head row's parenthetical when present, falling back to `.label`
+ *  otherwise — a label swap only, the row shape/layout above is unchanged. */
 
 import React from "react";
 import { Box, Text } from "ink";
@@ -40,7 +45,9 @@ function AgentTreeRow({ agent, isLast }: { agent: AgentRow; isLast: boolean }) {
       <Text>
         <Text dimColor>{headGutter}</Text>
         <Text bold>{agent.agentType}</Text>
-        {` (${agent.label})`}
+        {/* phase 5a T3: a mapped `name` (re-taskable handle) takes the label's place here — same
+            slot, same layout; `.label` is the fallback whenever no mapping exists. */}
+        {` (${agent.name ?? agent.label})`}
         {` · ${pluralizeToolUse(agent.toolCalls)}`}
       </Text>
       <Text dimColor>

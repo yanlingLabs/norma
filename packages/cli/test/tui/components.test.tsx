@@ -237,6 +237,23 @@ describe("AgentList — tree rows (phase 3b Task 6, c)", () => {
     const { lastFrame } = render(<AgentList agents={[]} nowMs={0} />);
     expect((lastFrame() ?? "").trim()).toBe("");
   });
+
+  // Phase 5a Task 3: a background child's `name` (recorded by state.ts's spawn_agent tool_call/
+  // tool_result pairing) is a re-taskable handle, distinct from `.label`'s description-derived
+  // display text — the row shape/layout is unchanged, this is a label swap only.
+  test("a mapped `name` renders in place of the label", () => {
+    const row = agent({ threadId: "th_1", label: "scout", name: "my-agent" });
+    const { lastFrame } = render(<AgentList agents={[row]} nowMs={0} />);
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("(my-agent)");
+    expect(frame).not.toContain("(scout)");
+  });
+
+  test("no mapped name falls back to the label, unchanged from before this task", () => {
+    const row = agent({ threadId: "th_1", label: "scout" });
+    const { lastFrame } = render(<AgentList agents={[row]} nowMs={0} />);
+    expect(lastFrame() ?? "").toContain("(scout)");
+  });
 });
 
 // The Ink <StatusLine> component was removed in Phase 3b Task 7 — the Spinner (turn chrome) + Footer

@@ -50,8 +50,13 @@ export type Block =
 export type LocalEvent = { type: "local_note"; text: string };
 
 /** `AgentRow` IS `CliSubagent`-shaped (the brief's interface matches it field-for-field) — reuse the
- *  type directly rather than re-declaring an equivalent interface that could drift out of lockstep. */
-export type AgentRow = CliSubagent;
+ *  type directly rather than re-declaring an equivalent interface that could drift out of lockstep.
+ *  `name` (phase 5a Task 3, added here rather than on `CliSubagent` itself so subagent-state.ts
+ *  stays untouched): the child's stable per-session handle, recorded from a background
+ *  `spawn_agent` tool_call/tool_result pair (see the `tool_result` case below) — the re-task
+ *  handle `send_message`/`resume` actually need, distinct from `.label`'s description-derived
+ *  display text. Undefined until (or unless) that pairing resolves for this row's threadId. */
+export type AgentRow = CliSubagent & { name?: string };
 
 export type PendingCard =
   | { kind: "approval"; callId: string; toolName: string; summary: string }
@@ -105,6 +110,35 @@ const CU_CLASS_LABELS: Record<string, string> = {
 };
 const cuClassLabel = (cls: string): string => CU_CLASS_LABELS[cls] ?? cls;
 
+/** Best-effort single string field out of a JSON blob — malformed JSON, a non-object shape, or a
+ *  missing/empty field all yield `undefined` rather than throwing (same try/catch-then-shape-check
+ *  idiom as subagent-display.ts's `extractToolDetail` / history-store.ts's `loadHistory`). */
+function parseStringField(json: string, key: string): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const v = (parsed as Record<string, unknown>)[key];
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+/** Phase 5a Task 3 (NO protocol changes): a background `spawn_agent` tool_call's `argsJson` carries
+ *  a `name` arg; its paired tool_result (the SAME main-thread call, per the `tool_result` case's own
+ *  one-in-flight invariant below) is `{agentId,status:"running"}` JSON ONLY for a background spawn
+ *  — a SYNC spawn's tool_result is the child's plain-text final report, so `parseStringField` fails
+ *  to parse it and this yields `undefined` by construction, same as any other non-JSON text. Also
+ *  `undefined` for a nameless spawn, or any tool_call that isn't `spawn_agent` at all. */
+function bgSpawnNameMapping(call: { name: string; argsJson: string } | undefined, output: string): { agentId: string; name: string } | undefined {
+  if (call?.name !== "spawn_agent") return undefined;
+  const name = parseStringField(call.argsJson, "name");
+  if (!name) return undefined;
+  const agentId = parseStringField(output, "agentId");
+  return agentId ? { agentId, name } : undefined;
+}
+
 /** Feeds ONE event into `updateSubagents` and returns the possibly-updated `agents` array — the
  *  single call site every child-thread branch below shares, so the "which events reach
  *  updateSubagents" decision lives in exactly one place. Deliberately NEVER called for a
@@ -149,17 +183,31 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
       // tool_call — so activeTools holds at most one entry for "main" and this call is always the
       // one it pairs with; no callId needs to ride the (call-id-less) activeTools/Block shapes.
       const call = s.activeTools[0];
-      return {
+      const output = str(e.output);
+      const next: TuiState = {
         ...s,
         activeTools: s.activeTools.slice(1),
         committed: [...s.committed, {
           kind: "tool",
           name: call?.name ?? "",
           argsJson: call?.argsJson ?? "",
-          output: str(e.output),
+          output,
           isError: e.isError === true,
         }],
       };
+      // phase 5a T3: learn a background child's `name` off this same call/result pairing (see
+      // bgSpawnNameMapping above). engine.ts's spawn bridge always emits the child's own
+      // thread_started BEFORE this tool_result (registerThread + the emit happen synchronously,
+      // ahead of the spawnOutcomes entry this result reads), so the matching AgentRow already
+      // exists here in the real wire order; no match (or no mapping at all) is a silent no-op —
+      // never an assumption this reducer would throw on if that ordering were ever violated.
+      const mapping = bgSpawnNameMapping(call, output);
+      if (!mapping) return next;
+      const idx = next.agents.findIndex((a) => a.threadId === mapping.agentId);
+      if (idx === -1) return next;
+      const agents = next.agents.slice();
+      agents[idx] = { ...agents[idx]!, name: mapping.name };
+      return { ...next, agents };
     }
 
     case "turn_started": {

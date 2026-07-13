@@ -50,6 +50,82 @@ describe("state.ts — tool call/result (b)", () => {
   });
 });
 
+describe("state.ts — spawn_agent name mapping (phase 5a T3)", () => {
+  test("a spawn_agent tool_call carrying `name`, paired with a background tool_result ({agentId,status}), maps the name onto the matching AgentRow", () => {
+    let s = initialState();
+    s = reduce(s, { type: "thread_started", threadId: "th_bg1", parentThreadId: "main", agentType: "general-purpose", prompt: "go" }, T0);
+    s = reduce(s, {
+      type: "tool_call", threadId: "main", callId: "c1", name: "spawn_agent",
+      argsJson: JSON.stringify({ prompt: "go", description: "scout", name: "scout-1" }),
+    }, T0 + 1);
+    s = reduce(s, {
+      type: "tool_result", threadId: "main", callId: "c1",
+      output: JSON.stringify({ agentId: "th_bg1", status: "running" }), isError: false,
+    }, T0 + 2);
+    expect(s.agents.find((a) => a.threadId === "th_bg1")?.name).toBe("scout-1");
+  });
+
+  test("a SYNC spawn's tool_result (the child's plain-text final report, not JSON) produces no mapping", () => {
+    let s = initialState();
+    s = reduce(s, { type: "thread_started", threadId: "th_sync1", parentThreadId: "main", agentType: "general-purpose", prompt: "go" }, T0);
+    s = reduce(s, {
+      type: "tool_call", threadId: "main", callId: "c2", name: "spawn_agent",
+      argsJson: JSON.stringify({ prompt: "go", description: "scout", name: "scout-2" }),
+    }, T0 + 1);
+    s = reduce(s, {
+      type: "tool_result", threadId: "main", callId: "c2",
+      output: "the child's plain-text final report", isError: false,
+    }, T0 + 2);
+    expect(s.agents.find((a) => a.threadId === "th_sync1")?.name).toBeUndefined();
+  });
+
+  test("a nameless spawn (no `name` arg) produces no mapping even with a background-shaped result", () => {
+    let s = initialState();
+    s = reduce(s, { type: "thread_started", threadId: "th_bg2", parentThreadId: "main", agentType: "general-purpose", prompt: "go" }, T0);
+    s = reduce(s, {
+      type: "tool_call", threadId: "main", callId: "c3", name: "spawn_agent",
+      argsJson: JSON.stringify({ prompt: "go", description: "scout" }),
+    }, T0 + 1);
+    s = reduce(s, {
+      type: "tool_result", threadId: "main", callId: "c3",
+      output: JSON.stringify({ agentId: "th_bg2", status: "running" }), isError: false,
+    }, T0 + 2);
+    expect(s.agents.find((a) => a.threadId === "th_bg2")?.name).toBeUndefined();
+  });
+
+  test("malformed argsJson and malformed output never throw and produce no mapping", () => {
+    let s = initialState();
+    s = reduce(s, { type: "thread_started", threadId: "th_bg3", parentThreadId: "main", agentType: "general-purpose", prompt: "go" }, T0);
+    s = reduce(s, { type: "tool_call", threadId: "main", callId: "c4", name: "spawn_agent", argsJson: "not json" }, T0 + 1);
+    expect(() => {
+      s = reduce(s, { type: "tool_result", threadId: "main", callId: "c4", output: "also not json", isError: false }, T0 + 2);
+    }).not.toThrow();
+    expect(s.agents.find((a) => a.threadId === "th_bg3")?.name).toBeUndefined();
+  });
+
+  test("a non-spawn tool_call/tool_result is unaffected — existing tool block behavior untouched", () => {
+    let s = initialState();
+    s = reduce(s, { type: "tool_call", threadId: "main", callId: "c5", name: "bash", argsJson: '{"command":"ls"}' }, T0);
+    s = reduce(s, { type: "tool_result", threadId: "main", callId: "c5", output: "file.txt", isError: false }, T0 + 1);
+    expect(s.committed).toEqual([{ kind: "tool", name: "bash", argsJson: '{"command":"ls"}', output: "file.txt", isError: false }]);
+  });
+
+  test("no matching AgentRow yet (thread_started hasn't landed) is a silent no-op, never throws", () => {
+    let s = initialState();
+    s = reduce(s, {
+      type: "tool_call", threadId: "main", callId: "c6", name: "spawn_agent",
+      argsJson: JSON.stringify({ prompt: "go", description: "scout", name: "scout-3" }),
+    }, T0);
+    expect(() => {
+      s = reduce(s, {
+        type: "tool_result", threadId: "main", callId: "c6",
+        output: JSON.stringify({ agentId: "th_ghost", status: "running" }), isError: false,
+      }, T0 + 1);
+    }).not.toThrow();
+    expect(s.agents).toEqual([]);
+  });
+});
+
 describe("state.ts — turn lifecycle (c)", () => {
   test("turn_started sets turnRunning+turnStartMs; turn_completed sets tokens+turnRunning=false and leaves agents intact", () => {
     let s = initialState();
