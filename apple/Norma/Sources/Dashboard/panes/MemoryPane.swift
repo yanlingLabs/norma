@@ -74,6 +74,17 @@ final class MemoryPaneModel: ObservableObject {
         return editedBody != detail.body || editedDescription != detail.description
     }
 
+    /// Save gating beyond `isDirty` (5b T5 review): `memory.write`'s wire schema requires
+    /// non-empty description/body (methods.ts `min(1)`) — an emptied field could only round-trip
+    /// to a server rejection surfaced as the generic save error, so the button disables
+    /// client-side instead. Trimmed check (whitespace-only is as unwritable as empty); the SENT
+    /// values stay untrimmed — this only gates.
+    var canSave: Bool {
+        isDirty
+            && !editedBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !editedDescription.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     /// Refresh the fact list — called on the pane's `.task` (initial appear) and after every
     /// mutation (save/delete), same "refresh after every action" posture as
     /// `PluginManagerModel.refresh()`. If the currently-selected fact vanished (deleted from
@@ -94,18 +105,28 @@ final class MemoryPaneModel: ObservableObject {
     }
 
     /// Loads `name`'s full body via `memory.read` and seeds the editable fields from it.
+    ///
+    /// Stale-response guard (5b T5 review): two quick row taps run CONCURRENT selects; an earlier
+    /// tap's slower `memory.read` resolving after a newer selection started must not overwrite the
+    /// newer fact's detail/edit state — `save()` reads `selectedName` and `detail`/`editedBody` as
+    /// one unit, so a stale overwrite would write fact A's body/type/description UNDER B'S NAME.
+    /// The same `selectedName == name` condition gates the defer and the catch: a stale response
+    /// may neither clear the NEWER selection's still-in-flight loading state nor surface its own
+    /// error under the newer name.
     func select(_ name: String) async {
         selectedName = name
         detail = nil
         detailErrorText = nil
         detailLoading = true
-        defer { detailLoading = false }
+        defer { if selectedName == name { detailLoading = false } }
         do {
             let fact = try await client.memoryRead(scope: scope, name: name)
+            guard selectedName == name else { return }
             detail = fact
             editedBody = fact.body
             editedDescription = fact.description
         } catch {
+            guard selectedName == name else { return }
             detailErrorText = "couldn't load \(name) — try again"
         }
     }
@@ -125,7 +146,11 @@ final class MemoryPaneModel: ObservableObject {
     /// audit tail on success, so the row's description and the "Recent changes" tail both reflect
     /// the write immediately.
     func save() async {
-        guard let name = selectedName, let type = detail?.type else { return }
+        // `canSave` re-checked here, not just at the button's `.disabled` (5b T5 review): a click
+        // landing before SwiftUI re-evaluates the disabled state must not send an emptied
+        // body/description the server would reject — same belt-and-suspenders posture as
+        // `PluginManagerModel.confirmConsent`'s double-submit guard.
+        guard canSave, let name = selectedName, let type = detail?.type else { return }
         saving = true
         defer { saving = false }
         do {
@@ -148,7 +173,11 @@ final class MemoryPaneModel: ObservableObject {
         defer { deleting = false }
         do {
             try await client.memoryDelete(scope: scope, name: name)
-            clearSelection()
+            // Same-shape stale guard as `select(_:)` (5b T5 review): the user may have selected a
+            // DIFFERENT fact while this delete was in flight — only clear the detail panel if the
+            // deleted fact is still the selected one (`refresh()` below prunes the deleted row
+            // from the list either way).
+            if selectedName == name { clearSelection() }
             errorText = nil
             await refresh()
             await loadAudit()
@@ -316,7 +345,7 @@ struct MemoryPane: View {
                     .foregroundStyle(.red)
                     .disabled(model.saving || model.deleting)
                 Button("Save") { Task { await model.save() } }
-                    .disabled(!model.isDirty || model.saving || model.deleting)
+                    .disabled(!model.canSave || model.saving || model.deleting)
             }
             TextField("Description", text: $model.editedDescription)
                 .textFieldStyle(.roundedBorder)
