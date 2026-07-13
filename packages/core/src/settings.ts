@@ -132,6 +132,19 @@ export const Settings = z.object({
   routines: z.object({
     maxConcurrent: z.number().int().positive().optional(),
   }).optional(),
+  /** LSP integration (Phase 5f, design doc — lsp_diagnostics/lsp_definition/lsp_references over a
+   *  lazily-spawned typescript-language-server/sourcekit-lsp). `enabled` is default-ON, the SAME
+   *  boot-snapshot shape as `reviewer.enabled`/`titles.enabled` above (an explicit `false` is the
+   *  only way to turn it off; block absent, field absent, or `true` all mean the three lsp_* tools
+   *  get registered — daemon.ts's registerLspTools gate reads `settings?.lsp?.enabled !== false`).
+   *  When off, the tools are never registered, so a model's query for one is the registry's
+   *  ordinary "unknown tool" error — no special-cased denial path. `idleShutdownMs` threads
+   *  straight into `new LspManager({idleShutdownMs})`; absent means the manager's own default
+   *  (300_000 — 5 min, agent/lsp/manager.ts's DEFAULT_SCHEDULER-adjacent constant). */
+  lsp: z.object({
+    enabled: z.boolean().optional(),
+    idleShutdownMs: z.number().int().positive().optional(),
+  }).optional(),
 });
 export type Settings = z.infer<typeof Settings>;
 

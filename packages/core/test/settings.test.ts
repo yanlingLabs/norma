@@ -259,6 +259,44 @@ describe("loadSettings", () => {
     expect(s.schemaVersion).toBe(2);
     expect(s.hooks).toBeUndefined();
   });
+
+  // Phase 5f Task 4: lsp.enabled/idleShutdownMs — mirrors hooks/toolSearch/subagents' own
+  // optional-nested-block shape (unknown keys stripped, wrong-typed known keys throw).
+  test("lsp config parses (both fields); absent block → undefined", () => {
+    const s = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, lsp: { enabled: false, idleShutdownMs: 60_000 } });
+    expect(s.lsp).toEqual({ enabled: false, idleShutdownMs: 60_000 });
+    expect(Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" } }).lsp).toBeUndefined();
+  });
+
+  test("lsp: a partial object (one field set) round-trips exactly — the other field stays absent, not defaulted-in at the settings layer", () => {
+    const enabledOnly = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, lsp: { enabled: true } });
+    expect(enabledOnly.lsp).toEqual({ enabled: true });
+    expect(enabledOnly.lsp).not.toHaveProperty("idleShutdownMs");
+    const idleOnly = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, lsp: { idleShutdownMs: 1000 } });
+    expect(idleOnly.lsp).toEqual({ idleShutdownMs: 1000 });
+    expect(idleOnly.lsp).not.toHaveProperty("enabled");
+    expect(Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, lsp: {} }).lsp).toEqual({});
+  });
+
+  test("lsp: an unrecognized key inside the block is tolerated — stripped like every other zod object here, never rejects the whole settings file", () => {
+    const s = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, lsp: { enabled: true, maxWorkers: 4 } });
+    expect(s.lsp).toEqual({ enabled: true });
+    expect(s.lsp).not.toHaveProperty("maxWorkers");
+  });
+
+  test("lsp: a wrong-typed known key throws (same idiom as subagents.maxConcurrent / worktree.baseRef)", () => {
+    expect(() => Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, lsp: { enabled: "yes" } })).toThrow();
+    expect(() => Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, lsp: { idleShutdownMs: -1 } })).toThrow();
+    expect(() => Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, lsp: { idleShutdownMs: 0 } })).toThrow();
+    expect(() => Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, lsp: { idleShutdownMs: "60000" } })).toThrow();
+  });
+
+  test("legacy migration keeps working with lsp field absent", () => {
+    const p = tmpSettings({ legacyCustom: { provider: "disabled" } });
+    const s = loadSettings(p);
+    expect(s.schemaVersion).toBe(2);
+    expect(s.lsp).toBeUndefined();
+  });
 });
 
 describe("hooksEnabledFrom (4f: hooks.enabled default-ON semantics)", () => {
