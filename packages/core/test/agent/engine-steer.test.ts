@@ -29,6 +29,9 @@ import type { BashReviewer } from "../../src/agent/reviewer";
 export function setupEngine(provider: Provider, opts?: {
   cwd?: string; assembler?: ContextAssembler; compactor?: Compactor; skills?: SkillStore; registry?: ToolRegistry; mcp?: McpManager;
   reviewer?: BashReviewer; reviewerEnabled?: boolean; reviewerAllow?: string[]; policy?: "ask" | "auto" | "plan";
+  // phase 5e T3: per-class review on/off — undefined (every pre-5e-T3 test) leaves every class
+  // enabled, unchanged. See EngineConfig.reviewerClasses's own doc comment.
+  reviewerClasses?: { bash?: boolean; fs?: boolean; external?: boolean };
   // undefined (default) → no deferral anywhere; every pre-existing engine test omits this and is unaffected.
   toolSearch?: { enabled?: boolean; deferThreshold?: number; deferExternals?: "count" | "always" };
   // undefined (default) → EngineConfig.provider.live is absent, matching every pre-existing
@@ -91,6 +94,7 @@ export function setupEngine(provider: Provider, opts?: {
     reviewer: opts?.reviewer,
     reviewerEnabled: opts?.reviewerEnabled,
     reviewerAllow: opts?.reviewerAllow,
+    reviewerClasses: opts?.reviewerClasses,
     toolSearch: opts?.toolSearch,
     worktrees: opts?.worktrees,
     bgRegistry: opts?.bgRegistry,

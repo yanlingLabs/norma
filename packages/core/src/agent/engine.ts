@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { relative, sep } from "node:path";
 import type { NewSessionEvent, Question, SessionEvent, Task } from "@norma/protocol";
 import type { SessionStore } from "../sessions/store";
 import type { SessionHub } from "../sessions/hub";
 import type { Provider, ProviderEvent, TurnInputItem } from "../providers/types";
 import type { ToolRegistry } from "./tools/registry";
+import { isExternalToolName } from "./tools/registry";
 import type { PermissionGate, SessionApprovalPolicy } from "./gate";
 import type { ApprovalBroker } from "./approvals";
 import type { QuestionBroker } from "./questions";
@@ -15,7 +17,8 @@ import { sessionTmpDir } from "./session-tmp";
 import type { ContextAssembler } from "./context";
 import type { Compactor } from "./compactor";
 import type { McpManager } from "./mcp/manager";
-import { bashLooksSafe, type BashReviewer } from "./reviewer";
+import { bashLooksSafe, type BashReviewer, type ReviewInput } from "./reviewer";
+import { resolveWithinAny, isWithin } from "./paths";
 import type { WorktreeManager } from "./worktree";
 import type { SubagentManager } from "./subagents";
 import type { AgentStore } from "./agents";
@@ -143,6 +146,56 @@ function sanitizeReviewText(s: string, maxLen: number): string {
   return s.replace(/\r?\n/g, " ").slice(0, maxLen);
 }
 
+/** phase 5e T3 (fs coverage): resolves a write/edit call's target against the review-time fence —
+ *  the session's roots (primary cwd first) PLUS the session tmp dir, mirroring bash's OS-level
+ *  sandbox-writable set (sandbox.ts's `writable`: cwd + roots + tmpDir), which is BROADER than
+ *  fs-write.ts's own application-level fence (`roots` only, no tmpDir). Reuses resolveWithinAny
+ *  (paths.ts) — the fence's own resolution logic — rather than reimplementing containment. A path
+ *  outside even this broader set is a guaranteed fence violation the tool will reject on its own
+ *  (fs-write.ts's own resolveWithinAny throws first) — reviewing a call that can never execute
+ *  buys nothing, so this returns null and the call falls through to executeCall's normal error. */
+function resolveFsReviewTarget(path: string, roots: string[], tmpDir: string): string | null {
+  try {
+    return resolveWithinAny([...roots, tmpDir], path);
+  } catch {
+    return null;
+  }
+}
+
+/** phase 5e T3 (fs coverage): true if an already-fence-resolved write/edit target is unusual
+ *  enough to review — (a) outside the PRIMARY cwd subtree (roots[0]: an added root or the session
+ *  tmp dir), reusing paths.ts's own isWithin, or (b) a dotfile/dot-directory path segment anywhere
+ *  inside cwd (.ssh/, .git/hooks/, a .zshrc-class file). A plain in-cwd, non-dotted write is NOT
+ *  reviewed — this is the "unusual", not "every write", trigger the brief specifies. */
+function fsWriteIsUnusual(resolved: string, primaryCwd: string): boolean {
+  if (!isWithin(resolved, primaryCwd)) return true;
+  return relative(primaryCwd, resolved).split(sep).some((seg) => seg.startsWith("."));
+}
+
+/** phase 5e T3 (fs coverage): the précis shown to the reviewer AND persisted as tool_review.summary
+ *  — resolved path + a character count, NEVER file content. `chars` is the length of the text
+ *  actually landing on disk: `content` for `write`, `new_string` for `edit` (the substituted
+ *  text — matches write's "what's landing on disk" semantics). Malformed argsJson (already past
+ *  resolution, so the call itself is well-formed enough to have a path) degrades to 0 chars rather
+ *  than throwing — this précis is display-only; zod re-validates the real args at execute time. */
+function fsWritePrecis(call: { name: string; argsJson: string }, resolved: string): string {
+  let chars = 0;
+  try {
+    const a = JSON.parse(call.argsJson || "{}") as { content?: unknown; new_string?: unknown };
+    const text = call.name === "edit" ? a.new_string : a.content;
+    if (typeof text === "string") chars = text.length;
+  } catch { /* malformed argsJson → chars stays 0 (display-only degradation) */ }
+  return `${call.name} ${resolved} (${chars} chars)`;
+}
+
+/** phase 5e T3 (external coverage): the précis for an mcp__/plugin__ call — tool name + a
+ *  single-line argsJson slice(160). Same "raw JSON, never a hand-crafted rendering" honesty as
+ *  approvalCardSummary's generic fallback, just capped shorter — this is what the REVIEWER sees,
+ *  not the human's approval card (that still goes through approvalCardSummary separately). */
+function externalPrecis(call: { name: string; argsJson: string }): string {
+  return `${call.name} ${call.argsJson.replace(/\r?\n/g, " ").slice(0, 160)}`;
+}
+
 export const SYSTEM_PROMPT = [
   "You are Norma, an agentic assistant running on the user's Mac.",
   "You operate inside a session working directory; file tool paths are relative to it.",
@@ -173,9 +226,15 @@ export interface EngineConfig {
   questions?: QuestionBroker;
   tasks?: TaskStore;
   approvalTimeoutMs?: number; // default 5 min
-  reviewer?: BashReviewer; // safety review for auto-policy bash calls (undefined → no review, unchanged behavior)
+  reviewer?: BashReviewer; // safety review for auto-policy bash/fs/external calls (undefined → no review, unchanged behavior)
   reviewerEnabled?: boolean; // default true when reviewer is set; false disables the review path entirely
   reviewerAllow?: string[]; // extra commands/argv0s bashLooksSafe treats as obviously-safe (bypass review)
+  // phase 5e T3: per-class on/off, read directly here (T4 threads settings.reviewerClasses → this
+  // field; until then a caller sets it directly, same "stub until the settings task" shape as
+  // reviewerEnabled predates settings wiring). Absent object OR an absent per-class key both mean
+  // enabled=true — every existing caller/test that never sets this keeps today's default-on
+  // behavior unchanged; only an EXPLICIT `false` for a class disables it.
+  reviewerClasses?: { bash?: boolean; fs?: boolean; external?: boolean };
   // deferral wired ONLY when this is set AND enabled !== false — undefined (the setupEngine/
   // daemon default before this config existed) leaves specs()/instructions/execute untouched.
   // deferExternals mirrors registry.ts's opt of the same name ("always": externals defer whenever
@@ -1849,7 +1908,7 @@ export class AgentEngine {
           outcome = await this.runEnterPlanBridge(sessionId, meta);
         } else if (
           decision === "allow" && call.name === "bash" && this.cfg.reviewer &&
-          this.cfg.reviewerEnabled !== false && meta.approvalPolicy === "auto"
+          this.cfg.reviewerEnabled !== false && meta.approvalPolicy === "auto" && this.reviewClassEnabled("bash")
         ) {
           let command = "";
           let justification: string | undefined;
@@ -1863,39 +1922,48 @@ export class AgentEngine {
             // observability covers actual reviewer invocations, not every gate decision).
             outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
           } else {
-            // "error" (phase 5e T2): review() THREW (fail-closed) — distinct from a genuine
-            // "unsafe" verdict for tool_review observability, though both escalate identically.
-            let v: { verdict: "safe" | "unsafe" | "error"; reason: string };
-            try {
-              v = await this.cfg.reviewer.review({ command, justification }, signal);
-            } catch {
-              v = { verdict: "error", reason: "reviewer unavailable — manual approval required" };
-            }
-            // Exactly one tool_review per ACTUAL review() invocation (this branch only), for every
-            // verdict — sanitized+capped at emission (reason<=300, summary<=160 per Global
-            // Constraints), never the raw client-observability-only fields eventToInput ignores.
-            this.emit(sessionId, {
-              type: "tool_review", sessionId, threadId, toolName: call.name, verdict: v.verdict,
-              reason: sanitizeReviewText(v.reason, 300),
-              summary: sanitizeReviewText(`${call.name} ${command}`, 160),
-            });
-            if (v.verdict !== "safe") {
-              outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
-                timeoutMs: Number(process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS ?? 60_000),
-                // Plain call summary (approvalCardSummary, same as every other card) — the old
-                // smashed-in "⚠ safety reviewer: ${reason} — " prefix is dropped; `reviewerReason`
-                // below carries the reason for clients to render distinctly (framing is a client
-                // concern, not baked into the wire string).
-                summary: approvalCardSummary(call),
-                reviewerReason: sanitizeReviewText(v.reason, 300),
-                // Byte-identical to pre-T2 (the one deliberate reviewer->model channel) — uses the
-                // RAW v.reason, not the sanitized/capped copy above, so this text never changes.
-                denialMessage: `blocked by the safety reviewer: ${v.reason}. No approval within 60s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.`,
-              }, loaded, undefined, pins, rootsOverride, visionCapable);
-            } else {
-              outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
-            }
+            outcome = await this.reviewAndDispatch(
+              { class: "bash", command, justification }, `${call.name} ${command}`,
+              call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable,
+            );
           }
+        } else if (
+          decision === "allow" && (call.name === "write" || call.name === "edit") && this.cfg.reviewer &&
+          this.cfg.reviewerEnabled !== false && meta.approvalPolicy === "auto" && this.reviewClassEnabled("fs")
+        ) {
+          // fs coverage (5e T3): review only an UNUSUAL write/edit target (outside the primary cwd
+          // subtree, or a dotfile/dot-dir segment inside it) — a plain in-cwd write falls straight
+          // to executeCall below, unreviewed, matching today's behavior exactly.
+          let path = "";
+          try {
+            const a = JSON.parse(call.argsJson || "{}") as { path?: unknown };
+            path = typeof a.path === "string" ? a.path : "";
+          } catch { /* malformed argsJson → executeCall's own zod validation rejects it below */ }
+          // Same roots/tmpDir executeCall itself will resolve against (rootsOverride ?? live
+          // session roots) — the review must see EXACTLY the fence executeCall enforces.
+          const fsRoots = rootsOverride ?? this.cfg.dirs.roots(sessionId);
+          const fsTmpDir = sessionTmpDir(sessionId);
+          const resolved = path ? resolveFsReviewTarget(path, fsRoots, fsTmpDir) : null;
+          if (resolved && fsWriteIsUnusual(resolved, fsRoots[0]!)) {
+            const precis = fsWritePrecis(call, resolved);
+            outcome = await this.reviewAndDispatch(
+              { class: "fs", precis }, precis,
+              call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable,
+            );
+          } else {
+            outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
+          }
+        } else if (
+          decision === "allow" && isExternalToolName(call.name) && this.cfg.reviewer &&
+          this.cfg.reviewerEnabled !== false && meta.approvalPolicy === "auto" && this.reviewClassEnabled("external")
+        ) {
+          // external coverage (5e T3): ALWAYS reviewed under auto when the class is enabled — no
+          // "looks safe" bypass exists for third-party code Norma can't inspect (unlike bash).
+          const precis = externalPrecis(call);
+          outcome = await this.reviewAndDispatch(
+            { class: "external", precis }, precis,
+            call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable,
+          );
         } else {
           outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
         }
@@ -2161,6 +2229,68 @@ export class AgentEngine {
     this.cfg.bgAgents!.complete(entry.agentId, { ok: !outcome.isError, result: outcome.output },
       { notified: true, timedOut: !result.ok && result.timedOut });
     return outcome;
+  }
+
+  /** phase 5e T3: class-off flag — T4 threads settings.reviewerClasses into cfg; until then a
+   *  caller sets cfg.reviewerClasses directly (see its own doc comment). Absent object OR absent
+   *  per-class key → enabled; only an EXPLICIT `false` disables that class. */
+  private reviewClassEnabled(cls: "bash" | "fs" | "external"): boolean {
+    return this.cfg.reviewerClasses?.[cls] !== false;
+  }
+
+  /** phase 5e T3: the machinery every review class shares (T2's original bash-only flow,
+   *  generalized) — call reviewer.review(), emit EXACTLY ONE tool_review (safe/unsafe/error), and
+   *  on any non-safe verdict escalate via requestApproval; on safe, run the call normally. This is
+   *  the ONE place that verdict/emission/escalation happens for bash/fs/external alike, so a class
+   *  can never drift from another's handling of the same verdict. The only per-class variance left
+   *  here is denialMessage's justification-reconsideration sentence — BASH ONLY, because only
+   *  bash's tool schema offers a `justification` param for the reviewer to reconsider on retry;
+   *  fs/external get the same "blocked by the safety reviewer: <reason>" + timeout sentence with
+   *  that clause dropped. */
+  private async reviewAndDispatch(
+    reviewInput: ReviewInput,
+    toolSummary: string,
+    call: { callId: string; name: string; argsJson: string },
+    cwd: string,
+    sessionId: string,
+    threadId: string,
+    signal: AbortSignal,
+    loaded: Set<string>,
+    pins: Set<string>,
+    rootsOverride: string[] | undefined,
+    visionCapable: boolean | undefined,
+  ): Promise<{ output: string; isError: boolean; deniedByHuman?: boolean }> {
+    // "error" (phase 5e T2): review() THREW (fail-closed) — distinct from a genuine "unsafe"
+    // verdict for tool_review observability, though both escalate identically.
+    let v: { verdict: "safe" | "unsafe" | "error"; reason: string };
+    try {
+      v = await this.cfg.reviewer!.review(reviewInput, signal);
+    } catch {
+      v = { verdict: "error", reason: "reviewer unavailable — manual approval required" };
+    }
+    // Exactly one tool_review per ACTUAL review() invocation, for every verdict — sanitized+capped
+    // at emission (reason<=300, summary<=160), never the raw client-observability-only fields
+    // eventToInput ignores.
+    this.emit(sessionId, {
+      type: "tool_review", sessionId, threadId, toolName: call.name, verdict: v.verdict,
+      reason: sanitizeReviewText(v.reason, 300),
+      summary: sanitizeReviewText(toolSummary, 160),
+    });
+    if (v.verdict === "safe") {
+      return await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
+    }
+    const denialMessage =
+      reviewInput.class === "fs" || reviewInput.class === "external"
+        ? `blocked by the safety reviewer: ${v.reason}. No approval within 60s.`
+        : `blocked by the safety reviewer: ${v.reason}. No approval within 60s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.`;
+    return await this.requestApproval(call, cwd, sessionId, threadId, signal, {
+      timeoutMs: Number(process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS ?? 60_000),
+      // Plain call summary (approvalCardSummary, same as every other card) — reviewerReason below
+      // carries the reason for clients to render distinctly.
+      summary: approvalCardSummary(call),
+      reviewerReason: sanitizeReviewText(v.reason, 300),
+      denialMessage,
+    }, loaded, undefined, pins, rootsOverride, visionCapable);
   }
 
   /** Shared approval-request flow for the `ask`-policy path, the reviewer's escalation path, and
