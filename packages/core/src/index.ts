@@ -50,7 +50,7 @@ export { SessionDirectories } from "./agent/dirs";
 export { sessionTmpDir } from "./agent/session-tmp";
 export { TrustStore } from "./agent/trust";
 export { ContextAssembler, BASE_PROMPT } from "./agent/context";
-export { SkillStore, type SkillMeta } from "./agent/skills";
+export { SkillStore, type SkillMeta, type SkillResult } from "./agent/skills";
 export {
   MemoryStore,
   type MemoryScope,

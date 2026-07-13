@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, realpathSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SkillStore } from "../../src/agent/skills";
@@ -25,12 +25,15 @@ describe("SkillStore", () => {
     writeSkill(join(cwd, ".norma", "skills"), "proj", "proj-skill", "Project thing", "PROJECT_BODY");
     const s = new SkillStore({ normaHome: home, trust });
 
-    const untrusted = s.list({ cwd });
+    // Filtered to source !== "builtin" throughout: the shipped writing-skills builtin is always
+    // present regardless of home/cwd fixtures (its root is resolved relative to the module, not
+    // normaHome) — this test is about project/user/self precedence, not the builtin set.
+    const untrusted = s.list({ cwd }).filter((m) => m.source !== "builtin");
     expect(untrusted.map((m) => m.name).sort()).toEqual(["greet", "note"]); // no project skill
     expect(s.load("proj-skill", { cwd })).toBeNull();                       // untrusted → not loadable
 
     trust.trust(cwd);
-    const trusted = s.list({ cwd });
+    const trusted = s.list({ cwd }).filter((m) => m.source !== "builtin");
     expect(trusted.map((m) => m.name).sort()).toEqual(["greet", "note", "proj-skill"]);
     expect(s.load("proj-skill", { cwd })!.body).toContain("PROJECT_BODY");
     expect(trusted.find((m) => m.name === "proj-skill")!.source).toBe("project");
@@ -77,14 +80,15 @@ describe("SkillStore", () => {
     writeSkill(join(home, "skills"), "ok", "ok", "fine", "OK_BODY");
     const s = new SkillStore({ normaHome: home, trust });
     expect(() => s.list({ cwd: null })).not.toThrow();
-    expect(s.list({ cwd: null }).map((m) => m.name)).toEqual(["ok"]); // only the valid one
+    // Filtered to source !== "builtin": see comment above on the first test in this file.
+    expect(s.list({ cwd: null }).filter((m) => m.source !== "builtin").map((m) => m.name)).toEqual(["ok"]); // only the valid one
     expect(s.load("noname", { cwd: null })).toBeNull();
   });
 
-  test("empty / missing dirs → empty list, no throw", () => {
+  test("empty / missing dirs → empty list (excluding the always-present builtin), no throw", () => {
     const { home, trust } = setup();
     const s = new SkillStore({ normaHome: home, trust });
-    expect(s.list({ cwd: null })).toEqual([]);
+    expect(s.list({ cwd: null }).filter((m) => m.source !== "builtin")).toEqual([]);
     expect(s.load("nope", { cwd: null })).toBeNull();
   });
 
@@ -168,5 +172,116 @@ describe("SkillStore", () => {
     const all = store.list({ cwd: null });
     expect(all.find((s) => s.name === "cc-plug:greet")?.claudeFormat).toBe(true);
     expect(all.find((s) => s.name === "native-plug:greet")?.claudeFormat).toBeUndefined();
+  });
+
+  describe("writeSelf / deleteSelf", () => {
+    test("writeSelf → list shows source self + author stamped in frontmatter", async () => {
+      const { home, trust } = setup();
+      const s = new SkillStore({ normaHome: home, trust });
+      const res = await s.writeSelf({ name: "my-skill", description: "Do a thing", body: "Step one. Step two." });
+      expect(res.ok).toBe(true);
+
+      const m = s.list({ cwd: null }).find((x) => x.name === "my-skill");
+      expect(m?.source).toBe("self");
+      expect(m?.description).toBe("Do a thing");
+      expect(s.load("my-skill", { cwd: null })!.body).toContain("Step one. Step two.");
+
+      const raw = readFileSync(join(home, "skills", "self", "my-skill", "SKILL.md"), "utf8");
+      expect(raw).toContain("author: norma");
+    });
+
+    test("overwrite updates body/description in place (overwrite-is-edit)", async () => {
+      const { home, trust } = setup();
+      const s = new SkillStore({ normaHome: home, trust });
+      await s.writeSelf({ name: "my-skill", description: "v1 desc", body: "V1_BODY" });
+      const res = await s.writeSelf({ name: "my-skill", description: "v2 desc", body: "V2_BODY" });
+      expect(res.ok).toBe(true);
+
+      const m = s.list({ cwd: null }).find((x) => x.name === "my-skill");
+      expect(m?.description).toBe("v2 desc");
+      const body = s.load("my-skill", { cwd: null })!.body;
+      expect(body).toContain("V2_BODY");
+      expect(body).not.toContain("V1_BODY");
+    });
+
+    test("description newlines stripped in frontmatter (mirrors memory.ts)", async () => {
+      const { home, trust } = setup();
+      const s = new SkillStore({ normaHome: home, trust });
+      await s.writeSelf({ name: "my-skill", description: "Line one\nLine two", body: "b" });
+      const m = s.list({ cwd: null }).find((x) => x.name === "my-skill");
+      expect(m?.description).not.toContain("\n");
+    });
+
+    test("deleteSelf removes the skill; list drops it and load returns null", async () => {
+      const { home, trust } = setup();
+      const s = new SkillStore({ normaHome: home, trust });
+      await s.writeSelf({ name: "my-skill", description: "d", body: "b" });
+      expect(s.list({ cwd: null }).map((m) => m.name)).toContain("my-skill");
+
+      const res = await s.deleteSelf("my-skill");
+      expect(res.ok).toBe(true);
+      expect(s.list({ cwd: null }).map((m) => m.name)).not.toContain("my-skill");
+      expect(s.load("my-skill", { cwd: null })).toBeNull();
+    });
+
+    test("deleteSelf on a name that was never written → ok:false kind:not_found", async () => {
+      const { home, trust } = setup();
+      const s = new SkillStore({ normaHome: home, trust });
+      const res = await s.deleteSelf("never-existed");
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.kind).toBe("not_found");
+    });
+
+    test("slug jail: traversal / uppercase / 65-char names → ok:false kind:invalid, fs untouched", async () => {
+      const { home, trust } = setup();
+      const s = new SkillStore({ normaHome: home, trust });
+      for (const bad of ["../evil", "Uppercase", "a".repeat(65), "with/slash", "with.dot", ""]) {
+        const res = await s.writeSelf({ name: bad, description: "d", body: "b" });
+        expect(res.ok).toBe(false);
+        if (!res.ok) expect(res.kind).toBe("invalid");
+
+        const del = await s.deleteSelf(bad);
+        expect(del.ok).toBe(false);
+        if (!del.ok) expect(del.kind).toBe("invalid");
+      }
+      expect(existsSync(join(home, "skills", "self"))).toBe(false); // no fs side effect from any rejected name
+    });
+
+    test("author-spoof attempt via body frontmatter injection does NOT override the store's stamp", async () => {
+      const { home, trust } = setup();
+      const s = new SkillStore({ normaHome: home, trust });
+      const spoofBody = "---\nname: evil\nauthor: hacker\ndescription: fake\n---\nPWNED_BODY";
+      const res = await s.writeSelf({ name: "my-skill", description: "real desc", body: spoofBody });
+      expect(res.ok).toBe(true);
+
+      const raw = readFileSync(join(home, "skills", "self", "my-skill", "SKILL.md"), "utf8");
+      expect(raw).toContain("author: norma"); // the store's own stamp, first in the file
+
+      const listed = s.list({ cwd: null });
+      expect(listed.find((m) => m.name === "my-skill")?.description).toBe("real desc");
+      expect(listed.find((m) => m.name === "evil")).toBeUndefined(); // spoofed name never surfaces
+      expect(s.load("my-skill", { cwd: null })!.body).toContain("PWNED_BODY"); // body is body, verbatim
+    });
+  });
+
+  describe("builtin source", () => {
+    test("the shipped writing-skills meta-skill is discovered with source builtin", () => {
+      const { home, trust } = setup();
+      const s = new SkillStore({ normaHome: home, trust });
+      const m = s.list({ cwd: null }).find((x) => x.name === "writing-skills");
+      expect(m?.source).toBe("builtin");
+      expect(s.load("writing-skills", { cwd: null })!.body.length).toBeGreaterThan(0);
+    });
+
+    test("a user-root skill of the same name SHADOWS the builtin in list precedence", () => {
+      const { home, trust } = setup();
+      writeSkill(join(home, "skills"), "writing-skills", "writing-skills", "user override", "USER_OVERRIDE_BODY");
+      const s = new SkillStore({ normaHome: home, trust });
+
+      const matches = s.list({ cwd: null }).filter((m) => m.name === "writing-skills");
+      expect(matches.length).toBe(1);
+      expect(matches[0]!.source).toBe("user");
+      expect(s.load("writing-skills", { cwd: null })!.body).toContain("USER_OVERRIDE_BODY");
+    });
   });
 });

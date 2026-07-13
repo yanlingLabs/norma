@@ -872,12 +872,15 @@ describe("daemon IPC", () => {
     c.close();
   });
 
-  test("skills.list returns [] when no skills are installed", async () => {
+  test("skills.list returns only the shipped builtin when no user/project skills are installed", async () => {
     await boot(); // no provider → default temp home has no user/project skills
     const c = await TestClient.connect(daemon.socketPath);
     await c.hello(harnessToken, "no-skills");
     const { result } = await c.request(METHODS.skillsList, {});
-    expect(result).toEqual({ ok: true, skills: [] });
+    expect(result.ok).toBe(true);
+    // The writing-skills builtin (phase 5c) is always discovered, regardless of home — it ships
+    // in-repo and is resolved relative to the module, not normaHome.
+    expect(result.skills).toEqual([{ name: "writing-skills", description: expect.any(String), source: "builtin", path: expect.any(String) }]);
     c.close();
   });
 
@@ -893,8 +896,10 @@ describe("daemon IPC", () => {
     await c.hello(harnessToken, "skills-lister");
     const { result } = await c.request(METHODS.skillsList, {});
     expect(result.ok).toBe(true);
-    expect(result.skills).toHaveLength(1);
-    expect(result.skills[0]).toMatchObject({ name: "greet", description: "Say hi", source: "user" });
+    // greet (user) + the always-present writing-skills builtin.
+    expect(result.skills).toHaveLength(2);
+    expect(result.skills.find((s: { name: string }) => s.name === "greet")).toMatchObject({ name: "greet", description: "Say hi", source: "user" });
+    expect(result.skills.find((s: { name: string }) => s.name === "writing-skills")).toMatchObject({ source: "builtin" });
     c.close();
   });
 
