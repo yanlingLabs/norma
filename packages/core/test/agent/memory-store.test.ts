@@ -162,7 +162,36 @@ describe("MemoryStore", () => {
     const { store } = setup(neverTrusted);
     const cwd = realDir();
     const res = store.list("project", cwd);
-    expect(res).toEqual({ ok: false, error: "project memory requires a trusted directory" });
+    expect(res).toEqual({ ok: false, error: "project memory requires a trusted directory", kind: "trust" });
+  });
+
+  // T3 review Finding 2: failures carry a structural `kind` so the RPC boundary maps them to
+  // JSON-RPC codes without string-matching error text (which embeds caller input verbatim —
+  // a name like "why is this not found" must classify as invalid, not not_found).
+  test("failure kinds: invalid name → 'invalid'; read/delete miss → 'not_found'; trust gate → 'trust'; fs failure → absent", async () => {
+    const { store } = setup(neverTrusted);
+
+    const invalid = store.read("user", "why is this not found");
+    expect(invalid.ok).toBe(false);
+    if (!invalid.ok) expect(invalid.kind).toBe("invalid");
+    const reserved = await store.write("user", fact({ name: "memory" }), { source: "tool" });
+    if (!reserved.ok) expect(reserved.kind).toBe("invalid");
+
+    const miss = store.read("user", "ghost");
+    if (!miss.ok) expect(miss.kind).toBe("not_found");
+    const delMiss = await store.delete("user", "ghost", { source: "tool" });
+    if (!delMiss.ok) expect(delMiss.kind).toBe("not_found");
+
+    const trust = await store.write("project", fact(), { source: "tool" }, realDir());
+    if (!trust.ok) expect(trust.kind).toBe("trust");
+
+    // fs failure (scope root collides with a plain file): wrapped error, deliberately unclassified
+    const home = realDir();
+    writeFileSync(join(home, "memory"), "not a directory");
+    const fsStore = new MemoryStore({ normaHome: home, trust: alwaysTrusted });
+    const fsFail = await fsStore.write("user", fact({ name: "a" }), { source: "tool" });
+    expect(fsFail.ok).toBe(false);
+    if (!fsFail.ok) expect(fsFail.kind).toBeUndefined();
   });
 
   test("project scope: missing cwd → ok:false", () => {

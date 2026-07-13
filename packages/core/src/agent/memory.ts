@@ -15,7 +15,12 @@ export interface MemoryAuditLine {
   name: string;
   description?: string;
 }
-export type MemoryResult<T = void> = { ok: true; value: T } | { ok: false; error: string };
+/** Structural failure class, so boundaries that must map errors to codes (the memory.* RPCs —
+ *  ipc/server.ts's `memoryErrorCode`) never string-match `error` text, which embeds caller input
+ *  verbatim (a name like "why is this not found" is an INVALID name, not a missing fact). Absent
+ *  on a wrapped fs failure (doWrite/doDelete's catch) — deliberately unclassified. */
+export type MemoryErrorKind = "not_found" | "invalid" | "trust";
+export type MemoryResult<T = void> = { ok: true; value: T } | { ok: false; error: string; kind?: MemoryErrorKind };
 
 const PROJECT_TRUST_ERROR = "project memory requires a trusted directory";
 
@@ -123,7 +128,7 @@ export class MemoryStore {
   /** user → `~/.norma/memory`; project → `<cwd>/.norma/memory`, gated on a trusted `cwd`. */
   private resolveRoot(scope: MemoryScope, cwd?: string): MemoryResult<string> {
     if (scope === "user") return { ok: true, value: join(this.normaHome, "memory") };
-    if (!cwd || !this.trust.isTrusted(cwd)) return { ok: false, error: PROJECT_TRUST_ERROR };
+    if (!cwd || !this.trust.isTrusted(cwd)) return { ok: false, error: PROJECT_TRUST_ERROR, kind: "trust" };
     return { ok: true, value: join(cwd, ".norma", "memory") };
   }
 
@@ -150,11 +155,11 @@ export class MemoryStore {
 
   read(scope: MemoryScope, name: string, cwd?: string): MemoryResult<MemoryFact> {
     const invalid = nameError(name);
-    if (invalid) return { ok: false, error: invalid };
+    if (invalid) return { ok: false, error: invalid, kind: "invalid" };
     const root = this.resolveRoot(scope, cwd);
     if (!root.ok) return root;
     const parsed = parseFactFile(join(root.value, `${name}.md`));
-    if (!parsed) return { ok: false, error: `memory fact "${name}" not found or corrupt` };
+    if (!parsed) return { ok: false, error: `memory fact "${name}" not found or corrupt`, kind: "not_found" };
     return { ok: true, value: parsed };
   }
 
@@ -176,7 +181,7 @@ export class MemoryStore {
 
   private doWrite(scope: MemoryScope, fact: MemoryFact, meta: { sessionId?: string; source: "tool" | "rpc" }, cwd?: string): MemoryResult {
     const invalid = nameError(fact.name);
-    if (invalid) return { ok: false, error: invalid };
+    if (invalid) return { ok: false, error: invalid, kind: "invalid" };
     const root = this.resolveRoot(scope, cwd);
     if (!root.ok) return root;
 
@@ -204,12 +209,12 @@ export class MemoryStore {
 
   private doDelete(scope: MemoryScope, name: string, meta: { sessionId?: string; source: "tool" | "rpc" }, cwd?: string): MemoryResult {
     const invalid = nameError(name);
-    if (invalid) return { ok: false, error: invalid };
+    if (invalid) return { ok: false, error: invalid, kind: "invalid" };
     const root = this.resolveRoot(scope, cwd);
     if (!root.ok) return root;
 
     const path = join(root.value, `${name}.md`);
-    if (!existsSync(path)) return { ok: false, error: `memory fact "${name}" not found` };
+    if (!existsSync(path)) return { ok: false, error: `memory fact "${name}" not found`, kind: "not_found" };
     try {
       unlinkSync(path);
 

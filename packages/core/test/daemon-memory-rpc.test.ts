@@ -189,6 +189,22 @@ describe("memory.* RPCs (Phase 5b Task 3)", () => {
     c.close();
   });
 
+  // T3 review Finding 2 regression: an INVALID name whose text happens to contain "not found"
+  // must classify by the store's structural error `kind` ("invalid" — spaces fail the slug jail),
+  // never by substring-matching the error message (which embeds the raw name verbatim).
+  test("invalid name containing 'not found' -> INVALID_PARAMS, never NOT_FOUND", async () => {
+    await boot();
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "memory-tester");
+
+    const read = await c.request(METHODS.memoryRead, { scope: "user", name: "why is this not found" });
+    expect(read.error?.code).toBe(ERR.INVALID_PARAMS);
+
+    const del = await c.request(METHODS.memoryDelete, { scope: "user", name: "why is this not found" });
+    expect(del.error?.code).toBe(ERR.INVALID_PARAMS);
+    c.close();
+  });
+
   test("memory.delete on an unknown name -> NOT_FOUND", async () => {
     await boot();
     const c = await TestClient.connect(daemon.socketPath);
@@ -220,6 +236,40 @@ describe("memory.* RPCs (Phase 5b Task 3)", () => {
     });
     expect(invalidSlug.error?.code).toBe(ERR.INVALID_PARAMS);
     c.close();
+  });
+
+  // T3 review Finding 1: the no-MemoryStore split — collection reads (list/audit) degrade to
+  // empty results (routines.list precedent); single-fact reads and mutations fail hard with a
+  // typed INTERNAL (a silently no-oping write/delete would mask a wiring bug). Reached via a bare
+  // startIpcServer with no `memory` wired — the daemon fixture above always wires one.
+  test("no MemoryStore wired: list/audit degrade to empty; read/write/delete are typed INTERNAL", async () => {
+    const home = mkdtempSync(join(tmpdir(), "norma-memory-no-store-"));
+    const store = new SessionStore(home);
+    const socketPath = join(home, "core.sock");
+    const authority = new TokenAuthority(new FileSecretStore(join(home, "secrets.json")));
+    const tokens = await authority.ensureTokens();
+    const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store });
+
+    const c = await TestClient.connect(socketPath);
+    await c.hello(tokens.harness, "memory-tester");
+
+    const listed = await c.request(METHODS.memoryList, { scope: "user" });
+    expect(listed.error).toBeUndefined();
+    expect(listed.result).toEqual({ facts: [] });
+
+    const audit = await c.request(METHODS.memoryAudit, {});
+    expect(audit.error).toBeUndefined();
+    expect(audit.result).toEqual({ lines: [] });
+
+    for (const [method, params] of [
+      [METHODS.memoryRead, { scope: "user", name: "x" }],
+      [METHODS.memoryWrite, { scope: "user", name: "x", description: "d", body: "b" }],
+      [METHODS.memoryDelete, { scope: "user", name: "x" }],
+    ] as const) {
+      const res = await c.request(method, params);
+      expect(res.error?.code).toBe(ERR.INTERNAL);
+    }
+    c.close(); server.stop(); store.close();
   });
 
   // A bare IPC server (own SessionStore + TokenAuthority, no memoryStore wired) mirrors
