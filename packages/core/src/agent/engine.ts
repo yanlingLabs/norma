@@ -1292,8 +1292,15 @@ export class AgentEngine {
           // phase 5a Task 1: agent_list/agent_output are excluded from EVERY child for the SAME
           // depth-0-only reason — a child must not enumerate or read its siblings'/parent's OWN
           // background agents, only the main thread orchestrates.
+          // phase 5c Task 2: skill_write is excluded from EVERY child UNCONDITIONALLY — consent
+          // laundering: skill_write's whole gate posture is ALWAYS_ASK (a card the human sees on
+          // every call, gate.ts), but a child's approval requests surface through the PARENT's
+          // queue, where a background child pushing standing-instruction cards is exactly the
+          // durable-prompt-injection path the card exists to guard — the human would be approving
+          // a persistent skill mid-stream of some other task's card traffic. Only the main thread,
+          // where the card appears in direct response to the conversation, may author skills.
           const childDepth = opts.depth + 1;
-          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode", "send_message", "task_stop", "agent_list", "agent_output"]);
+          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode", "send_message", "task_stop", "agent_list", "agent_output", "skill_write"]);
           if (childDepth >= maxDepth) childExcludeTools.add("spawn_agent");
           // 4h-ii-b Task 1: instructionsFull is computed ONCE here — hoisted out of the bg and
           // sync closures below, which used to each build their own copy independently — so it

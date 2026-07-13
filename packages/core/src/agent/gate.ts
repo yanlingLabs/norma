@@ -87,6 +87,19 @@ const SELF_GATING = new Set(["request_directory"]);
 // allow under `auto`), because a live network call is still an external side effect worth a human's
 // visibility. See evaluate() below for exactly where each half of this is implemented.
 const NETWORK = new Set(["web_fetch", "web_search"]);
+// skill_write (phase 5c Task 2) gets a NEW class, strictly stricter than MUTATING: "ask" under
+// BOTH `ask` AND `auto` (a card on EVERY call — no policy setting silences it), "deny" under
+// `plan`. THE SKETCH PIN (phase-5-intelligence-design-sketch.md §5c): "a skill is standing
+// instructions, i.e. durable prompt injection into future sessions" — higher blast radius than a
+// file write, because a landed skill keeps steering sessions long after the one that wrote it.
+// This completes the memory story told above MUTATING: memory_write's USER pin deliberately chose
+// audit-instead-of-card (under `auto` a fact lands silently; the audit.jsonl line + dashboard
+// memory editor are the review surface) because a recalled FACT is data the model weighs — a
+// skill is INSTRUCTIONS the model follows, so the same silent-under-auto posture would let an
+// unattended session install standing directives into every future session. Checked BEFORE the
+// policy branches in evaluate(): membership overrides policy entirely, so a later accidental
+// reclassification (e.g. skill_write ALSO added to MUTATING) cannot widen it to allow-under-auto.
+const ALWAYS_ASK = new Set(["skill_write"]);
 
 /**
  * v1 policy matrix (spec §4.10 arrives fully in 1b-ii with the AI reviewer):
@@ -95,6 +108,9 @@ const NETWORK = new Set(["web_fetch", "web_search"]);
  */
 export class PermissionGate {
   evaluate(toolName: string, policy: SessionApprovalPolicy): GateDecision {
+    // ALWAYS_ASK precedes every policy branch (see the set's doc comment): plan → deny (a skill
+    // write is a mutation; plan mode mutates nothing), ask/auto → ask (the card is unconditional).
+    if (ALWAYS_ASK.has(toolName)) return policy === "plan" ? "deny" : "ask";
     // Plan mode: only reads/self-gating tools (incl. exit_plan_mode, ask_user, task_*) are allowed;
     // everything else (writes/edit/bash/mcp__/plugin__/unclassified) is denied outright — no prompt,
     // since the whole point of plan mode is that nothing mutates until the plan is approved.

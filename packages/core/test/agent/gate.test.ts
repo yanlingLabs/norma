@@ -175,4 +175,33 @@ describe("PermissionGate v1", () => {
     expect(g.evaluate("web_search", "auto")).toBe("allow");
     expect(g.evaluate("web_search", "ask")).toBe("ask");
   });
+
+  // Phase 5c Task 2 (THE SKETCH PIN, phase-5-intelligence-design-sketch.md §5c): skill_write is
+  // the first member of a NEW gate class, ALWAYS_ASK — "a skill is standing instructions, i.e.
+  // durable prompt injection into future sessions" — so it is approval-carded under BOTH `ask`
+  // AND `auto` (the class-defining assertions: no policy setting silences the card), and denied
+  // under `plan` like any mutation. CONTRAST memory_write above: that one deliberately rides
+  // plain MUTATING (allow-silently-under-auto, audit-instead-of-card); skill_write must NOT.
+  test("skill_write is ALWAYS_ASK: ask under ask-policy AND under auto-policy, deny under plan", () => {
+    expect(gate.evaluate("skill_write", "ask")).toBe("ask");
+    expect(gate.evaluate("skill_write", "auto")).toBe("ask");
+    expect(gate.evaluate("skill_write", "plan")).toBe("deny");
+  });
+
+  // Guard: skill_write must be ALWAYS_ASK's ONLY member. "ask under auto" is the class's unique
+  // signature — every tool previously classified in any other class must still resolve to
+  // "allow" under `auto`, so a tool silently moved into (or added to) ALWAYS_ASK fails HERE,
+  // not in some downstream E2E. The list enumerates every member of READ_ONLY, MUTATING,
+  // SELF_GATING, and NETWORK as of 5c T2, plus the external (mcp__/plugin__) shape.
+  test("guard: no existing tool joined ALWAYS_ASK — every previously classified tool still allows under auto", () => {
+    const classified = [
+      // READ_ONLY
+      "read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output", "memory_read",
+      // MUTATING
+      "write", "edit", "bash", "bash_kill", "notebook_edit", "enter_worktree", "exit_worktree", "computer", "schedule", "memory_write", "memory_delete",
+      // SELF_GATING + NETWORK + externals
+      "request_directory", "web_fetch", "web_search", "mcp__x__y", "plugin__x__y",
+    ];
+    for (const t of classified) expect(gate.evaluate(t, "auto")).toBe("allow");
+  });
 });
