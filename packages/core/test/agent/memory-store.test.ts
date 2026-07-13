@@ -48,6 +48,41 @@ describe("MemoryStore", () => {
     if (read.ok) expect(read.value.description).not.toContain("\n");
   });
 
+  test("whitespace-only description → ok:false kind:invalid, fs untouched; valid rewrite of same name then succeeds", async () => {
+    // Wire/tool schemas validate the RAW description with min(1), so " " and "\n" pass them —
+    // but normalization collapses both to "", which parseFactFile treats as corrupt: the write
+    // would report ok while read() fails and MEMORY.md carries a blank-description line. The
+    // store must fail fast on the NORMALIZED value, before any fs op.
+    for (const ws of [" ", "\n", " \n "]) {
+      const { home, store } = setup();
+      const res = await store.write("user", fact({ name: "x", description: ws }), { source: "tool" });
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.kind).toBe("invalid");
+        expect(res.error).toContain("non-empty description");
+      }
+      expect(existsSync(join(home, "memory"))).toBe(false); // no fact file, no index, no audit — nothing created
+
+      const valid = await store.write("user", fact({ name: "x", description: "real description" }), { source: "tool" });
+      expect(valid.ok).toBe(true);
+      const read = store.read("user", "x");
+      expect(read.ok).toBe(true);
+      if (read.ok) expect(read.value.description).toBe("real description");
+    }
+  });
+
+  test("whitespace-only description on OVERWRITE leaves the existing fact + index unchanged", async () => {
+    const { home, store } = setup();
+    await store.write("user", fact({ name: "x", description: "original" }), { source: "tool" });
+    const factBefore = readFileSync(join(home, "memory", "x.md"), "utf8");
+    const indexBefore = readFileSync(join(home, "memory", "MEMORY.md"), "utf8");
+
+    const res = await store.write("user", fact({ name: "x", description: "  " }), { source: "tool" });
+    expect(res.ok).toBe(false);
+    expect(readFileSync(join(home, "memory", "x.md"), "utf8")).toBe(factBefore);
+    expect(readFileSync(join(home, "memory", "MEMORY.md"), "utf8")).toBe(indexBefore);
+  });
+
   test("overwrite keeps index position, updates description", async () => {
     const { home, store } = setup();
     await store.write("user", fact({ name: "a", description: "first" }), { source: "tool" });
@@ -298,7 +333,7 @@ describe("MemoryStore", () => {
     expect(tail[3]!.name).toBe("c"); // newest LAST — the manually-appended line comes after the corrupt one in file order
   });
 
-  test("auditTail(limit) returns the last N entries, newest last", async () => {
+  test("auditTail(limit): 2 → last 2 newest-last; 0 → [] (slice(-0) trap); undefined → all", async () => {
     const { store } = setup();
     for (let i = 0; i < 5; i++) {
       await store.write("user", fact({ name: `f${i}` }), { source: "tool" });
@@ -307,6 +342,12 @@ describe("MemoryStore", () => {
     expect(tail).toHaveLength(2);
     expect(tail[0]!.name).toBe("f3");
     expect(tail[1]!.name).toBe("f4");
+
+    // limit 0 is a valid nonnegative int on the wire (memory.audit {limit:0}) — must mean
+    // "none", not the JS slice(-0)===slice(0) full-array trap.
+    expect(store.auditTail(0)).toEqual([]);
+    expect(store.auditTail(undefined)).toHaveLength(5);
+    expect(store.auditTail()).toHaveLength(5);
   });
 
   test("audit file never contains fact bodies", async () => {

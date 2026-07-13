@@ -186,6 +186,12 @@ export class MemoryStore {
     if (!root.ok) return root;
 
     const description = fact.description.split(/\r?\n/).join(" ").trim();
+    // Checked on the NORMALIZED value, before any fs op: wire/tool schemas validate the RAW
+    // description with min(1), so a whitespace-only value (" ", "\n") passes them but collapses
+    // to "" here — and an empty description is exactly what parseFactFile treats as corrupt, so
+    // accepting it would write a fact that read() can't read, list() drops, and MEMORY.md
+    // renders as a blank `- [x](x.md) — ` line in every future session's ambient context.
+    if (!description) return { ok: false, error: `memory fact "${fact.name}" needs a non-empty description`, kind: "invalid" };
     // Wrapped: a genuine fs error (permission denied, disk full, root path colliding with a
     // plain file, ...) must become a typed ok:false — "never throws" is the store's contract,
     // and an uncaught throw would surface to the caller as a rejected write() promise.
@@ -267,6 +273,8 @@ export class MemoryStore {
         }
       } catch { /* corrupt line — skip */ }
     }
-    return limit !== undefined ? out.slice(-limit) : out;
+    // limit 0 must mean "none": slice(-0) === slice(0) returns the FULL array in JS, and 0 is a
+    // valid nonnegative limit on the wire (memory.audit {limit:0}).
+    return limit === undefined ? out : limit <= 0 ? [] : out.slice(-limit);
   }
 }
