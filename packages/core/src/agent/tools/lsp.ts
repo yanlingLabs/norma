@@ -175,7 +175,8 @@ export function registerLspTools(r: ToolRegistry, deps: LspToolDeps): void {
     async run({ path, line, character }, { sessionId }) {
       const { abs, cwd, language, readRoots } = resolvePathAndLanguage(sessionId, path);
       const client = await lsp.clientFor(cwd, language);
-      const locs = await client.definition(toFileUri(abs), line - 1, character - 1); // 1-based tool args -> 0-based client
+      const text = readFileSync(abs, "utf8"); // the client opens the doc before querying — servers only answer for open docs
+      const locs = await client.definition(toFileUri(abs), text, line - 1, character - 1); // 1-based tool args -> 0-based client
       return formatDefinition(locs, readRoots);
     },
   });
@@ -190,7 +191,8 @@ export function registerLspTools(r: ToolRegistry, deps: LspToolDeps): void {
     async run({ path, line, character }, { sessionId }) {
       const { abs, cwd, language } = resolvePathAndLanguage(sessionId, path);
       const client = await lsp.clientFor(cwd, language);
-      const locs = await client.references(toFileUri(abs), line - 1, character - 1);
+      const text = readFileSync(abs, "utf8");
+      const locs = await client.references(toFileUri(abs), text, line - 1, character - 1);
       return formatReferences(locs);
     },
   });
