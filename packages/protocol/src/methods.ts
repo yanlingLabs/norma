@@ -583,6 +583,68 @@ export const RoutinesUpdateResult = z.object({ routine: RoutineSchema });
 export const RoutinesDeleteParams = z.object({ id: z.string().min(1) });
 export const RoutinesDeleteResult = z.object({ ok: z.literal(true), removed: z.boolean() });
 
+// ---------------------------------------------------------------------------------------------
+// Memory (Phase 5b Task 3, design doc §4): the management surface over `MemoryStore` (core/src/
+// agent/memory.ts) — mirrors that store's `MemoryFactMeta`/`MemoryFact`/`MemoryAuditLine` shapes
+// field-for-field, same precedent as the routines block above. Unlike routines (no session
+// context to source a cwd from), the caller here IS a session-less dashboard/CLI connection, so
+// `cwd` is an explicit param on every scope-bearing verb — the store's own trust gate (project
+// scope requires a TrustStore-trusted cwd) does the enforcement, not this schema. No typed
+// error-code unions (unlike the plugin-lifecycle verbs): a store `ok:false` becomes a thrown
+// RpcFailure, same precedent as routines.create/update above.
+// ---------------------------------------------------------------------------------------------
+
+export const MemoryScopeSchema = z.enum(["user", "project"]);
+export const MemoryTypeSchema = z.enum(["user", "feedback", "project", "reference"]);
+
+/** Mirrors `MemoryFactMeta` (core/src/agent/memory.ts) field-for-field. */
+export const MemoryFactMetaSchema = z.object({
+  name: z.string(),
+  description: z.string(),
+  type: MemoryTypeSchema,
+});
+/** Mirrors `MemoryFact` — `MemoryFactMetaSchema` plus the full body. */
+export const MemoryFactSchema = MemoryFactMetaSchema.extend({ body: z.string() });
+
+/** Mirrors `MemoryAuditLine` — `sessionId`/`description` optional exactly as the store's
+ *  `appendAudit` omits them from the JSON line when absent (never serializes `null`). */
+export const MemoryAuditLineSchema = z.object({
+  ts: z.number().int().nonnegative(),
+  sessionId: z.string().optional(),
+  source: z.enum(["tool", "rpc"]),
+  scope: MemoryScopeSchema,
+  action: z.enum(["write", "delete"]),
+  name: z.string(),
+  description: z.string().optional(),
+});
+
+export const MemoryListParams = z.object({ scope: MemoryScopeSchema, cwd: AbsoluteDirPath.optional() });
+export const MemoryListResult = z.object({ facts: z.array(MemoryFactMetaSchema) });
+
+export const MemoryReadParams = z.object({ scope: MemoryScopeSchema, name: z.string().min(1), cwd: AbsoluteDirPath.optional() });
+export const MemoryReadResult = z.object({ fact: MemoryFactSchema });
+
+export const MemoryWriteParams = z.object({
+  scope: MemoryScopeSchema,
+  name: z.string().min(1),
+  description: z.string().min(1),
+  type: MemoryTypeSchema.default("user"),
+  body: z.string().min(1),
+  cwd: AbsoluteDirPath.optional(),
+});
+/** Nothing to round-trip on success — the wire result truly is empty (design doc §4's own
+ *  `{scope, name, ...} → {}` shape), unlike routines.delete's `{ok, removed}`: an unknown-name
+ *  delete/write failure is a store `ok:false` (thrown RpcFailure) here, never a soft boolean. */
+export const MemoryWriteResult = z.object({});
+
+export const MemoryDeleteParams = z.object({ scope: MemoryScopeSchema, name: z.string().min(1), cwd: AbsoluteDirPath.optional() });
+export const MemoryDeleteResult = z.object({});
+
+export const MemoryAuditParams = z.object({ limit: z.number().int().nonnegative().optional() });
+/** Newest FIRST (design doc §4) — the inverse of `MemoryStore.auditTail`'s own newest-LAST
+ *  contract; the handler reverses the store's slice before returning it. */
+export const MemoryAuditResult = z.object({ lines: z.array(MemoryAuditLineSchema) });
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -641,4 +703,9 @@ export const METHODS = {
   routinesList: "routines.list",
   routinesUpdate: "routines.update",
   routinesDelete: "routines.delete",
+  memoryList: "memory.list",
+  memoryRead: "memory.read",
+  memoryWrite: "memory.write",
+  memoryDelete: "memory.delete",
+  memoryAudit: "memory.audit",
 } as const;

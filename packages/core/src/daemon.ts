@@ -623,6 +623,10 @@ export async function startDaemon(opts: {
     // `if (agentProvider)` gate above) and the scheduler (constructed just above this call) both
     // share — one sqlite handle for the whole daemon.
     routines: routineStore,
+    // Phase 5b Task 3: same MemoryStore instance T2's memory_read/write/delete tools (inside the
+    // `if (agentProvider)` gate above) run against — one single-writer promise chain for the
+    // whole daemon (memory.ts's own §4.8 contract).
+    memory: memoryStore,
     ...opts.server,
   });
 

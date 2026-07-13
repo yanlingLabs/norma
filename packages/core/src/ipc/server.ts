@@ -17,11 +17,13 @@ import {
   ShortcutInvokeParams, TileActionParams,
   PluginsInstallParams, PluginEnableParams, PluginDisableParams, PluginRemoveParams, PluginSetConsentParams,
   RoutinesCreateParams, RoutinesListParams, RoutinesUpdateParams, RoutinesDeleteParams,
+  MemoryListParams, MemoryReadParams, MemoryWriteParams, MemoryDeleteParams, MemoryAuditParams,
   SYSTEM_SESSION_ID,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
 import type { RoutineStore } from "../routines/store";
+import type { MemoryStore } from "../agent/memory";
 import type { SessionStore } from "../sessions/store";
 import { SessionHub, type HubClient } from "../sessions/hub";
 import type { AgentEngine } from "../agent/engine";
@@ -130,6 +132,14 @@ export interface IpcServerOptions {
   // routines.list to an empty list and routines.create/update to a typed INTERNAL RpcFailure,
   // rather than throwing on construction.
   routines?: RoutineStore;
+  // Phase 5b Task 3 (design doc §4): the daemon-owned MemoryStore backing memory.* (list/read/
+  // write/delete/audit) — the SAME instance T2's memory_read/write/delete tools run against
+  // (daemon.ts hoists ONE MemoryStore for exactly this sharing; a second instance would split the
+  // single-writer promise chain §4.8 requires). Optional — same "typed no-op, never a crash"
+  // precedent as `routines` above: a server built without one (most existing tests) degrades
+  // memory.list/memory.audit to empty results and memory.read/write/delete to a typed INTERNAL
+  // RpcFailure, rather than throwing on construction.
+  memory?: MemoryStore;
   providerInfo?: { id: string; model: string } | null; // active LLM provider identity; daemon.status
   startedAt?: number;        // daemon process start time (Date.now()); daemon.status uptimeMs
   helloTimeoutMs?: number;   // default 5000
@@ -140,6 +150,17 @@ export interface IpcServerOptions {
 export interface IpcServer { stop(): void }
 
 class RpcFailure extends Error { constructor(public code: number, message: string) { super(message); } }
+
+/** Maps a `MemoryStore` `ok:false` result's error string to a JSON-RPC code, for the memory.*
+ *  handlers below. Only two buckets, same precedent as routines.create/update's INVALID_PARAMS/
+ *  NOT_FOUND split above: the store's "not found" messages (unknown/corrupt fact on read,
+ *  unknown fact on delete — memory.ts's `parseFactFile`/`doDelete`) are the ONLY case that means
+ *  "no such resource"; every other message (invalid/reserved name, untrusted project cwd, or a
+ *  genuine fs failure wrapped by `doWrite`/`doDelete`) is a caller-facing input problem from this
+ *  RPC boundary's point of view, so it maps to INVALID_PARAMS. */
+function memoryErrorCode(error: string): number {
+  return error.includes("not found") ? ERR.NOT_FOUND : ERR.INVALID_PARAMS;
+}
 
 // Phase 4b Task 2 (spec §3): the table-driven role→methods gate for plugin connections. A plugin
 // authenticates as a SPECIFIC installed plugin id (hello role "plugin") and may ONLY ever call
@@ -653,6 +674,54 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         const p = parseParams(RoutinesDeleteParams, params);
         const removed = opts.routines?.delete(p.id) ?? false;
         return { ok: true, removed };
+      }
+
+      // -----------------------------------------------------------------------------------------
+      // Memory (Phase 5b Task 3, design doc §4): the management surface over `MemoryStore` — the
+      // SAME instance T2's memory_read/write/delete tools run against (daemon.ts). Role-gated
+      // exactly like routines.* above (harness AND admin; a plugin-role connection never reaches
+      // this switch for any of these five). RPC-sourced mutations pass `source:"rpc"` and no
+      // `sessionId` (there is no session context on this connection) — mirrors the tools' own
+      // `source:"tool"` + real sessionId (agent/tools/memory.ts). A store `ok:false` becomes a
+      // thrown RpcFailure via `memoryErrorCode` above, never a typed result union.
+      // -----------------------------------------------------------------------------------------
+      case METHODS.memoryList: {
+        const p = parseParams(MemoryListParams, params);
+        if (!opts.memory) throw new RpcFailure(ERR.INTERNAL, "memory is not available on this server (no MemoryStore configured)");
+        const res = opts.memory.list(p.scope, p.cwd);
+        if (!res.ok) throw new RpcFailure(memoryErrorCode(res.error), res.error);
+        return { facts: res.value };
+      }
+      case METHODS.memoryRead: {
+        const p = parseParams(MemoryReadParams, params);
+        if (!opts.memory) throw new RpcFailure(ERR.INTERNAL, "memory is not available on this server (no MemoryStore configured)");
+        const res = opts.memory.read(p.scope, p.name, p.cwd);
+        if (!res.ok) throw new RpcFailure(memoryErrorCode(res.error), res.error);
+        return { fact: res.value };
+      }
+      case METHODS.memoryWrite: {
+        const p = parseParams(MemoryWriteParams, params);
+        if (!opts.memory) throw new RpcFailure(ERR.INTERNAL, "memory is not available on this server (no MemoryStore configured)");
+        const res = await opts.memory.write(
+          p.scope, { name: p.name, description: p.description, type: p.type, body: p.body }, { source: "rpc" }, p.cwd,
+        );
+        if (!res.ok) throw new RpcFailure(memoryErrorCode(res.error), res.error);
+        return {};
+      }
+      case METHODS.memoryDelete: {
+        const p = parseParams(MemoryDeleteParams, params);
+        if (!opts.memory) throw new RpcFailure(ERR.INTERNAL, "memory is not available on this server (no MemoryStore configured)");
+        const res = await opts.memory.delete(p.scope, p.name, { source: "rpc" }, p.cwd);
+        if (!res.ok) throw new RpcFailure(memoryErrorCode(res.error), res.error);
+        return {};
+      }
+      case METHODS.memoryAudit: {
+        const p = parseParams(MemoryAuditParams, params);
+        // Store contract is newest-LAST (memory.ts's own doc comment); the wire contract (design
+        // doc §4) is newest-FIRST — reversed here, once, rather than pushing that inversion onto
+        // every caller (dashboard/CLI) of this RPC.
+        const lines = (opts.memory?.auditTail(p.limit) ?? []).slice().reverse();
+        return { lines };
       }
 
       case METHODS.sessionAddDir: {

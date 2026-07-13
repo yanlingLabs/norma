@@ -97,6 +97,19 @@ import {
   RoutinesUpdateResult,
   RoutinesDeleteParams,
   RoutinesDeleteResult,
+  MemoryFactMetaSchema,
+  MemoryFactSchema,
+  MemoryAuditLineSchema,
+  MemoryListParams,
+  MemoryListResult,
+  MemoryReadParams,
+  MemoryReadResult,
+  MemoryWriteParams,
+  MemoryWriteResult,
+  MemoryDeleteParams,
+  MemoryDeleteResult,
+  MemoryAuditParams,
+  MemoryAuditResult,
   METHODS,
 } from "../src/methods";
 
@@ -740,5 +753,68 @@ describe("routines RPCs (Phase 5 routines T3, design doc §3)", () => {
     expect(() => RoutinesDeleteParams.parse({ id: "" })).toThrow();
     expect(RoutinesDeleteResult.parse({ ok: true, removed: true })).toEqual({ ok: true, removed: true });
     expect(RoutinesDeleteResult.parse({ ok: true, removed: false })).toEqual({ ok: true, removed: false });
+  });
+});
+
+describe("memory RPCs (Phase 5b Task 3, design doc §4)", () => {
+  const factMeta = { name: "coffee-pref", description: "Likes oat milk lattes", type: "user" as const };
+  const fact = { ...factMeta, body: "User prefers oat milk lattes over regular." };
+  const auditLine = { ts: 1700000000000, source: "rpc" as const, scope: "user" as const, action: "write" as const, name: "coffee-pref" };
+
+  test("METHODS carries all five verbs", () => {
+    expect(METHODS.memoryList).toBe("memory.list");
+    expect(METHODS.memoryRead).toBe("memory.read");
+    expect(METHODS.memoryWrite).toBe("memory.write");
+    expect(METHODS.memoryDelete).toBe("memory.delete");
+    expect(METHODS.memoryAudit).toBe("memory.audit");
+  });
+
+  test("MemoryFactMetaSchema/MemoryFactSchema mirror the store's shapes", () => {
+    expect(MemoryFactMetaSchema.parse(factMeta)).toEqual(factMeta);
+    expect(MemoryFactSchema.parse(fact)).toEqual(fact);
+    expect(() => MemoryFactMetaSchema.parse({ ...factMeta, type: "bogus" })).toThrow();
+  });
+
+  test("MemoryAuditLineSchema: sessionId/description optional, omitted when absent", () => {
+    expect(MemoryAuditLineSchema.parse(auditLine)).toEqual(auditLine);
+    const full = { ...auditLine, sessionId: "s_1", description: "d", action: "delete" as const };
+    expect(MemoryAuditLineSchema.parse(full)).toEqual(full);
+    expect(() => MemoryAuditLineSchema.parse({ ...auditLine, source: "bogus" })).toThrow();
+  });
+
+  test("memory.list params require scope, cwd optional + absolute", () => {
+    expect(MemoryListParams.parse({ scope: "user" })).toEqual({ scope: "user" });
+    expect(MemoryListParams.parse({ scope: "project", cwd: "/tmp/proj" })).toEqual({ scope: "project", cwd: "/tmp/proj" });
+    expect(() => MemoryListParams.parse({})).toThrow();
+    expect(() => MemoryListParams.parse({ scope: "user", cwd: "relative/path" })).toThrow();
+    expect(MemoryListResult.parse({ facts: [factMeta] })).toEqual({ facts: [factMeta] });
+    expect(MemoryListResult.parse({ facts: [] })).toEqual({ facts: [] });
+  });
+
+  test("memory.read params require scope + name; result is {fact}", () => {
+    expect(MemoryReadParams.parse({ scope: "user", name: "x" })).toEqual({ scope: "user", name: "x" });
+    expect(() => MemoryReadParams.parse({ scope: "user", name: "" })).toThrow();
+    expect(MemoryReadResult.parse({ fact })).toEqual({ fact });
+  });
+
+  test("memory.write params: type defaults to 'user' when omitted; result is empty", () => {
+    const p = MemoryWriteParams.parse({ scope: "user", name: "x", description: "d", body: "b" });
+    expect(p.type).toBe("user");
+    expect(MemoryWriteParams.parse({ scope: "user", name: "x", description: "d", body: "b", type: "reference" }).type).toBe("reference");
+    expect(() => MemoryWriteParams.parse({ scope: "user", name: "x", description: "d", body: "" })).toThrow();
+    expect(MemoryWriteResult.parse({})).toEqual({});
+  });
+
+  test("memory.delete params/result", () => {
+    expect(MemoryDeleteParams.parse({ scope: "project", name: "x", cwd: "/tmp/proj" })).toEqual({ scope: "project", name: "x", cwd: "/tmp/proj" });
+    expect(MemoryDeleteResult.parse({})).toEqual({});
+  });
+
+  test("memory.audit params: limit optional nonnegative; result is {lines}", () => {
+    expect(MemoryAuditParams.parse({})).toEqual({});
+    expect(MemoryAuditParams.parse({ limit: 10 }).limit).toBe(10);
+    expect(() => MemoryAuditParams.parse({ limit: -1 })).toThrow();
+    expect(MemoryAuditResult.parse({ lines: [auditLine] })).toEqual({ lines: [auditLine] });
+    expect(MemoryAuditResult.parse({ lines: [] })).toEqual({ lines: [] });
   });
 });
