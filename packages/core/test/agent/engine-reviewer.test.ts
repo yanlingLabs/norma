@@ -14,7 +14,10 @@ import { sessionTmpDir } from "../../src/agent/session-tmp";
 
 // A stub bash tool (NOT the real sandboxed one): records every invocation to `calls` so tests
 // can assert whether bash actually ran, without depending on macOS sandbox-exec.
-function stubRegistry(): { registry: ToolRegistry; calls: Array<{ command: string; justification?: string }> } {
+// Exported (with bashTurn/writeTurn/stubReviewer below) for reuse by reviewer-e2e.test.ts (phase
+// 5e T6) — same reuse precedent as engine-steer.test.ts's setupEngine / engine-spawn.test.ts's
+// setup: the e2e file drives the SAME harness idiom, not a re-derived one.
+export function stubRegistry(): { registry: ToolRegistry; calls: Array<{ command: string; justification?: string }> } {
   const registry = new ToolRegistry();
   const calls: Array<{ command: string; justification?: string }> = [];
   registry.register({
@@ -30,7 +33,7 @@ function stubRegistry(): { registry: ToolRegistry; calls: Array<{ command: strin
 }
 
 // One round: model calls bash(command[, justification]) then stops with tool_calls; round 2 ends the turn.
-function bashTurn(command: string, justification?: string): ProviderEvent[][] {
+export function bashTurn(command: string, justification?: string): ProviderEvent[][] {
   const args: Record<string, string> = { command };
   if (justification !== undefined) args.justification = justification;
   return [
@@ -44,7 +47,7 @@ function types(events: SessionEvent[]): string[] { return events.map((e) => e.ty
 // One round: model calls write(path, content) then stops with tool_calls; round 2 ends the turn.
 // Uses the REAL write tool (setupEngine always registers it) — not a stub — so a "safe" verdict's
 // executeCall does a genuine filesystem write a test can assert on.
-function writeTurn(path: string, content: string): ProviderEvent[][] {
+export function writeTurn(path: string, content: string): ProviderEvent[][] {
   return [
     [{ type: "tool_call", callId: "c1", name: "write", argsJson: JSON.stringify({ path, content }) }, { type: "done", stopReason: "tool_calls" }],
     [{ type: "text_delta", delta: "done" }, { type: "done", stopReason: "end_turn" }],
@@ -87,7 +90,7 @@ function registryWithExternal(): { registry: ToolRegistry; calls: Array<{ argsJs
 // Stub reviewer: scripted verdict/throw, records every input it was asked to review — bash's
 // {command, justification} shape (with `class:"bash"`, per 5e T3) as well as fs/external's
 // {class, precis} shape.
-function stubReviewer(behavior: { verdict: "safe" | "unsafe"; reason: string } | "throw") {
+export function stubReviewer(behavior: { verdict: "safe" | "unsafe"; reason: string } | "throw") {
   const seen: ReviewInput[] = [];
   return {
     seen,
