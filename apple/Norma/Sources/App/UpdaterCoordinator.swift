@@ -1,4 +1,5 @@
 import Foundation
+import NormaKit
 import Sparkle
 
 /// Injectable seam for everything the updater touches outside its own logic
@@ -7,7 +8,7 @@ struct UpdaterCoordinatorDeps {
     /// Current number of executing agent turns; nil when the daemon is unreachable
     /// (treated as idle — nothing to interrupt).
     var activeTurns: () async -> Int?
-    /// updates.channel from ~/.norma/settings.json; nil/absent → stable. (Wired in T5.)
+    /// updates.channel from ~/.norma/settings.json; nil/absent → stable.
     var readChannel: () -> String?
     /// NORMA_UPDATE_FEED env override for local test feeds; nil → Info.plist SUFeedURL.
     var feedOverride: () -> String?
@@ -17,12 +18,13 @@ struct UpdaterCoordinatorDeps {
 }
 
 extension UpdaterCoordinatorDeps {
-    /// Production wiring. activeTurns/readChannel are placeholders until T4/T5 wire them
-    /// (both fail-open: nil activity = idle, nil channel = stable).
+    /// Production wiring. activeTurns is a placeholder until it's wired to the daemon's
+    /// engine.activity RPC (T2); readChannel reads live from settings.json (T5). Both
+    /// fail-open: nil activity = idle, nil channel = stable.
     @MainActor static var live: UpdaterCoordinatorDeps {
         .init(
             activeTurns: { nil },
-            readChannel: { nil },
+            readChannel: { UpdaterCoordinator.readChannelFromSettings() },
             feedOverride: { ProcessInfo.processInfo.environment["NORMA_UPDATE_FEED"] },
             now: { Date() },
             pollIntervalSeconds: 30,
@@ -95,6 +97,21 @@ final class UpdaterCoordinator: NSObject {
         guard let at = stagedAt else { return }
         onBadgeChange?(deps.now().timeIntervalSince(at) >= deps.badgeAfterSeconds)
     }
+
+    /// stable/nil/unknown → default channel only (empty set); beta → +"beta".
+    func allowedChannelSet(for channelSetting: String?) -> Set<String> {
+        channelSetting == "beta" ? ["beta"] : []
+    }
+
+    /// Live read of updates.channel from ~/.norma/settings.json (nil on absent/malformed).
+    nonisolated static func readChannelFromSettings() -> String? {
+        let url = URL(fileURLWithPath: NormaPaths.settingsPath())
+        guard let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let updates = obj["updates"] as? [String: Any]
+        else { return nil }
+        return updates["channel"] as? String
+    }
 }
 
 extension UpdaterCoordinator: SPUUpdaterDelegate {
@@ -111,5 +128,11 @@ extension UpdaterCoordinator: SPUUpdaterDelegate {
         MainActor.assumeIsolated {
             handleRelaunchRequest(version: item.displayVersionString, untilInvoking: installHandler)
         }
+    }
+
+    /// Beta/stable channel gate — Sparkle re-asks this per check, so a settings.json edit
+    /// takes effect at the very next check with no daemon/app restart needed.
+    nonisolated func allowedChannels(for updater: SPUUpdater) -> Set<String> {
+        MainActor.assumeIsolated { allowedChannelSet(for: deps.readChannel()) }
     }
 }

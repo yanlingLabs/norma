@@ -145,6 +145,13 @@ export const Settings = z.object({
     enabled: z.boolean().optional(),
     idleShutdownMs: z.number().int().positive().optional(),
   }).optional(),
+  /** Auto-update channel. "beta" additionally receives beta-tagged appcast items;
+   *  absent/stable = stable only. Read live by the app at each update check (hot — no restart). */
+  updates: z
+    .object({
+      channel: z.enum(["stable", "beta"]).optional(),
+    })
+    .optional(),
 });
 export type Settings = z.infer<typeof Settings>;
 

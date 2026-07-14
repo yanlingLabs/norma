@@ -76,4 +76,26 @@ final class UpdaterCoordinatorTests: XCTestCase {
         try? await Task.sleep(for: .seconds(0.05))
         XCTAssertTrue(badges.contains(true))
     }
+
+    // MARK: - Sparkle T5: channels
+
+    func testChannelMapping() {
+        let c = UpdaterCoordinator(deps: Self.deps())
+        XCTAssertEqual(c.allowedChannelSet(for: nil), [])          // stable = default channel only
+        XCTAssertEqual(c.allowedChannelSet(for: "stable"), [])
+        XCTAssertEqual(c.allowedChannelSet(for: "beta"), ["beta"])
+        XCTAssertEqual(c.allowedChannelSet(for: "junk"), [])       // unknown → stable
+    }
+
+    func testReadChannelFromSettingsFile() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        setenv("NORMA_HOME", dir.path, 1)
+        defer { unsetenv("NORMA_HOME") }
+        try #"{"schemaVersion":2,"updates":{"channel":"beta"}}"#
+            .write(to: dir.appendingPathComponent("settings.json"), atomically: true, encoding: .utf8)
+        XCTAssertEqual(UpdaterCoordinator.readChannelFromSettings(), "beta")
+        try "not json".write(to: dir.appendingPathComponent("settings.json"), atomically: true, encoding: .utf8)
+        XCTAssertNil(UpdaterCoordinator.readChannelFromSettings()) // malformed → stable default
+    }
 }
