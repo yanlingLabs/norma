@@ -86,6 +86,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// running" instead — the product's ChatGPT/Claude-desktop-style lifecycle contract.
     var reallyQuitting = false
 
+    /// Sparkle whole-branch review (Critical): the updater's DEDICATED true-quit axis — set by
+    /// `UpdaterCoordinator.onWillInstall` (wired in `boot()`) immediately before Sparkle's install
+    /// handler runs. Sparkle terminates the host via a CANCELLABLE Apple quit event with no
+    /// kAEQuitReason (so `systemQuitReasonProvider` reads false too) — without this axis the
+    /// terminate gate below would answer `.terminateCancel` like a ⌘Q and silently defeat the
+    /// entire install+relaunch on BOTH paths (idle poll and Restart Now). A dedicated flag rather
+    /// than reusing `reallyQuitting`: if the quit somehow failed, a stale `reallyQuitting = true`
+    /// would corrupt later ⌘Q semantics (the ONE-true-quit-source contract above).
+    private var updaterQuitting = false
+
     /// Lifecycle T3 review fix: seam for the Apple-Event quit-reason read
     /// (`isSystemInitiatedQuitEvent()` below the class) — injectable so a unit test can drive the
     /// systemInitiated axis of `applicationShouldTerminate` without synthesizing a real
@@ -648,6 +658,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updaterCoordinator?.onBadgeChange = { [weak self] badged in
             self?.menuBar?.setUpdateBadge(badged)
         }
+        // Sparkle whole-branch review (Critical): arm the updater-quit axis right before the
+        // install handler runs — Sparkle's quit event is cancellable and would otherwise be
+        // intercepted by `applicationShouldTerminate` like a ⌘Q (see `updaterQuitting`'s doc).
+        updaterCoordinator?.onWillInstall = { [weak self] in self?.updaterQuitting = true }
 
         // Task 4 (2f): the red panic item mounts/unmounts as `activeLeases` crosses zero. Safe to
         // wire unconditionally (not gated by `isRunningUnitTests`) — `activeLeases` only ever
@@ -703,7 +717,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// belt-and-suspenders for the edge case where no main window was open (nothing to close, so
     /// nothing to trigger demotion through those callbacks).
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        let reply = terminateDecision(reallyQuitting: reallyQuitting, systemInitiated: systemQuitReasonProvider())
+        let reply = terminateDecision(
+            reallyQuitting: reallyQuitting,
+            systemInitiated: systemQuitReasonProvider(),
+            updaterQuitting: updaterQuitting)
         if reply == .terminateCancel {
             closeMainWindows()
             hideDockIcon()
@@ -733,12 +750,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// reference, so the whole truth table is unit-testable without any AppKit state (see
 /// `AppLifecycleTests.testTerminateDecision`). `.terminateNow` iff `reallyQuitting` (set ONLY by
 /// the menu-bar "Quit Norma") OR `systemInitiated` (review fix: the quit Apple Event carries a
-/// logout/restart/shutdown reason — refusing THOSE would block the user's logout indefinitely);
-/// everything else — ⌘Q, dock-tile quit — cancels. Window state never gates a quit: the T3 spec's
-/// original `hasMainWindow` param was truth-table-inert and was dropped when `systemInitiated`
-/// (the real second axis) replaced it.
-func terminateDecision(reallyQuitting: Bool, systemInitiated: Bool) -> NSApplication.TerminateReply {
-    (reallyQuitting || systemInitiated) ? .terminateNow : .terminateCancel
+/// logout/restart/shutdown reason — refusing THOSE would block the user's logout indefinitely)
+/// OR `updaterQuitting` (Sparkle whole-branch review fix: Sparkle's installer quits the host via
+/// a CANCELLABLE quit event with no kAEQuitReason — `AppDelegate.updaterQuitting`, armed by
+/// `UpdaterCoordinator.onWillInstall` right before the install handler, is the third true-quit
+/// axis that lets the install relaunch through); everything else — ⌘Q, dock-tile quit — cancels.
+/// Window state never gates a quit: the T3 spec's original `hasMainWindow` param was
+/// truth-table-inert and was dropped when `systemInitiated` (the real second axis) replaced it.
+func terminateDecision(reallyQuitting: Bool, systemInitiated: Bool, updaterQuitting: Bool = false) -> NSApplication.TerminateReply {
+    (reallyQuitting || systemInitiated || updaterQuitting) ? .terminateNow : .terminateCancel
 }
 
 /// Lifecycle T3 review fix: TRUE when the in-flight quit Apple Event carries a system quit reason

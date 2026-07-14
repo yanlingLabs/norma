@@ -63,6 +63,23 @@ final class UpdaterCoordinatorTests: XCTestCase {
         XCTAssertEqual(installed, 1)
     }
 
+    /// Whole-branch review (Critical): Sparkle terminates the host via a CANCELLABLE quit event,
+    /// which Norma's lifecycle terminate gate would intercept like a ⌘Q (`.terminateCancel`) and
+    /// silently defeat the whole install+relaunch. `onWillInstall` is the arming hook — AppDelegate
+    /// wires it to set its `updaterQuitting` axis — so it must fire exactly once, BEFORE the
+    /// install handler runs (the terminate round-trip happens inside `install()`), and never again
+    /// on the idempotent second `installNow()`.
+    func testOnWillInstallFiresOnceBeforeInstallHandler() async {
+        let c = UpdaterCoordinator(deps: Self.deps(activeTurns: { 5 }))
+        var events: [String] = []
+        c.onWillInstall = { events.append("willInstall") }
+        _ = c.handleRelaunchRequest(version: "0.2.002", untilInvoking: { events.append("install") })
+        c.installNow()
+        XCTAssertEqual(events, ["willInstall", "install"])
+        c.installNow()                            // idempotent second call — no re-arm, no re-install
+        XCTAssertEqual(events, ["willInstall", "install"])
+    }
+
     func testStagedAndBadgeCallbacksFire() async {
         var clock = Date()
         var stagedStates: [Bool] = []

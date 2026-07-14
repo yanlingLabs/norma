@@ -20,13 +20,21 @@ final class AppLifecycleTests: XCTestCase {
 
     /// T3 review fix: the second axis is `systemInitiated` (the Apple-Event logout/restart/
     /// shutdown quit reason), not the truth-table-inert `hasMainWindow` the original brief
-    /// threaded through. ONLY (false, false) — a plain user ⌘Q/dock-quit — cancels; refusing a
+    /// threaded through. Sparkle whole-branch review fix: the third axis is `updaterQuitting`
+    /// (armed by `UpdaterCoordinator.onWillInstall` right before Sparkle's install handler —
+    /// Sparkle quits the host via a CANCELLABLE quit event with no kAEQuitReason, so without
+    /// this axis the gate would answer it `.terminateCancel` like a ⌘Q and silently defeat the
+    /// whole update). ONLY all-false — a plain user ⌘Q/dock-quit — cancels; refusing a
     /// system-initiated quit would block the user's logout indefinitely.
     func testTerminateDecision() {
         XCTAssertEqual(terminateDecision(reallyQuitting: true, systemInitiated: true), .terminateNow)
         XCTAssertEqual(terminateDecision(reallyQuitting: true, systemInitiated: false), .terminateNow)
         XCTAssertEqual(terminateDecision(reallyQuitting: false, systemInitiated: true), .terminateNow)
         XCTAssertEqual(terminateDecision(reallyQuitting: false, systemInitiated: false), .terminateCancel)
+        // Sparkle whole-branch review: the updater-quit axis lets Sparkle's install relaunch
+        // through; all-false (the default param) still cancels — existing behavior unchanged.
+        XCTAssertEqual(terminateDecision(reallyQuitting: false, systemInitiated: false, updaterQuitting: true), .terminateNow)
+        XCTAssertEqual(terminateDecision(reallyQuitting: false, systemInitiated: false, updaterQuitting: false), .terminateCancel)
     }
 
     // MARK: - fixtures

@@ -18,9 +18,11 @@ struct UpdaterCoordinatorDeps {
 }
 
 extension UpdaterCoordinatorDeps {
-    /// Production wiring. activeTurns is a placeholder until it's wired to the daemon's
-    /// engine.activity RPC (T2); readChannel reads live from settings.json (T5). Both
-    /// fail-open: nil activity = idle, nil channel = stable.
+    /// Production wiring. activeTurns here is only the fail-open default (nil = idle):
+    /// `AppDelegate.boot()` replaces it with the live daemon bridge
+    /// (`AppModel.engineActivity()`, the T2 engine.activity RPC) whenever no test override is
+    /// installed (T4). readChannel reads live from settings.json (T5). Both fail-open:
+    /// nil activity = idle, nil channel = stable.
     @MainActor static var live: UpdaterCoordinatorDeps {
         .init(
             activeTurns: { nil },
@@ -46,6 +48,12 @@ final class UpdaterCoordinator: NSObject {
     /// Menu-bar hooks (installed by AppDelegate).
     var onStagedChange: ((_ staged: Bool, _ version: String?) -> Void)?
     var onBadgeChange: ((_ badged: Bool) -> Void)?
+    /// Whole-branch review (Critical): fired exactly once, immediately before the install handler
+    /// runs. Sparkle terminates the host via a CANCELLABLE Apple quit event (no forceTerminate,
+    /// no kAEQuitReason), which routes through `applicationShouldTerminate` — without arming,
+    /// Norma's lifecycle gate answers it `.terminateCancel` (like a ⌘Q) and the install dies
+    /// silently. AppDelegate wires this to set its `updaterQuitting` true-quit axis.
+    var onWillInstall: (() -> Void)?
 
     init(deps: UpdaterCoordinatorDeps) {
         self.deps = deps
@@ -90,6 +98,7 @@ final class UpdaterCoordinator: NSObject {
         pendingInstall = nil
         pollTask?.cancel()
         onStagedChange?(false, stagedVersion)
+        onWillInstall?() // arm the updater-quit axis BEFORE Sparkle's cancellable terminate round-trip
         install() // Sparkle proceeds: quit → swap bundle → relaunch (supervisor spawns the new daemon)
     }
 
