@@ -80,8 +80,48 @@ export interface RegisterInput {
 
 export type RegisterResult = { ok: true } | { ok: false; error: string };
 
+/** CC v2.1.199 parity: the stale agent-name guard's pure decision. Given the agentId a `name`
+ *  PREVIOUSLY, successfully reached (`recorded` — undefined if this is the first time this
+ *  (sessionId, name) pair is used) and the agentId THIS by-name resolution just found
+ *  (`resolvedAgentId`), decides whether the caller may proceed. A `name` is a stable per-session
+ *  handle a model uses to refer to an agent across several turns; if it were ever possible for that
+ *  name to resolve to a DIFFERENT agent later (today's `register()` rejects a name collision
+ *  outright, so this can't happen through the public API yet — this guard is defense-in-depth for
+ *  any future name-reuse/eviction feature), a stale model reference would silently reach the WRONG
+ *  agent. Exported and pure so it's unit-testable without a live registry. */
+export type NameResolution = { ok: true } | { ok: false; error: string };
+export function checkNameNotStale(recorded: string | undefined, resolvedAgentId: string, name: string): NameResolution {
+  if (recorded !== undefined && recorded !== resolvedAgentId) {
+    return {
+      ok: false,
+      error: `name '${name}' now reaches a different agent (${resolvedAgentId}); it previously reached ${recorded}. Address the agent by ID instead.`,
+    };
+  }
+  return { ok: true };
+}
+
 export class BackgroundAgentRegistry {
   private agents = new Map<string, AgentEntry>();
+  // Stale-name guard bookkeeping (checkNameNotStale above): plain storage ONLY — the actual
+  // refuse-or-proceed DECISION is made by each caller (engine.ts's send_message bridge,
+  // task-stop.ts's tool), never here, so a read-only resolver (agent_output/agent_list) that never
+  // calls firstReached/recordReached is completely unaffected by this guard. Keyed
+  // `${sessionId} ${name}` — never cleared, matching this registry's own agents map lifetime
+  // (process/daemon lifetime, no session-scoped teardown exists today).
+  private nameReach = new Map<string, string>();
+
+  /** The agentId this (sessionId, name) pair previously, successfully reached — undefined if
+   *  never recorded. Callers check this via `checkNameNotStale` BEFORE acting on a by-name
+   *  resolution. */
+  firstReached(sessionId: string, name: string): string | undefined {
+    return this.nameReach.get(`${sessionId} ${name}`);
+  }
+
+  /** Records `agentId` as the (possibly first) agentId this (sessionId, name) pair reached. Callers
+   *  call this only AFTER `checkNameNotStale` confirms there's no conflicting prior record. */
+  recordReached(sessionId: string, name: string, agentId: string): void {
+    this.nameReach.set(`${sessionId} ${name}`, agentId);
+  }
 
   /**
    * Registers a new running entry. Rejects (never throws) two cases:

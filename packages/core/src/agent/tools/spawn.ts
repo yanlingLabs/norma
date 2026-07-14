@@ -95,6 +95,7 @@ export function registerSpawnAgentTool(r: ToolRegistry, opts: { models?: string[
     name: "spawn_agent",
     description:
       "Launch a child agent to handle a task autonomously with its own fresh context. It runs its own tool loop and returns its final report. " +
+      "Its full transcript is also saved to a file (path included in the result/notification, and via agent_output) you can read/glob/grep — it can be large, so grep it or read it with offset/limit rather than reading it whole. " +
       "Delegate multi-step work; run several in parallel by emitting multiple spawn_agent calls in one message. " +
       "The child does NOT see this conversation — put everything it needs in `prompt`. " +
       `agentType: optional subagent type; ${modelClause}; description: a short (3-5 word) summary of the task (required); ` +

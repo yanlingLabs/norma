@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { BackgroundAgentRegistry } from "../../src/agent/bg-agent-registry";
+import { BackgroundAgentRegistry, checkNameNotStale } from "../../src/agent/bg-agent-registry";
 
 function entry(overrides: Partial<{ agentId: string; sessionId: string; threadId: string; name?: string }> = {}) {
   return {
@@ -357,6 +357,48 @@ describe("BackgroundAgentRegistry", () => {
       reg.complete("a1", { ok: false, result: "timed out" }, { timedOut: true, notified: true });
       expect(reg.get("a1")).toMatchObject({ status: "timeout", notified: true });
       expect(reg.takeForNotification("a1")).toBeUndefined();
+    });
+  });
+
+  // 4h-ii-b Task 5 (CC v2.1.199 parity: stale agent-name guard) — plain storage on the registry
+  // (firstReached/recordReached); the refuse-or-proceed DECISION itself is `checkNameNotStale`, a
+  // pure function callers (engine.ts's send_message bridge, task-stop.ts) invoke explicitly. `get()`
+  // itself is completely untouched by this — a read-only resolver never calls these.
+  describe("stale-name guard bookkeeping (firstReached/recordReached/checkNameNotStale)", () => {
+    test("firstReached is undefined until recordReached is called", () => {
+      const reg = new BackgroundAgentRegistry();
+      expect(reg.firstReached("s1", "worker")).toBeUndefined();
+      reg.recordReached("s1", "worker", "a1");
+      expect(reg.firstReached("s1", "worker")).toBe("a1");
+    });
+
+    test("firstReached is scoped per session — the same name in a different session is independent", () => {
+      const reg = new BackgroundAgentRegistry();
+      reg.recordReached("s1", "worker", "a1");
+      expect(reg.firstReached("s2", "worker")).toBeUndefined();
+    });
+
+    test("recordReached overwrites — callers only call it after checkNameNotStale confirms no conflict", () => {
+      const reg = new BackgroundAgentRegistry();
+      reg.recordReached("s1", "worker", "a1");
+      reg.recordReached("s1", "worker", "a1"); // same id again — idempotent
+      expect(reg.firstReached("s1", "worker")).toBe("a1");
+    });
+
+    test("checkNameNotStale: no prior record → ok", () => {
+      expect(checkNameNotStale(undefined, "a1", "worker")).toEqual({ ok: true });
+    });
+
+    test("checkNameNotStale: prior record matches the new resolution → ok", () => {
+      expect(checkNameNotStale("a1", "a1", "worker")).toEqual({ ok: true });
+    });
+
+    test("checkNameNotStale: prior record DIFFERS from the new resolution → refused, naming both ids", () => {
+      const result = checkNameNotStale("a1", "a2", "worker");
+      expect(result).toEqual({
+        ok: false,
+        error: "name 'worker' now reaches a different agent (a2); it previously reached a1. Address the agent by ID instead.",
+      });
     });
   });
 });

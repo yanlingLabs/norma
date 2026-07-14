@@ -66,6 +66,63 @@ describe("task_stop tool (4h-ii-c Task 2)", () => {
     expect(abort.signal.aborted).toBe(true);
   });
 
+  // 4h-ii-b Task 5 (stale-name guard, CC v2.1.199 parity): a name that PREVIOUSLY, successfully
+  // reached one agentId must refuse to act on a LATER resolution to a DIFFERENT agentId — naming
+  // task_stop's own resolution against a stale mental reference could stop the WRONG agent.
+  // Today's register() can't organically produce this (a name in use is permanently reserved), so
+  // this seeds the tracking map directly — exactly the state a future name-reuse/eviction feature
+  // would leave behind.
+  describe("stale-name guard (4h-ii-b Task 5)", () => {
+    test("a name that previously reached a different agentId refuses the stop and does NOT fire abort", async () => {
+      const bgAgents = new BackgroundAgentRegistry();
+      bgAgents.recordReached("s1", "worker", "th_stale_old");
+      const abort = new AbortController();
+      bgAgents.register({ agentId: "th_real_new", sessionId: "s1", threadId: "th_real_new", name: "worker", abort });
+      const r = new ToolRegistry();
+      registerTaskStopTool(r, { bgAgents });
+
+      const out = await r.execute("task_stop", { task_id: "worker" }, ctx("s1"));
+      expect(out).toMatchObject({
+        isError: true,
+        output: "name 'worker' now reaches a different agent (th_real_new); it previously reached th_stale_old. Address the agent by ID instead.",
+      });
+      expect(abort.signal.aborted).toBe(false);
+      expect(bgAgents.get("th_real_new", "s1")?.status).toBe("running"); // untouched — never stopped
+    });
+
+    test("a by-ID stop bypasses the guard entirely, even when a stale record exists for some name", async () => {
+      const bgAgents = new BackgroundAgentRegistry();
+      bgAgents.recordReached("s1", "worker", "th_stale_old");
+      const abort = new AbortController();
+      bgAgents.register({ agentId: "th_real_new", sessionId: "s1", threadId: "th_real_new", name: "worker", abort });
+      const r = new ToolRegistry();
+      registerTaskStopTool(r, { bgAgents });
+
+      const out = await r.execute("task_stop", { task_id: "th_real_new" }, ctx("s1"));
+      expect(out).toMatchObject({ isError: false, output: "stopped agent 'th_real_new'" });
+      expect(abort.signal.aborted).toBe(true);
+      // by-ID sends never update the tracking map — the stale record for "worker" is untouched
+      expect(bgAgents.firstReached("s1", "worker")).toBe("th_stale_old");
+    });
+
+    test("the FIRST time a name is used, it's recorded (no refusal) and a later consistent by-name call still succeeds", async () => {
+      const bgAgents = new BackgroundAgentRegistry();
+      const abort = new AbortController();
+      bgAgents.register({ agentId: "th_first", sessionId: "s1", threadId: "th_first", name: "worker", abort });
+      const r = new ToolRegistry();
+      registerTaskStopTool(r, { bgAgents });
+
+      expect(bgAgents.firstReached("s1", "worker")).toBeUndefined();
+      const out1 = await r.execute("task_stop", { task_id: "worker" }, ctx("s1"));
+      expect(out1).toMatchObject({ isError: false });
+      expect(bgAgents.firstReached("s1", "worker")).toBe("th_first");
+
+      // a SECOND by-name call resolving to the SAME agentId is still fine (idempotent-friendly)
+      const out2 = await r.execute("task_stop", { task_id: "worker" }, ctx("s1"));
+      expect(out2).toMatchObject({ isError: false, output: "agent 'worker' already stopped" });
+    });
+  });
+
   test("(c) already-completed agent → 'already completed', isError:false, no abort fired", async () => {
     const bgAgents = new BackgroundAgentRegistry();
     const abort = new AbortController();
