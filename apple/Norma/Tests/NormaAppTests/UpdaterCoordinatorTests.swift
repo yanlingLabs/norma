@@ -63,6 +63,30 @@ final class UpdaterCoordinatorTests: XCTestCase {
         XCTAssertEqual(installed, 1)
     }
 
+    /// Live-gate finding: in SILENT automatic mode Sparkle stages for install-on-quit and never
+    /// proactively relaunches — `updater(_:willInstallUpdateOnQuit:immediateInstallationBlock:)`
+    /// is the seam that hands us the install handler, implemented as a thin shim over
+    /// `handleRelaunchRequest` (same tested-via-the-core posture as `feedURLString`/
+    /// `allowedChannels`/`shouldPostponeRelaunchForUpdate`: the delegate method itself takes a
+    /// live `SPUUpdater`, which a unit test can't construct without spinning real updater
+    /// machinery). This test pins the full silent-flow contract that shim funnels into: staging
+    /// a fresh handler with NO user action fires the staged callback, holds while the daemon is
+    /// busy, then unstages + arms `onWillInstall` + installs exactly once on idle.
+    func testSilentOnQuitStagingDrivesIdleInstallWithoutUserAction() async {
+        var turns = 1
+        let c = UpdaterCoordinator(deps: Self.deps(activeTurns: { turns }))
+        var events: [String] = []
+        c.onStagedChange = { staged, _ in events.append(staged ? "staged" : "unstaged") }
+        c.onWillInstall = { events.append("willInstall") }
+        _ = c.handleRelaunchRequest(version: "0.2.002", untilInvoking: { events.append("install") })
+        XCTAssertEqual(c.stagedVersion, "0.2.002")
+        try? await Task.sleep(for: .seconds(0.05))
+        XCTAssertEqual(events, ["staged"])        // busy: staged only — no install, no arming
+        turns = 0
+        try? await Task.sleep(for: .seconds(0.1)) // next poll sees idle
+        XCTAssertEqual(events, ["staged", "unstaged", "willInstall", "install"])
+    }
+
     /// Whole-branch review (Critical): Sparkle terminates the host via a CANCELLABLE quit event,
     /// which Norma's lifecycle terminate gate would intercept like a ⌘Q (`.terminateCancel`) and
     /// silently defeat the whole install+relaunch. `onWillInstall` is the arming hook — AppDelegate
