@@ -26,6 +26,7 @@ import { AgentStore } from "../../src/agent/agents";
 import { SubagentManager } from "../../src/agent/subagents";
 import { BackgroundAgentRegistry } from "../../src/agent/bg-agent-registry";
 import { WorktreeManager } from "../../src/agent/worktree";
+import { sessionTmpDir } from "../../src/agent/session-tmp";
 import type { ModelInfo, Provider, ProviderEvent, TurnRequest } from "../../src/providers/types";
 
 export function setup(
@@ -54,6 +55,12 @@ export function setup(
     // it to 2 itself (one level deeper than the old hardcoded depth-1 cap). Pass 1 explicitly to
     // pin the OLD default behavior (a depth-1 child could never spawn further) as a regression.
     maxDepth?: number;
+    // CC-parity subagent transcripts: default false (EngineConfig.tmpDirOf absent), matching every
+    // pre-existing test in this file — none of them care about transcript files, and leaving this
+    // off keeps them byte-identical (no real tmp-dir writes beyond what executeCall's OWN
+    // unconditional sessionTmpDir call already does for other reasons). Pass true to wire the SAME
+    // sessionTmpDir daemon.ts uses, for tests that specifically exercise transcript surfacing.
+    withTranscripts?: boolean;
   } = {},
 ) {
   const withSubagents = opts.withSubagents !== false;
@@ -124,6 +131,7 @@ export function setup(
           deferExternals: () => opts.toolSearch?.deferExternals,
         }
       : undefined,
+    tmpDirOf: opts.withTranscripts ? sessionTmpDir : undefined,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: opts.approvalPolicy ?? "auto" });
   const events: SessionEvent[] = [];
@@ -133,6 +141,10 @@ export function setup(
 
 const done = (reason: "end_turn" | "tool_calls" | "aborted"): ProviderEvent => ({ type: "done", stopReason: reason });
 const text = (t: string): ProviderEvent[] => [{ type: "text_delta", delta: t }, done("end_turn")];
+// CC-parity SYNC result trailer (engine.ts's `syncTrailer`): every SUCCESSFUL sync spawn/resume
+// tool_result now ends with this pointer — `setup()` never wires `tmpDirOf` by default, so the
+// transcript clause is always omitted here (that omission is its own dedicated test elsewhere).
+const trailer = (childId: string): string => `\n\nagentId: ${childId} (send_message with to: '${childId}' to continue this agent)`;
 // 4g-ii (CC parity): `description` is now a REQUIRED spawn_agent arg — defaulted here so the
 // ~15 pre-existing call sites below (none of which are testing the description contract itself)
 // don't all need individual edits; `extra.description` still overrides it (see the "description
@@ -182,7 +194,7 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     expect(completed).toMatchObject({ stopReason: "end_turn" });
 
     const toolResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
-    expect(toolResult).toMatchObject({ isError: false, output: "child final report" });
+    expect(toolResult).toMatchObject({ isError: false, output: "child final report" + trailer(childId) });
 
     // 3 provider calls: parent round 0 (spawn), the child's one round (index 1), then the
     // parent's own continuation round (index 2, script clamps to the last entry — also
@@ -223,8 +235,9 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
 
     const r1 = events.find((e) => e.type === "tool_result" && e.callId === "s1");
     const r2 = events.find((e) => e.type === "tool_result" && e.callId === "s2");
-    expect(r1).toMatchObject({ isError: false, output: "child result" });
-    expect(r2).toMatchObject({ isError: false, output: "child result" });
+    const startedFor = (prompt: string) => (events.find((e) => e.type === "thread_started" && e.prompt === prompt) as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+    expect(r1).toMatchObject({ isError: false, output: "child result" + trailer(startedFor("task A")) });
+    expect(r2).toMatchObject({ isError: false, output: "child result" + trailer(startedFor("task B")) });
   });
 
   test("maxDepth:1 (regression pin, today's old default): depth>0 spawn (a child trying to spawn) is denied without running the bridge", async () => {
@@ -369,7 +382,7 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
   // that tool_result's `output`, never as a distinct `{type:"message",role:"assistant"}` item (which
   // would mean the child's OWN assistant_message, mistagged or thread-filter-bypassed, leaked in).
   test("multi-turn: a child's own thread-tagged assistant_message never leaks as a message item — its report legitimately appears only as the spawn_agent tool_result's output (Seam #1 regression)", async () => {
-    const { engine, hub, sessionId, provider } = setup([
+    const { engine, hub, sessionId, provider, store } = setup([
       [spawnCall("s1", "do X"), done("tool_calls")], // turn 1, parent round 0: spawn
       text("SECRET-CHILD-CHATTER"), // the child's only round — its assistant_message is tagged with the CHILD's threadId, not main
       text("parent turn1 final report"), // turn 1, parent's own continuation round after the child returns
@@ -396,8 +409,9 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     ).toBe(true);
     // but the parent's OWN spawn_agent tool_result (a main-thread event) legitimately carries the
     // child's report as its output, and — per history-parity Task 1 — main-thread tool_result
-    // events are now replayed across turns
-    expect(input.some((it) => it.type === "tool_result" && it.callId === "s1" && it.output === "SECRET-CHILD-CHATTER")).toBe(true);
+    // events are now replayed across turns (with the CC-parity sync trailer appended)
+    const started = store.read(sessionId).find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>;
+    expect(input.some((it) => it.type === "tool_result" && it.callId === "s1" && it.output === "SECRET-CHILD-CHATTER" + trailer(started.threadId))).toBe(true);
 
     // sanity: the parent's own turn-1 assistant_message and the new user message ARE present
     const asText = JSON.stringify(input);
@@ -452,10 +466,59 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     const events = store.read(sessionId);
 
     expect(events.some((e) => e.type === "thread_started")).toBe(true);
+    const childId = (events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>).threadId;
     const toolResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
-    expect(toolResult).toMatchObject({ isError: false, output: "child final report" });
+    expect(toolResult).toMatchObject({ isError: false, output: "child final report" + trailer(childId) });
 
     expect(provider.requests[1]!.model).toBe("gpt-5.6-terra");
+  });
+
+  // 4h-ii-b Task 6 (CC parity: short model aliases) — "sol"/"terra"/"luna" resolve to the unique
+  // known id ending "-<alias>" BEFORE the unknown-model check, so a spawn override of just "sol"
+  // reaches the child as the FULL id, exactly as if the caller had spelled it out.
+  test("spawn model override as a short alias ('sol') resolves to the full known id", async () => {
+    const script = [
+      [spawnCall("s1", "do X", { model: "sol" }), done("tool_calls")],
+      text("child final report"),
+      text("parent wrap-up"),
+    ];
+    const provider = new FakeProvider(script, TRIO_MODELS);
+    const { engine, store, sessionId } = setup(script, { provider });
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(events.some((e) => e.type === "thread_started")).toBe(true);
+    const childId = (events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+    const toolResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(toolResult).toMatchObject({ isError: false, output: "child final report" + trailer(childId) });
+
+    // the CHILD's own TurnRequest carries the RESOLVED full id, not the bare alias
+    expect(provider.requests[1]!.model).toBe("gpt-5.6-sol");
+  });
+
+  // Ambiguity safety: an alias with no unique match falls straight into the EXISTING unknown-model
+  // error path, unchanged — never a silent pass-through, never a crash.
+  test("an ambiguous/unresolvable alias falls through to the existing unknown-model error", async () => {
+    const ambiguousModels = [
+      { id: "vendor-a-sol", family: "gpt-5", contextWindow: 100_000, supportsVision: false },
+      { id: "vendor-b-sol", family: "gpt-5", contextWindow: 100_000, supportsVision: false },
+    ];
+    const script = [
+      [spawnCall("s1", "do X", { model: "sol" }), done("tool_calls")],
+      text("parent noticed the failure and wrapped up"),
+    ];
+    const provider = new FakeProvider(script, ambiguousModels);
+    const { engine, store, sessionId } = setup(script, { provider });
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(events.some((e) => e.type === "thread_started")).toBe(false);
+    const result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(result).toMatchObject({ isError: true });
+    const output = (result as Extract<SessionEvent, { type: "tool_result" }>).output;
+    expect(output).toContain("unknown model 'sol'");
+    expect(output).toContain("vendor-a-sol");
+    expect(output).toContain("vendor-b-sol");
   });
 
   test("provider with EMPTY models() → an arbitrary spawn model override passes through unchecked", async () => {
@@ -470,8 +533,9 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     const events = store.read(sessionId);
 
     expect(events.some((e) => e.type === "thread_started")).toBe(true);
+    const childId = (events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>).threadId;
     const toolResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
-    expect(toolResult).toMatchObject({ isError: false, output: "child final report" });
+    expect(toolResult).toMatchObject({ isError: false, output: "child final report" + trailer(childId) });
 
     expect(provider.requests[1]!.model).toBe("totally-made-up-model");
   });
@@ -583,7 +647,8 @@ describe("AgentEngine: subagent ToolSearch-load-then-call (4g final-review fix)"
     // The parent sees the child's real final text, not a "subagent … failed: tool-iteration cap
     // reached" typed error.
     const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
-    expect(spawnResult).toMatchObject({ isError: false, output: "child fetched the page" });
+    const spawnChildId = (events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+    expect(spawnResult).toMatchObject({ isError: false, output: "child fetched the page" + trailer(spawnChildId) });
 
     // The parent's own turn completed normally.
     const mainTurnCompleted = events.find((e) => e.type === "turn_completed" && e.threadId === "main");
@@ -746,7 +811,8 @@ describe("AgentEngine: spawn_agent max_turns (4h-i)", () => {
     const events = store.read(sessionId);
 
     const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
-    expect(spawnResult).toMatchObject({ isError: false, output: "child final report" });
+    const childId = (events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+    expect(spawnResult).toMatchObject({ isError: false, output: "child final report" + trailer(childId) });
   });
 });
 
@@ -838,7 +904,8 @@ describe("AgentEngine: spawn_agent mode (restrict-only, 4h-i Task 2)", () => {
     expect(completed).toMatchObject({ stopReason: "end_turn" });
 
     const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
-    expect(spawnResult).toMatchObject({ isError: false, output: "child final report" });
+    const childId = (events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+    expect(spawnResult).toMatchObject({ isError: false, output: "child final report" + trailer(childId) });
 
     // the parent's post-spawn write still went through the normal "ask" approval flow
     const approvalReq = events.find((e) => e.type === "approval_requested" && e.callId === "p1");
@@ -967,7 +1034,8 @@ describe("AgentEngine: spawn_agent mode (restrict-only, 4h-i Task 2)", () => {
     expect(completed).toMatchObject({ stopReason: "end_turn" });
 
     const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
-    expect(spawnResult).toMatchObject({ isError: false, output: "child final report" });
+    const childId = (events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+    expect(spawnResult).toMatchObject({ isError: false, output: "child final report" + trailer(childId) });
 
     // the parent's post-spawn write was NOT plan-denied — proof the narrowing spawn didn't corrupt
     // the parent's own `meta.approvalPolicy` for the rest of the turn
@@ -1025,11 +1093,11 @@ describe("AgentEngine: configurable subagent nesting depth (4h-i Task 3)", () =>
 
     // the grandchild's own result bubbles up as the CHILD's tool_result for s2
     const s2Result = events.find((e) => e.type === "tool_result" && e.callId === "s2");
-    expect(s2Result).toMatchObject({ isError: false, output: "grandchild final report" });
+    expect(s2Result).toMatchObject({ isError: false, output: "grandchild final report" + trailer(grandchildStart.threadId) });
     // and the child's own final text (after the grandchild returns) bubbles up as the PARENT's
     // tool_result for s1 — proves the child kept running its OWN loop after the nested spawn
     const s1Result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
-    expect(s1Result).toMatchObject({ isError: false, output: "child wrapped up after grandchild" });
+    expect(s1Result).toMatchObject({ isError: false, output: "child wrapped up after grandchild" + trailer(childStart.threadId) });
 
     const fp = provider as FakeProvider;
     // request[1] = child's round 0 (depth 1) — spawn_agent still visible, one level of room left
@@ -1059,8 +1127,11 @@ describe("AgentEngine: configurable subagent nesting depth (4h-i Task 3)", () =>
     const denied = events.find((e) => e.type === "tool_result" && e.callId === "s3");
     expect(denied).toMatchObject({ isError: true, output: "subagents cannot spawn further subagents" });
 
+    const starts = events.filter((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>[];
+    const childStart = starts.find((e) => e.parentThreadId === "main")!;
+    const grandchildStart = starts.find((e) => e.parentThreadId === childStart.threadId)!;
     const s2Result = events.find((e) => e.type === "tool_result" && e.callId === "s2");
-    expect(s2Result).toMatchObject({ isError: false, output: "grandchild gave up on spawning further" });
+    expect(s2Result).toMatchObject({ isError: false, output: "grandchild gave up on spawning further" + trailer(grandchildStart.threadId) });
   });
 
   test("default maxDepth (5, CC parity): a depth-2 grandchild's specs INCLUDE spawn_agent — the default allows deeper nesting than 2 (proves the default is >2, i.e. 5)", async () => {
@@ -1160,7 +1231,8 @@ describe("AgentEngine: configurable subagent nesting depth (4h-i Task 3)", () =>
 
     // the parent's own turn still completes normally afterward — no stall propagates upward
     const s1Result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
-    expect(s1Result).toMatchObject({ isError: false, output: "child noticed the saturation error and wrapped up" });
+    const childId = (events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+    expect(s1Result).toMatchObject({ isError: false, output: "child noticed the saturation error and wrapped up" + trailer(childId) });
   });
 });
 
@@ -1266,7 +1338,8 @@ describe.if(isMac)("AgentEngine: spawn_agent isolation:\"worktree\" (4h-i Task 4
     expect(writeResult).toMatchObject({ isError: false });
 
     const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
-    expect(spawnResult).toMatchObject({ isError: false, output: "wrote the note" });
+    const startedThreadId = (started as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+    expect(spawnResult).toMatchObject({ isError: false, output: "wrote the note" + trailer(startedThreadId) });
 
     // the parent repo itself was never touched
     expect(existsSync(join(cwd, "note.txt"))).toBe(false);
@@ -1308,7 +1381,8 @@ describe.if(isMac)("AgentEngine: spawn_agent isolation:\"worktree\" (4h-i Task 4
     const completed = events.find((e) => e.type === "thread_completed");
     expect(completed).toMatchObject({ stopReason: "end_turn" });
     const spawnResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
-    expect(spawnResult).toMatchObject({ isError: false, output: "nothing to change" });
+    const childId = (events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+    expect(spawnResult).toMatchObject({ isError: false, output: "nothing to change" + trailer(childId) });
 
     // clean → auto-removed: `git worktree list` shows ONLY the main repo, no leftover worktree
     const list = git(["worktree", "list"], cwd);
@@ -1510,7 +1584,8 @@ describe("AgentEngine: spawn_agent run_in_background (4h-ii-a)", () => {
     expect(events.filter((e) => e.type === "thread_started").length).toBe(2);
 
     const syncResult = events.find((e) => e.type === "tool_result" && e.callId === "sSync");
-    expect(syncResult).toMatchObject({ isError: false, output: "sync child done" });
+    const syncChildId = (events.find((e) => e.type === "thread_started" && e.prompt === "sync task") as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+    expect(syncResult).toMatchObject({ isError: false, output: "sync child done" + trailer(syncChildId) });
 
     const bgResult = events.find((e) => e.type === "tool_result" && e.callId === "sBg");
     expect(bgResult).toMatchObject({ isError: false });
@@ -1607,16 +1682,16 @@ describe("AgentEngine: spawn_agent run_in_background (4h-ii-a)", () => {
     expect(completed).toMatchObject({ stopReason: "end_turn" });
 
     const toolResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
-    expect(toolResult).toMatchObject({ isError: false, output: "child final report" });
+    const started = events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>;
+    expect(toolResult).toMatchObject({ isError: false, output: "child final report" + trailer(started.threadId) });
 
     // 4h-ii-b Task 1: a sync spawn now ALSO registers (and completes) in the bg registry — CC
     // parity, so a finished sync-spawned agent is resumable too, not just a bg-spawned one — but
     // it's registered `notified` (see BackgroundAgentRegistry.complete's own doc comment): the
     // parent already got this result directly as the tool_result above, this same turn, so it
     // must never ALSO surface via the next turn's completion-reminder sweep.
-    const started = events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>;
     const entry = bgAgents.list(sessionId).find((e) => e.agentId === started.threadId);
-    expect(entry).toMatchObject({ status: "completed", result: "child final report", notified: true });
+    expect(entry).toMatchObject({ status: "completed", result: "child final report" + trailer(started.threadId), notified: true });
     expect(entry?.resume).toMatchObject({ agentType: "general-purpose", approvalPolicy: "auto" });
   });
 
@@ -1639,7 +1714,8 @@ describe("AgentEngine: spawn_agent run_in_background (4h-ii-a)", () => {
     expect(completed).toMatchObject({ stopReason: "end_turn" });
 
     const toolResult = events.find((e) => e.type === "tool_result" && e.callId === "s1");
-    expect(toolResult).toMatchObject({ isError: false, output: "child final report" });
+    const childId = (events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+    expect(toolResult).toMatchObject({ isError: false, output: "child final report" + trailer(childId) });
   });
 
   // 5a matrix case 5: depth 1 (a spawn issued FROM WITHIN a child) + run_in_background OMITTED →
@@ -1662,13 +1738,16 @@ describe("AgentEngine: spawn_agent run_in_background (4h-ii-a)", () => {
     // the grandchild's result bubbles up as the CHILD's own tool_result for s2 — only possible if
     // the depth-1 spawn was awaited synchronously (a detached s2 would have returned an immediate
     // {agentId,status:"running"} tool_result instead of the grandchild's actual report)
+    const starts = events.filter((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>[];
+    const childStart = starts.find((e) => e.parentThreadId === "main")!;
+    const grandchildStart = starts.find((e) => e.parentThreadId === childStart.threadId)!;
     const s2Result = events.find((e) => e.type === "tool_result" && e.callId === "s2");
-    expect(s2Result).toMatchObject({ isError: false, output: "grandchild final report" });
+    expect(s2Result).toMatchObject({ isError: false, output: "grandchild final report" + trailer(grandchildStart.threadId) });
 
     // and the child's own final text (after the grandchild returns) bubbles up as the PARENT's
     // tool_result for s1, proving the child kept running its OWN loop after the nested spawn
     const s1Result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
-    expect(s1Result).toMatchObject({ isError: false, output: "child wrapped up after grandchild" });
+    expect(s1Result).toMatchObject({ isError: false, output: "child wrapped up after grandchild" + trailer(childStart.threadId) });
   });
 
   test("run_in_background:true whose child provider ERRORS → registry.complete records isError-shaped failure text, thread_completed stopReason 'error'", async () => {
@@ -1884,7 +1963,7 @@ describe("AgentEngine: spawn_agent name (4h-ii-b Task 2)", () => {
     expect(entry2!.sessionId).toBe(session2);
 
     const result2 = store.read(session2).find((e) => e.type === "tool_result" && e.callId === "s2");
-    expect(result2).toMatchObject({ isError: false, output: "child2 final report" });
+    expect(result2).toMatchObject({ isError: false, output: "child2 final report" + trailer(entry2!.agentId) });
   });
 });
 
@@ -2019,8 +2098,10 @@ describe("AgentEngine: no-default-wall-clock — ESC cascade + stall watchdog (n
     hub.attach(client, sessionId, 0);
     hub.send(client, sessionId, "again");
     await engine.runTurn(sessionId);
-    const result2 = store.read(sessionId).find((e) => e.type === "tool_result" && e.callId === "s2");
-    expect(result2).toMatchObject({ isError: false, output: "second child ok" });
+    const finalEvents = store.read(sessionId);
+    const result2 = finalEvents.find((e) => e.type === "tool_result" && e.callId === "s2");
+    const secondChildId = (finalEvents.find((e) => e.type === "thread_started" && e.prompt === "follow-up task") as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+    expect(result2).toMatchObject({ isError: false, output: "second child ok" + trailer(secondChildId) });
   });
 
   test("stall partial-output surfacing: a child that persisted an assistant message then went silent → the stall-abort tool_result contains 'stalled' AND the partial text", async () => {
@@ -2098,7 +2179,9 @@ describe("AgentEngine: no-default-wall-clock — ESC cascade + stall watchdog (n
       subagentsOpts: { stallTimeoutMs: 50 },
     });
     await engine.runTurn(sessionId);
-    const result = store.read(sessionId).find((e) => e.type === "tool_result" && e.callId === "s1");
-    expect(result).toMatchObject({ isError: false, output: "chunk chunk chunk chunk chunk " });
+    const slowEvents = store.read(sessionId);
+    const result = slowEvents.find((e) => e.type === "tool_result" && e.callId === "s1");
+    const childId = (slowEvents.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>).threadId;
+    expect(result).toMatchObject({ isError: false, output: "chunk chunk chunk chunk chunk " + trailer(childId) });
   });
 });

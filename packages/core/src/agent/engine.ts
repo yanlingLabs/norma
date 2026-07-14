@@ -22,9 +22,11 @@ import { resolveWithinAny, isWithin, canonicalizeForWrite } from "./paths";
 import type { WorktreeManager } from "./worktree";
 import type { SubagentManager } from "./subagents";
 import type { AgentStore } from "./agents";
-import type { BackgroundAgentRegistry, ResumeContext } from "./bg-agent-registry";
+import { checkNameNotStale, type BackgroundAgentRegistry, type ResumeContext } from "./bg-agent-registry";
 import type { HookResult } from "../plugins/hook-runner";
 import type { ComputerUseService } from "./computer-use";
+import { SubagentTranscripts } from "./subagent-transcript";
+import { resolveModelAlias } from "./model-aliases";
 
 /** Structural narrowing of BackgroundTaskRegistry (bg-registry.ts) to just what pinnedTools
  *  (below) needs — lets the engine (and tests) work with anything shaped like a per-session task
@@ -331,6 +333,13 @@ export interface EngineConfig {
   // ToolContext (registry.ts) is UNCHANGED — it stays a plain `ComputerUseService | undefined`;
   // only this config field became a getter, resolved to that plain value at each read site below.
   computerUse?: () => ComputerUseService | undefined;
+  // Subagent transcript files (CC parity: surfacing a subagent's full transcript as a file the
+  // parent can read/glob/grep) — the SAME session-tmp-dir accessor daemon.ts already builds for
+  // registerLspTools (`tmpDirOf`, sessionTmpDir-backed). Optional/absent (e.g. a test harness that
+  // never wires it) → transcriptPathFor always resolves undefined and the writer never touches the
+  // filesystem — every surface that would show a path (bg spawn tool_result, task_notification,
+  // the sync trailer, agent_output) simply omits it, byte-identical to before this feature.
+  tmpDirOf?: (sessionId: string) => string | undefined;
 }
 
 export class AgentEngine {
@@ -394,7 +403,24 @@ export class AgentEngine {
   private static cuImageKey(sessionId: string, threadId: string, callId: string): string {
     return `${sessionId}|${threadId}|${callId}`;
   }
-  constructor(private readonly cfg: EngineConfig) {}
+  // CC-parity subagent transcript writer (subagent-transcript.ts) — constructed in the constructor
+  // BODY (not a field initializer) so it can close over `this.cfg`, which parameter-property
+  // assignment guarantees is already set by the time the body runs.
+  private readonly subagentTranscripts: SubagentTranscripts;
+  // 4h-ii-b Task 5 (stale-name guard, CC v2.1.199 parity): per-session-per-name bookkeeping now
+  // lives on BackgroundAgentRegistry itself (firstReached/recordReached) so BOTH the send_message
+  // bridge (below) and task-stop.ts's plain tool can share it; nothing engine-local is needed here.
+  constructor(private readonly cfg: EngineConfig) {
+    this.subagentTranscripts = new SubagentTranscripts((sessionId) => this.cfg.tmpDirOf?.(sessionId));
+  }
+
+  /** Public path accessor (CC parity: surfacing a subagent's transcript file path) — undefined when
+   *  cfg.tmpDirOf is absent/unresolved for this session. Every surface that shows the path (bg spawn
+   *  tool_result, task_notification, the sync trailer, agent_output) goes through this ONE
+   *  accessor, so they can never disagree on where the file lives. */
+  transcriptPathFor(sessionId: string, threadId: string): string | undefined {
+    return this.subagentTranscripts.pathFor(sessionId, threadId);
+  }
 
   /** True while a turn is executing for the session. */
   isRunning(sessionId: string): boolean { return this.runningTurns.has(sessionId); }
@@ -540,7 +566,24 @@ export class AgentEngine {
   }
 
   private emit(sessionId: string, event: NewSessionEvent): SessionEvent {
-    return this.cfg.hub.append(sessionId, event); // hub.append: store.append + broadcast (added below)
+    const persisted = this.cfg.hub.append(sessionId, event); // hub.append: store.append + broadcast (added below)
+    this.captureSubagentTranscript(sessionId, persisted);
+    return persisted;
+  }
+
+  /** CC-parity subagent transcript surfacing — see subagent-transcript.ts's own doc comment for the
+   *  file format/exclusions. FAST NO-OP PATH FIRST: the vast majority of events are MAIN-thread (or
+   *  carry no threadId at all), which must stay byte-identical to before this feature — so the
+   *  cheap identity/string checks run before the registry scan. Only a REGISTERED child thread's
+   *  own events reach the writer: `this.threads` is the SAME registry registerThread/threadsFor
+   *  (thread.list) already maintain. The spawn bridge now calls registerThread BEFORE its paired
+   *  thread_started emit (previously the other way around) specifically so a child's very FIRST
+   *  captured event here IS its own thread_started — letting the writer derive its synthetic
+   *  spawn_prompt line straight from it, with no separate "start" call needed at this chokepoint. */
+  private captureSubagentTranscript(sessionId: string, event: SessionEvent): void {
+    if (!("threadId" in event) || event.threadId === MAIN_THREAD) return;
+    if (!this.threads.get(sessionId)?.some((t) => t.threadId === event.threadId)) return;
+    this.subagentTranscripts.append(sessionId, event.threadId, event);
   }
 
   /** Manually trigger compaction (e.g. via an explicit IPC method), scoped to any turn
@@ -782,6 +825,19 @@ export class AgentEngine {
     return text;
   }
 
+  /** CC parity: a SUCCESSFUL synchronous spawn/resume result ends with an `agentId: <id>` trailer
+   *  (sync results end with an agentId trailer the model can use to keep addressing this same
+   *  agent — via send_message — after it already has the final report in hand). Shared by the
+   *  fresh sync spawn path and the sync `resume` path (identical shape either way). The transcript
+   *  clause is omitted when `path` is undefined (cfg.tmpDirOf unwired) — the rest of the trailer
+   *  (agentId + the send_message pointer) still applies, since neither depends on a file existing.
+   *  Never applied to an ERROR outcome — only a clean success gives the caller a "reason to keep
+   *  talking to this same agent" pointer. */
+  private syncTrailer(childId: string, path: string | undefined): string {
+    const transcriptClause = path ? `transcript: ${path} — read/glob/grep it surgically for details; ` : "";
+    return `\n\nagentId: ${childId} (${transcriptClause}send_message with to: '${childId}' to continue this agent)`;
+  }
+
   // Shared by every <system-reminder> builder below (taskListReminder) AND by notifyBgCompletion's
   // persisted <task-notification>: both interpolate model/tool-authored strings (task subjects,
   // subagent name/result text) that may carry attacker-influenced content — newlines would inject
@@ -904,7 +960,13 @@ export class AgentEngine {
       : e.status === "timeout" ? `Agent "${label}" timed out`
       : `Agent "${label}" was stopped`;
     const result = e.result ? `\n<result>${clean(e.result)}</result>` : "";
-    const content = `<task-notification>\n<task-id>${e.agentId}</task-id>\n<status>${e.status}</status>\n<summary>${summary}</summary>${result}\n</task-notification>`;
+    // CC parity: completion notifications carry an <output-file> element — an engine-controlled
+    // path (session tmp dir + this agent's own threadId), never model/user text, so it needs no
+    // sanitization pass. Omitted entirely when cfg.tmpDirOf is unwired (transcriptPathFor
+    // undefined), matching every other transcript-path surface in this file.
+    const outputFile = this.transcriptPathFor(sessionId, e.threadId);
+    const outputFileTag = outputFile ? `\n<output-file>${outputFile}</output-file>` : "";
+    const content = `<task-notification>\n<task-id>${e.agentId}</task-id>\n<status>${e.status}</status>\n<summary>${summary}</summary>${outputFileTag}${result}\n</task-notification>`;
     this.cfg.hub.append(sessionId, { type: "task_notification", sessionId, threadId: MAIN_THREAD, content });
     // bg-retrigger Task 2 (CC parity: background-agent wake): if a turn is already running for
     // this session, defer — runTurn's finally drains it once that turn settles (between-turns
@@ -1397,9 +1459,14 @@ export class AgentEngine {
           // models() (openai-compatible with no static `models` configured, i.e. an arbitrary
           // endpoint the provider can't enumerate) can't validate anything, so the override
           // passes through unchanged — same as before this fix.
-          const effectiveOverride = modelOverride ?? def.model;
+          let effectiveOverride = modelOverride ?? def.model;
           if (effectiveOverride !== undefined) {
             const known = this.cfg.provider.provider.models();
+            // Short model aliases (CC parity, model-aliases.ts): "sol"/"terra"/"luna" resolve to
+            // the unique known id ending "-<alias>" (e.g. "gpt-5.6-sol") BEFORE the unknown-model
+            // check below — an unresolvable alias (ambiguous or no match) is returned unchanged, so
+            // it falls straight into that SAME existing error path, unchanged.
+            if (known.length > 0) effectiveOverride = resolveModelAlias(effectiveOverride, known.map((m) => m.id));
             if (known.length > 0 && !known.some((m) => m.id === effectiveOverride)) {
               const ids = known.map((m) => m.id).join(", ");
               spawnOutcomes.set(call.callId, {
@@ -1482,12 +1549,19 @@ export class AgentEngine {
           const childCwd = isolatedWorktree?.dir ?? opts.cwd;
 
           const childId = "th_" + randomUUID().slice(0, 8);
+          // Subagent transcript surfacing (captureSubagentTranscript, above): registerThread now
+          // runs BEFORE the thread_started emit (swapped from the original order) so that emit's
+          // registry-membership check already sees `childId` as registered the instant
+          // thread_started fires — making thread_started itself the FIRST event the transcript
+          // writer ever sees for this thread, which is what lets it derive the synthetic
+          // spawn_prompt line directly from that event. Nothing between the two statements reads
+          // `this.threads`, so this reorder has no other observable effect.
+          this.registerThread(sessionId, {
+            threadId: childId, parentThreadId: threadId, agentType: agentType ?? "general-purpose", status: "running",
+          });
           this.emit(sessionId, {
             type: "thread_started", sessionId, threadId: childId, parentThreadId: threadId,
             agentType: agentType ?? "general-purpose", prompt, description,
-          });
-          this.registerThread(sessionId, {
-            threadId: childId, parentThreadId: threadId, agentType: agentType ?? "general-purpose", status: "running",
           });
           // 4h-i Task 3: spawn_agent is excluded from the child's own specs ONLY when the child
           // itself sits AT (or past) the nesting cap — i.e. it has no room left to spawn a
@@ -1691,10 +1765,14 @@ export class AgentEngine {
                 // path surfaces the same fault as a caught turn error, but a detached child has no
                 // caller to surface to, so swallow it here rather than emit an unhandled rejection.
               });
-            // NOTE: only {agentId, status} — never the AbortController/registry entry itself —
-            // ever reaches the model, via this tool_result JSON.
+            // NOTE: only {agentId, status, outputFile?} — never the AbortController/registry entry
+            // itself — ever reaches the model, via this tool_result JSON. `outputFile` (CC parity:
+            // bg spawn results carry an output-file path) is OMITTED entirely when undefined
+            // (cfg.tmpDirOf unwired) rather than serialized as `null`/absent-looking — a caller that
+            // greps this JSON for the key literally either finds it or doesn't.
+            const outputFile = this.transcriptPathFor(sessionId, childId);
             spawnOutcomes.set(call.callId, {
-              output: JSON.stringify({ agentId: childId, status: "running" }),
+              output: JSON.stringify({ agentId: childId, status: "running", ...(outputFile ? { outputFile } : {}) }),
               isError: false,
             });
             return; // Promise.all resolves without waiting on the detached chain above
@@ -1824,7 +1902,10 @@ export class AgentEngine {
                 ? { output: `subagent (${agentType ?? "general-purpose"}) failed: ${result.value.errorMessage ?? "provider error"}`, isError: true }
                 : result.value.stopReason === "aborted"
                   ? { output: `subagent (${agentType ?? "general-purpose"}) aborted`, isError: true }
-                  : { output: result.value.finalText || "the subagent finished without a final message", isError: false };
+                  // CC parity (SYNC result trailer): a successful sync result ends with an
+                  // `agentId: <id>` trailer pointing at the transcript file + how to keep
+                  // addressing this same agent — see syncTrailer's own doc comment.
+                  : { output: (result.value.finalText || "the subagent finished without a final message") + this.syncTrailer(childId, this.transcriptPathFor(sessionId, childId)), isError: false };
             spawnOutcomes.set(call.callId, outcome);
             // { notified: true } — this sync child's result already reached the parent directly
             // as this SAME call's tool_result, this SAME turn; without this a later
@@ -1889,6 +1970,16 @@ export class AgentEngine {
         if (!this.cfg.bgAgents) { sendMessageOutcomes.set(call.callId, { output: "send_message is not available in this session", isError: true }); continue; }
         const target = this.cfg.bgAgents.get(to, sessionId);
         if (!target) { sendMessageOutcomes.set(call.callId, { output: `no agent '${to}' to message`, isError: true }); continue; }
+        // 4h-ii-b Task 5 (stale-name guard, CC v2.1.199 parity): only a BY-NAME resolution is
+        // checked/tracked — `to !== target.agentId` is exactly that (get() tries the agentId map
+        // FIRST, so a hit where `to` equals the returned entry's own agentId was resolved BY ID).
+        // A direct by-ID send bypasses this entirely and never updates the tracking map — a stable
+        // identifier that never goes stale needs no guard.
+        if (to !== target.agentId) {
+          const check = checkNameNotStale(this.cfg.bgAgents.firstReached(sessionId, to), target.agentId, to);
+          if (!check.ok) { sendMessageOutcomes.set(call.callId, { output: check.error, isError: true }); continue; }
+          this.cfg.bgAgents.recordReached(sessionId, to, target.agentId);
+        }
         if (target.status === "running") {
           this.sendToThread(sessionId, target.threadId, message);
           sendMessageOutcomes.set(call.callId, { output: `message delivered to '${to}'`, isError: false });
@@ -2341,7 +2432,8 @@ export class AgentEngine {
           this.notifyBgCompletion(sessionId, entry.agentId);
         })
         .catch(() => { /* terminal net: a throw in the .catch above (persistent IO fault on the completion emit) has no caller to surface to on a detached run — swallow rather than emit an unhandled rejection */ });
-      return { output: JSON.stringify({ agentId: entry.threadId, status: "running" }), isError: false };
+      const resumeOutputFile = this.transcriptPathFor(sessionId, entry.threadId);
+      return { output: JSON.stringify({ agentId: entry.threadId, status: "running", ...(resumeOutputFile ? { outputFile: resumeOutputFile } : {}) }), isError: false };
     }
 
     const result = await this.cfg.subagents!.run(async (childSignal, progress) => runResumed(childSignal, progress), { reentrant: depth > 0 });
@@ -2357,7 +2449,8 @@ export class AgentEngine {
         ? { output: `subagent (${agentType}) failed: ${result.value.errorMessage ?? "provider error"}`, isError: true }
         : result.value.stopReason === "aborted"
           ? { output: `subagent (${agentType}) aborted`, isError: true }
-          : { output: result.value.finalText || "the subagent finished without a final message", isError: false };
+          // CC parity (SYNC result trailer) — same helper the fresh sync spawn path uses.
+          : { output: (result.value.finalText || "the subagent finished without a final message") + this.syncTrailer(entry.threadId, this.transcriptPathFor(sessionId, entry.threadId)), isError: false };
     // { notified: true }: this sync resume's result reached the caller directly as its own
     // tool_result this same turn, so a later takeForNotification claim must never re-surface
     // it (same reasoning as the fresh sync path). `timedOut` (4h-ii-c): only reachable with an

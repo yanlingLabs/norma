@@ -48,6 +48,7 @@ import { AgentStore } from "./agent/agents";
 import { SubagentManager } from "./agent/subagents";
 import { BackgroundAgentRegistry } from "./agent/bg-agent-registry";
 import { AgentEngine, SYSTEM_PROMPT } from "./agent/engine";
+import { deriveModelAliases } from "./agent/model-aliases";
 import { BashReviewer } from "./agent/reviewer";
 import { SessionTitler } from "./agent/titles";
 import { Compactor } from "./agent/compactor";
@@ -400,7 +401,13 @@ export async function startDaemon(opts: {
     // to validate a spawn_agent model override (4e gate F9) — so this list is exactly what the
     // bridge will accept. Empty (an openai-compatible provider with no static `models` configured)
     // → registerSpawnAgentTool falls back to its generic "model: optional model override" wording.
-    registerSpawnAgentTool(registry, { models: agentProvider.provider.models().map((m) => m.id) });
+    // 4h-ii-b Task 6 (CC parity: short model aliases) — the full ids are extended with their
+    // UNAMBIGUOUS derived short aliases ("sol"/"terra"/"luna" for the gpt-5.6 trio), never
+    // replacing them, so the enum/description offer both spellings; engine.ts's own
+    // resolveModelAlias (the spawn bridge's runtime gate) uses the identical uniqueness rule, so an
+    // alias offered here is always one the bridge will actually accept.
+    const knownModelIds = agentProvider.provider.models().map((m) => m.id);
+    registerSpawnAgentTool(registry, { models: [...knownModelIds, ...deriveModelAliases(knownModelIds)] });
     // 4h-ii-b Task 4 (CC SendMessage): registered alongside spawn_agent (only when subagents are
     // available) so the MAIN thread can address a subagent by agentId/name — a running one gets the
     // message at its next step, a finished one is resumed with it. Like spawn_agent it's an engine
@@ -418,7 +425,12 @@ export async function startDaemon(opts: {
     // they report is exactly what the engine's own pin/completion bookkeeping sees. `deferred:
     // true` is hardcoded inside registerAgentQueryTools itself (unlike task_stop's caller-supplied
     // flag), so no `deferred` option is passed here.
-    registerAgentQueryTools(registry, { bgAgents, store });
+    // `transcriptPathFor` (CC-parity subagent transcripts): a closure over the `engine` binding
+    // declared above — `engine` isn't assigned until further down this same `if` block, but this
+    // closure is only ever INVOKED at tool-call time (well after boot completes), by which point
+    // it's set. Mirrors `cwdOf`/`rootsOf`/`tmpDirOf`'s own lazy-closure-over-a-later-assigned-const
+    // shape used for registerLspTools above.
+    registerAgentQueryTools(registry, { bgAgents, store, transcriptPathFor: (sid, tid) => engine?.transcriptPathFor(sid, tid) });
     // Phase 5b Task 2: memory_read/memory_write/memory_delete over the SAME `memoryStore`
     // instance T3's RPCs will share. `cwdOf` resolves the SESSION's cwd (store.meta(sid).cwd —
     // the identical source registerRequestDirTool's `projectDir` dep uses below), not `ctx.cwd`:
@@ -600,6 +612,11 @@ export async function startDaemon(opts: {
         deferExternals: () => settings?.toolSearch?.deferExternals,
       },
       hooks: hookFacade,
+      // Subagent transcript files (CC parity): the SAME session-tmp-dir accessor registerLspTools
+      // above already gets — sessionTmpDir-backed, so a subagent's transcript lands right next to
+      // whatever else this session's tools already write there (web_fetch's saved pages, bg-task
+      // output), inside the SAME sandbox-readable root.
+      tmpDirOf,
     });
 
     // hot-settings T5b (final task of the hot-settings track): compose T2's live getters (already

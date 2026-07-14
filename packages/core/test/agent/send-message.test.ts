@@ -213,6 +213,74 @@ describe("AgentEngine: send_message (4h-ii-b Task 4 — CC SendMessage parity)",
     expect((provider as FakeProvider).requests.length).toBe(2); // only the parent's two rounds
   });
 
+  // 4h-ii-b Task 5 (stale-name guard, CC v2.1.199 parity): a name that PREVIOUSLY, successfully
+  // reached one agentId refuses a send_message that resolves it to a DIFFERENT agentId — never
+  // delivers. Today's registry can't organically reuse a name (register() permanently reserves
+  // it), so this seeds the tracking map directly, exactly like the task_stop-level tests — the
+  // state a future name-reuse/eviction feature would leave behind.
+  test("(h) send_message refuses a by-name resolution that now reaches a different agentId than one it previously reached — no delivery", async () => {
+    const { engine, store, sessionId, bgAgents } = setupSend([
+      [spawnNamed("s1", "do the task", "worker"), done("tool_calls")], // turn 1: sync spawn → completes clean, registers "worker"
+      text("child-out-1"),
+      text("parent turn1"),
+      [sendMessage("m1", "worker", "hi again"), done("tool_calls")], // turn 2: message by name
+      text("parent turn2"),
+    ]);
+    await engine.runTurn(sessionId); // turn 1
+    const worker = bgAgents.get("worker", sessionId)!;
+
+    // Seed a STALE record for "worker" pointing at a DIFFERENT (fake) agentId — simulating a prior
+    // reach that no longer matches what "worker" resolves to now.
+    bgAgents.recordReached(sessionId, "worker", "th_stale_fake_id");
+
+    await engine.runTurn(sessionId); // turn 2: send_message by name → must be refused
+    const result = toolResult(store.read(sessionId), "m1");
+    expect(result).toMatchObject({ isError: true });
+    expect(result!.output).toBe(
+      `name 'worker' now reaches a different agent (${worker.threadId}); it previously reached th_stale_fake_id. Address the agent by ID instead.`,
+    );
+    // no delivery: the (already-completed) worker's status is untouched, still notified from turn 1
+    expect(bgAgents.get("worker", sessionId)).toMatchObject({ status: "completed" });
+  });
+
+  // (i) a by-ID send_message bypasses the guard entirely, even with a stale record for some name.
+  test("(i) send_message by agentId bypasses the stale-name guard — delivery proceeds regardless of any stale name record", async () => {
+    class ByIdProvider implements Provider {
+      readonly id = "fake";
+      private round = 0;
+      targetId: string | undefined;
+      models(): ModelInfo[] { return [{ id: "fake-1", family: "fake", contextWindow: 100_000, supportsVision: false }]; }
+      async *streamTurn(req: TurnRequest): AsyncIterable<ProviderEvent> {
+        const input = req.input;
+        if (isChildRun(input, "do the task")) {
+          if (lastUserOf(input) === "resume by id") { yield { type: "text_delta", delta: "resumed by id" }; yield done("end_turn"); return; }
+          yield { type: "text_delta", delta: "child-out-1" }; yield done("end_turn"); return;
+        }
+        const n = this.round++;
+        if (n === 0) { yield spawnNamed("s1", "do the task", "worker"); yield done("tool_calls"); return; }
+        // n===1 ends TURN 1 with plain text (the sync spawn+child already completed within turn 1's
+        // own round loop) — targetId isn't known until AFTER runTurn(...) returns below, so the
+        // send_message call itself must wait for a SEPARATE turn 2.
+        if (n === 1) { yield { type: "text_delta", delta: "parent turn1" }; yield done("end_turn"); return; }
+        if (n === 2) { yield sendMessage("m1", this.targetId!, "resume by id"); yield done("tool_calls"); return; }
+        yield { type: "text_delta", delta: "parent turn2" }; yield done("end_turn");
+      }
+    }
+    const provider = new ByIdProvider();
+    const { engine, store, sessionId, bgAgents } = setupSend([], { provider });
+    await engine.runTurn(sessionId); // turn 1: sync spawn named "worker" completes, parent wraps up
+    const worker = bgAgents.get("worker", sessionId)!;
+    bgAgents.recordReached(sessionId, "worker", "th_stale_fake_id"); // stale record for the NAME only
+    provider.targetId = worker.agentId;
+
+    await engine.runTurn(sessionId); // turn 2: send_message BY ID (not by name)
+    const result = toolResult(store.read(sessionId), "m1");
+    expect(result).toMatchObject({ isError: false });
+    expect(JSON.parse(result!.output)).toMatchObject({ agentId: worker.agentId, status: "running" });
+    // the stale record for the NAME is untouched — a by-ID send never writes to it
+    expect(bgAgents.firstReached(sessionId, "worker")).toBe("th_stale_fake_id");
+  });
+
   // (d) SM6: send_message is DEPTH-0 only — excluded from every child thread's tool set (v1 has no
   // agent-to-agent messaging). A depth-1 child's specs()-derived tool set (after excludeTools
   // filtering) does NOT contain send_message, while the MAIN thread's DOES.

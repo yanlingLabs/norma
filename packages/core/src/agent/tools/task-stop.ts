@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { ToolRegistry } from "./registry";
-import type { BackgroundAgentRegistry } from "../bg-agent-registry";
+import { checkNameNotStale, type BackgroundAgentRegistry } from "../bg-agent-registry";
 import type { BackgroundTaskRegistry } from "../bg-registry";
 
 /**
@@ -39,6 +39,15 @@ export function registerTaskStopTool(
     run({ task_id }, { sessionId }) {
       const entry = bgAgents?.get(task_id, sessionId);
       if (entry) {
+        // 4h-ii-b Task 5 (stale-name guard, CC v2.1.199 parity) — same rule as the send_message
+        // bridge (engine.ts): only a BY-NAME resolution is checked/tracked; by-ID stop calls bypass
+        // this entirely. Stopping the WRONG agent under a stale name is worse than messaging it, so
+        // task_stop gets the same guard.
+        if (task_id !== entry.agentId) {
+          const check = checkNameNotStale(bgAgents!.firstReached(sessionId, task_id), entry.agentId, task_id);
+          if (!check.ok) throw new Error(check.error);
+          bgAgents!.recordReached(sessionId, task_id, entry.agentId);
+        }
         if (entry.status === "running") {
           bgAgents!.stop(entry.agentId);
           entry.notified = true;

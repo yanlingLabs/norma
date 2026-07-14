@@ -19,9 +19,16 @@ import type { SessionStore } from "../../sessions/store";
  */
 export function registerAgentQueryTools(
   r: ToolRegistry,
-  deps: { bgAgents: BackgroundAgentRegistry; store: Pick<SessionStore, "read"> },
+  deps: {
+    bgAgents: BackgroundAgentRegistry;
+    store: Pick<SessionStore, "read">;
+    // Subagent transcript files (CC parity) — threaded through like `store`/`bgAgents` above.
+    // Optional/absent (e.g. a test harness that never wires it) → agent_output simply never shows
+    // a transcript line, matching every other transcript-path surface's "undefined = omit" rule.
+    transcriptPathFor?: (sessionId: string, threadId: string) => string | undefined;
+  },
 ): void {
-  const { bgAgents, store } = deps;
+  const { bgAgents, store, transcriptPathFor } = deps;
 
   r.register({
     name: "agent_list",
@@ -48,24 +55,27 @@ export function registerAgentQueryTools(
     name: "agent_output",
     description:
       "Fetch a background subagent's output by agentId or name (BackgroundAgentRegistry.get's own dual resolution) — " +
-      "its final result once finished, or its latest assistant message while still running.",
+      "its final result once finished, or its latest assistant message while still running. " +
+      "Also shows the path to its full transcript file, when available — that file can be large; grep it or read it with offset/limit rather than reading it whole.",
     args: z.object({ agent: z.string().min(1) }),
     deferred: true,
     run({ agent }, { sessionId }) {
       const entry = bgAgents.get(agent, sessionId);
       if (!entry) throw new Error(`no such agent '${agent}' in this session — agent_list shows them`);
+      const transcript = transcriptPathFor?.(sessionId, entry.threadId);
+      const transcriptLine = transcript ? `\ntranscript: ${transcript}` : "";
       if (entry.status !== "running") {
         // Terminal (completed/failed/stopped/timeout) — deliberately readable even when
         // `notified` is already true (a settle-time completion notice and an on-demand
         // agent_output peek are independent readers of the SAME result string).
-        return `agent '${agent}' ${entry.status}\n${entry.result ?? "(no result recorded)"}`;
+        return `agent '${agent}' ${entry.status}\n${entry.result ?? "(no result recorded)"}${transcriptLine}`;
       }
       const elapsedS = Math.floor((Date.now() - entry.startedAt) / 1000);
       let latest: string | undefined;
       for (const e of store.read(sessionId)) {
         if (e.type === "assistant_message" && e.threadId === entry.threadId) latest = e.text;
       }
-      return `agent '${agent}' running (${elapsedS}s elapsed)\n${latest ? `latest: ${latest}` : "no output yet"}`;
+      return `agent '${agent}' running (${elapsedS}s elapsed)\n${latest ? `latest: ${latest}` : "no output yet"}${transcriptLine}`;
     },
   });
 }
