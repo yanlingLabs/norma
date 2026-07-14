@@ -38,7 +38,15 @@ if (!existsSync(join(TOOLS, "bin", "sign_update"))) {
   sh(`curl -sL "${url}" -o "${TOOLS}/sparkle.tar.xz" && tar -xf "${TOOLS}/sparkle.tar.xz" -C "${TOOLS}"`);
 }
 
-// 2. Ephemeral test keypair (isolated Keychain account; NOT the production key/account).
+// 2. Reset Sparkle's per-app schedule state (LIVE-GATE FINDING 2026-07-14): Sparkle schedules
+// checks ~24h from SULastCheckTime, so a prior gate run's state silently suppresses the fresh
+// launch's automatic check — the hands-off flow then never fires and the gate false-fails.
+// Delete the schedule + any skipped-version marker; deliberately KEEP SUAutomaticallyUpdate
+// (the automatic-download consent) so the silent path stays enabled.
+sh(`defaults delete com.norma.app SULastCheckTime 2>/dev/null || true`);
+sh(`defaults delete com.norma.app SUSkippedVersion 2>/dev/null || true`);
+
+// 3. Ephemeral test keypair (isolated Keychain account; NOT the production key/account).
 rmSync(OUT, { recursive: true, force: true });
 mkdirSync(OUT, { recursive: true });
 const keyFile = join(OUT, "test-eddsa.key");
