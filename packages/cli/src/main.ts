@@ -206,7 +206,62 @@ function socketPath(): string {
   return join(resolveNormaHome(), "run", "core.sock");
 }
 
+const AUTOLAUNCH_POLL_MS = 200;
+const AUTOLAUNCH_TIMEOUT_MS = 8000;
+
+// Lifecycle Task 5: the pure core behind "norma auto-launches Norma.app when the daemon is down."
+// fs/exec/clock/env are all seams (deps) so the 3 outcomes are unit-testable with zero real process
+// launches — connect() below wires the real ones. Dev is unaffected: my bun daemon already has the
+// socket live → "already-up" before anything else runs; without it and without an installed app
+// bundle in the dev tree → "no-app", and the caller preserves today's getToken() dev-hint error.
+export async function ensureDaemonReachable(deps: {
+  socketExists: () => boolean;
+  appBundlePresent: () => boolean; // `open -Ra "Norma"` / bundle-id lookup succeeds
+  launchApp: () => void; // `open -g -b com.norma.app` — comes up as the menu-bar agent, no window
+  sleepMs: (ms: number) => Promise<void>;
+  now: () => number;
+  noAutoLaunch: boolean; // NORMA_NO_AUTOLAUNCH — escape hatch for scripts/CI, always "no-app"
+}): Promise<"already-up" | "launched" | "no-app"> {
+  if (deps.socketExists()) return "already-up";
+  if (deps.noAutoLaunch || !deps.appBundlePresent()) return "no-app";
+  deps.launchApp();
+  const deadline = deps.now() + AUTOLAUNCH_TIMEOUT_MS;
+  while (deps.now() < deadline) {
+    // A real scheduler handoff before each check: the socket is created by a separate OS process
+    // (the app finishing its launch), not by anything on our own microtask chain. Production's
+    // sleepMs (Bun.sleep) already yields for real, but relying on that alone starves this check
+    // when a poll cycle's delay resolves synchronously (e.g. an instantly-resolving test stub) —
+    // a chain of already-resolved-promise awaits never lets a pending macrotask (here, the daemon
+    // actually coming up) run. Confirmed empirically: without this line, the second unit test
+    // below (socket appears via a mocked setTimeout) times out and throws instead of returning
+    // "launched", even though nothing else about the loop's logic changes.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    if (deps.socketExists()) return "launched";
+    await deps.sleepMs(AUTOLAUNCH_POLL_MS);
+  }
+  if (deps.socketExists()) return "launched";
+  throw new Error("Norma isn't responding — open Norma.app manually, or run: norma daemon run");
+}
+
+function appBundlePresent(): boolean {
+  // Spotlight metadata lookup by bundle id: silent (no Finder/UI side effect, unlike `open -Ra`,
+  // which reveals the app in a Finder window even just to check presence) and exit 0 either way,
+  // so "found" is real, non-empty stdout rather than the exit code.
+  const proc = Bun.spawnSync(["mdfind", "kMDItemCFBundleIdentifier == 'com.norma.app'"]);
+  return proc.stdout.toString("utf8").trim().length > 0;
+}
+
 async function connect(name: string, onEvent: (e: any) => void = () => {}): Promise<NormaClient> {
+  await ensureDaemonReachable({
+    socketExists: () => existsSync(socketPath()),
+    appBundlePresent,
+    launchApp: () => { Bun.spawnSync(["open", "-g", "-b", "com.norma.app"]); },
+    sleepMs: (ms) => Bun.sleep(ms),
+    now: () => Date.now(),
+    noAutoLaunch: !!process.env.NORMA_NO_AUTOLAUNCH,
+  });
+  // "no-app" falls through here unchanged: getToken() throws its existing dev-hint error below,
+  // byte-identical to before this task (the daemon's actually-down error path is untouched).
   return NormaClient.connect({ socketPath: socketPath(), token: await getToken(), clientName: name, onEvent });
 }
 
