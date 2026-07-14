@@ -29,7 +29,7 @@ export { CODEX, CODEX_MODELS, DEFAULT_CODEX_MODEL } from "./providers/codex-conf
 export { AgentEngine, type EngineConfig } from "./agent/engine";
 export { FakeProvider } from "./agent/fake-provider";
 export { ToolRegistry, type ToolDefinition, type ToolContext, type ToolOutcome } from "./agent/tools/registry";
-export { registerReadTools } from "./agent/tools/fs-read";
+export { registerReadTools, type ReadToolsConfig } from "./agent/tools/fs-read";
 export { registerWriteTools } from "./agent/tools/fs-write";
 export { registerNotebookTool } from "./agent/tools/notebook";
 export { registerBashTool } from "./agent/tools/bash";

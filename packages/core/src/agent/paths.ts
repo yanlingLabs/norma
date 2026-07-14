@@ -1,7 +1,12 @@
 import { realpathSync } from "node:fs";
 import { isAbsolute, resolve, sep, dirname, basename, join } from "node:path";
 
-function canonAncestor(target: string): string {
+/** Symlink-hardened: realpath of `target` itself if it exists, else of its deepest existing
+ *  ancestor (walking up dirname). Exported for fs-read.ts's denylist check, which needs the exact
+ *  same "what real directory does this path's existing part actually live in" answer that
+ *  resolveWithinAny's own containment check below relies on — a symlink can't be used to hide a
+ *  path from either. */
+export function canonAncestor(target: string): string {
   let probe = target;
   while (true) {
     try { return realpathSync(probe); }

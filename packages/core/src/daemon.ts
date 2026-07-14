@@ -349,7 +349,18 @@ export async function startDaemon(opts: {
   if (agentProvider) {
     const registry = new ToolRegistry();
     sharedRegistry = registry;
-    registerReadTools(registry);
+    // Reads-unrestricted (user rule, memory/reads-unrestricted.md, task-10): read/ls/glob/grep get
+    // NO path fence — the ONE carve-out is denying `dirs.runDir` (~/.norma/run), the sole directory
+    // bootstrapNormaDir (norma-dir.ts) locks down to 0700; every other normaHome subdir (sessions,
+    // memory, skills, agents, plugins, hooks, logs, settings.json) stays fully readable by design.
+    // Boot-constant: normaHome can't change within a daemon lifetime, and `run` already exists by
+    // this point (bootstrapNormaDir mkdir'd it above). This is belt-and-suspenders — today every
+    // actual secret (harness/admin tokens, Codex OAuth tokens, web-search/OpenAI API keys) lives in
+    // the OS Keychain via `secrets` (KeychainSecretStore), never on disk under normaHome — but it's
+    // the real, deliberately-hardened boundary Norma draws around its own runtime material (the IPC
+    // socket, the daemon lock file, plugin-supervisor PID files), so a prompt-injected turn can't
+    // read the daemon's own control-plane files through the tool the daemon itself hosts.
+    registerReadTools(registry, { deniedPrefixes: [dirs.runDir] });
     registerWriteTools(registry);
     registerBashTool(registry, { bgRegistry }); // bash itself is NEVER deferred — only its background-poll pair below
     registerBackgroundTools(registry, { bgRegistry }, { deferred: true });
