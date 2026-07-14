@@ -38,9 +38,19 @@ export function makeApply(deps: SettingsApplyDeps): (prev: Settings | null, next
   const sleep = deps.sleep ?? ((ms: number) => Bun.sleep(ms));
   const log = deps.log ?? (() => {});
 
+  // Per-flag polarity — the two flags have OPPOSITE defaults, so a single `!!` form is wrong for
+  // one of them. These mirror the exact boot gates in daemon.ts so `prev` (boot settings) yields
+  // the true registered-at-boot state, INCLUDING the absent-block boundary:
+  //   - computerUse: opt-in / default-OFF  (daemon.ts `if (settings?.computerUse?.enabled)`) —
+  //     absent block ⇒ NOT registered. `cuEnabled(null)` ⇒ false.
+  //   - lsp: opt-out / default-ON (daemon.ts `if (lspCfg?.enabled !== false)`, same `!== false`
+  //     convention as hooks/reviewer) — absent block ⇒ registered. `lspEnabled(null)` ⇒ true.
+  const cuEnabled = (s: Settings | null) => !!s?.computerUse?.enabled;
+  const lspEnabled = (s: Settings | null) => s?.lsp?.enabled !== false;
+
   async function applyComputerUseDiff(prev: Settings | null, next: Settings): Promise<void> {
-    const wasEnabled = !!prev?.computerUse?.enabled;
-    const isEnabled = !!next?.computerUse?.enabled;
+    const wasEnabled = cuEnabled(prev);
+    const isEnabled = cuEnabled(next);
     if (wasEnabled === isEnabled) return; // no flip — value-only change already applied by the swap
 
     if (isEnabled) {
@@ -71,8 +81,8 @@ export function makeApply(deps: SettingsApplyDeps): (prev: Settings | null, next
   }
 
   async function applyLspDiff(prev: Settings | null, next: Settings): Promise<void> {
-    const wasEnabled = !!prev?.lsp?.enabled;
-    const isEnabled = !!next?.lsp?.enabled;
+    const wasEnabled = lspEnabled(prev);
+    const isEnabled = lspEnabled(next);
     if (wasEnabled === isEnabled) return; // no flip
 
     if (isEnabled) {

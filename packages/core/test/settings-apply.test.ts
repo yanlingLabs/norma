@@ -112,6 +112,58 @@ describe("makeApply", () => {
     expect(teardown).toHaveBeenCalledTimes(1);
   });
 
+  // lsp is default-ON / opt-out (absent block ⇒ enabled). These cross the absent-field boundary
+  // the explicit-only tests above never touch — the exact class the `!!` polarity bug missed.
+  test("lsp absent → {enabled:false} tears down", async () => {
+    const build = mock(() => ({}) as any);
+    const register = mock(() => {});
+    const teardown = mock(() => {});
+    const apply = makeApply(baseDeps({ buildLspManager: build, registerLsp: register, teardownLsp: teardown }));
+    // prev has NO lsp block = enabled-by-default; next explicitly disables → this IS a flip.
+    await apply({ provider: { model: "a" } } as any, { lsp: { enabled: false } } as any);
+    expect(teardown).toHaveBeenCalledTimes(1);
+    expect(register).not.toHaveBeenCalled();
+    expect(build).not.toHaveBeenCalled();
+  });
+
+  test("lsp {enabled:false} → absent re-registers", async () => {
+    const build = mock(() => ({}) as any);
+    const register = mock(() => {});
+    const teardown = mock(() => {});
+    const apply = makeApply(baseDeps({ buildLspManager: build, registerLsp: register, teardownLsp: teardown }));
+    // prev explicitly disabled; next drops the lsp block = re-enabled by default → flip.
+    await apply({ lsp: { enabled: false } } as any, { provider: { model: "a" } } as any);
+    expect(build).toHaveBeenCalledTimes(1);
+    expect(register).toHaveBeenCalledTimes(1);
+    expect(teardown).not.toHaveBeenCalled();
+  });
+
+  test("lsp absent → absent is a no-op", async () => {
+    const build = mock(() => ({}) as any);
+    const register = mock(() => {});
+    const teardown = mock(() => {});
+    const apply = makeApply(baseDeps({ buildLspManager: build, registerLsp: register, teardownLsp: teardown }));
+    // both default-enabled (no lsp block on either side) → no flip.
+    await apply({ provider: { model: "a" } } as any, { provider: { model: "b" } } as any);
+    expect(build).not.toHaveBeenCalled();
+    expect(register).not.toHaveBeenCalled();
+    expect(teardown).not.toHaveBeenCalled();
+  });
+
+  test("computerUse absent → absent touches nothing (opt-in polarity: both default-OFF)", async () => {
+    const build = mock(() => ({}) as any);
+    const register = mock(() => {});
+    const teardown = mock(() => {});
+    const apply = makeApply(
+      baseDeps({ buildComputerService: build, registerComputer: register, teardownComputer: teardown }),
+    );
+    // No computerUse block on either side ⇒ both disabled ⇒ no flip (CU is opt-in, unlike lsp).
+    await apply({ provider: { model: "a" } } as any, { provider: { model: "b" } } as any);
+    expect(build).not.toHaveBeenCalled();
+    expect(register).not.toHaveBeenCalled();
+    expect(teardown).not.toHaveBeenCalled();
+  });
+
   test("a value-only change (no flag flip) swaps but touches NO tools", async () => {
     const buildCu = mock(() => ({}) as any);
     const registerCu = mock(() => {});
