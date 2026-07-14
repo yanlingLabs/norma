@@ -24,7 +24,8 @@ final class MenuBarEntryPointsTests: XCTestCase {
         quit: @escaping () -> Void = {},
         onReallyQuit: @escaping () -> Void = {},
         onRestartDaemon: @escaping () -> Void = {},
-        onCheckForUpdates: @escaping () -> Void = {}
+        onCheckForUpdates: @escaping () -> Void = {},
+        onInstallUpdate: @escaping () -> Void = {}
     ) -> MenuBarController {
         MenuBarController(
             statusLine: { "idle" },
@@ -43,7 +44,8 @@ final class MenuBarEntryPointsTests: XCTestCase {
             quit: quit,
             onReallyQuit: onReallyQuit,
             onRestartDaemon: onRestartDaemon,
-            onCheckForUpdates: onCheckForUpdates
+            onCheckForUpdates: onCheckForUpdates,
+            onInstallUpdate: onInstallUpdate
         )
     }
 
@@ -279,6 +281,25 @@ final class MenuBarEntryPointsTests: XCTestCase {
         controller.install()
 
         let item = controller.checkForUpdatesItem
+        XCTAssertNotNil(item.target)
+        XCTAssertNotNil(item.action)
+        NSApp.sendAction(item.action!, to: item.target, from: item)
+
+        XCTAssertEqual(fired, 1)
+    }
+
+    // MARK: - Sparkle T4: staged-update "Restart Now" override
+
+    /// The staged-update line only exists once an update is staged (`setUpdateStaged(true, ...)`),
+    /// same mount-not-by-default posture as `panicItem` — so this test mounts it first, then fires
+    /// the injected `onInstallUpdate` closure exactly like every other item's firing test above.
+    func testUpdateItemFiresInjectedClosure() {
+        var fired = 0
+        let controller = makeController(onInstallUpdate: { fired += 1 })
+        controller.install()
+        controller.setUpdateStaged(true, version: "0.2.002")
+
+        let item = controller.updateItem
         XCTAssertNotNil(item.target)
         XCTAssertNotNil(item.action)
         NSApp.sendAction(item.action!, to: item.target, from: item)

@@ -272,6 +272,12 @@ final class AppModel: ObservableObject {
         return (try? await client.planRespond(sessionId: sid, callId: callId, approved: approved, autoAccept: autoAccept, feedback: feedback)) != nil
     }
 
+    /// Sparkle T4: Update idle gate — executing agent-turn count; nil when the daemon is
+    /// unreachable.
+    func engineActivity() async -> Int? {
+        try? await client.engineActivity()
+    }
+
     private func handle(_ ev: NormaEvent) async {
         switch ev {
         case .session(let e):

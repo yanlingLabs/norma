@@ -22,6 +22,9 @@ final class MenuBarController {
     // Sparkle T3: fires the "Check for Updates…" item's manual Sparkle check — same
     // decoupled-closure posture as every other action in this initializer.
     private let onCheckForUpdates: () -> Void
+    // Sparkle T4: fires the staged-update "Restart Now" override — same decoupled-closure
+    // posture as every other action in this initializer.
+    private let onInstallUpdate: () -> Void
     private let loginItemController: LoginItemController
     // Task 3 (2e-iv): internal (not private), same stored-`let` pattern as `stateItem` below, so
     // `MenuBarEntryPointsTests` (`@testable import Norma`) can walk `statusItem`'s built menu for
@@ -57,6 +60,10 @@ final class MenuBarController {
     // Sparkle T3: manual "Check for Updates…" entry — `internal`, same testability posture as
     // `openCliItem`/`panicItem` above.
     let checkForUpdatesItem = NSMenuItem(title: "Check for Updates…", action: #selector(didCheckForUpdates), keyEquivalent: "")
+    // Sparkle T4: the staged-update "Restart Now" line — mounted/unmounted (not just shown/hidden)
+    // like `panicItem`, since it must not exist at all while no update is staged. `internal`, same
+    // testability posture as `checkForUpdatesItem`/`panicItem` above.
+    let updateItem = NSMenuItem(title: "Update ready — Restart Now", action: #selector(didInstallUpdate), keyEquivalent: "")
     private var panicMounted = false
 
     init(
@@ -72,7 +79,8 @@ final class MenuBarController {
         quit: @escaping () -> Void,
         onReallyQuit: @escaping () -> Void,
         onRestartDaemon: @escaping () -> Void,
-        onCheckForUpdates: @escaping () -> Void
+        onCheckForUpdates: @escaping () -> Void,
+        onInstallUpdate: @escaping () -> Void
     ) {
         self.statusLine = statusLine
         self.toggleOrb = toggleOrb
@@ -87,6 +95,7 @@ final class MenuBarController {
         self.onReallyQuit = onReallyQuit
         self.onRestartDaemon = onRestartDaemon
         self.onCheckForUpdates = onCheckForUpdates
+        self.onInstallUpdate = onInstallUpdate
     }
 
     func install() {
@@ -186,6 +195,27 @@ final class MenuBarController {
         panicMounted = visible
     }
 
+    /// Sparkle T4: Show/hide the staged-update line (inserted above the pre-quit separator).
+    func setUpdateStaged(_ staged: Bool, version: String?) {
+        guard let menu = statusItem?.menu else { return }
+        let present = menu.items.contains(updateItem)
+        if staged && !present {
+            updateItem.title = "Update ready (\(version ?? "new version")) — Restart Now"
+            updateItem.target = self
+            menu.insertItem(updateItem, at: menu.index(of: preQuitSeparator))
+        } else if !staged && present {
+            menu.removeItem(updateItem)
+            setUpdateBadge(false)
+        }
+    }
+
+    /// Sparkle T4: >24h staged: swap the status icon to a badged variant. No dialog, ever.
+    func setUpdateBadge(_ badged: Bool) {
+        statusItem?.button?.image = NSImage(
+            systemSymbolName: badged ? "arrow.down.circle.fill" : "circle.circle",
+            accessibilityDescription: "Norma")
+    }
+
     @objc private func didToggleOrb() { toggleOrb() }
     @objc private func didSummonField() { summonField() }
     @objc private func didOpenCli() { openCli() }
@@ -195,6 +225,7 @@ final class MenuBarController {
     @objc private func didPanic() { panicAction() }
     @objc private func didRestartDaemon() { onRestartDaemon() }
     @objc private func didCheckForUpdates() { onCheckForUpdates() }
+    @objc private func didInstallUpdate() { onInstallUpdate() }
 
     // Lifecycle T4: `reallyQuitting` MUST be armed before `quitApplication()` runs — reversed
     // order would let `NSApp.terminate`'s synchronous `applicationShouldTerminate` round-trip read

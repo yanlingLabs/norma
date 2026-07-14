@@ -345,7 +345,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // real-side-effect construction in this method; `updaterDepsOverride` (nil in production)
         // lets a test drive `UpdaterCoordinator` directly without ever touching this controller.
         if !Self.isRunningUnitTests {
-            let coordinator = UpdaterCoordinator(deps: updaterDepsOverride ?? .live)
+            // Sparkle T4: live `activeTurns` wiring — `appModel` doesn't exist yet at this point in
+            // boot() (it's constructed further down), but the closure only evaluates it lazily at
+            // poll time, long after `appModel` is set, so construction order here doesn't matter.
+            // `updaterDepsOverride` (a test seam) must keep winning over this live wiring.
+            var deps = updaterDepsOverride ?? .live
+            if updaterDepsOverride == nil {
+                deps.activeTurns = { [weak self] in await self?.appModel?.engineActivity() }
+            }
+            let coordinator = UpdaterCoordinator(deps: deps)
             let controller = SPUStandardUpdaterController(
                 startingUpdater: true, updaterDelegate: coordinator, userDriverDelegate: nil)
             controller.updater.automaticallyChecksForUpdates = true
@@ -620,10 +628,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onRestartDaemon: { [weak self] in self?.daemonSupervisor?.restart() },
             // Sparkle T3: the "Check for Updates…" item's action — fires Sparkle's own UI-driven
             // check (progress/"you're up to date"/error alerts are Sparkle's standard user driver).
-            onCheckForUpdates: { [weak self] in self?.updaterController?.checkForUpdates(nil) }
+            onCheckForUpdates: { [weak self] in self?.updaterController?.checkForUpdates(nil) },
+            // Sparkle T4: the staged-update "Restart Now" line's action — same override path as
+            // the idle gate's own poll-triggered install, routed through `installNow()`'s
+            // idempotent guard.
+            onInstallUpdate: { [weak self] in self?.updaterCoordinator?.installNow() }
         )
         mb.install()
         menuBar = mb
+
+        // Sparkle T4: hook the idle gate's staged/badge callbacks to the menu bar. Installed here
+        // (after `menuBar = mb`) rather than right where the coordinator is constructed earlier in
+        // this method — order is safe either way since staging can only happen after an update
+        // check, long past boot; `updaterCoordinator` is nil under unit tests, so these are no-ops
+        // there.
+        updaterCoordinator?.onStagedChange = { [weak self] staged, version in
+            self?.menuBar?.setUpdateStaged(staged, version: version)
+        }
+        updaterCoordinator?.onBadgeChange = { [weak self] badged in
+            self?.menuBar?.setUpdateBadge(badged)
+        }
 
         // Task 4 (2f): the red panic item mounts/unmounts as `activeLeases` crosses zero. Safe to
         // wire unconditionally (not gated by `isRunningUnitTests`) — `activeLeases` only ever

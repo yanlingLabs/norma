@@ -36,6 +36,15 @@ extension UpdaterCoordinatorDeps {
 final class UpdaterCoordinator: NSObject {
     let deps: UpdaterCoordinatorDeps
 
+    // Staged-update state
+    private(set) var stagedVersion: String?
+    private var stagedAt: Date?
+    private var pendingInstall: (() -> Void)?
+    private var pollTask: Task<Void, Never>?
+    /// Menu-bar hooks (installed by AppDelegate).
+    var onStagedChange: ((_ staged: Bool, _ version: String?) -> Void)?
+    var onBadgeChange: ((_ badged: Bool) -> Void)?
+
     init(deps: UpdaterCoordinatorDeps) {
         self.deps = deps
     }
@@ -44,11 +53,63 @@ final class UpdaterCoordinator: NSObject {
     func resolvedFeedOverride() -> String? {
         deps.feedOverride()
     }
+
+    /// The idle gate. Sparkle asks permission to relaunch after staging an update; we always
+    /// postpone and let the poll (first tick immediate) or the user's Restart-now decide.
+    /// Returns true = postpone (Sparkle holds until `installHandler` is invoked).
+    func handleRelaunchRequest(version: String, untilInvoking installHandler: @escaping () -> Void) -> Bool {
+        stagedVersion = version
+        stagedAt = deps.now()
+        pendingInstall = installHandler
+        onStagedChange?(true, version)
+        startPolling()
+        return true
+    }
+
+    /// Poll: first check immediately (idle-at-stage installs with no 30s lag), then every
+    /// pollIntervalSeconds. nil activeTurns (daemon unreachable) counts as idle.
+    private func startPolling() {
+        pollTask?.cancel()
+        pollTask = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                if (await self.deps.activeTurns() ?? 0) == 0 {
+                    self.installNow()
+                    return
+                }
+                self.refreshBadge()
+                try? await Task.sleep(for: .seconds(self.deps.pollIntervalSeconds))
+            }
+        }
+    }
+
+    /// The poll's idle trigger AND the user's "Restart Now" override. Idempotent.
+    func installNow() {
+        guard let install = pendingInstall else { return }
+        pendingInstall = nil
+        pollTask?.cancel()
+        onStagedChange?(false, stagedVersion)
+        install() // Sparkle proceeds: quit → swap bundle → relaunch (supervisor spawns the new daemon)
+    }
+
+    private func refreshBadge() {
+        guard let at = stagedAt else { return }
+        onBadgeChange?(deps.now().timeIntervalSince(at) >= deps.badgeAfterSeconds)
+    }
 }
 
 extension UpdaterCoordinator: SPUUpdaterDelegate {
     /// Dev/test override: NORMA_UPDATE_FEED wins; nil → Sparkle falls back to Info.plist.
     nonisolated func feedURLString(for updater: SPUUpdater) -> String? {
         MainActor.assumeIsolated { resolvedFeedOverride() }
+    }
+
+    nonisolated func updater(
+        _ updater: SPUUpdater,
+        shouldPostponeRelaunchForUpdate item: SUAppcastItem,
+        untilInvoking installHandler: @escaping () -> Void
+    ) -> Bool {
+        MainActor.assumeIsolated {
+            handleRelaunchRequest(version: item.displayVersionString, untilInvoking: installHandler)
+        }
     }
 }

@@ -27,4 +27,44 @@ final class UpdaterCoordinatorTests: XCTestCase {
         let c = UpdaterCoordinator(deps: Self.deps(feedOverride: { nil }))
         XCTAssertNil(c.resolvedFeedOverride()) // nil → Sparkle uses Info.plist SUFeedURL
     }
+
+    // MARK: - Sparkle T4: the idle gate
+
+    func testBusyDaemonPostponesAndIdleInstalls() async {
+        var turns = 1
+        let c = UpdaterCoordinator(deps: Self.deps(activeTurns: { turns }))
+        var installed = 0
+        let postponed = c.handleRelaunchRequest(version: "0.2.002", untilInvoking: { installed += 1 })
+        XCTAssertTrue(postponed)
+        XCTAssertEqual(c.stagedVersion, "0.2.002")
+        try? await Task.sleep(for: .seconds(0.05))
+        XCTAssertEqual(installed, 0)              // still busy — never yanked
+        turns = 0
+        try? await Task.sleep(for: .seconds(0.1)) // next poll sees idle
+        XCTAssertEqual(installed, 1)
+    }
+
+    func testRestartNowOverridesWhileBusy() async {
+        let c = UpdaterCoordinator(deps: Self.deps(activeTurns: { 5 }))
+        var installed = 0
+        _ = c.handleRelaunchRequest(version: "0.2.002", untilInvoking: { installed += 1 })
+        c.installNow()
+        XCTAssertEqual(installed, 1)
+        c.installNow()                            // idempotent — no double-install
+        XCTAssertEqual(installed, 1)
+    }
+
+    func testStagedAndBadgeCallbacksFire() async {
+        var clock = Date()
+        var stagedStates: [Bool] = []
+        var badges: [Bool] = []
+        let c = UpdaterCoordinator(deps: Self.deps(activeTurns: { 1 }, now: { clock }, badgeAfter: 0.01))
+        c.onStagedChange = { staged, _ in stagedStates.append(staged) }
+        c.onBadgeChange = { badges.append($0) }
+        _ = c.handleRelaunchRequest(version: "0.2.002", untilInvoking: {})
+        XCTAssertEqual(stagedStates, [true])
+        clock = clock.addingTimeInterval(1)       // "24h" later (scaled by badgeAfter)
+        try? await Task.sleep(for: .seconds(0.05))
+        XCTAssertTrue(badges.contains(true))
+    }
 }
