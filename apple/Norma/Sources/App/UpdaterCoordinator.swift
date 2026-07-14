@@ -106,7 +106,7 @@ extension UpdaterCoordinator: SPUUpdaterDelegate {
     nonisolated func updater(
         _ updater: SPUUpdater,
         shouldPostponeRelaunchForUpdate item: SUAppcastItem,
-        untilInvoking installHandler: @escaping () -> Void
+        untilInvokingBlock installHandler: @escaping () -> Void
     ) -> Bool {
         MainActor.assumeIsolated {
             handleRelaunchRequest(version: item.displayVersionString, untilInvoking: installHandler)

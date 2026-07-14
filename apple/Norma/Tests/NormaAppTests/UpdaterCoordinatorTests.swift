@@ -44,6 +44,15 @@ final class UpdaterCoordinatorTests: XCTestCase {
         XCTAssertEqual(installed, 1)
     }
 
+    func testFirstPollTickIsImmediate() async {
+        // pollInterval far larger than the test window: only an immediate first check can install.
+        let c = UpdaterCoordinator(deps: Self.deps(activeTurns: { 0 }, pollInterval: 1000))
+        var installed = 0
+        _ = c.handleRelaunchRequest(version: "0.2.002", untilInvoking: { installed += 1 })
+        try? await Task.sleep(for: .seconds(0.05))
+        XCTAssertEqual(installed, 1)   // fails if the impl waits pollIntervalSeconds before the first check
+    }
+
     func testRestartNowOverridesWhileBusy() async {
         let c = UpdaterCoordinator(deps: Self.deps(activeTurns: { 5 }))
         var installed = 0
