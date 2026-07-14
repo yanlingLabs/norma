@@ -181,7 +181,16 @@ final class DaemonSupervisor {
 /// BEFORE signaling the process, so whichever exit races in reads back the right flag — a SIGTERM
 /// from an external `kill` would otherwise be indistinguishable from our own.
 final class RealDaemonProcess: DaemonProcess {
+    /// Bound the SIGTERM->SIGKILL escalation (T6 review FIX 2) so `terminateGracefully()` always
+    /// finishes well within `applicationWillTerminate`'s window — macOS gives ~5s before it
+    /// force-quits us, so 2s of grace then SIGKILL is safe.
+    static let gracefulExitTimeout: TimeInterval = 2.0
+    private static let pollInterval: TimeInterval = 0.05
+
     private let process: Process
+    /// Written ONLY on the main actor (`terminateGracefully`/`forceStop`, both called from the
+    /// `@MainActor` supervisor), read ONLY on the main actor (inside the `terminationHandler`'s
+    /// `Task { @MainActor }` hop below) — T6 review FIX 1. Same actor read+write, no cross-thread race.
     private var stoppedByUs = false
     var onExit: ((_ intentional: Bool) -> Void)?
 
@@ -194,8 +203,10 @@ final class RealDaemonProcess: DaemonProcess {
         process = p
         p.terminationHandler = { [weak self] _ in
             guard let self else { return }
-            let intentional = self.stoppedByUs
-            Task { @MainActor in self.onExit?(intentional) } // hop off the background termination queue
+            // T6 review FIX 1: read `stoppedByUs` INSIDE the main-actor hop, not on Foundation's
+            // background termination thread — the flag is written on the main actor, so reading it
+            // anywhere else is an unsynchronized cross-thread read (ThreadSanitizer would flag it).
+            Task { @MainActor in self.onExit?(self.stoppedByUs) }
         }
         do {
             try p.run()
@@ -211,19 +222,53 @@ final class RealDaemonProcess: DaemonProcess {
         }
     }
 
-    /// SIGTERM.
+    /// SIGTERM, then a BOUNDED wait, then SIGKILL if the child is still alive (T6 review FIX 2).
+    /// CONTRACT: after this returns, the child is guaranteed dead — it either exited on SIGTERM
+    /// (the daemon's normal path) or was SIGKILLed. This closes the "app quit -> daemon quit"
+    /// invariant gap: a wedged/hung norma-core that ignores SIGTERM would otherwise survive app
+    /// quit. Blocks the calling thread for up to `gracefulExitTimeout` — deliberate, since the sole
+    /// caller (`DaemonSupervisor.stop()` from `applicationWillTerminate`) needs the kill to COMPLETE
+    /// before the process exits; a healthy daemon exits on SIGTERM in well under the deadline, so
+    /// the full wait only ever elapses for an actually-wedged one.
     func terminateGracefully() {
-        stoppedByUs = true
-        process.terminate()
+        stoppedByUs = true // set BEFORE signalling so the ensuing exit classifies as intentional
+        Self.escalateTermination(
+            isRunning: { [process] in process.isRunning },
+            sigterm: { [process] in process.terminate() },
+            sigkill: { [weak self] in self?.forceStop() },
+            timeout: Self.gracefulExitTimeout
+        )
     }
 
-    /// SIGKILL. Not called anywhere yet (see the protocol doc above) — reserved for a future
-    /// graceful-timeout escalation.
+    /// SIGKILL. Reachable now — the escalation path above calls it when SIGTERM doesn't land in
+    /// time. `stoppedByUs` is (re)set so a SIGKILL-triggered exit still classifies as intentional.
     func forceStop() {
         stoppedByUs = true
         if process.isRunning {
             kill(process.processIdentifier, SIGKILL)
         }
+    }
+
+    /// The bounded SIGTERM->wait->SIGKILL DECISION, factored out with pure seams so it's
+    /// unit-testable without a real `Process` (the real signal calls / `Process.isRunning` are the
+    /// only un-fakeable parts, exercised live-gate-only). Sends `sigterm`, polls `isRunning` until
+    /// it clears or `timeout` elapses (via the `now`/`pause` clock seams), then escalates to
+    /// `sigkill` iff still running. No-op (never even SIGTERMs) if the child is already gone.
+    static func escalateTermination(
+        isRunning: () -> Bool,
+        sigterm: () -> Void,
+        sigkill: () -> Void,
+        timeout: TimeInterval,
+        now: () -> Date = { Date() },
+        pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
+    ) {
+        guard isRunning() else { return }
+        sigterm()
+        let deadline = now().addingTimeInterval(timeout)
+        while isRunning() && now() < deadline {
+            pause(pollInterval)
+        }
+        if isRunning() { sigkill() }
     }
 }
 

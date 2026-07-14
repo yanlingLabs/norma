@@ -107,6 +107,60 @@ final class DaemonSupervisorTests: XCTestCase {
         XCTAssertNotEqual(s.state, .failed)
     }
 
+    // MARK: - T6 review FIX 2: bounded SIGTERM->SIGKILL escalation (the "app quit -> daemon quit" gap)
+
+    /// A wedged daemon that ignores SIGTERM (never stops running) MUST be SIGKILLed once the
+    /// bounded grace deadline elapses — otherwise it survives app quit and the "app quit -> daemon
+    /// quit" invariant breaks. The `now`/`pause` clock seams let this assert the escalation decision
+    /// without sleeping the real 2s or touching a real `Process` (the real signal calls are
+    /// live-gate-only — see the report). `pause` advances the fake clock instead of blocking.
+    func testEscalateTerminationSIGKILLsAProcessThatIgnoresSIGTERM() {
+        var sigterms = 0; var sigkills = 0
+        var clock = Date()
+        RealDaemonProcess.escalateTermination(
+            isRunning: { true }, // never exits — models a hung/wedged daemon
+            sigterm: { sigterms += 1 },
+            sigkill: { sigkills += 1 },
+            timeout: 2.0,
+            now: { clock },
+            pause: { clock = clock.addingTimeInterval($0) }
+        )
+        XCTAssertEqual(sigterms, 1, "SIGTERM must be sent exactly once, first")
+        XCTAssertEqual(sigkills, 1, "a daemon still alive past the deadline must be SIGKILLed")
+    }
+
+    /// The common path: a daemon that DOES exit on SIGTERM (before the deadline) must NEVER be
+    /// SIGKILLed — escalation is the wedged-daemon fallback, not the normal teardown.
+    func testEscalateTerminationDoesNotSIGKILLAProcessThatExitsOnSIGTERM() {
+        var sigterms = 0; var sigkills = 0
+        var polls = 0
+        var clock = Date()
+        RealDaemonProcess.escalateTermination(
+            isRunning: { polls += 1; return polls < 3 }, // exits on the 3rd poll, well before the deadline
+            sigterm: { sigterms += 1 },
+            sigkill: { sigkills += 1 },
+            timeout: 2.0,
+            now: { clock },
+            pause: { clock = clock.addingTimeInterval($0) }
+        )
+        XCTAssertEqual(sigterms, 1)
+        XCTAssertEqual(sigkills, 0, "a daemon that exits on SIGTERM must never be SIGKILLed")
+    }
+
+    /// An already-dead child (e.g. it crashed the instant before teardown) must not even be
+    /// SIGTERMed, let alone SIGKILLed.
+    func testEscalateTerminationIsANoOpWhenAlreadyDead() {
+        var sigterms = 0; var sigkills = 0
+        RealDaemonProcess.escalateTermination(
+            isRunning: { false },
+            sigterm: { sigterms += 1 },
+            sigkill: { sigkills += 1 },
+            timeout: 2.0
+        )
+        XCTAssertEqual(sigterms, 0)
+        XCTAssertEqual(sigkills, 0)
+    }
+
     /// Spec behavior: an occasional crash hours apart doesn't accumulate toward the cap — crashes
     /// older than `rapidWindowSeconds` are pruned before counting. `deps.now` exists precisely so
     /// this is testable; a mutable clock separates crash 1 from the burst by > the window, so the
