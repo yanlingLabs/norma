@@ -194,4 +194,34 @@ describe("subagent transcript surfacing — engine wiring (e2e)", () => {
     const finishedOut = await registry.execute("agent_output", { agent: "worker" }, { cwd: "/tmp", roots: ["/tmp"], sessionId });
     expect(finishedOut.output).toContain(`transcript: ${path}`);
   });
+
+  // task-9 review, Minor 2: a SYNC-completed agent's stored result already carries the engine's
+  // syncTrailer (whose own `transcript: <path>` clause names the file) — agent_output must not
+  // append a SECOND mention of the same path on top of it.
+  test("agent_output on a SYNC-completed agent shows exactly ONE transcript mention (trailer already carries it)", async () => {
+    const registry = new ToolRegistry();
+    const { engine, sessionId, bgAgents, store } = setup(
+      [
+        [spawnCall("s1", "sync task", { run_in_background: false, name: "worker" }), done("tool_calls")],
+        text("sync child done"),
+        text("parent wrap-up"),
+      ],
+      { withTranscripts: true, registry },
+    );
+    registerAgentQueryTools(registry, {
+      bgAgents,
+      store,
+      transcriptPathFor: (sid, tid) => engine.transcriptPathFor(sid, tid),
+    });
+    await engine.runTurn(sessionId); // sync spawn — completes in-turn, result stored WITH the trailer
+
+    const worker = bgAgents.get("worker", sessionId)!;
+    expect(worker.status).toBe("completed");
+    expect(worker.result).toContain("transcript:"); // precondition: the stored result carries the trailer
+
+    const out = await registry.execute("agent_output", { agent: "worker" }, { cwd: "/tmp", roots: ["/tmp"], sessionId });
+    expect(out.isError).toBe(false);
+    const mentions = out.output.split("transcript:").length - 1;
+    expect(mentions).toBe(1); // the trailer's own mention — no duplicate appended line
+  });
 });

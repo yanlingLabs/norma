@@ -68,7 +68,13 @@ export function registerAgentQueryTools(
         // Terminal (completed/failed/stopped/timeout) — deliberately readable even when
         // `notified` is already true (a settle-time completion notice and an on-demand
         // agent_output peek are independent readers of the SAME result string).
-        return `agent '${agent}' ${entry.status}\n${entry.result ?? "(no result recorded)"}${transcriptLine}`;
+        const result = entry.result ?? "(no result recorded)";
+        // Dedupe (task-9 review, Minor 2): a SYNC-completed agent's stored result already ends
+        // with the engine's syncTrailer, whose own `transcript: <path>` clause would make the
+        // appended line here a SECOND mention of the same path — skip it then. A bg-completed
+        // agent's result is the raw finalText (no trailer), so it still gets the line.
+        const dedupedLine = result.includes("transcript:") ? "" : transcriptLine;
+        return `agent '${agent}' ${entry.status}\n${result}${dedupedLine}`;
       }
       const elapsedS = Math.floor((Date.now() - entry.startedAt) / 1000);
       let latest: string | undefined;
