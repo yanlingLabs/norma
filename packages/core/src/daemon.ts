@@ -68,6 +68,8 @@ import { ProviderLink } from "./peripheral/provider-link";
 import { HardwareBroker } from "./peripheral/hardware";
 import { openRoutineStore } from "./routines/store";
 import { RoutineAuditLog } from "./routines/audit";
+import { makeApply } from "./settings-apply";
+import { SettingsWatcher } from "./settings-watcher";
 import { makeDaemonRoutineRunner } from "./routines/runner";
 import { makeRoutineScheduler } from "./routines/scheduler";
 import type { NewSessionEvent } from "@norma/protocol";
@@ -251,6 +253,10 @@ export async function startDaemon(opts: {
   let engine: AgentEngine | null = null;
   let mcp: McpManager | null = null;
   let lspManager: LspManager | null = null;
+  // hot-settings T5b: reassigned inside the `if (agentProvider)` gate below (built only when the
+  // engine/registry exist to hot-apply against); declared here (function scope, outside the gate)
+  // so the shutdown path past the gate's close can still stop() it regardless of agentProvider.
+  let settingsWatcher: SettingsWatcher | null = null;
   let questions: QuestionBroker | null = null;
   let taskStore: TaskStore | null = null;
   let plans: PlanBroker | null = null;
@@ -444,14 +450,15 @@ export async function startDaemon(opts: {
     // one becomes the registry's ordinary "unknown tool" error, no special-cased denial).
     // `idleShutdownMs` threads straight from settings into the SAME LspManager constructor call.
     const lspCfg = settings?.lsp;
+    // hot-settings T5b: named (not inline-arrow) so a later lsp.enabled hot re-enable (the apply
+    // deps' `registerLsp` below) re-registers the SAME session-meta sources this boot call uses —
+    // one definition, two registration sites, never drifting.
+    const cwdOf = (sid: string) => store.meta(sid).cwd ?? undefined;
+    const rootsOf = (sid: string) => sessionDirs.roots(sid);
+    const tmpDirOf = (sid: string) => sessionTmpDir(sid);
     if (lspCfg?.enabled !== false) {
       lspManager = new LspManager({ idleShutdownMs: lspCfg?.idleShutdownMs });
-      registerLspTools(registry, {
-        lsp: lspManager,
-        cwdOf: (sid) => store.meta(sid).cwd ?? undefined,
-        rootsOf: (sid) => sessionDirs.roots(sid),
-        tmpDirOf: (sid) => sessionTmpDir(sid),
-      });
+      registerLspTools(registry, { lsp: lspManager, cwdOf, rootsOf, tmpDirOf });
     }
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
     await mcp.startAll(settings?.mcpServers ?? {});
@@ -572,13 +579,12 @@ export async function startDaemon(opts: {
       // ever consulted (see its own doc comment), so no extra defaulting belongs here.
       reviewerClasses: () => settings?.reviewer?.classes,
       titler,
-      // hot-settings T5a: EngineConfig.computerUse became a getter (engine.ts) so a LATER task
-      // (T5b) can back it with a live, reassignable holder + SettingsWatcher — that wiring is
-      // explicitly NOT this task's job. This is the minimal mechanical thunk-wrap needed to keep
-      // the interface satisfied; `computerUse` above is still assigned exactly ONCE at boot
-      // (line ~423), so this getter always resolves to that same frozen value — byte-identical to
-      // today's behavior, not yet hot-reloadable. T5b replaces this closure body (and the
-      // surrounding boot-gate above) with a read off its live holder.
+      // hot-settings T5a/T5b: EngineConfig.computerUse is a getter (engine.ts) over the SAME `let
+      // computerUse` holder assigned at boot above (~line 423) — T5b (below, after this engine is
+      // constructed) builds the apply callbacks that reassign that holder (registerComputer sets
+      // it, teardownComputer clears it) as settings.json changes, so this closure — unchanged since
+      // T5a — now resolves LIVE: a hot enable/disable is visible on this session's NEXT tool ctx
+      // with no engine reconstruction.
       computerUse: () => computerUse,
       toolSearch: {
         enabled: () => settings?.toolSearch?.enabled,
@@ -587,6 +593,53 @@ export async function startDaemon(opts: {
       },
       hooks: hookFacade,
     });
+
+    // hot-settings T5b (final task of the hot-settings track): compose T2's live getters (already
+    // reading `settings` above), T3's SettingsWatcher, and T4's makeApply diff-applier into one
+    // running watcher — the payoff that makes flipping computerUse.enabled/lsp.enabled/any other
+    // value knob in settings.json take effect in THIS running daemon, no restart. Built here (after
+    // `engine`, so `registry`/`computerUse`/`lspManager` above are all in their post-boot-
+    // registration state) and only when `agentProvider` — a no-provider daemon has no registry/
+    // engine to hot-apply against (same "agent disabled" boundary the rest of this gate follows).
+    const apply = makeApply({
+      // THE atomic swap — a single synchronous assignment, first thing every apply does (T4).
+      setLiveSettings: (s) => { settings = s; },
+      registry,
+      buildComputerService: (s) => new ComputerUseService({ broker: peripheral, heartbeatMs: s?.peripheral?.heartbeatMs }),
+      registerComputer: (svc, s) => {
+        computerUse = svc; // reassigns the SAME holder the `computerUse: () => computerUse` getter above reads
+        registerComputerTool(registry, { screenshotMaxDim: s?.computerUse?.screenshotMaxDim });
+      },
+      teardownComputer: () => {
+        // T4's drain (computerInFlight gate below) already waited out any in-flight `computer`
+        // call before this runs — never yanks a live capability call.
+        registry.unregister("computer");
+        computerUse?.releaseAll();
+        computerUse = undefined;
+      },
+      computerInFlight: () => computerUse?.inFlight() ?? false,
+      buildLspManager: (s) => new LspManager({ idleShutdownMs: s?.lsp?.idleShutdownMs }),
+      registerLsp: (mgr) => {
+        lspManager = mgr;
+        registerLspTools(registry, { lsp: mgr, cwdOf, rootsOf, tmpDirOf }); // SAME session-meta sources as the boot registration above
+      },
+      teardownLsp: async () => {
+        registry.unregister("lsp_diagnostics");
+        registry.unregister("lsp_definition");
+        registry.unregister("lsp_references");
+        const m = lspManager;
+        lspManager = null;
+        await m?.stopAll();
+      },
+      log: (msg) => console.error(`settings-apply: ${msg}`),
+    });
+    settingsWatcher = new SettingsWatcher({
+      path: dirs.settingsPath,
+      load: loadSettings,
+      apply,
+      log: (msg) => console.error(`settings-watcher: ${msg}`),
+    });
+    settingsWatcher.start(settings);
   }
 
   // Scheduled routines (Phase 5 T2, design doc §2; `routineStore` itself hoisted above the
@@ -686,6 +739,7 @@ export async function startDaemon(opts: {
       // its shutdown-request/.then + SIGKILL-timer before they can fire. stopAll still runs to drain
       // any in-flight spawn on the in-process (awaited) path.
       server.stop(); mcp?.stopAll(); lspManager?.killAllNow(); void lspManager?.stopAll(); pluginSupervisor.stopAll(); bgRegistry.killAll();
+      settingsWatcher?.stop(); // closes the fs.watch handle on settings.json — no leaked watcher past shutdown
       routineScheduler.stop(); routineStore.close(); // no orphan tick timer past drain
       store.close(); lock.release();
     },

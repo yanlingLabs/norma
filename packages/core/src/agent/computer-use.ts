@@ -171,7 +171,7 @@ export class ComputerUseService {
    *  service holding nothing but still usable (a later re-enable calls act() as normal, which
    *  lazily re-acquires). Reuses releaseSession per session id — idempotent, and a no-op when
    *  there are no sessions. Snapshots the id list first since releaseSession mutates `sessions`
-   *  (same copy-before-iterate pattern as renewAll's lease loop above). */
+   *  (same copy-before-iterate pattern as renewAll's lease loop below). */
   releaseAll(): void {
     for (const sessionId of [...this.sessions.keys()]) {
       this.releaseSession(sessionId);

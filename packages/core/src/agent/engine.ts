@@ -430,11 +430,6 @@ export class AgentEngine {
     this.runningTurns.add(sessionId);
     const ac = new AbortController();
     this.aborters.set(sessionId, ac);
-    // hot-settings T5a: snapshot the getter ONCE for this turn so the finally-release below acts
-    // on the SAME service this turn actually used, even if a hot-disable flips the live holder to
-    // undefined (or a different instance) mid-turn — per-tool-call sites (executeCall) still read
-    // the getter live, which is what lets a mid-turn disable take effect for later tool calls.
-    const cu = this.cfg.computerUse?.();
     try {
       await this.turn(sessionId, ac.signal);
     } finally {
@@ -449,6 +444,19 @@ export class AgentEngine {
       // service's own idle backstop (maxIdleMs, default 60s without a CU action) bounds the hold
       // for that case instead. Guarded so CU-less configs are byte-identical. Runs before the
       // bg-retrigger drain so a follow-up turn starts with a clean lease slate.
+      //
+      // hot-settings T5b: read the getter LIVE here, at finally-time — NOT a turn-start snapshot
+      // (T5a's original shape). settings-apply.ts's teardownComputer calls releaseAll() globally
+      // the instant CU is hot-DISABLED, so that direction was already covered without this read
+      // needing to be live. The gap a snapshot left was the OPPOSITE direction — a hot ENABLE
+      // mid-turn: a lease acquired by a live per-tool-call ctx.computerUse read (executeCall
+      // always reads the getter fresh) wouldn't be released here until the service's own 60s
+      // maxIdleMs backstop, since the turn-start snapshot was still `undefined`. Reading live
+      // resolves to whatever service is actually live when the turn settles — the SAME instance
+      // that would hold this session's lease in both the steady-state and enable-mid-turn cases;
+      // a mid-turn DISABLE is a harmless no-op here (teardownComputer's releaseAll already released
+      // everyone AND cleared the holder, so this read resolves to `undefined` — nothing to release).
+      const cu = this.cfg.computerUse?.();
       if (cu) {
         const bgRunning = this.cfg.bgAgents?.list(sessionId).some((e) => e.status === "running") ?? false;
         if (!bgRunning) {
