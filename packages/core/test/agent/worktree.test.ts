@@ -26,7 +26,7 @@ function repo(): string {
 describe.if(isMac)("WorktreeManager", () => {
   test("enter creates the worktree dir + branch (head baseRef)", () => {
     const dir = repo();
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     const wt = m.enter("s", dir, "feat");
     expect(wt.branch).toBe("norma/feat");
     expect(wt.name).toBe("feat");
@@ -39,7 +39,7 @@ describe.if(isMac)("WorktreeManager", () => {
 
   test("enter creates the worktree dir + branch (fresh baseRef, falls back to HEAD without origin)", () => {
     const dir = repo();
-    const m = new WorktreeManager({ baseRef: "fresh" });
+    const m = new WorktreeManager({ baseRef: () => "fresh" });
     const wt = m.enter("s", dir, "feat2");
     expect(wt.branch).toBe("norma/feat2");
     expect(existsSync(wt.dir)).toBe(true);
@@ -49,14 +49,14 @@ describe.if(isMac)("WorktreeManager", () => {
 
   test("enter default name uses a random 8-char id when omitted", () => {
     const dir = repo();
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     const wt = m.enter("s", dir);
     expect(wt.name).toMatch(/^[0-9a-f]{8}$/);
   });
 
   test("active tracks the entered worktree", () => {
     const dir = repo();
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     expect(m.active("s")).toBeUndefined();
     const wt = m.enter("s", dir, "feat");
     expect(m.active("s")).toEqual(wt);
@@ -64,20 +64,20 @@ describe.if(isMac)("WorktreeManager", () => {
 
   test("enter twice for the same session → error", () => {
     const dir = repo();
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     m.enter("s", dir, "feat");
     expect(() => m.enter("s", dir, "feat2")).toThrow(/already in worktree/);
   });
 
   test("enter in a non-git dir → error", () => {
     const dir = realpathSync(mkdtempSync(join(tmpdir(), "norma-wt-notgit-")));
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     expect(() => m.enter("s", dir, "feat")).toThrow(/not a git repository/);
   });
 
   test("exit keep leaves the worktree dir; active is cleared; removed:false", () => {
     const dir = repo();
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     const wt = m.enter("s", dir, "feat");
     const result = m.exit("s", "keep");
     expect(result).toEqual({ name: "feat", branch: "norma/feat", removed: false, originalCwd: dir });
@@ -87,7 +87,7 @@ describe.if(isMac)("WorktreeManager", () => {
 
   test("exit remove (clean) removes the worktree dir; removed:true", () => {
     const dir = repo();
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     const wt = m.enter("s", dir, "feat");
     const result = m.exit("s", "remove");
     expect(result).toEqual({ name: "feat", branch: "norma/feat", removed: true, originalCwd: dir });
@@ -97,7 +97,7 @@ describe.if(isMac)("WorktreeManager", () => {
 
   test("exit remove (dirty) refuses without discardChanges — error lists the git status --short output", () => {
     const dir = repo();
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     const wt = m.enter("s", dir, "feat");
     writeFileSync(join(wt.dir, "dirty.txt"), "uncommitted\n");
     expect(() => m.exit("s", "remove")).toThrow(/refusing to remove: uncommitted changes:/);
@@ -110,7 +110,7 @@ describe.if(isMac)("WorktreeManager", () => {
 
   test("exit remove (dirty) with discardChanges:true force-removes despite uncommitted changes", () => {
     const dir = repo();
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     const wt = m.enter("s", dir, "feat");
     writeFileSync(join(wt.dir, "dirty.txt"), "uncommitted\n");
     const result = m.exit("s", "remove", true);
@@ -120,7 +120,7 @@ describe.if(isMac)("WorktreeManager", () => {
   });
 
   test("exit when not in a worktree → error", () => {
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     expect(() => m.exit("no-such-session", "keep")).toThrow(/not currently in a worktree/);
   });
 });
@@ -133,7 +133,7 @@ describe.if(isMac)("WorktreeManager", () => {
 describe.if(isMac)("WorktreeManager: createDetached/removeDetached (stateless, 4h-i Task 4)", () => {
   test("createDetached creates the worktree dir + branch, same layout as enter(), WITHOUT touching sessions state", () => {
     const dir = repo();
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     const wt = m.createDetached(dir, "spawn-feat");
     expect(wt.branch).toBe("norma/spawn-feat");
     expect(existsSync(wt.dir)).toBe(true);
@@ -145,7 +145,7 @@ describe.if(isMac)("WorktreeManager: createDetached/removeDetached (stateless, 4
 
   test("createDetached default name uses a random 8-char id when omitted", () => {
     const dir = repo();
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     const wt = m.createDetached(dir);
     expect(wt.branch).toMatch(/^norma\/[0-9a-f]{8}$/);
     expect(existsSync(wt.dir)).toBe(true);
@@ -153,7 +153,7 @@ describe.if(isMac)("WorktreeManager: createDetached/removeDetached (stateless, 4
 
   test("createDetached does NOT collide with an active session worktree (enter() + createDetached() coexist)", () => {
     const dir = repo();
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     const sessionWt = m.enter("s1", dir, "session-feat"); // occupies the session's ONE slot
     const childWt = m.createDetached(dir, "spawn-child"); // must NOT throw "already in worktree"
     expect(existsSync(sessionWt.dir)).toBe(true);
@@ -165,13 +165,13 @@ describe.if(isMac)("WorktreeManager: createDetached/removeDetached (stateless, 4
 
   test("createDetached in a non-git dir → error", () => {
     const dir = realpathSync(mkdtempSync(join(tmpdir(), "norma-wt-notgit-")));
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     expect(() => m.createDetached(dir, "x")).toThrow(/not a git repository/);
   });
 
   test("removeDetached (clean, cleanOnly:true) removes the worktree dir, returns true, does NOT touch sessions", () => {
     const dir = repo();
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     const wt = m.createDetached(dir, "spawn-clean");
     const removed = m.removeDetached(wt.dir, dir, true);
     expect(removed).toBe(true);
@@ -180,7 +180,7 @@ describe.if(isMac)("WorktreeManager: createDetached/removeDetached (stateless, 4
 
   test("removeDetached (dirty, cleanOnly:true) leaves the worktree on disk, returns false, does NOT throw", () => {
     const dir = repo();
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     const wt = m.createDetached(dir, "spawn-dirty");
     writeFileSync(join(wt.dir, "dirty.txt"), "uncommitted\n");
     const removed = m.removeDetached(wt.dir, dir, true);
@@ -190,7 +190,7 @@ describe.if(isMac)("WorktreeManager: createDetached/removeDetached (stateless, 4
 
   test("removeDetached (dirty, cleanOnly:false) force-removes despite uncommitted changes", () => {
     const dir = repo();
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     const wt = m.createDetached(dir, "spawn-force");
     writeFileSync(join(wt.dir, "dirty.txt"), "uncommitted\n");
     const removed = m.removeDetached(wt.dir, dir, false);
@@ -200,7 +200,7 @@ describe.if(isMac)("WorktreeManager: createDetached/removeDetached (stateless, 4
 
   test("createDetached + removeDetached never mutate an unrelated active session worktree", () => {
     const dir = repo();
-    const m = new WorktreeManager({ baseRef: "head" });
+    const m = new WorktreeManager({ baseRef: () => "head" });
     const sessionWt = m.enter("s1", dir, "session-feat2");
     const childWt = m.createDetached(dir, "spawn-child2");
     m.removeDetached(childWt.dir, dir, true);

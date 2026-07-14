@@ -28,10 +28,17 @@ import type { BashReviewer } from "../../src/agent/reviewer";
 // instead of duplicating it.
 export function setupEngine(provider: Provider, opts?: {
   cwd?: string; assembler?: ContextAssembler; compactor?: Compactor; skills?: SkillStore; registry?: ToolRegistry; mcp?: McpManager;
-  reviewer?: BashReviewer; reviewerEnabled?: boolean; reviewerAllow?: string[]; policy?: "ask" | "auto" | "plan";
+  // reviewerEnabled accepts a plain boolean (wrapped into a getter below) OR a getter directly —
+  // hot-settings T2's engine-hot-config.test.ts passes `() => live` closing over a reassignable
+  // outer var to prove reviewer.enabled is hot in BOTH directions with no engine reconstruction.
+  reviewer?: BashReviewer; reviewerEnabled?: boolean | (() => boolean | undefined); reviewerAllow?: string[]; policy?: "ask" | "auto" | "plan";
   // phase 5e T3: per-class review on/off — undefined (every pre-5e-T3 test) leaves every class
-  // enabled, unchanged. See EngineConfig.reviewerClasses's own doc comment.
-  reviewerClasses?: { bash?: boolean; fs?: boolean; external?: boolean };
+  // enabled, unchanged. See EngineConfig.reviewerClasses's own doc comment. Also accepts a getter
+  // directly (hot-settings T2's engine-hot-config.test.ts passes `() => live.reviewer?.classes`
+  // closing over an outer, reassignable `live` — proving the ENGINE reads it fresh per call, with
+  // no engine reconstruction between two runTurn()s) — every other caller passes the plain value,
+  // wrapped below into a getter same as reviewerEnabled/reviewerAllow/toolSearch.
+  reviewerClasses?: { bash?: boolean; fs?: boolean; external?: boolean } | (() => { bash?: boolean; fs?: boolean; external?: boolean } | undefined);
   // undefined (default) → no deferral anywhere; every pre-existing engine test omits this and is unaffected.
   toolSearch?: { enabled?: boolean; deferThreshold?: number; deferExternals?: "count" | "always" };
   // undefined (default) → EngineConfig.provider.live is absent, matching every pre-existing
@@ -82,6 +89,11 @@ export function setupEngine(provider: Provider, opts?: {
   // compaction of its own — keeps every pre-existing engine test working without threading one
   // through. Mirrors the assembler default above.
   const compactor = opts?.compactor ?? new Compactor({ provider: { provider, model: "gated-1" }, store, hub });
+  // `const`s so TS's narrowing on `typeof ... === "function"` below survives into the
+  // arrow-function closures (re-reading `opts?....` directly inside a closure would NOT narrow —
+  // control-flow narrowing doesn't cross a lazily-invoked function boundary).
+  const reviewerClassesOpt = opts?.reviewerClasses;
+  const reviewerEnabledOpt = opts?.reviewerEnabled;
   const engine = new AgentEngine({
     store, hub, registry, broker,
     gate: new PermissionGate(),
@@ -92,10 +104,20 @@ export function setupEngine(provider: Provider, opts?: {
     compactor,
     mcp: opts?.mcp,
     reviewer: opts?.reviewer,
-    reviewerEnabled: opts?.reviewerEnabled,
-    reviewerAllow: opts?.reviewerAllow,
-    reviewerClasses: opts?.reviewerClasses,
-    toolSearch: opts?.toolSearch,
+    // hot-settings T2: EngineConfig's in-scope fields are now getters — every existing caller
+    // here still passes a plain value (or, for reviewerClasses only, an already-built getter —
+    // see its own doc comment above), wrapped into a getter at this ONE boundary so none of the
+    // ~15 test files reusing setupEngine need their own call sites touched.
+    reviewerEnabled: typeof reviewerEnabledOpt === "function" ? reviewerEnabledOpt : () => reviewerEnabledOpt,
+    reviewerAllow: () => opts?.reviewerAllow,
+    reviewerClasses: typeof reviewerClassesOpt === "function" ? reviewerClassesOpt : () => reviewerClassesOpt,
+    toolSearch: opts?.toolSearch
+      ? {
+          enabled: () => opts.toolSearch?.enabled,
+          deferThreshold: () => opts.toolSearch?.deferThreshold,
+          deferExternals: () => opts.toolSearch?.deferExternals,
+        }
+      : undefined,
     worktrees: opts?.worktrees,
     bgRegistry: opts?.bgRegistry,
   });

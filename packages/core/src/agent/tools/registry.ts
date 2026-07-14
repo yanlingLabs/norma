@@ -160,7 +160,11 @@ export class ToolRegistry {
 
   has(name: string): boolean { return this.defs.has(name); }
 
-  unregister(name: string): void { this.defs.delete(name); }
+  /** Idempotent, never throws: true iff `name` was present and is now removed. No memoized/
+   *  derived state to invalidate — specs()/isDeferred/deferredIndex all read `defs` live on every
+   *  call (see externalCountActive, specs, deferredIndex above), so a def added or removed here is
+   *  immediately reflected with no separate cache-busting step. */
+  unregister(name: string): boolean { return this.defs.delete(name); }
 
   /** Removes every tool whose name starts with `prefix` — used by ipc/server.ts to unregister an
    *  entire plugin's `plugin__<id>__` tool set at once (on connection disconnect or the

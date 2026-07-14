@@ -81,7 +81,12 @@ export function setup(
   const agentsHome = mkdtempSync(join(tmpdir(), "norma-engine-spawn-agents-"));
   const agentsTrust = new TrustStore(join(agentsHome, "trust.json"));
   const agents = withSubagents ? new AgentStore({ normaHome: agentsHome, trust: agentsTrust }) : undefined;
-  const subagents = withSubagents ? new SubagentManager(opts.subagentsOpts ?? {}) : undefined;
+  // hot-settings T2: SubagentManager.maxConcurrent is now a getter — opts.subagentsOpts stays a
+  // plain-value shape (every existing call site here passes a raw number) and gets wrapped at
+  // this ONE boundary, mirroring daemon.ts's own `() => settings?.subagents?.maxConcurrent`.
+  const subagents = withSubagents
+    ? new SubagentManager({ ...opts.subagentsOpts, maxConcurrent: () => opts.subagentsOpts?.maxConcurrent })
+    : undefined;
   // 4h-ii-a: constructed by default (even when withSubagents is false — mirrors `subagents`'s own
   // optionality, cfg.bgAgents is independently optional in EngineConfig) so run_in_background
   // tests can inspect it directly without a separate setup path. `withBgAgents:false` omits it
@@ -100,8 +105,16 @@ export function setup(
     agents,
     subagents,
     bgAgents: withBgAgents ? bgAgents : undefined,
-    subagentMaxDepth: opts.maxDepth,
-    toolSearch: opts.toolSearch,
+    // hot-settings T2: both are now getters — opts stays the plain-value shape every existing
+    // call site here uses, wrapped at this ONE boundary (mirrors daemon.ts's own getters).
+    subagentMaxDepth: () => opts.maxDepth,
+    toolSearch: opts.toolSearch
+      ? {
+          enabled: () => opts.toolSearch?.enabled,
+          deferThreshold: () => opts.toolSearch?.deferThreshold,
+          deferExternals: () => opts.toolSearch?.deferExternals,
+        }
+      : undefined,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: opts.approvalPolicy ?? "auto" });
   const events: SessionEvent[] = [];
@@ -1185,7 +1198,7 @@ function setupIsolation(
     const m = store.meta(sid);
     return m.cwd ? [m.cwd] : [];
   });
-  const worktrees = opts.withWorktrees !== false ? new WorktreeManager({ baseRef: "head" }) : undefined;
+  const worktrees = opts.withWorktrees !== false ? new WorktreeManager({ baseRef: () => "head" }) : undefined;
   const assemblerHome = mkdtempSync(join(tmpdir(), "norma-engine-spawn-wt-actx-"));
   const assemblerTrust = new TrustStore(join(assemblerHome, "trust.json"));
   const assembler = new ContextAssembler({

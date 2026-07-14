@@ -14,6 +14,9 @@ class FakeBroker implements PeripheralBrokerLike {
   renewResult: any = null;
   callResult: any = { ok: true, resultJson: "{}" };
   expiresAt = 100_000;
+  /** When set, `call()` awaits this before resolving — lets a test hold an act() mid-flight to
+   *  probe ComputerUseService.inFlight() deterministically (no real timers/races). */
+  gate: Promise<void> | null = null;
 
   async lease(req: { sessionId: string; class: any }) {
     this.leaseCalls.push({ sessionId: req.sessionId, class: req.class });
@@ -30,6 +33,7 @@ class FakeBroker implements PeripheralBrokerLike {
   }
   async call(req: { leaseId: string; token: string; class: any; payloadJson: string }) {
     this.callCalls.push({ leaseId: req.leaseId, token: req.token, class: req.class, payloadJson: req.payloadJson });
+    if (this.gate) await this.gate;
     return this.callResult;
   }
 }
@@ -251,6 +255,49 @@ describe("ComputerUseService", () => {
     const broker = new FakeBroker();
     const { svc } = makeService(broker);
     expect(() => svc.releaseSession("nope")).not.toThrow();
+    expect(broker.releaseCalls.length).toBe(0);
+  });
+
+  test("inFlight() is false when idle, true while an act() is mid-flight, false again after it settles", async () => {
+    const broker = new FakeBroker();
+    const { svc } = makeService(broker);
+    expect(svc.inFlight()).toBe(false);
+
+    let release!: () => void;
+    broker.gate = new Promise((resolve) => { release = resolve; });
+    const pending = svc.act("s1", "screenshot", "{}");
+    // act() is now awaiting broker.call(), which is blocked on the gate — flush the microtask
+    // queue (lease acquisition's own internal awaits) so execution actually reaches that point.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(svc.inFlight()).toBe(true);
+
+    release();
+    const r = await pending;
+    expect(r.ok).toBe(true);
+    expect(svc.inFlight()).toBe(false);
+  });
+
+  test("releaseAll() releases every session's held leases and stops their timers", async () => {
+    const broker = new FakeBroker();
+    const { svc, tick } = makeService(broker);
+    await svc.act("s1", "screenshot", "{}");
+    await svc.act("s2", "input-drive", "{}");
+    expect(svc.holdsAny("s1")).toBe(true);
+    expect(svc.holdsAny("s2")).toBe(true);
+
+    svc.releaseAll();
+    expect(broker.releaseCalls.length).toBe(2);
+    expect(svc.holdsAny("s1")).toBe(false);
+    expect(svc.holdsAny("s2")).toBe(false);
+    // timers stopped: a tick renews nothing
+    tick();
+    expect(broker.renewCalls.length).toBe(0);
+  });
+
+  test("releaseAll() is a no-op when there are no sessions", () => {
+    const broker = new FakeBroker();
+    const { svc } = makeService(broker);
+    expect(() => svc.releaseAll()).not.toThrow();
     expect(broker.releaseCalls.length).toBe(0);
   });
 });

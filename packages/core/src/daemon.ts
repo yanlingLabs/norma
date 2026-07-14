@@ -1,6 +1,5 @@
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { statSync } from "node:fs";
 import { bootstrapNormaDir, resolveNormaHome } from "./norma-dir";
 import { acquireLock, type Lock } from "./lock";
 import { TokenAuthority } from "./auth/tokens";
@@ -69,6 +68,8 @@ import { ProviderLink } from "./peripheral/provider-link";
 import { HardwareBroker } from "./peripheral/hardware";
 import { openRoutineStore } from "./routines/store";
 import { RoutineAuditLog } from "./routines/audit";
+import { makeApply } from "./settings-apply";
+import { SettingsWatcher } from "./settings-watcher";
 import { makeDaemonRoutineRunner } from "./routines/runner";
 import { makeRoutineScheduler } from "./routines/scheduler";
 import type { NewSessionEvent } from "@norma/protocol";
@@ -79,14 +80,6 @@ export interface RunningDaemon {
   socketPath: string;
   tokens: { harness: string; admin: string };
   stop(): void;
-}
-
-/** Same mtime-or-zero helper providers/manager.ts's `liveModel` and ipc/server.ts's `livePlugins`
- *  each already define locally — kept as a tiny module-private duplicate here too rather than
- *  exported/shared, matching that existing precedent (no shared "settings hot-read" utility file
- *  exists yet; each hot-read site owns its own cache). */
-function statMtimeOrZero(path: string): number {
-  try { return statSync(path).mtimeMs; } catch { return 0; } // missing file -> key 0
 }
 
 /** Builds the `policy(sessionId, cls)` dependency PeripheralBroker.lease() awaits (spec §A1:
@@ -260,6 +253,10 @@ export async function startDaemon(opts: {
   let engine: AgentEngine | null = null;
   let mcp: McpManager | null = null;
   let lspManager: LspManager | null = null;
+  // hot-settings T5b: reassigned inside the `if (agentProvider)` gate below (built only when the
+  // engine/registry exist to hot-apply against); declared here (function scope, outside the gate)
+  // so the shutdown path past the gate's close can still stop() it regardless of agentProvider.
+  let settingsWatcher: SettingsWatcher | null = null;
   let questions: QuestionBroker | null = null;
   let taskStore: TaskStore | null = null;
   let plans: PlanBroker | null = null;
@@ -363,7 +360,10 @@ export async function startDaemon(opts: {
     plans = new PlanBroker();
     registerPlanTool(registry, { deferred: true });
     registerNotebookTool(registry, { deferred: true });
-    const worktrees = new WorktreeManager({ baseRef: settings?.worktree?.baseRef });
+    // hot-settings T2: getter over the live `settings` holder (was a boot-captured value) — a
+    // later task's watcher reassigns `settings` in place; this closure re-reads it on the NEXT
+    // enter_worktree/spawn isolation call, no WorktreeManager reconstruction needed.
+    const worktrees = new WorktreeManager({ baseRef: () => settings?.worktree?.baseRef });
     registerWorktreeTools(registry, { deferred: true });
     // 4g Task 5: web_fetch — Norma's ONLY sanctioned network egress (bash's sandbox denies network
     // by design). Shares the SAME `audit` appender instance as peripheral/hardware below (hoisted
@@ -377,7 +377,10 @@ export async function startDaemon(opts: {
       normaHome, trust: trustStore, baseInstructions: SYSTEM_PROMPT,
       plugins: { disabled: settings?.plugins?.disabled ?? [] },
     });
-    const subagents = new SubagentManager({ maxConcurrent: settings?.subagents?.maxConcurrent });
+    // hot-settings T2: getter over the live `settings` holder (was a boot-captured value) — a
+    // later task's watcher reassigns `settings` in place; this closure re-reads it on the NEXT
+    // acquire(), no SubagentManager reconstruction needed.
+    const subagents = new SubagentManager({ maxConcurrent: () => settings?.subagents?.maxConcurrent });
     // Async spawn (4h-ii-a): tracks DETACHED (`run_in_background:true`) child threads — see
     // bg-agent-registry.ts's own doc comment for why this is separate from `bgRegistry` above
     // (that one owns backgrounded bash processes; this one owns agent threads). Built
@@ -447,14 +450,15 @@ export async function startDaemon(opts: {
     // one becomes the registry's ordinary "unknown tool" error, no special-cased denial).
     // `idleShutdownMs` threads straight from settings into the SAME LspManager constructor call.
     const lspCfg = settings?.lsp;
+    // hot-settings T5b: named (not inline-arrow) so a later lsp.enabled hot re-enable (the apply
+    // deps' `registerLsp` below) re-registers the SAME session-meta sources this boot call uses —
+    // one definition, two registration sites, never drifting.
+    const cwdOf = (sid: string) => store.meta(sid).cwd ?? undefined;
+    const rootsOf = (sid: string) => sessionDirs.roots(sid);
+    const tmpDirOf = (sid: string) => sessionTmpDir(sid);
     if (lspCfg?.enabled !== false) {
       lspManager = new LspManager({ idleShutdownMs: lspCfg?.idleShutdownMs });
-      registerLspTools(registry, {
-        lsp: lspManager,
-        cwdOf: (sid) => store.meta(sid).cwd ?? undefined,
-        rootsOf: (sid) => sessionDirs.roots(sid),
-        tmpDirOf: (sid) => sessionTmpDir(sid),
-      });
+      registerLspTools(registry, { lsp: lspManager, cwdOf, rootsOf, tmpDirOf });
     }
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
     await mcp.startAll(settings?.mcpServers ?? {});
@@ -511,10 +515,17 @@ export async function startDaemon(opts: {
       projectDir: (sid) => store.meta(sid).cwd,
     });
     const compactor = new Compactor({ provider: agentProvider, store, hub });
-    // Default ON: the reviewer is built unless settings.reviewer.enabled is explicitly false.
+    // hot-settings T2 review: ALWAYS constructed, never gated on the boot-time reviewer.enabled.
+    // The BashReviewer constructor is inert (stores provider/model/timeoutMs refs only — no I/O,
+    // spawns nothing; review() is what does work, and it's only ever reached through the engine's
+    // `reviewerEnabled?.() !== false` gate). Building it unconditionally is what makes
+    // reviewer.enabled hot in BOTH directions: were it left undefined at a disabled-boot, a later
+    // false→true edit could never take effect (the getter gates whether review RUNS, but only if
+    // there's a reviewer object to run) — a restart-required toggle, which the "no restart
+    // anywhere" rule forbids. `reviewer.model` stays a boot snapshot (out of T2's scope — it
+    // picks WHICH model the reviewer would use, not whether reviewing is on).
     const reviewerCfg = settings?.reviewer;
-    const reviewer =
-      reviewerCfg?.enabled === false ? undefined : new BashReviewer({ provider: agentProvider, model: reviewerCfg?.model });
+    const reviewer = new BashReviewer({ provider: agentProvider, model: reviewerCfg?.model });
     // Default ON: the titler is built unless settings.titles.enabled is explicitly false.
     const titlesCfg = settings?.titles;
     const titler =
@@ -522,23 +533,14 @@ export async function startDaemon(opts: {
     // Plugin hooks runtime (Phase 4f Task 2): the engine-facing `cfg.hooks` facade. `hookRegistry`
     // is the SAME instance ipc/server.ts's plugin-lifecycle RPCs rebuild in place (passed through
     // startIpcServer's opts below), so a `plugin.enable`/`disable` hot-apply is visible to the
-    // facade with no daemon restart. `hooksEnabledHot` mirrors providers/manager.ts's `liveModel`
-    // pattern (mtime-cached settings.json re-read per call, never throwing — falls back to the
-    // spec default of enabled) rather than closing over the boot-time `settings` snapshot above,
-    // so `hooks.enabled` toggles live too, exactly like the plan's "read like other hot settings".
-    let hooksEnabledCache: { key: number; value: boolean } | null = null;
-    const hooksEnabledHot = (): boolean => {
-      const key = statMtimeOrZero(dirs.settingsPath);
-      if (hooksEnabledCache && hooksEnabledCache.key === key) return hooksEnabledCache.value;
-      let value: boolean;
-      try {
-        value = hooksEnabledFrom(loadSettings(dirs.settingsPath));
-      } catch {
-        value = true; // never throw into a hook call — same fail-open-on-read-failure precedent as liveModel
-      }
-      hooksEnabledCache = { key, value };
-      return value;
-    };
+    // facade with no daemon restart. hot-settings T2: `hooksEnabledHot` COLLAPSES from a
+    // mtime-cached settings.json re-read per call into a plain thunk over the live `settings`
+    // holder above — no disk read at all; a later task's watcher reassigns `settings` in place
+    // and this thunk re-reads that same reference on its NEXT call, exactly the getter shape
+    // every other in-scope field in this file now uses. `settings` can still be null (a malformed
+    // settings.json at boot, or a test injecting `agentProvider` directly) — `true` there is the
+    // SAME fail-open default the pre-collapse disk-read-failure catch used.
+    const hooksEnabledHot = (): boolean => (settings ? hooksEnabledFrom(settings) : true);
     const hookFacade = new HookFacade({ registry: hookRegistry, runner: new HookRunner(), hooksEnabled: hooksEnabledHot });
     engine = new AgentEngine({
       store, hub, registry, broker: approvalBroker,
@@ -558,25 +560,86 @@ export async function startDaemon(opts: {
       subagents,
       bgAgents,
       // 4h-i Task 3: undefined (settings.subagents.maxDepth unset) → engine.ts's runThread
-      // defaults it to 2 itself (`subagentMaxDepth ?? 2`) — mirrors the maxConcurrent line above,
-      // which leans on SubagentManager's own internal default the same way.
-      subagentMaxDepth: settings?.subagents?.maxDepth,
+      // defaults it to 5 itself (`subagentMaxDepth?.() ?? 5`) — mirrors the maxConcurrent line
+      // above, which leans on SubagentManager's own internal default the same way. hot-settings
+      // T2: getter over the live `settings` holder, not the boot-captured value — see
+      // `worktrees`/`subagents` above for the same shape.
+      subagentMaxDepth: () => settings?.subagents?.maxDepth,
       reviewer,
-      reviewerEnabled: reviewerCfg?.enabled,
-      reviewerAllow: reviewerCfg?.allow ?? [],
+      // hot-settings T2: these three read the LIVE `settings` holder directly (NOT the
+      // boot-captured `reviewerCfg` above, which only decides whether the BashReviewer object
+      // itself gets constructed — that decision stays a one-time boot snapshot, out of T2's
+      // scope). A later task's watcher reassigns `settings` in place; engine.ts calls each getter
+      // fresh per read site, so a reviewer.enabled/allow/classes edit applies with no engine
+      // reconstruction.
+      reviewerEnabled: () => settings?.reviewer?.enabled,
+      reviewerAllow: () => settings?.reviewer?.allow ?? [],
       // Phase 5e T4: raw pass-through — engine.ts's reviewClassEnabled already treats an absent
       // object/key as enabled, and reviewerEnabled:false already short-circuits before this is
       // ever consulted (see its own doc comment), so no extra defaulting belongs here.
-      reviewerClasses: reviewerCfg?.classes,
+      reviewerClasses: () => settings?.reviewer?.classes,
       titler,
-      computerUse,
+      // hot-settings T5a/T5b: EngineConfig.computerUse is a getter (engine.ts) over the SAME `let
+      // computerUse` holder assigned at boot above (~line 423) — T5b (below, after this engine is
+      // constructed) builds the apply callbacks that reassign that holder (registerComputer sets
+      // it, teardownComputer clears it) as settings.json changes, so this closure — unchanged since
+      // T5a — now resolves LIVE: a hot enable/disable is visible on this session's NEXT tool ctx
+      // with no engine reconstruction.
+      computerUse: () => computerUse,
       toolSearch: {
-        enabled: settings?.toolSearch?.enabled,
-        deferThreshold: settings?.toolSearch?.deferThreshold ?? Number(process.env.NORMA_TOOLSEARCH_THRESHOLD ?? 12),
-        deferExternals: settings?.toolSearch?.deferExternals,
+        enabled: () => settings?.toolSearch?.enabled,
+        deferThreshold: () => settings?.toolSearch?.deferThreshold ?? Number(process.env.NORMA_TOOLSEARCH_THRESHOLD ?? 12),
+        deferExternals: () => settings?.toolSearch?.deferExternals,
       },
       hooks: hookFacade,
     });
+
+    // hot-settings T5b (final task of the hot-settings track): compose T2's live getters (already
+    // reading `settings` above), T3's SettingsWatcher, and T4's makeApply diff-applier into one
+    // running watcher — the payoff that makes flipping computerUse.enabled/lsp.enabled/any other
+    // value knob in settings.json take effect in THIS running daemon, no restart. Built here (after
+    // `engine`, so `registry`/`computerUse`/`lspManager` above are all in their post-boot-
+    // registration state) and only when `agentProvider` — a no-provider daemon has no registry/
+    // engine to hot-apply against (same "agent disabled" boundary the rest of this gate follows).
+    const apply = makeApply({
+      // THE atomic swap — a single synchronous assignment, first thing every apply does (T4).
+      setLiveSettings: (s) => { settings = s; },
+      registry,
+      buildComputerService: (s) => new ComputerUseService({ broker: peripheral, heartbeatMs: s?.peripheral?.heartbeatMs }),
+      registerComputer: (svc, s) => {
+        computerUse = svc; // reassigns the SAME holder the `computerUse: () => computerUse` getter above reads
+        registerComputerTool(registry, { screenshotMaxDim: s?.computerUse?.screenshotMaxDim });
+      },
+      teardownComputer: () => {
+        // T4's drain (computerInFlight gate below) already waited out any in-flight `computer`
+        // call before this runs — never yanks a live capability call.
+        registry.unregister("computer");
+        computerUse?.releaseAll();
+        computerUse = undefined;
+      },
+      computerInFlight: () => computerUse?.inFlight() ?? false,
+      buildLspManager: (s) => new LspManager({ idleShutdownMs: s?.lsp?.idleShutdownMs }),
+      registerLsp: (mgr) => {
+        lspManager = mgr;
+        registerLspTools(registry, { lsp: mgr, cwdOf, rootsOf, tmpDirOf }); // SAME session-meta sources as the boot registration above
+      },
+      teardownLsp: async () => {
+        registry.unregister("lsp_diagnostics");
+        registry.unregister("lsp_definition");
+        registry.unregister("lsp_references");
+        const m = lspManager;
+        lspManager = null;
+        await m?.stopAll();
+      },
+      log: (msg) => console.error(`settings-apply: ${msg}`),
+    });
+    settingsWatcher = new SettingsWatcher({
+      path: dirs.settingsPath,
+      load: loadSettings,
+      apply,
+      log: (msg) => console.error(`settings-watcher: ${msg}`),
+    });
+    settingsWatcher.start(settings);
   }
 
   // Scheduled routines (Phase 5 T2, design doc §2; `routineStore` itself hoisted above the
@@ -585,11 +648,10 @@ export async function startDaemon(opts: {
   // `routines.*` RPCs (T3) work and existing routines aren't silently dropped; `engine` being null
   // just makes every fire fail cleanly via runHeadless's own "agent disabled" short-circuit (below
   // `engine` is ALREADY its final value — this sits after the `if (agentProvider)` block closes,
-  // never reassigned again — so no thunk/live-read indirection is needed here, unlike
-  // hooksEnabledHot's mtime-cached settings re-read, which exists for a genuinely different
-  // reason: hot-reloading a boolean without a restart). `routines.maxConcurrent` is a boot-time
-  // settings snapshot (the SAME precedent as `subagents.maxConcurrent` above — not hot-reloaded; a
-  // live "no restart needed" override wasn't asked for here the way it was for `hooks.enabled`).
+  // never reassigned again — so no thunk/live-read indirection is needed for `engine` itself here.
+  // `routines.maxConcurrent` below is ALREADY a getter over the live `settings` holder (hot-settings
+  // T2 leaves it exactly as it already was — same shape `subagents.maxConcurrent`/`worktrees.baseRef`
+  // above were just converted TO).
   const routinesAudit = new RoutineAuditLog(join(normaHome, "routines-audit.jsonl"));
   const routineRunner = makeDaemonRoutineRunner({ store, hub, engine });
   const routineScheduler = makeRoutineScheduler({
@@ -677,6 +739,7 @@ export async function startDaemon(opts: {
       // its shutdown-request/.then + SIGKILL-timer before they can fire. stopAll still runs to drain
       // any in-flight spawn on the in-process (awaited) path.
       server.stop(); mcp?.stopAll(); lspManager?.killAllNow(); void lspManager?.stopAll(); pluginSupervisor.stopAll(); bgRegistry.killAll();
+      settingsWatcher?.stop(); // closes the fs.watch handle on settings.json — no leaked watcher past shutdown
       routineScheduler.stop(); routineStore.close(); // no orphan tick timer past drain
       store.close(); lock.release();
     },

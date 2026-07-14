@@ -242,19 +242,29 @@ export interface EngineConfig {
   tasks?: TaskStore;
   approvalTimeoutMs?: number; // default 5 min
   reviewer?: BashReviewer; // safety review for auto-policy bash/fs/external calls (undefined → no review, unchanged behavior)
-  reviewerEnabled?: boolean; // default true when reviewer is set; false disables the review path entirely
-  reviewerAllow?: string[]; // extra commands/argv0s bashLooksSafe treats as obviously-safe (bypass review)
+  // hot-settings T2: these were plain boot-captured values; now getters read LIVE off daemon.ts's
+  // `settings` holder (reassigned whole-object by a later task's watcher) so a settings reload
+  // needs no engine reconstruction. Every default below is preserved AT THE READ SITE (`?.()`
+  // followed by the same `?? `/`!== false` fallback the pre-getter code used) — the getter itself
+  // may be absent (a caller/test that never sets the field, same as before) or may resolve to
+  // undefined at call time; both fall through to that identical default.
+  reviewerEnabled?: () => boolean | undefined; // default true when reviewer is set; false disables the review path entirely
+  // Widened to `| undefined` (rather than a getter always guaranteed to return string[]) so the
+  // `?? []` at the read site stays meaningful for a getter/test that doesn't pre-bake the default
+  // itself — daemon.ts's own getter DOES pre-bake it (`() => settings?.reviewer?.allow ?? []`),
+  // but that's a choice, not a contract this type enforces.
+  reviewerAllow?: () => string[] | undefined; // extra commands/argv0s bashLooksSafe treats as obviously-safe (bypass review)
   // phase 5e T3: per-class on/off, read directly here (T4 threads settings.reviewerClasses → this
   // field; until then a caller sets it directly, same "stub until the settings task" shape as
   // reviewerEnabled predates settings wiring). Absent object OR an absent per-class key both mean
   // enabled=true — every existing caller/test that never sets this keeps today's default-on
   // behavior unchanged; only an EXPLICIT `false` for a class disables it.
-  reviewerClasses?: { bash?: boolean; fs?: boolean; external?: boolean };
+  reviewerClasses?: () => { bash?: boolean; fs?: boolean; external?: boolean } | undefined;
   // deferral wired ONLY when this is set AND enabled !== false — undefined (the setupEngine/
   // daemon default before this config existed) leaves specs()/instructions/execute untouched.
   // deferExternals mirrors registry.ts's opt of the same name ("always": externals defer whenever
   // ANY is visible, ignoring deferThreshold's count comparison; absent/"count" = unchanged).
-  toolSearch?: { enabled?: boolean; deferThreshold?: number; deferExternals?: "count" | "always" };
+  toolSearch?: { enabled?: () => boolean | undefined; deferThreshold?: () => number | undefined; deferExternals?: () => "count" | "always" | undefined };
   // Plan mode (1d-ii): both optional, and both absent leaves existing behavior untouched. Without
   // `plans`, exit_plan_mode falls to the else executeCall branch → the tool's own placeholder
   // run() (tools/plan.ts) rather than the approval bridge below. `setPolicy` persists an approved
@@ -289,14 +299,16 @@ export interface EngineConfig {
   bgAgents?: BackgroundAgentRegistry;
   // 4h-i Task 3 (CC parity: configurable nesting depth, settings.subagents.maxDepth): how many
   // levels of spawn_agent nesting are allowed, orthogonal to SubagentManager's maxConcurrent
-  // (fan-out width) — this is depth, not count or concurrency. Undefined → defaults to 5
-  // (runThread reads `subagentMaxDepth ?? 5`), matching Claude Code's fixed max nesting depth of
-  // 5 (user decision: "whatever Claude Code does"). `maxDepth: 1` reproduces the pre-4h-i
-  // behavior (a depth-1 child could never spawn further). A thread at `depth <
-  // maxDepth` may spawn (spawn_agent stays in its specs, the bridge runs its calls); a thread AT
-  // `depth >= maxDepth` has spawn_agent excluded from its specs and, belt-and-braces, rejects any
-  // spawn_agent call it receives anyway.
-  subagentMaxDepth?: number;
+  // (fan-out width) — this is depth, not count or concurrency. Undefined (getter absent, or
+  // present but resolving to undefined) → defaults to 5 (runThread reads `subagentMaxDepth?.() ??
+  // 5`), matching Claude Code's fixed max nesting depth of 5 (user decision: "whatever Claude Code
+  // does"). `maxDepth: 1` reproduces the pre-4h-i behavior (a depth-1 child could never spawn
+  // further). A thread at `depth < maxDepth` may spawn (spawn_agent stays in its specs, the bridge
+  // runs its calls); a thread AT `depth >= maxDepth` has spawn_agent excluded from its specs and,
+  // belt-and-braces, rejects any spawn_agent call it receives anyway.
+  // hot-settings T2: getter over the live settings holder (was a plain boot-captured number) — see
+  // reviewerEnabled's doc comment just above for the general shape/rationale.
+  subagentMaxDepth?: () => number | undefined;
   // SessionTitler (Phase 2e-iii Task 3): optional — absent means no session gets an
   // auto-generated title. Fired fire-and-forget, only at the main thread's (depth 0) turn
   // completion, never on the error paths (an errored first turn has nothing worth titling).
@@ -313,7 +325,12 @@ export interface EngineConfig {
   // engine (1) exposes it + an image-staging callback on the tool ctx, (2) drains staged screenshots
   // into the turn's input as `{type:"image"}` items at each round's end, and (3) releases the
   // session's held leases when the top-level turn settles (runTurn's finally).
-  computerUse?: ComputerUseService;
+  // hot-settings T5a: getter over the live settings-backed holder (was a plain boot-captured
+  // value) — same T2 pattern/rationale as reviewerEnabled et al. above, so a boot-disabled CU can
+  // be hot-enabled (and vice versa) without rebuilding the engine. `ctx.computerUse`'s type on
+  // ToolContext (registry.ts) is UNCHANGED — it stays a plain `ComputerUseService | undefined`;
+  // only this config field became a getter, resolved to that plain value at each read site below.
+  computerUse?: () => ComputerUseService | undefined;
 }
 
 export class AgentEngine {
@@ -427,10 +444,23 @@ export class AgentEngine {
       // service's own idle backstop (maxIdleMs, default 60s without a CU action) bounds the hold
       // for that case instead. Guarded so CU-less configs are byte-identical. Runs before the
       // bg-retrigger drain so a follow-up turn starts with a clean lease slate.
-      if (this.cfg.computerUse) {
+      //
+      // hot-settings T5b: read the getter LIVE here, at finally-time — NOT a turn-start snapshot
+      // (T5a's original shape). settings-apply.ts's teardownComputer calls releaseAll() globally
+      // the instant CU is hot-DISABLED, so that direction was already covered without this read
+      // needing to be live. The gap a snapshot left was the OPPOSITE direction — a hot ENABLE
+      // mid-turn: a lease acquired by a live per-tool-call ctx.computerUse read (executeCall
+      // always reads the getter fresh) wouldn't be released here until the service's own 60s
+      // maxIdleMs backstop, since the turn-start snapshot was still `undefined`. Reading live
+      // resolves to whatever service is actually live when the turn settles — the SAME instance
+      // that would hold this session's lease in both the steady-state and enable-mid-turn cases;
+      // a mid-turn DISABLE is a harmless no-op here (teardownComputer's releaseAll already released
+      // everyone AND cleared the holder, so this read resolves to `undefined` — nothing to release).
+      const cu = this.cfg.computerUse?.();
+      if (cu) {
         const bgRunning = this.cfg.bgAgents?.list(sessionId).some((e) => e.status === "running") ?? false;
         if (!bgRunning) {
-          this.cfg.computerUse.releaseSession(sessionId);
+          cu.releaseSession(sessionId);
           // Teardown sweep for staged-but-undrained screenshots (an abnormal unwind between
           // staging and the round-end drain — e.g. an emit throw mid-dispatch — would otherwise
           // leak the base64 in the map for the daemon's lifetime). Keys are namespaced
@@ -514,17 +544,20 @@ export class AgentEngine {
     return this.cfg.compactor.compact(sessionId, this.aborters.get(sessionId)?.signal);
   }
 
-  /** ToolSearch deferral is wired ONLY when cfg.toolSearch is set AND enabled !== false. */
+  /** ToolSearch deferral is wired ONLY when cfg.toolSearch is set AND enabled !== false. Each
+   *  sub-field is a getter (hot-settings T2) read fresh here — `enabled?.()` returning undefined
+   *  (getter absent, or present but resolving to undefined) keeps the same "not explicitly false"
+   *  default the pre-getter code had. */
   private toolSearchEnabled(): boolean {
-    return this.cfg.toolSearch !== undefined && this.cfg.toolSearch.enabled !== false;
+    return this.cfg.toolSearch !== undefined && this.cfg.toolSearch.enabled?.() !== false;
   }
 
   private toolSearchThreshold(): number | undefined {
-    return this.toolSearchEnabled() ? this.cfg.toolSearch!.deferThreshold : undefined;
+    return this.toolSearchEnabled() ? this.cfg.toolSearch!.deferThreshold?.() : undefined;
   }
 
   private toolSearchDeferExternals(): "count" | "always" | undefined {
-    return this.toolSearchEnabled() ? this.cfg.toolSearch!.deferExternals : undefined;
+    return this.toolSearchEnabled() ? this.cfg.toolSearch!.deferExternals?.() : undefined;
   }
 
   /** Per-turn/round pins (4g-i): state-required deferred built-ins forced visible WITHOUT
@@ -1024,8 +1057,9 @@ export class AgentEngine {
     const effectiveMaxIterations = opts.maxTurns ?? MAX_TOOL_ITERATIONS;
     // 4h-i Task 3: the nesting-depth cap for THIS thread's own spawn attempts — see
     // EngineConfig.subagentMaxDepth's doc comment. Computed once so the spawn-gather filter below
-    // and the belt-and-braces reject agree on the exact same number.
-    const maxDepth = this.cfg.subagentMaxDepth ?? 5;
+    // and the belt-and-braces reject agree on the exact same number. hot-settings T2: getter
+    // read fresh per thread — `?? 5` is the SAME default the pre-getter code applied.
+    const maxDepth = this.cfg.subagentMaxDepth?.() ?? 5;
     // 4h-ii-b Task 4 (SM3): delete THIS child thread's steer queue when its runThread terminates,
     // so a send_message that landed but wasn't drained before the child finished can't resurface
     // when the SAME threadId is later resumed (resume reuses the threadId; its round-top drain
@@ -1923,7 +1957,7 @@ export class AgentEngine {
           outcome = await this.runEnterPlanBridge(sessionId, meta);
         } else if (
           decision === "allow" && call.name === "bash" && this.cfg.reviewer &&
-          this.cfg.reviewerEnabled !== false && meta.approvalPolicy === "auto" && this.reviewClassEnabled("bash")
+          this.cfg.reviewerEnabled?.() !== false && meta.approvalPolicy === "auto" && this.reviewClassEnabled("bash")
         ) {
           let command = "";
           let justification: string | undefined;
@@ -1932,7 +1966,7 @@ export class AgentEngine {
             command = typeof a.command === "string" ? a.command : "";
             justification = typeof a.justification === "string" ? a.justification : undefined;
           } catch { /* fall through to review of "" → likely unsafe */ }
-          if (command && bashLooksSafe(command, this.cfg.reviewerAllow ?? [])) {
+          if (command && bashLooksSafe(command, this.cfg.reviewerAllow?.() ?? [])) {
             // Static bypass — reviewer.review() never runs, so NO tool_review event (phase 5e T2:
             // observability covers actual reviewer invocations, not every gate decision).
             outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
@@ -1944,7 +1978,7 @@ export class AgentEngine {
           }
         } else if (
           decision === "allow" && (call.name === "write" || call.name === "edit") && this.cfg.reviewer &&
-          this.cfg.reviewerEnabled !== false && meta.approvalPolicy === "auto" && this.reviewClassEnabled("fs")
+          this.cfg.reviewerEnabled?.() !== false && meta.approvalPolicy === "auto" && this.reviewClassEnabled("fs")
         ) {
           // fs coverage (5e T3): review only an UNUSUAL write/edit target (outside the primary cwd
           // subtree, or a dotfile/dot-dir segment inside it) — a plain in-cwd write falls straight
@@ -1970,7 +2004,7 @@ export class AgentEngine {
           }
         } else if (
           decision === "allow" && isExternalToolName(call.name) && this.cfg.reviewer &&
-          this.cfg.reviewerEnabled !== false && meta.approvalPolicy === "auto" && this.reviewClassEnabled("external")
+          this.cfg.reviewerEnabled?.() !== false && meta.approvalPolicy === "auto" && this.reviewClassEnabled("external")
         ) {
           // external coverage (5e T3): ALWAYS reviewed under auto when the class is enabled — no
           // "looks safe" bypass exists for third-party code Norma can't inspect (unlike bash).
@@ -2248,9 +2282,12 @@ export class AgentEngine {
 
   /** phase 5e T3: class-off flag — T4 threads settings.reviewerClasses into cfg; until then a
    *  caller sets cfg.reviewerClasses directly (see its own doc comment). Absent object OR absent
-   *  per-class key → enabled; only an EXPLICIT `false` disables that class. */
+   *  per-class key → enabled; only an EXPLICIT `false` disables that class. hot-settings T2:
+   *  `reviewerClasses` is now a getter, called fresh here — an absent getter, or one that
+   *  resolves to undefined/an absent key, both fall through to the same enabled-by-default `!==
+   *  false` check. */
   private reviewClassEnabled(cls: "bash" | "fs" | "external"): boolean {
-    return this.cfg.reviewerClasses?.[cls] !== false;
+    return this.cfg.reviewerClasses?.()?.[cls] !== false;
   }
 
   /** phase 5e T3: the machinery every review class shares (T2's original bash-only flow,
@@ -2632,7 +2669,16 @@ export class AgentEngine {
     // `attachImage` closes over this call's namespaced key (session|thread|callId — see the
     // pendingCuImages doc comment for why bare callId is unsafe): a staged screenshot lands in
     // pendingCuImages under that key, drained into `input` at this round's end (drainRoundImages).
-    const attachImage = this.cfg.computerUse
+    // hot-settings T5a: read the getter LIVE here (per tool call), not the runTurn-start snapshot
+    // — a mid-turn hot-disable must make a LATER call in the same turn see `undefined` too. Safe
+    // unguarded: during T5b's disable DRAIN window the `computer` tool is still registered and the
+    // getter still resolves live, so a NEW `computer` call CAN still dispatch then — it merely
+    // prolongs the bounded drain (T4's computerInFlight gate waits it out) rather than being
+    // yanked; once teardownComputer runs (unregister + holder cleared) this getter resolves
+    // `undefined` and the tool is gone, so a later call errors cleanly. No "half disabled" state
+    // is ever observed: at every instant the tool's presence and this getter agree.
+    const cuNow = this.cfg.computerUse?.();
+    const attachImage = cuNow
       ? (dataUrl: string) => {
           const key = AgentEngine.cuImageKey(sessionId, threadId, call.callId);
           const arr = this.pendingCuImages.get(key) ?? [];
@@ -2649,7 +2695,7 @@ export class AgentEngine {
       builtinDeferral: this.toolSearchEnabled(),
       ask,
       taskEvent,
-      computerUse: this.cfg.computerUse,
+      computerUse: cuNow,
       attachImage,
       visionCapable,
     });

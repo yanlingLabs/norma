@@ -295,7 +295,7 @@ describe.if(isMac)("engine: deferred-tool guard runs before the worktree bridge 
     const registry = new ToolRegistry();
     registerToolSearchTool(registry);
     registerWorktreeTools(registry, { deferred: true });
-    const worktrees = new WorktreeManager({ baseRef: "head" });
+    const worktrees = new WorktreeManager({ baseRef: () => "head" });
     const provider = new FakeProvider([
       [{ type: "tool_call", callId: "e1", name: "enter_worktree", argsJson: JSON.stringify({ name: "feat" }) }, done("tool_calls")],
       [{ type: "text_delta", delta: "ok" }, done("end_turn")],
@@ -320,7 +320,7 @@ describe.if(isMac)("engine: deferred-tool guard runs before the worktree bridge 
     const registry = new ToolRegistry();
     registerToolSearchTool(registry);
     registerWorktreeTools(registry, { deferred: true });
-    const worktrees = new WorktreeManager({ baseRef: "head" });
+    const worktrees = new WorktreeManager({ baseRef: () => "head" });
     const provider = new FakeProvider([
       [{ type: "tool_call", callId: "s1", name: "ToolSearch", argsJson: JSON.stringify({ query: "select:enter_worktree" }) }, done("tool_calls")],
       [{ type: "tool_call", callId: "e1", name: "enter_worktree", argsJson: JSON.stringify({ name: "feat" }) }, done("tool_calls")],
@@ -341,7 +341,7 @@ describe.if(isMac)("engine: deferred-tool guard runs before the worktree bridge 
     const registry = new ToolRegistry();
     registerToolSearchTool(registry);
     registerWorktreeTools(registry, { deferred: true });
-    const worktrees = new WorktreeManager({ baseRef: "head" });
+    const worktrees = new WorktreeManager({ baseRef: () => "head" });
     const provider = new FakeProvider([
       [{ type: "tool_call", callId: "s1", name: "ToolSearch", argsJson: JSON.stringify({ query: "select:enter_worktree" }) }, done("tool_calls")],
       [{ type: "tool_call", callId: "e1", name: "enter_worktree", argsJson: JSON.stringify({ name: "feat" }) }, done("tool_calls")],
@@ -362,7 +362,7 @@ describe.if(isMac)("engine: deferred-tool guard runs before the worktree bridge 
     const cwd = repo();
     const registry = new ToolRegistry();
     registerWorktreeTools(registry, { deferred: true }); // deferred:true, but inert without toolSearch enabled
-    const worktrees = new WorktreeManager({ baseRef: "head" });
+    const worktrees = new WorktreeManager({ baseRef: () => "head" });
     const provider = new FakeProvider([
       [{ type: "tool_call", callId: "e1", name: "enter_worktree", argsJson: JSON.stringify({ name: "feat" }) }, done("tool_calls")],
       [{ type: "text_delta", delta: "ok" }, done("end_turn")],
