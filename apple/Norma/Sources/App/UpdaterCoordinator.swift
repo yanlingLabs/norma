@@ -139,6 +139,26 @@ extension UpdaterCoordinator: SPUUpdaterDelegate {
         }
     }
 
+    /// Live-gate finding: the SILENT automatic flow never reaches the postpone hook above —
+    /// Sparkle stages for install-on-quit and waits; the postpone hook only fires on an
+    /// already-relaunching (user-initiated) install. THIS is the seam that drives auto-install:
+    /// returning true takes control (stalling future update cycles — correct, the idle poll or
+    /// Restart Now WILL invoke the handler), and Sparkle still installs on a natural app quit
+    /// regardless. Recovery note: Sparkle 2.3+ allows invoking `immediateInstallHandler` multiple
+    /// times if the app cancels the termination request — our single-shot `installNow()` never
+    /// needs that today (the `updaterQuitting` arming makes a cancelled termination a non-path),
+    /// but re-invocation is the documented avenue if a future terminate-blocker ever appears.
+    nonisolated func updater(
+        _ updater: SPUUpdater,
+        willInstallUpdateOnQuit item: SUAppcastItem,
+        immediateInstallationBlock immediateInstallHandler: @escaping () -> Void
+    ) -> Bool {
+        MainActor.assumeIsolated {
+            _ = handleRelaunchRequest(version: item.displayVersionString, untilInvoking: immediateInstallHandler)
+            return true   // we take control: the idle poll (or Restart Now) invokes the handler
+        }
+    }
+
     /// Beta/stable channel gate — Sparkle re-asks this per check, so a settings.json edit
     /// takes effect at the very next check with no daemon/app restart needed.
     nonisolated func allowedChannels(for updater: SPUUpdater) -> Set<String> {
