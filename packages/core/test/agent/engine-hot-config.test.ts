@@ -45,6 +45,37 @@ describe("hot-settings T2: getters read the live holder, no reconstruction", () 
     expect(calls.length).toBe(2);
   });
 
+  // hot-settings T2 review: reviewer.enabled must be hot in BOTH directions. The GAP this pins:
+  // daemon.ts now ALWAYS constructs the BashReviewer (never leaves it undefined at a disabled
+  // boot), so an OFF→ON flip works — the reviewer object is present the whole time, and the
+  // `reviewerEnabled` getter is the sole gate on whether review actually runs.
+  test("reviewer PRESENT but reviewerEnabled:()=>false → NO review (bash runs unreviewed under auto); flip live to true → review NOW runs, SAME engine, no reconstruction", async () => {
+    const { registry, calls } = stubRegistry();
+    const reviewer = stubReviewer({ verdict: "safe", reason: "fine" });
+    const provider = new FakeProvider([...bashTurn("rm -rf x"), ...bashTurn("rm -rf x")]);
+    // Reviewer stays PRESENT across both turns (mirrors daemon.ts always constructing it); only
+    // the enabled flag flips, via a whole-object swap of the live holder.
+    let live: { reviewer?: { enabled?: boolean } } = { reviewer: { enabled: false } };
+    const { engine, sessionId } = setupEngine(provider, {
+      registry, reviewer: reviewer as any,
+      reviewerEnabled: () => live.reviewer?.enabled,
+    });
+
+    await engine.runTurn(sessionId);
+    // enabled:false -> the reviewer-gate branch is skipped even though `cfg.reviewer` is present ->
+    // bash falls straight to executeCall, unreviewed.
+    expect(reviewer.seen.length).toBe(0);
+    expect(calls.length).toBe(1); // ran unreviewed
+
+    live = { reviewer: { enabled: true } }; // false→true edit landing between turns — the GAP's key case
+
+    await engine.runTurn(sessionId);
+    // enabled now true + reviewer still present -> review RUNS this turn. Proves off→on is hot with
+    // the reviewer always constructed; no engine reconstruction happened between the two turns.
+    expect(reviewer.seen.length).toBe(1);
+    expect(calls.length).toBe(2);
+  });
+
   test("SubagentManager.maxConcurrent getter reflects a live change", () => {
     let live: any = { subagents: { maxConcurrent: 2 } };
     const m = new SubagentManager({ maxConcurrent: () => live.subagents?.maxConcurrent });

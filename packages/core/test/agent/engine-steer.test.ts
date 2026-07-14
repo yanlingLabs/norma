@@ -28,7 +28,10 @@ import type { BashReviewer } from "../../src/agent/reviewer";
 // instead of duplicating it.
 export function setupEngine(provider: Provider, opts?: {
   cwd?: string; assembler?: ContextAssembler; compactor?: Compactor; skills?: SkillStore; registry?: ToolRegistry; mcp?: McpManager;
-  reviewer?: BashReviewer; reviewerEnabled?: boolean; reviewerAllow?: string[]; policy?: "ask" | "auto" | "plan";
+  // reviewerEnabled accepts a plain boolean (wrapped into a getter below) OR a getter directly —
+  // hot-settings T2's engine-hot-config.test.ts passes `() => live` closing over a reassignable
+  // outer var to prove reviewer.enabled is hot in BOTH directions with no engine reconstruction.
+  reviewer?: BashReviewer; reviewerEnabled?: boolean | (() => boolean | undefined); reviewerAllow?: string[]; policy?: "ask" | "auto" | "plan";
   // phase 5e T3: per-class review on/off — undefined (every pre-5e-T3 test) leaves every class
   // enabled, unchanged. See EngineConfig.reviewerClasses's own doc comment. Also accepts a getter
   // directly (hot-settings T2's engine-hot-config.test.ts passes `() => live.reviewer?.classes`
@@ -86,10 +89,11 @@ export function setupEngine(provider: Provider, opts?: {
   // compaction of its own — keeps every pre-existing engine test working without threading one
   // through. Mirrors the assembler default above.
   const compactor = opts?.compactor ?? new Compactor({ provider: { provider, model: "gated-1" }, store, hub });
-  // `const` so TS's narrowing on `typeof reviewerClassesOpt === "function"` below survives into
-  // the arrow-function closure (re-reading `opts?.reviewerClasses` directly inside that closure
-  // would NOT narrow — control-flow narrowing doesn't cross a lazily-invoked function boundary).
+  // `const`s so TS's narrowing on `typeof ... === "function"` below survives into the
+  // arrow-function closures (re-reading `opts?....` directly inside a closure would NOT narrow —
+  // control-flow narrowing doesn't cross a lazily-invoked function boundary).
   const reviewerClassesOpt = opts?.reviewerClasses;
+  const reviewerEnabledOpt = opts?.reviewerEnabled;
   const engine = new AgentEngine({
     store, hub, registry, broker,
     gate: new PermissionGate(),
@@ -104,7 +108,7 @@ export function setupEngine(provider: Provider, opts?: {
     // here still passes a plain value (or, for reviewerClasses only, an already-built getter —
     // see its own doc comment above), wrapped into a getter at this ONE boundary so none of the
     // ~15 test files reusing setupEngine need their own call sites touched.
-    reviewerEnabled: () => opts?.reviewerEnabled,
+    reviewerEnabled: typeof reviewerEnabledOpt === "function" ? reviewerEnabledOpt : () => reviewerEnabledOpt,
     reviewerAllow: () => opts?.reviewerAllow,
     reviewerClasses: typeof reviewerClassesOpt === "function" ? reviewerClassesOpt : () => reviewerClassesOpt,
     toolSearch: opts?.toolSearch

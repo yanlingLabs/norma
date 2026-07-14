@@ -508,10 +508,17 @@ export async function startDaemon(opts: {
       projectDir: (sid) => store.meta(sid).cwd,
     });
     const compactor = new Compactor({ provider: agentProvider, store, hub });
-    // Default ON: the reviewer is built unless settings.reviewer.enabled is explicitly false.
+    // hot-settings T2 review: ALWAYS constructed, never gated on the boot-time reviewer.enabled.
+    // The BashReviewer constructor is inert (stores provider/model/timeoutMs refs only — no I/O,
+    // spawns nothing; review() is what does work, and it's only ever reached through the engine's
+    // `reviewerEnabled?.() !== false` gate). Building it unconditionally is what makes
+    // reviewer.enabled hot in BOTH directions: were it left undefined at a disabled-boot, a later
+    // false→true edit could never take effect (the getter gates whether review RUNS, but only if
+    // there's a reviewer object to run) — a restart-required toggle, which the "no restart
+    // anywhere" rule forbids. `reviewer.model` stays a boot snapshot (out of T2's scope — it
+    // picks WHICH model the reviewer would use, not whether reviewing is on).
     const reviewerCfg = settings?.reviewer;
-    const reviewer =
-      reviewerCfg?.enabled === false ? undefined : new BashReviewer({ provider: agentProvider, model: reviewerCfg?.model });
+    const reviewer = new BashReviewer({ provider: agentProvider, model: reviewerCfg?.model });
     // Default ON: the titler is built unless settings.titles.enabled is explicitly false.
     const titlesCfg = settings?.titles;
     const titler =
