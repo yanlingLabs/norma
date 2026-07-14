@@ -37,16 +37,27 @@ export interface SubagentRunOptions {
 class SubagentTimeoutError extends Error {}
 
 export class SubagentManager {
-  private readonly maxConcurrent: number;
+  // hot-settings T2: was a plain boot-captured number; now an optional getter read fresh by
+  // currentMaxConcurrent() on every acquire() — a later settings reload's new
+  // subagents.maxConcurrent applies to the NEXT acquire() with no pool reconstruction. Absent
+  // getter, or one resolving to undefined, keeps the SAME default (4) the pre-getter code had.
+  private readonly maxConcurrentFn?: () => number | undefined;
   private readonly timeoutMs: number;
   private readonly acquireTimeoutMs: number;
   private active = 0;
   private readonly queue: Array<() => void> = [];
 
-  constructor(deps?: { maxConcurrent?: number; timeoutMs?: number; acquireTimeoutMs?: number }) {
-    this.maxConcurrent = deps?.maxConcurrent ?? 4;
+  constructor(deps?: { maxConcurrent?: () => number | undefined; timeoutMs?: number; acquireTimeoutMs?: number }) {
+    this.maxConcurrentFn = deps?.maxConcurrent;
     this.timeoutMs = deps?.timeoutMs ?? Number(process.env.NORMA_SUBAGENT_TIMEOUT_MS ?? 300000);
     this.acquireTimeoutMs = deps?.acquireTimeoutMs ?? Number(process.env.NORMA_SUBAGENT_ACQUIRE_TIMEOUT_MS ?? 15000);
+  }
+
+  /** Read fresh on every call — never cached at construction. Exposed (not just used internally
+   *  by acquire()) so a test can assert a live settings-holder change is reflected without
+   *  reconstructing the pool (hot-settings T2). */
+  currentMaxConcurrent(): number {
+    return this.maxConcurrentFn?.() ?? 4;
   }
 
   /**
@@ -69,7 +80,7 @@ export class SubagentManager {
    */
   private acquire(reentrant: boolean): Promise<boolean> {
     return new Promise((resolve) => {
-      if (this.active < this.maxConcurrent) {
+      if (this.active < this.currentMaxConcurrent()) {
         this.active++;
         resolve(true);
         return;

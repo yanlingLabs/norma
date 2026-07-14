@@ -50,7 +50,7 @@ function setup(
   const registry = new ToolRegistry();
   registerWriteTools(registry);
   registerWorktreeTools(registry);
-  const worktrees = withWorktrees ? new WorktreeManager({ baseRef: "head" }) : undefined;
+  const worktrees = withWorktrees ? new WorktreeManager({ baseRef: () => "head" }) : undefined;
   const broker = new ApprovalBroker();
   const provider = new FakeProvider(script);
   // Mirrors daemon.ts's real wiring: roots are derived LIVE from store.meta(sid).cwd, so a

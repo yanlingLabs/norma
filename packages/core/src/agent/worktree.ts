@@ -22,11 +22,22 @@ function git(args: string[], cwd: string): GitResult {
 
 /** Pure git worktree lifecycle (add/remove) + per-session active state. No shell, no persistence. */
 export class WorktreeManager {
-  private readonly baseRef: "fresh" | "head";
+  // hot-settings T2: was a plain boot-captured value; now an optional getter read fresh by
+  // currentBaseRef()/resolveBaseRef() on every worktree creation — a later settings reload's new
+  // worktree.baseRef applies to the NEXT enter()/createDetached() with no reconstruction.
+  private readonly baseRefFn?: () => string | undefined;
   private readonly sessions = new Map<string, ActiveWorktree>();
 
-  constructor(deps?: { baseRef?: "fresh" | "head" }) {
-    this.baseRef = deps?.baseRef ?? "fresh";
+  constructor(deps?: { baseRef?: () => string | undefined }) {
+    this.baseRefFn = deps?.baseRef;
+  }
+
+  /** Read fresh on every call — never cached at construction. Anything other than the literal
+   *  "head" (absent getter, undefined, or any other string) defaults to "fresh", the SAME default
+   *  the pre-getter code applied. Exposed so a test can assert a live settings-holder change is
+   *  reflected without reconstructing the manager (hot-settings T2). */
+  currentBaseRef(): "fresh" | "head" {
+    return this.baseRefFn?.() === "head" ? "head" : "fresh";
   }
 
   enter(sessionId: string, cwd: string, name?: string): ActiveWorktree {
@@ -148,7 +159,7 @@ export class WorktreeManager {
   }
 
   private resolveBaseRef(root: string): string {
-    if (this.baseRef === "head") return "HEAD";
+    if (this.currentBaseRef() === "head") return "HEAD";
     const symref = git(["symbolic-ref", "refs/remotes/origin/HEAD"], root);
     if (symref.code !== 0) return "HEAD";
     const ref = symref.stdout.trim();

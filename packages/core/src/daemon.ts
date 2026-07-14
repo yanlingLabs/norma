@@ -1,6 +1,5 @@
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { statSync } from "node:fs";
 import { bootstrapNormaDir, resolveNormaHome } from "./norma-dir";
 import { acquireLock, type Lock } from "./lock";
 import { TokenAuthority } from "./auth/tokens";
@@ -79,14 +78,6 @@ export interface RunningDaemon {
   socketPath: string;
   tokens: { harness: string; admin: string };
   stop(): void;
-}
-
-/** Same mtime-or-zero helper providers/manager.ts's `liveModel` and ipc/server.ts's `livePlugins`
- *  each already define locally — kept as a tiny module-private duplicate here too rather than
- *  exported/shared, matching that existing precedent (no shared "settings hot-read" utility file
- *  exists yet; each hot-read site owns its own cache). */
-function statMtimeOrZero(path: string): number {
-  try { return statSync(path).mtimeMs; } catch { return 0; } // missing file -> key 0
 }
 
 /** Builds the `policy(sessionId, cls)` dependency PeripheralBroker.lease() awaits (spec §A1:
@@ -363,7 +354,10 @@ export async function startDaemon(opts: {
     plans = new PlanBroker();
     registerPlanTool(registry, { deferred: true });
     registerNotebookTool(registry, { deferred: true });
-    const worktrees = new WorktreeManager({ baseRef: settings?.worktree?.baseRef });
+    // hot-settings T2: getter over the live `settings` holder (was a boot-captured value) — a
+    // later task's watcher reassigns `settings` in place; this closure re-reads it on the NEXT
+    // enter_worktree/spawn isolation call, no WorktreeManager reconstruction needed.
+    const worktrees = new WorktreeManager({ baseRef: () => settings?.worktree?.baseRef });
     registerWorktreeTools(registry, { deferred: true });
     // 4g Task 5: web_fetch — Norma's ONLY sanctioned network egress (bash's sandbox denies network
     // by design). Shares the SAME `audit` appender instance as peripheral/hardware below (hoisted
@@ -377,7 +371,10 @@ export async function startDaemon(opts: {
       normaHome, trust: trustStore, baseInstructions: SYSTEM_PROMPT,
       plugins: { disabled: settings?.plugins?.disabled ?? [] },
     });
-    const subagents = new SubagentManager({ maxConcurrent: settings?.subagents?.maxConcurrent });
+    // hot-settings T2: getter over the live `settings` holder (was a boot-captured value) — a
+    // later task's watcher reassigns `settings` in place; this closure re-reads it on the NEXT
+    // acquire(), no SubagentManager reconstruction needed.
+    const subagents = new SubagentManager({ maxConcurrent: () => settings?.subagents?.maxConcurrent });
     // Async spawn (4h-ii-a): tracks DETACHED (`run_in_background:true`) child threads — see
     // bg-agent-registry.ts's own doc comment for why this is separate from `bgRegistry` above
     // (that one owns backgrounded bash processes; this one owns agent threads). Built
@@ -522,23 +519,14 @@ export async function startDaemon(opts: {
     // Plugin hooks runtime (Phase 4f Task 2): the engine-facing `cfg.hooks` facade. `hookRegistry`
     // is the SAME instance ipc/server.ts's plugin-lifecycle RPCs rebuild in place (passed through
     // startIpcServer's opts below), so a `plugin.enable`/`disable` hot-apply is visible to the
-    // facade with no daemon restart. `hooksEnabledHot` mirrors providers/manager.ts's `liveModel`
-    // pattern (mtime-cached settings.json re-read per call, never throwing — falls back to the
-    // spec default of enabled) rather than closing over the boot-time `settings` snapshot above,
-    // so `hooks.enabled` toggles live too, exactly like the plan's "read like other hot settings".
-    let hooksEnabledCache: { key: number; value: boolean } | null = null;
-    const hooksEnabledHot = (): boolean => {
-      const key = statMtimeOrZero(dirs.settingsPath);
-      if (hooksEnabledCache && hooksEnabledCache.key === key) return hooksEnabledCache.value;
-      let value: boolean;
-      try {
-        value = hooksEnabledFrom(loadSettings(dirs.settingsPath));
-      } catch {
-        value = true; // never throw into a hook call — same fail-open-on-read-failure precedent as liveModel
-      }
-      hooksEnabledCache = { key, value };
-      return value;
-    };
+    // facade with no daemon restart. hot-settings T2: `hooksEnabledHot` COLLAPSES from a
+    // mtime-cached settings.json re-read per call into a plain thunk over the live `settings`
+    // holder above — no disk read at all; a later task's watcher reassigns `settings` in place
+    // and this thunk re-reads that same reference on its NEXT call, exactly the getter shape
+    // every other in-scope field in this file now uses. `settings` can still be null (a malformed
+    // settings.json at boot, or a test injecting `agentProvider` directly) — `true` there is the
+    // SAME fail-open default the pre-collapse disk-read-failure catch used.
+    const hooksEnabledHot = (): boolean => (settings ? hooksEnabledFrom(settings) : true);
     const hookFacade = new HookFacade({ registry: hookRegistry, runner: new HookRunner(), hooksEnabled: hooksEnabledHot });
     engine = new AgentEngine({
       store, hub, registry, broker: approvalBroker,
@@ -558,22 +546,30 @@ export async function startDaemon(opts: {
       subagents,
       bgAgents,
       // 4h-i Task 3: undefined (settings.subagents.maxDepth unset) → engine.ts's runThread
-      // defaults it to 2 itself (`subagentMaxDepth ?? 2`) — mirrors the maxConcurrent line above,
-      // which leans on SubagentManager's own internal default the same way.
-      subagentMaxDepth: settings?.subagents?.maxDepth,
+      // defaults it to 5 itself (`subagentMaxDepth?.() ?? 5`) — mirrors the maxConcurrent line
+      // above, which leans on SubagentManager's own internal default the same way. hot-settings
+      // T2: getter over the live `settings` holder, not the boot-captured value — see
+      // `worktrees`/`subagents` above for the same shape.
+      subagentMaxDepth: () => settings?.subagents?.maxDepth,
       reviewer,
-      reviewerEnabled: reviewerCfg?.enabled,
-      reviewerAllow: reviewerCfg?.allow ?? [],
+      // hot-settings T2: these three read the LIVE `settings` holder directly (NOT the
+      // boot-captured `reviewerCfg` above, which only decides whether the BashReviewer object
+      // itself gets constructed — that decision stays a one-time boot snapshot, out of T2's
+      // scope). A later task's watcher reassigns `settings` in place; engine.ts calls each getter
+      // fresh per read site, so a reviewer.enabled/allow/classes edit applies with no engine
+      // reconstruction.
+      reviewerEnabled: () => settings?.reviewer?.enabled,
+      reviewerAllow: () => settings?.reviewer?.allow ?? [],
       // Phase 5e T4: raw pass-through — engine.ts's reviewClassEnabled already treats an absent
       // object/key as enabled, and reviewerEnabled:false already short-circuits before this is
       // ever consulted (see its own doc comment), so no extra defaulting belongs here.
-      reviewerClasses: reviewerCfg?.classes,
+      reviewerClasses: () => settings?.reviewer?.classes,
       titler,
       computerUse,
       toolSearch: {
-        enabled: settings?.toolSearch?.enabled,
-        deferThreshold: settings?.toolSearch?.deferThreshold ?? Number(process.env.NORMA_TOOLSEARCH_THRESHOLD ?? 12),
-        deferExternals: settings?.toolSearch?.deferExternals,
+        enabled: () => settings?.toolSearch?.enabled,
+        deferThreshold: () => settings?.toolSearch?.deferThreshold ?? Number(process.env.NORMA_TOOLSEARCH_THRESHOLD ?? 12),
+        deferExternals: () => settings?.toolSearch?.deferExternals,
       },
       hooks: hookFacade,
     });
@@ -585,11 +581,10 @@ export async function startDaemon(opts: {
   // `routines.*` RPCs (T3) work and existing routines aren't silently dropped; `engine` being null
   // just makes every fire fail cleanly via runHeadless's own "agent disabled" short-circuit (below
   // `engine` is ALREADY its final value — this sits after the `if (agentProvider)` block closes,
-  // never reassigned again — so no thunk/live-read indirection is needed here, unlike
-  // hooksEnabledHot's mtime-cached settings re-read, which exists for a genuinely different
-  // reason: hot-reloading a boolean without a restart). `routines.maxConcurrent` is a boot-time
-  // settings snapshot (the SAME precedent as `subagents.maxConcurrent` above — not hot-reloaded; a
-  // live "no restart needed" override wasn't asked for here the way it was for `hooks.enabled`).
+  // never reassigned again — so no thunk/live-read indirection is needed for `engine` itself here.
+  // `routines.maxConcurrent` below is ALREADY a getter over the live `settings` holder (hot-settings
+  // T2 leaves it exactly as it already was — same shape `subagents.maxConcurrent`/`worktrees.baseRef`
+  // above were just converted TO).
   const routinesAudit = new RoutineAuditLog(join(normaHome, "routines-audit.jsonl"));
   const routineRunner = makeDaemonRoutineRunner({ store, hub, engine });
   const routineScheduler = makeRoutineScheduler({

@@ -3,7 +3,7 @@ import { SubagentManager } from "../../src/agent/subagents";
 
 describe("SubagentManager", () => {
   test("never exceeds maxConcurrent; queue drains", async () => {
-    const m = new SubagentManager({ maxConcurrent: 2, timeoutMs: 5000 });
+    const m = new SubagentManager({ maxConcurrent: () => 2, timeoutMs: 5000 });
     let inFlight = 0;
     let peak = 0;
     const task = () =>
@@ -43,7 +43,7 @@ describe("SubagentManager", () => {
   });
 
   test("slot released on throw (a queued task still runs)", async () => {
-    const m = new SubagentManager({ maxConcurrent: 1, timeoutMs: 5000 });
+    const m = new SubagentManager({ maxConcurrent: () => 1, timeoutMs: 5000 });
     const first = m.run(async () => {
       throw new Error("first fails");
     });
@@ -59,7 +59,7 @@ describe("SubagentManager", () => {
   // AND must not leak the slot it never got.
   describe("reentrant acquire (nested spawn saturation)", () => {
     test("a reentrant acquire under full saturation fails with the typed 'pool saturated' error within the bounded acquireTimeoutMs, not the (much longer) per-run timeoutMs", async () => {
-      const m = new SubagentManager({ maxConcurrent: 1, timeoutMs: 5000, acquireTimeoutMs: 30 });
+      const m = new SubagentManager({ maxConcurrent: () => 1, timeoutMs: 5000, acquireTimeoutMs: 30 });
       // saturate the single slot with a long-running non-reentrant task that never releases
       // in time for the reentrant probe below
       const holder = m.run(() => new Promise((res) => setTimeout(() => res("holder done"), 2000)));
@@ -81,7 +81,7 @@ describe("SubagentManager", () => {
     });
 
     test("no slot leak: after a reentrant give-up, the internal queue is empty and a subsequent acquire still hands the slot to a LIVE waiter", async () => {
-      const m = new SubagentManager({ maxConcurrent: 1, timeoutMs: 5000, acquireTimeoutMs: 30 });
+      const m = new SubagentManager({ maxConcurrent: () => 1, timeoutMs: 5000, acquireTimeoutMs: 30 });
       let releaseHolder!: (v: string) => void;
       const holder = m.run(() => new Promise<string>((res) => { releaseHolder = res; }));
 
@@ -104,7 +104,7 @@ describe("SubagentManager", () => {
     });
 
     test("a NON-reentrant queued acquire is NOT prematurely timed out — it still waits for a real release, even past acquireTimeoutMs", async () => {
-      const m = new SubagentManager({ maxConcurrent: 1, timeoutMs: 5000, acquireTimeoutMs: 20 });
+      const m = new SubagentManager({ maxConcurrent: () => 1, timeoutMs: 5000, acquireTimeoutMs: 20 });
       let releaseHolder!: (v: string) => void;
       const holder = m.run(() => new Promise<string>((res) => { releaseHolder = res; }));
 
