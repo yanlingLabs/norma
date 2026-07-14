@@ -313,6 +313,14 @@ export const DaemonStatusResult = z.object({
   pluginsCount: z.number().int().nonnegative(),
 });
 
+// Sparkle T2: the update idle gate's poll — how many sessions have a turn executing right now
+// (off AgentEngine.runningTurns). Engine-wide, not per-session: the gate only needs to know
+// whether the DAEMON is idle before Sparkle is allowed to relaunch it.
+export const EngineActivityParams = z.object({});
+export const EngineActivityResult = z.object({
+  activeTurns: z.number().int().nonnegative(),
+});
+
 export const QuotaStateParams = z.object({});
 /** The FLAT merge of `QuotaManager.state()` ({kind:"ok"} | {kind:"limited", resumeAt}) and
  *  `.usage()` ({inputTokens, outputTokens}) — matches NormaKit's `quotaState()` wrapper
@@ -727,6 +735,7 @@ export const METHODS = {
   peripheralRevoke: "peripheral.revoke",
   peripheralRespond: "peripheral.respond",
   daemonStatus: "daemon.status",
+  engineActivity: "engine.activity",
   quotaState: "quota.state",
   trustList: "trust.list",
   trustRemove: "trust.remove",

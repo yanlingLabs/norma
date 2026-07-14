@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import Combine
 import NormaKit
+import Sparkle
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -31,6 +32,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `boot()` (production deps `.live` unless `daemonSupervisorDeps` below overrides them) and
     /// stopped in `applicationWillTerminate`.
     private(set) var daemonSupervisor: DaemonSupervisor?
+    /// Sparkle T3: owns the silent `SPUStandardUpdaterController` — constructed in `boot()`,
+    /// gated `!isRunningUnitTests` (same posture as `daemonSupervisor`'s real spawn path), so no
+    /// updater ever starts from the xctest host.
+    private(set) var updaterController: SPUStandardUpdaterController?
+    /// Sparkle T3: the `SPUUpdaterDelegate` this controller drives — Norma-specific gating (idle
+    /// gate in T4, channels in T5) lives on this seam, not in the controller itself.
+    private(set) var updaterCoordinator: UpdaterCoordinator?
+    /// Sparkle T3 test seam: overrides the `UpdaterCoordinatorDeps` `boot()` constructs the
+    /// coordinator with — set BEFORE calling `boot()`. `nil` (production) resolves to `.live`
+    /// (mirrors `daemonSupervisorDeps` above).
+    var updaterDepsOverride: UpdaterCoordinatorDeps?
     /// Lifecycle T6 test seam: overrides the `DaemonSupervisorDeps` `boot()` constructs the
     /// supervisor with — set BEFORE calling `boot()`. `nil` (production) resolves to `.live`, or to
     /// `.neverSupervise` under `isRunningUnitTests` (see `boot()`); a test injects a
@@ -73,6 +85,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// treated as "close the main windows, demote to `.accessory`, keep the menu bar + daemon
     /// running" instead — the product's ChatGPT/Claude-desktop-style lifecycle contract.
     var reallyQuitting = false
+
+    /// Sparkle whole-branch review (Critical): the updater's DEDICATED true-quit axis — set by
+    /// `UpdaterCoordinator.onWillInstall` (wired in `boot()`) immediately before Sparkle's install
+    /// handler runs. Sparkle terminates the host via a CANCELLABLE Apple quit event with no
+    /// kAEQuitReason (so `systemQuitReasonProvider` reads false too) — without this axis the
+    /// terminate gate below would answer `.terminateCancel` like a ⌘Q and silently defeat the
+    /// entire install+relaunch on BOTH paths (idle poll and Restart Now). A dedicated flag rather
+    /// than reusing `reallyQuitting`: if the quit somehow failed, a stale `reallyQuitting = true`
+    /// would corrupt later ⌘Q semantics (the ONE-true-quit-source contract above).
+    private var updaterQuitting = false
 
     /// Lifecycle T3 review fix: seam for the Apple-Event quit-reason read
     /// (`isSystemInitiatedQuitEvent()` below the class) — injectable so a unit test can drive the
@@ -327,6 +349,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         supervisor.start()
         daemonSupervisor = supervisor
+
+        // Sparkle T3: the silent background updater. Never constructed under unit tests — same
+        // `!isRunningUnitTests` posture as the daemon supervisor's real spawn path and every other
+        // real-side-effect construction in this method; `updaterDepsOverride` (nil in production)
+        // lets a test drive `UpdaterCoordinator` directly without ever touching this controller.
+        if !Self.isRunningUnitTests {
+            // Sparkle T4: live `activeTurns` wiring — `appModel` doesn't exist yet at this point in
+            // boot() (it's constructed further down), but the closure only evaluates it lazily at
+            // poll time, long after `appModel` is set, so construction order here doesn't matter.
+            // `updaterDepsOverride` (a test seam) must keep winning over this live wiring.
+            var deps = updaterDepsOverride ?? .live
+            if updaterDepsOverride == nil {
+                deps.activeTurns = { [weak self] in await self?.appModel?.engineActivity() }
+            }
+            let coordinator = UpdaterCoordinator(deps: deps)
+            let controller = SPUStandardUpdaterController(
+                startingUpdater: true, updaterDelegate: coordinator, userDriverDelegate: nil)
+            controller.updater.automaticallyChecksForUpdates = true
+            controller.updater.automaticallyDownloadsUpdates = true
+            updaterCoordinator = coordinator
+            updaterController = controller
+        }
 
         // AX permission: stickiness needs it; ask once, run degraded until granted.
         // Never prompt during unit tests (ScaffoldTests drives boot() directly); prompt once in real runs.
@@ -591,10 +635,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // ⌘Q/dock-quit (close windows, keep running).
             onReallyQuit: { [weak self] in self?.reallyQuitting = true },
             // Lifecycle T6: the `.failed`-state "engine stopped — Restart" item's action.
-            onRestartDaemon: { [weak self] in self?.daemonSupervisor?.restart() }
+            onRestartDaemon: { [weak self] in self?.daemonSupervisor?.restart() },
+            // Sparkle T3: the "Check for Updates…" item's action — fires Sparkle's own UI-driven
+            // check (progress/"you're up to date"/error alerts are Sparkle's standard user driver).
+            onCheckForUpdates: { [weak self] in self?.updaterController?.checkForUpdates(nil) },
+            // Sparkle T4: the staged-update "Restart Now" line's action — same override path as
+            // the idle gate's own poll-triggered install, routed through `installNow()`'s
+            // idempotent guard.
+            onInstallUpdate: { [weak self] in self?.updaterCoordinator?.installNow() }
         )
         mb.install()
         menuBar = mb
+
+        // Sparkle T4: hook the idle gate's staged/badge callbacks to the menu bar. Installed here
+        // (after `menuBar = mb`) rather than right where the coordinator is constructed earlier in
+        // this method — order is safe either way since staging can only happen after an update
+        // check, long past boot; `updaterCoordinator` is nil under unit tests, so these are no-ops
+        // there.
+        updaterCoordinator?.onStagedChange = { [weak self] staged, version in
+            self?.menuBar?.setUpdateStaged(staged, version: version)
+        }
+        updaterCoordinator?.onBadgeChange = { [weak self] badged in
+            self?.menuBar?.setUpdateBadge(badged)
+        }
+        // Sparkle whole-branch review (Critical): arm the updater-quit axis right before the
+        // install handler runs — Sparkle's quit event is cancellable and would otherwise be
+        // intercepted by `applicationShouldTerminate` like a ⌘Q (see `updaterQuitting`'s doc).
+        updaterCoordinator?.onWillInstall = { [weak self] in self?.updaterQuitting = true }
 
         // Task 4 (2f): the red panic item mounts/unmounts as `activeLeases` crosses zero. Safe to
         // wire unconditionally (not gated by `isRunningUnitTests`) — `activeLeases` only ever
@@ -650,7 +717,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// belt-and-suspenders for the edge case where no main window was open (nothing to close, so
     /// nothing to trigger demotion through those callbacks).
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        let reply = terminateDecision(reallyQuitting: reallyQuitting, systemInitiated: systemQuitReasonProvider())
+        let reply = terminateDecision(
+            reallyQuitting: reallyQuitting,
+            systemInitiated: systemQuitReasonProvider(),
+            updaterQuitting: updaterQuitting)
         if reply == .terminateCancel {
             closeMainWindows()
             hideDockIcon()
@@ -680,12 +750,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// reference, so the whole truth table is unit-testable without any AppKit state (see
 /// `AppLifecycleTests.testTerminateDecision`). `.terminateNow` iff `reallyQuitting` (set ONLY by
 /// the menu-bar "Quit Norma") OR `systemInitiated` (review fix: the quit Apple Event carries a
-/// logout/restart/shutdown reason — refusing THOSE would block the user's logout indefinitely);
-/// everything else — ⌘Q, dock-tile quit — cancels. Window state never gates a quit: the T3 spec's
-/// original `hasMainWindow` param was truth-table-inert and was dropped when `systemInitiated`
-/// (the real second axis) replaced it.
-func terminateDecision(reallyQuitting: Bool, systemInitiated: Bool) -> NSApplication.TerminateReply {
-    (reallyQuitting || systemInitiated) ? .terminateNow : .terminateCancel
+/// logout/restart/shutdown reason — refusing THOSE would block the user's logout indefinitely)
+/// OR `updaterQuitting` (Sparkle whole-branch review fix: Sparkle's installer quits the host via
+/// a CANCELLABLE quit event with no kAEQuitReason — `AppDelegate.updaterQuitting`, armed by
+/// `UpdaterCoordinator.onWillInstall` right before the install handler, is the third true-quit
+/// axis that lets the install relaunch through); everything else — ⌘Q, dock-tile quit — cancels.
+/// Window state never gates a quit: the T3 spec's original `hasMainWindow` param was
+/// truth-table-inert and was dropped when `systemInitiated` (the real second axis) replaced it.
+func terminateDecision(reallyQuitting: Bool, systemInitiated: Bool, updaterQuitting: Bool = false) -> NSApplication.TerminateReply {
+    (reallyQuitting || systemInitiated || updaterQuitting) ? .terminateNow : .terminateCancel
 }
 
 /// Lifecycle T3 review fix: TRUE when the in-flight quit Apple Event carries a system quit reason

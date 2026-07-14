@@ -98,4 +98,11 @@ public enum NormaPaths {
             ?? (NSHomeDirectory() + "/.norma")
         return home + "/run/core.sock"
     }
+
+    /// Mirror of core's resolveNormaHome(): $NORMA_HOME ?? ~/.norma, + /settings.json.
+    public static func settingsPath() -> String {
+        let home = ProcessInfo.processInfo.environment["NORMA_HOME"]
+            ?? (NSHomeDirectory() + "/.norma")
+        return home + "/settings.json"
+    }
 }

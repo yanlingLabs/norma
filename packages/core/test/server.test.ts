@@ -1989,6 +1989,19 @@ describe("daemon IPC", () => {
     c.close();
   });
 
+  // Sparkle T2: engine.activity is the update idle gate's poll — activeTurns off
+  // AgentEngine.runningTurns, same accessor engine-activity.test.ts exercises directly. Here we
+  // only need the idle (0) shape over the wire; the 0->1->0 transition is covered engine-side.
+  test("engine.activity reports zero active turns when idle", async () => {
+    const { FakeProvider } = await import("../src/agent/fake-provider");
+    await boot({}, new FakeProvider([[{ type: "done", stopReason: "end_turn" }]]));
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "activity-checker");
+    const r = (await c.request(METHODS.engineActivity, {})).result;
+    expect(r.activeTurns).toBe(0);
+    c.close();
+  });
+
   // ---------------------------------------------------------------------------------------------
   // Phase 4b Task 2: role→method allowlist for plugin connections (spec §3) + plugin.revokeToken.
   // ---------------------------------------------------------------------------------------------

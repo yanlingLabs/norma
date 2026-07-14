@@ -459,6 +459,12 @@ extension NormaClient {
         )
     }
 
+    /// engine.activity — number of agent turns executing right now (update idle gate).
+    public func engineActivity() async throws -> Int {
+        let r = try await request("engine.activity", params: nil)
+        return r["activeTurns"]?.intValue ?? 0
+    }
+
     /// Dashboard read: rate-limit state (`kind: "ok"|"limited"`, `resumeAt` when limited) + token usage.
     public func quotaState() async throws -> (kind: String, resumeAt: Int?, inputTokens: Int, outputTokens: Int) {
         let r = try await request("quota.state", params: nil)

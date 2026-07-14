@@ -9,6 +9,9 @@ packages:
     path: ../NormaKit
   NormaProtocol:
     path: ../NormaProtocol
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: "2.6.0"
 targets:
   Norma:
     type: application
@@ -20,6 +23,7 @@ targets:
     dependencies:
       - package: NormaKit
       - package: NormaProtocol
+      - package: Sparkle
       - target: NormaHelper
         embed: false
     postCompileScripts:
@@ -55,14 +59,18 @@ targets:
         CFBundleDisplayName: Norma
         CFBundleIdentifier: com.norma.app
         CFBundleIconFile: AppIcon
-        CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "0.2.001"
+        CFBundleVersion: "0.2.001"
         LSUIElement: true
         LSMinimumSystemVersion: "26.0"
         NSPrincipalClass: NSApplication
         # Computer use (Phase 5 CU): screen-recording purpose string shown in the TCC prompt when
         # Norma first captures the screen for a computer-use screenshot.
         NSScreenCaptureUsageDescription: "Norma captures your screen for computer-use screenshots you explicitly ask it to take."
+        SUFeedURL: "https://raw.githubusercontent.com/evaprotocol/norma/main/releases/appcast.xml"
+        SUPublicEDKey: "z8++xdFBdjTq+kTj5v/5OGP0WRaIJrg3VarFSWVt/jE="
+        SUEnableAutomaticChecks: true
+        SUAutomaticallyUpdate: true
     entitlements:
       path: Support/Norma.entitlements
       properties:

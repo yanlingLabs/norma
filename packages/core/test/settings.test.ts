@@ -297,6 +297,16 @@ describe("loadSettings", () => {
     expect(s.schemaVersion).toBe(2);
     expect(s.lsp).toBeUndefined();
   });
+
+  // Sparkle T5: updates.channel — beta/stable auto-update channel, read live by the app at
+  // each check (no daemon restart needed — see UpdaterCoordinator.readChannelFromSettings()).
+  test("updates.channel accepts stable/beta/absent and rejects junk", () => {
+    const base = { schemaVersion: 2 as const, provider: { type: "codex-oauth" as const, model: "gpt-5.4" } };
+    expect(Settings.safeParse({ ...base, updates: { channel: "beta" } }).success).toBe(true);
+    expect(Settings.safeParse({ ...base, updates: { channel: "stable" } }).success).toBe(true);
+    expect(Settings.safeParse({ ...base, updates: {} }).success).toBe(true);
+    expect(Settings.safeParse({ ...base, updates: { channel: "nightly" } }).success).toBe(false);
+  });
 });
 
 describe("hooksEnabledFrom (4f: hooks.enabled default-ON semantics)", () => {

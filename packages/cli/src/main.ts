@@ -1,7 +1,7 @@
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, readFileSync } from "node:fs";
-import { resolveNormaHome, KeychainSecretStore, startDaemon, TOKEN_NAMES, loadSettings } from "@norma/core";
+import { resolveNormaHome, KeychainSecretStore, startDaemon, TOKEN_NAMES, loadSettings, CORE_VERSION } from "@norma/core";
 import type { Settings } from "@norma/core";
 import { METHODS, type ApprovalPolicy, type Task } from "@norma/protocol";
 import { NormaClient } from "./client";
@@ -806,14 +806,11 @@ async function runTurnSession(opts: { promptOverride?: string; forceAuto?: boole
   // dangling legacy timers/listener and exit cleanly, exactly as the legacy chat teardown does.
   if (inkMode) {
     const { mountTui } = await import("./tui/mount");
-    // Welcome-banner data. Version: this package's own manifest (read relative to THIS module, not
-    // cwd — the CLI runs from the user's project dir). Model: the resolved provider model the daemon
-    // will use, read from settings.json (same source as `norma model`). Both best-effort with inert
-    // fallbacks so a missing manifest / settings never blocks the interactive session.
-    let version = "0.0.0";
-    try {
-      version = (JSON.parse(readFileSync(join(import.meta.dir, "..", "package.json"), "utf8")) as { version?: string }).version ?? version;
-    } catch { /* keep fallback */ }
+    // Welcome-banner data. Version: the unified @norma/core CORE_VERSION (also correct for a
+    // compiled binary, which has no adjacent package.json to read). Model: the resolved provider
+    // model the daemon will use, read from settings.json (same source as `norma model`), best-effort
+    // with an inert fallback so missing settings never blocks the interactive session.
+    const version = CORE_VERSION;
     let model = "";
     try {
       model = loadSettings(join(resolveNormaHome(), "settings.json")).provider.model;

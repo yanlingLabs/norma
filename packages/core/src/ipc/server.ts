@@ -11,7 +11,7 @@ import {
   PluginsListParams, AskUserRespondParams, TaskListParams, PlanRespondParams, SessionSetPolicyParams,
   ThreadListParams,
   PeripheralLeaseParams, PeripheralRenewParams, PeripheralReleaseParams, PeripheralAdvertiseParams,
-  PeripheralRevokeParams, PeripheralRespondParams, DaemonStatusParams, QuotaStateParams,
+  PeripheralRevokeParams, PeripheralRespondParams, DaemonStatusParams, EngineActivityParams, QuotaStateParams,
   TrustListParams, TrustRemoveParams, PluginRevokeTokenParams, PluginRestartParams,
   PluginRegisterParams, ToolRegisterParams, ShortcutRegisterParams, TileUpdateParams,
   ProviderRegisterParams, PluginsContribParams, PluginToolResultParams, HardwareRequestParams, HardwareRespondParams,
@@ -957,6 +957,10 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
           // everything discovered, not just currently-active entries).
           pluginsCount: opts.plugins?.list().length ?? 0,
         };
+      }
+      case METHODS.engineActivity: {
+        parseParams(EngineActivityParams, params);
+        return { activeTurns: opts.engine?.activeTurnCount() ?? 0 };
       }
       case METHODS.quotaState: {
         parseParams(QuotaStateParams, params);
