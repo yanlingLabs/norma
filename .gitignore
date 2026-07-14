@@ -19,6 +19,11 @@ spikes/*/out/
 .build/
 *.bun-build
 
+# Sparkle local-feed gate rig (scripts/sparkle-feed-gate.ts) — downloaded CLI tools + all
+# generated test bundles/keys/appcast; never real, never committed.
+.tools/
+out/
+
 # tsc must never emit alongside sources (bun runs .ts directly; compile via bun build)
 packages/*/src/**/*.js
 packages/*/test/**/*.js
