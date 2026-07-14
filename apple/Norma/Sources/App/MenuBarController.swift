@@ -19,6 +19,9 @@ final class MenuBarController {
     // Lifecycle T6: fires `DaemonSupervisor.restart()` — wired to `stateItem` only while
     // `engineFailed` is true (see `setEngineFailed`/`didRestartDaemon` below).
     private let onRestartDaemon: () -> Void
+    // Sparkle T3: fires the "Check for Updates…" item's manual Sparkle check — same
+    // decoupled-closure posture as every other action in this initializer.
+    private let onCheckForUpdates: () -> Void
     private let loginItemController: LoginItemController
     // Task 3 (2e-iv): internal (not private), same stored-`let` pattern as `stateItem` below, so
     // `MenuBarEntryPointsTests` (`@testable import Norma`) can walk `statusItem`'s built menu for
@@ -51,6 +54,9 @@ final class MenuBarController {
     // Lifecycle T4: the "Launch Norma at login" checkbox, bound to `loginItemController`. `internal`
     // (not `private`), same testability posture as `openCliItem`/`panicItem` above.
     let loginItemItem = NSMenuItem(title: "Launch Norma at login", action: #selector(didToggleLoginItem), keyEquivalent: "")
+    // Sparkle T3: manual "Check for Updates…" entry — `internal`, same testability posture as
+    // `openCliItem`/`panicItem` above.
+    let checkForUpdatesItem = NSMenuItem(title: "Check for Updates…", action: #selector(didCheckForUpdates), keyEquivalent: "")
     private var panicMounted = false
 
     init(
@@ -65,7 +71,8 @@ final class MenuBarController {
         panic: @escaping () -> Void,
         quit: @escaping () -> Void,
         onReallyQuit: @escaping () -> Void,
-        onRestartDaemon: @escaping () -> Void
+        onRestartDaemon: @escaping () -> Void,
+        onCheckForUpdates: @escaping () -> Void
     ) {
         self.statusLine = statusLine
         self.toggleOrb = toggleOrb
@@ -79,6 +86,7 @@ final class MenuBarController {
         self.quitApplication = quit
         self.onReallyQuit = onReallyQuit
         self.onRestartDaemon = onRestartDaemon
+        self.onCheckForUpdates = onCheckForUpdates
     }
 
     func install() {
@@ -105,6 +113,8 @@ final class MenuBarController {
         menu.addItem(pluginManagerItem)
         loginItemItem.target = self
         menu.addItem(loginItemItem)
+        checkForUpdatesItem.target = self
+        menu.addItem(checkForUpdatesItem)
         menu.addItem(preQuitSeparator)
         quitItem.target = self
         menu.addItem(quitItem)
@@ -184,6 +194,7 @@ final class MenuBarController {
     @objc private func didOpenPluginManager() { openPluginManager() }
     @objc private func didPanic() { panicAction() }
     @objc private func didRestartDaemon() { onRestartDaemon() }
+    @objc private func didCheckForUpdates() { onCheckForUpdates() }
 
     // Lifecycle T4: `reallyQuitting` MUST be armed before `quitApplication()` runs — reversed
     // order would let `NSApp.terminate`'s synchronous `applicationShouldTerminate` round-trip read

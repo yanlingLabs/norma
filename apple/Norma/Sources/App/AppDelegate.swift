@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import Combine
 import NormaKit
+import Sparkle
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -31,6 +32,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `boot()` (production deps `.live` unless `daemonSupervisorDeps` below overrides them) and
     /// stopped in `applicationWillTerminate`.
     private(set) var daemonSupervisor: DaemonSupervisor?
+    /// Sparkle T3: owns the silent `SPUStandardUpdaterController` — constructed in `boot()`,
+    /// gated `!isRunningUnitTests` (same posture as `daemonSupervisor`'s real spawn path), so no
+    /// updater ever starts from the xctest host.
+    private(set) var updaterController: SPUStandardUpdaterController?
+    /// Sparkle T3: the `SPUUpdaterDelegate` this controller drives — Norma-specific gating (idle
+    /// gate in T4, channels in T5) lives on this seam, not in the controller itself.
+    private(set) var updaterCoordinator: UpdaterCoordinator?
+    /// Sparkle T3 test seam: overrides the `UpdaterCoordinatorDeps` `boot()` constructs the
+    /// coordinator with — set BEFORE calling `boot()`. `nil` (production) resolves to `.live`
+    /// (mirrors `daemonSupervisorDeps` above).
+    var updaterDepsOverride: UpdaterCoordinatorDeps?
     /// Lifecycle T6 test seam: overrides the `DaemonSupervisorDeps` `boot()` constructs the
     /// supervisor with — set BEFORE calling `boot()`. `nil` (production) resolves to `.live`, or to
     /// `.neverSupervise` under `isRunningUnitTests` (see `boot()`); a test injects a
@@ -328,6 +340,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         supervisor.start()
         daemonSupervisor = supervisor
 
+        // Sparkle T3: the silent background updater. Never constructed under unit tests — same
+        // `!isRunningUnitTests` posture as the daemon supervisor's real spawn path and every other
+        // real-side-effect construction in this method; `updaterDepsOverride` (nil in production)
+        // lets a test drive `UpdaterCoordinator` directly without ever touching this controller.
+        if !Self.isRunningUnitTests {
+            let coordinator = UpdaterCoordinator(deps: updaterDepsOverride ?? .live)
+            let controller = SPUStandardUpdaterController(
+                startingUpdater: true, updaterDelegate: coordinator, userDriverDelegate: nil)
+            controller.updater.automaticallyChecksForUpdates = true
+            controller.updater.automaticallyDownloadsUpdates = true
+            updaterCoordinator = coordinator
+            updaterController = controller
+        }
+
         // AX permission: stickiness needs it; ask once, run degraded until granted.
         // Never prompt during unit tests (ScaffoldTests drives boot() directly); prompt once in real runs.
         let axTrusted = Self.isRunningUnitTests
@@ -591,7 +617,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // ⌘Q/dock-quit (close windows, keep running).
             onReallyQuit: { [weak self] in self?.reallyQuitting = true },
             // Lifecycle T6: the `.failed`-state "engine stopped — Restart" item's action.
-            onRestartDaemon: { [weak self] in self?.daemonSupervisor?.restart() }
+            onRestartDaemon: { [weak self] in self?.daemonSupervisor?.restart() },
+            // Sparkle T3: the "Check for Updates…" item's action — fires Sparkle's own UI-driven
+            // check (progress/"you're up to date"/error alerts are Sparkle's standard user driver).
+            onCheckForUpdates: { [weak self] in self?.updaterController?.checkForUpdates(nil) }
         )
         mb.install()
         menuBar = mb

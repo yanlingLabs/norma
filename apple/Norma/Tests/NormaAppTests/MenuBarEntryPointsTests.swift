@@ -23,7 +23,8 @@ final class MenuBarEntryPointsTests: XCTestCase {
         panic: @escaping () -> Void = {},
         quit: @escaping () -> Void = {},
         onReallyQuit: @escaping () -> Void = {},
-        onRestartDaemon: @escaping () -> Void = {}
+        onRestartDaemon: @escaping () -> Void = {},
+        onCheckForUpdates: @escaping () -> Void = {}
     ) -> MenuBarController {
         MenuBarController(
             statusLine: { "idle" },
@@ -41,7 +42,8 @@ final class MenuBarEntryPointsTests: XCTestCase {
             panic: panic,
             quit: quit,
             onReallyQuit: onReallyQuit,
-            onRestartDaemon: onRestartDaemon
+            onRestartDaemon: onRestartDaemon,
+            onCheckForUpdates: onCheckForUpdates
         )
     }
 
@@ -103,8 +105,14 @@ final class MenuBarEntryPointsTests: XCTestCase {
             return XCTFail("expected Launch Norma at login present, got \(titles)")
         }
         XCTAssertEqual(loginItemIdx, pluginManagerIdx + 1, "Launch Norma at login must be adjacent to Manage Plugins…, no separator between them")
-        XCTAssertEqual(quitIdx, loginItemIdx + 2)
-        XCTAssertTrue(items[loginItemIdx + 1].isSeparatorItem)
+        // Sparkle T3: "Check for Updates…" sits between "Launch Norma at login" and the
+        // pre-existing pre-Quit separator — still no separator between Launch Norma at login and it.
+        guard let checkForUpdatesIdx = titles.firstIndex(of: "Check for Updates…") else {
+            return XCTFail("expected Check for Updates… present, got \(titles)")
+        }
+        XCTAssertEqual(checkForUpdatesIdx, loginItemIdx + 1, "Check for Updates… must be adjacent to Launch Norma at login, no separator between them")
+        XCTAssertEqual(quitIdx, checkForUpdatesIdx + 2)
+        XCTAssertTrue(items[checkForUpdatesIdx + 1].isSeparatorItem)
     }
 
     func testDashboardItemFiresInjectedClosure() {
@@ -163,6 +171,7 @@ final class MenuBarEntryPointsTests: XCTestCase {
         XCTAssertEqual(titles.filter { $0 == "Dashboard…" }.count, 1)
         XCTAssertEqual(titles.filter { $0 == "Manage Plugins…" }.count, 1)
         XCTAssertEqual(titles.filter { $0 == "Launch Norma at login" }.count, 1)
+        XCTAssertEqual(titles.filter { $0 == "Check for Updates…" }.count, 1)
     }
 
     // MARK: - Closure firing
@@ -255,6 +264,21 @@ final class MenuBarEntryPointsTests: XCTestCase {
         controller.setPanicVisible(true)
 
         let item = controller.panicItem
+        XCTAssertNotNil(item.target)
+        XCTAssertNotNil(item.action)
+        NSApp.sendAction(item.action!, to: item.target, from: item)
+
+        XCTAssertEqual(fired, 1)
+    }
+
+    // MARK: - Sparkle T3: "Check for Updates…"
+
+    func testCheckForUpdatesItemFiresInjectedClosure() {
+        var fired = 0
+        let controller = makeController(onCheckForUpdates: { fired += 1 })
+        controller.install()
+
+        let item = controller.checkForUpdatesItem
         XCTAssertNotNil(item.target)
         XCTAssertNotNil(item.action)
         NSApp.sendAction(item.action!, to: item.target, from: item)

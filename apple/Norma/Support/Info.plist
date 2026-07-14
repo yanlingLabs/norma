@@ -30,5 +30,13 @@
 	<string>NSApplication</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Norma captures your screen for computer-use screenshots you explicitly ask it to take.</string>
+	<key>SUAutomaticallyUpdate</key>
+	<true/>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://raw.githubusercontent.com/evaprotocol/norma/main/releases/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>z8++xdFBdjTq+kTj5v/5OGP0WRaIJrg3VarFSWVt/jE=</string>
 </dict>
 </plist>
