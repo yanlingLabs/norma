@@ -200,10 +200,32 @@ describe("AgentList — tree rows (phase 3b Task 6, c)", () => {
   });
 
   test("a DONE agent's continuation row reads 'Done'", () => {
-    const row = agent({ status: "done", toolCalls: 1 });
+    const row = agent({ status: "done", finish: "done", toolCalls: 1 });
     const { lastFrame } = render(<AgentList agents={[row]} nowMs={0} />);
     const frame = lastFrame() ?? "";
     expect(frame).toContain("⎿");
+    expect(frame).toContain("Done");
+  });
+
+  // Roster honesty (no-timeout task): failed/stopped terminal rows must NOT read "Done" — the
+  // wire's thread_completed.stopReason (mapped to `finish` by subagent-state.ts) drives the verb.
+  test("a FAILED agent's continuation row reads 'Failed', not 'Done'", () => {
+    const row = agent({ status: "done", finish: "failed", toolCalls: 2 });
+    const frame = render(<AgentList agents={[row]} nowMs={0} />).lastFrame() ?? "";
+    expect(frame).toContain("Failed");
+    expect(frame).not.toContain("Done");
+  });
+
+  test("a STOPPED agent's continuation row reads 'Stopped', not 'Done'", () => {
+    const row = agent({ status: "done", finish: "stopped", toolCalls: 0 });
+    const frame = render(<AgentList agents={[row]} nowMs={0} />).lastFrame() ?? "";
+    expect(frame).toContain("Stopped");
+    expect(frame).not.toContain("Done");
+  });
+
+  test("a terminal row with NO finish recorded (pre-change replay) falls back to 'Done'", () => {
+    const row = agent({ status: "done", toolCalls: 1 }); // finish deliberately absent
+    const frame = render(<AgentList agents={[row]} nowMs={0} />).lastFrame() ?? "";
     expect(frame).toContain("Done");
   });
 

@@ -12,6 +12,16 @@ export interface CliSubagent {
   agentType: string;
   label: string;
   status: string; // "queued" | "working" | "done"
+  // Roster honesty (no-timeout task): HOW the thread finished, derived from the wire's own
+  // thread_completed.stopReason (end_turn → "done", error → "failed", aborted → "stopped").
+  // ADDITIVE alongside `status` — `status` stays "done" for EVERY terminal thread on purpose:
+  // it is the single terminal marker all the prune/footer filters (`status !== "done"`) and the
+  // Swift-lockstep helpers (subagent-display.ts subagentGlyph/anySubagentAlive) key off, and
+  // those must not fork per finish kind. Renderers that want the honest verb (agent-list.tsx's
+  // continuation row, tui/state.ts's finish note) read `finish` instead; a STALLED child arrives
+  // as stopReason "error" → "failed" (the wire carries no distinct stall reason — protocol
+  // change deferred, see the no-timeout task report).
+  finish?: "done" | "failed" | "stopped";
   inputTokens?: number; // latest child turn_completed.inputTokens — unknown until the first
   outputTokens: number; // banked sum of child turn_completed.outputTokens
   liveOutputChars: number; // child assistant_delta chars since the last reconcile (↓ estimate /4)
@@ -64,7 +74,14 @@ export function updateSubagents(items: CliSubagent[], e: WireEvent): CliSubagent
         ...closeSpan(s, e),
       }));
     case "thread_completed":
-      return patch(items, threadId, (s) => ({ ...s, status: "done", ...closeSpan(s, e) }));
+      // status is ALWAYS "done" (the terminal marker — see the `finish` field's doc comment);
+      // `finish` carries the honest verdict off the event's own stopReason.
+      return patch(items, threadId, (s) => ({
+        ...s,
+        status: "done",
+        finish: e.stopReason === "error" ? "failed" : e.stopReason === "aborted" ? "stopped" : "done",
+        ...closeSpan(s, e),
+      }));
     case "tool_call": {
       if (threadId === "main") return items;
       const name = typeof e.name === "string" ? e.name : "";

@@ -37,7 +37,7 @@ export function setup(
     // a test isolate "run_in_background requested but the registry was never wired" from the
     // unrelated "subagent bridge entirely absent" case above).
     withBgAgents?: boolean;
-    subagentsOpts?: { maxConcurrent?: number; timeoutMs?: number; acquireTimeoutMs?: number };
+    subagentsOpts?: { maxConcurrent?: number; timeoutMs?: number | null; stallTimeoutMs?: number | null; acquireTimeoutMs?: number };
     provider?: Provider; // override — script ignored when set (e.g. a hanging provider for timeout tests)
     // undefined (default) → EngineConfig.provider.live absent, matching every pre-existing test
     // here (unchanged behavior: every turn uses the "fake-1" boot snapshot below).
@@ -81,11 +81,20 @@ export function setup(
   const agentsHome = mkdtempSync(join(tmpdir(), "norma-engine-spawn-agents-"));
   const agentsTrust = new TrustStore(join(agentsHome, "trust.json"));
   const agents = withSubagents ? new AgentStore({ normaHome: agentsHome, trust: agentsTrust }) : undefined;
-  // hot-settings T2: SubagentManager.maxConcurrent is now a getter — opts.subagentsOpts stays a
-  // plain-value shape (every existing call site here passes a raw number) and gets wrapped at
-  // this ONE boundary, mirroring daemon.ts's own `() => settings?.subagents?.maxConcurrent`.
+  // hot-settings T2 (+ no-timeout task): SubagentManager.maxConcurrent/timeoutMs/stallTimeoutMs
+  // are all getters now — opts.subagentsOpts stays a plain-value shape (every existing call site
+  // here passes raw numbers) and gets wrapped at this ONE boundary, mirroring daemon.ts's own
+  // `() => settings?.subagents?.maxConcurrent` (and its timeoutMs/stallTimeoutMs twins, this
+  // same task). Absent `subagentsOpts.timeoutMs`/`.stallTimeoutMs` → the getter resolves to
+  // undefined → SubagentManager's own defaults apply (no wall clock; the 600s stall default),
+  // unchanged from every pre-existing call site here that never mentioned either field.
   const subagents = withSubagents
-    ? new SubagentManager({ ...opts.subagentsOpts, maxConcurrent: () => opts.subagentsOpts?.maxConcurrent })
+    ? new SubagentManager({
+        maxConcurrent: () => opts.subagentsOpts?.maxConcurrent,
+        timeoutMs: () => opts.subagentsOpts?.timeoutMs,
+        stallTimeoutMs: () => opts.subagentsOpts?.stallTimeoutMs,
+        acquireTimeoutMs: opts.subagentsOpts?.acquireTimeoutMs,
+      })
     : undefined;
   // 4h-ii-a: constructed by default (even when withSubagents is false — mirrors `subagents`'s own
   // optionality, cfg.bgAgents is independently optional in EngineConfig) so run_in_background
@@ -277,7 +286,10 @@ describe("AgentEngine: spawn_agent bridge (1d-iv T5)", () => {
     expect((writeResult as Extract<SessionEvent, { type: "tool_result" }>).output).toContain("Blocked in plan mode");
   });
 
-  test("timeout: a SubagentManager with a tiny timeout + a child that never ends → typed error tool_result", async () => {
+  // No-timeout task: `timeoutMs` here is the EXPLICIT wall-clock opt-in (settings.subagents
+  // .timeoutMs via the constructor getter) — no wall clock exists by default anymore. The
+  // opted-in clock must still work end-to-end exactly as the old default one did.
+  test("explicit wall-clock opt-in: a SubagentManager configured with a tiny timeoutMs + a child that never ends → typed error tool_result", async () => {
     class HangOnSecondCall implements Provider {
       readonly id = "fake";
       private call = 0;
@@ -1722,11 +1734,12 @@ describe("AgentEngine: spawn_agent run_in_background (4h-ii-a)", () => {
     expect(bgAgents.list(sessionId)).toEqual([]);
   });
 
-  // 4h-ii-c: a detached run_in_background child has no waiting parent to time out FOR — the
-  // 300s SubagentManager clock existed only as a safety net until a manual kill (task_stop,
-  // this same phase) existed. This spawn branch now passes `timeoutMs: null` for the detached
-  // call specifically — the sync path just below stays on the constructor default, unchanged.
-  test("run_in_background:true → subagents.run receives timeoutMs:null (untimed; task_stop is the only kill, not SubagentManager's own clock)", async () => {
+  // No-timeout task (user rule 2026-07-12): the old bg-path `timeoutMs: null`/`undefined`
+  // depth-fork is RETIRED along with the manager's default wall clock — NO spawn path passes a
+  // timeoutMs override anymore, at any depth. What bounds a child now: the manager's own
+  // progress-stall watchdog (default 600s of NO provider events, every depth), the per-thread
+  // iteration cap, task_stop (depth-0 bg), and an EXPLICIT settings.subagents.timeoutMs opt-in.
+  test("run_in_background:true → subagents.run receives NO timeoutMs override (no wall clock; the stall watchdog + task_stop bound it)", async () => {
     const { engine, store, sessionId, subagents } = setup([
       [spawnCall("s1", "bg task", { run_in_background: true }), done("tool_calls")],
       text("parent wrap-up"),
@@ -1735,16 +1748,16 @@ describe("AgentEngine: spawn_agent run_in_background (4h-ii-a)", () => {
     try {
       await engine.runTurn(sessionId);
       expect(spy.mock.calls.length).toBeGreaterThan(0);
-      expect(spy.mock.calls[0]?.[1]).toMatchObject({ timeoutMs: null });
+      expect(spy.mock.calls[0]?.[1]).not.toHaveProperty("timeoutMs");
     } finally {
       spy.mockRestore();
     }
   });
 
-  // Contrast case: the SYNC path's own subagents.run call must NOT get a timeoutMs override —
-  // it stays on the constructor default (undefined opts.timeoutMs), unchanged from before this
-  // task.
-  test("no run_in_background (sync spawn) → subagents.run's opts carry NO timeoutMs override (constructor default applies, unchanged)", async () => {
+  // The SYNC path likewise carries NO timeoutMs override — with the manager's default wall clock
+  // gone, "no override" now means NO wall clock at all unless settings.subagents.timeoutMs
+  // explicitly configures one (the constructor getter).
+  test("no run_in_background (sync spawn) → subagents.run's opts carry NO timeoutMs override (no default wall clock)", async () => {
     const { engine, store, sessionId, subagents } = setup([
       [spawnCall("s1", "do X"), done("tool_calls")],
       text("child final report"),
@@ -1759,18 +1772,15 @@ describe("AgentEngine: spawn_agent run_in_background (4h-ii-a)", () => {
     }
   });
 
-  // Whole-branch review C1 (4h-ii-c): the untimed relax above must be scoped to DEPTH 0 ONLY.
-  // task_stop — the sole kill mechanism for an untimed agent — is main-thread-only (it's in
-  // childExcludeTools, and only the main thread's tool_result ever learns a bg agentId), so a
-  // depth>0 spawner's OWN bg grandchild would be untimed AND unreachable by any kill: task_stop
-  // can't stop it, the parent's entryAbort doesn't cascade into the grandchild's AbortSignal.any
-  // set, and there is no session-level bg-agent kill-all. That reintroduces the unbounded-runaway
-  // the timeout existed to prevent, exactly where the kill switch can't reach. Drives a depth-1
-  // child (spawned synchronously, so its own bg spawn call is guaranteed to land as the SECOND
-  // subagents.run invocation) that itself issues a `run_in_background` spawn — mirrors the
-  // nested-spawn pattern from the "maxDepth: 2 ... depth-1 child spawns a depth-2 grandchild"
-  // test above, but the depth-1 spawn is a BG spawn rather than a sync one.
-  test("bg spawn issued FROM a depth-1 child (nested) → subagents.run receives timeoutMs:undefined, not null — the 300s default net still applies (only a depth-0 spawn gets the untimed relax)", async () => {
+  // No-timeout task, superseding whole-branch review C1 (4h-ii-c "untimed ⟺ killable"): a
+  // depth-1 child's OWN bg grandchild used to keep the 300s net because task_stop can't reach it
+  // (main-thread-only; entryAbort doesn't cascade into a grandchild's AbortSignal.any set). The
+  // progress-stall watchdog — SubagentManager's own default, applied to EVERY run at EVERY depth
+  // — is what covers that unreachable-by-task_stop case now, so the depth fork is gone: a nested
+  // bg spawn passes NO timeoutMs either, same as depth 0. Drives a depth-1 child (spawned
+  // synchronously, so its own bg spawn call is guaranteed to land as the SECOND subagents.run
+  // invocation) that itself issues a `run_in_background` spawn.
+  test("bg spawn issued FROM a depth-1 child (nested) → subagents.run receives NO timeoutMs override either (the stall watchdog covers what the old 300s net did)", async () => {
     const script: ProviderEvent[][] = [
       [spawnCall("s1", "do X"), done("tool_calls")], // parent (depth 0) round 0: SYNC-spawns the child — awaited, so calls[0] is recorded before calls[1] can exist
       [spawnCall("s2", "grandchild bg task", { run_in_background: true }), done("tool_calls")], // child (depth 1) round 0: bg-spawns a depth-2 grandchild
@@ -1781,13 +1791,11 @@ describe("AgentEngine: spawn_agent run_in_background (4h-ii-a)", () => {
     try {
       await engine.runTurn(sessionId);
       expect(spy.mock.calls.length).toBeGreaterThanOrEqual(2);
-      // calls[0] = parent's (depth 0) own sync spawn of the child — unaffected by this task, no
-      // timeoutMs override at all (contrast test above).
+      // calls[0] = parent's (depth 0) own sync spawn of the child — no timeoutMs override.
       expect(spy.mock.calls[0]?.[1]).not.toHaveProperty("timeoutMs");
-      // calls[1] = the depth-1 CHILD's bg spawn of the grandchild — depth>0, so must NOT get the
-      // untimed relax: timeoutMs undefined (SubagentManager's own 300s constructor default
-      // applies), never null.
-      expect(spy.mock.calls[1]?.[1]?.timeoutMs).toBeUndefined();
+      // calls[1] = the depth-1 CHILD's bg spawn of the grandchild — no override here either (the
+      // old depth>0 300s fallback is retired; the stall watchdog bounds it instead).
+      expect(spy.mock.calls[1]?.[1]).not.toHaveProperty("timeoutMs");
     } finally {
       spy.mockRestore();
     }
@@ -1940,5 +1948,157 @@ describe("AgentEngine: dispatch loop preserves strict per-call tool_call/tool_re
     // assertion above, which is why both are asserted here.
     expect(bgAgents.get("alpha", sessionId)?.agentId).toBe(agentIdA);
     expect(bgAgents.get("beta", sessionId)?.agentId).toBe(agentIdB);
+  });
+});
+
+// -------------------------------------------------------------------------------------------
+// No-timeout task (user rule 2026-07-12, CC parity): the default subagent wall clock is GONE —
+// replaced by (a) a progress-STALL watchdog whose window resets on every provider event the
+// child streams (runThread's onProgress chokepoint), (b) ESC cascading into SYNC children (the
+// parent turn's signal folded into the child's composite — a user interrupt now actually stops
+// the foreground child instead of leaving the parent blocked on it), and (c) stall failures
+// surfacing the child's last persisted assistant text (partial output) to the parent.
+// -------------------------------------------------------------------------------------------
+describe("AgentEngine: no-default-wall-clock — ESC cascade + stall watchdog (no-timeout task)", () => {
+  test("ESC cascade: interrupt(sessionId) aborts a running SYNC child; the tool_result reads 'aborted' (never stalled/timed out), the parent turn settles aborted, and the child's slot is RELEASED (a follow-up spawn acquires it)", async () => {
+    class ChildAwaitAbortProvider implements Provider {
+      readonly id = "fake";
+      private call = 0;
+      models(): ModelInfo[] { return [{ id: "fake-1", family: "fake", contextWindow: 100_000, supportsVision: false }]; }
+      async *streamTurn(req: TurnRequest): AsyncIterable<ProviderEvent> {
+        const n = this.call++;
+        if (n === 0) { yield spawnCall("s1", "long sync task"); yield done("tool_calls"); return; }
+        if (n === 1) {
+          // the CHILD's only round: blocks until ITS OWN composite signal aborts (which, with the
+          // ESC cascade, the parent turn's interrupt now fires), then reports aborted — exactly
+          // what the real providers do when their signal fires mid-stream.
+          await new Promise<void>((resolve) => {
+            if (req.signal?.aborted) return resolve();
+            req.signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+          yield done("aborted");
+          return;
+        }
+        if (n === 2) { yield done("aborted"); return; } // parent's own continuation: signal already aborted
+        if (n === 3) { yield spawnCall("s2", "follow-up task"); yield done("tool_calls"); return; } // turn 2: spawn again
+        if (n === 4) { yield { type: "text_delta", delta: "second child ok" }; yield done("end_turn"); return; } // child 2
+        yield { type: "text_delta", delta: "turn 2 wrapped" }; yield done("end_turn"); // parent 2 continuation
+      }
+    }
+    // maxConcurrent: 1 makes the slot-release assertion REAL: if the ESC'd child's slot leaked,
+    // turn 2's spawn below would queue unbounded (non-reentrant) and this test would hang.
+    const { engine, store, hub, sessionId } = setup([], {
+      provider: new ChildAwaitAbortProvider(),
+      subagentsOpts: { maxConcurrent: 1 },
+    });
+
+    const turn = engine.runTurn(sessionId);
+    await new Promise((r) => setTimeout(r, 30)); // let the bridge start the child (it's now blocked awaiting abort)
+    expect(engine.isRunning(sessionId)).toBe(true);
+    const res = engine.interrupt(sessionId);
+    expect(res.wasRunning).toBe(true);
+    await turn;
+
+    const events = store.read(sessionId);
+    const result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(result).toMatchObject({ isError: true });
+    const out = (result as Extract<SessionEvent, { type: "tool_result" }>).output;
+    expect(out).toContain("aborted");
+    expect(out).not.toContain("stalled");
+    expect(out).not.toContain("timed out");
+
+    // the child's completion reports the abort, not an error
+    const childCompleted = events.find((e) => e.type === "thread_completed");
+    expect(childCompleted).toMatchObject({ stopReason: "aborted" });
+    // and the main turn itself settled as user-interrupted
+    const mainCompleted = events.filter((e) => e.type === "turn_completed" && e.threadId === "main").at(-1);
+    expect(mainCompleted).toMatchObject({ stopReason: "aborted" });
+
+    // slot released: a follow-up spawn in a fresh turn acquires the single slot and completes
+    const client = { clientName: "u", deliver: () => true };
+    hub.attach(client, sessionId, 0);
+    hub.send(client, sessionId, "again");
+    await engine.runTurn(sessionId);
+    const result2 = store.read(sessionId).find((e) => e.type === "tool_result" && e.callId === "s2");
+    expect(result2).toMatchObject({ isError: false, output: "second child ok" });
+  });
+
+  test("stall partial-output surfacing: a child that persisted an assistant message then went silent → the stall-abort tool_result contains 'stalled' AND the partial text", async () => {
+    class TalkThenHangProvider implements Provider {
+      readonly id = "fake";
+      private call = 0;
+      constructor(private readonly filePath: string) {}
+      models(): ModelInfo[] { return [{ id: "fake-1", family: "fake", contextWindow: 100_000, supportsVision: false }]; }
+      async *streamTurn(): AsyncIterable<ProviderEvent> {
+        const n = this.call++;
+        if (n === 0) { yield spawnCall("s1", "scan the machine"); yield done("tool_calls"); return; }
+        if (n === 1) {
+          // child round 0: emits REAL assistant text (persisted at round end) + a tool call so
+          // the round ends on tool_calls and the child CONTINUES into the hanging round below.
+          yield { type: "text_delta", delta: "PARTIAL-FINDINGS: found 3 candidate dirs so far" };
+          yield { type: "tool_call", callId: "r1", name: "read", argsJson: JSON.stringify({ file_path: this.filePath }) };
+          yield done("tool_calls");
+          return;
+        }
+        if (n === 2) {
+          // child round 1: total silence — no events, never resolves. Only the stall watchdog
+          // (40ms below) ends this.
+          await new Promise<never>(() => {});
+          return;
+        }
+        yield { type: "text_delta", delta: "parent wrapped up after the stall" }; yield done("end_turn");
+      }
+    }
+    const home = mkdtempSync(join(tmpdir(), "norma-stall-partial-"));
+    const filePath = join(home, "probe.txt");
+    writeFileSync(filePath, "probe contents");
+    const { engine, store, sessionId } = setup([], {
+      provider: new TalkThenHangProvider(filePath),
+      subagentsOpts: { stallTimeoutMs: 40 },
+    });
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    const result = events.find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(result).toMatchObject({ isError: true });
+    const out = (result as Extract<SessionEvent, { type: "tool_result" }>).output;
+    expect(out).toContain("stalled: no progress");
+    expect(out).not.toContain("timed out"); // a stall must never masquerade as a wall-clock timeout
+    expect(out).toContain("partial output before stall:");
+    expect(out).toContain("PARTIAL-FINDINGS: found 3 candidate dirs so far");
+
+    const completed = events.find((e) => e.type === "thread_completed");
+    expect(completed).toMatchObject({ stopReason: "error" });
+  });
+
+  test("progress pings genuinely reach the watchdog: a child streaming events SLOWER than the stall window in total (but faster per-event) completes fine — the chokepoint resets the window per provider event", async () => {
+    class SlowStreamProvider implements Provider {
+      readonly id = "fake";
+      private call = 0;
+      models(): ModelInfo[] { return [{ id: "fake-1", family: "fake", contextWindow: 100_000, supportsVision: false }]; }
+      async *streamTurn(): AsyncIterable<ProviderEvent> {
+        const n = this.call++;
+        if (n === 0) { yield spawnCall("s1", "slow but alive"); yield done("tool_calls"); return; }
+        if (n === 1) {
+          // the child's only round: ~5 x 20ms between events = ~100ms total, all gaps well under
+          // the 50ms stall window. Without the onProgress chokepoint wiring, the watchdog (armed
+          // once at run start) would fire at 50ms absolute and kill this child mid-stream.
+          for (let i = 0; i < 5; i++) {
+            await new Promise((r) => setTimeout(r, 20));
+            yield { type: "text_delta", delta: "chunk " };
+          }
+          yield done("end_turn");
+          return;
+        }
+        yield { type: "text_delta", delta: "parent done" }; yield done("end_turn");
+      }
+    }
+    const { engine, store, sessionId } = setup([], {
+      provider: new SlowStreamProvider(),
+      subagentsOpts: { stallTimeoutMs: 50 },
+    });
+    await engine.runTurn(sessionId);
+    const result = store.read(sessionId).find((e) => e.type === "tool_result" && e.callId === "s1");
+    expect(result).toMatchObject({ isError: false, output: "chunk chunk chunk chunk chunk " });
   });
 });

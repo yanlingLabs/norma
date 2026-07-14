@@ -36,10 +36,19 @@ function pluralizeToolUse(n: number): string {
   return `${n} tool use${n === 1 ? "" : "s"}`;
 }
 
+// Roster honesty (no-timeout task): the terminal verb comes from `finish` (the wire's own
+// thread_completed.stopReason, mapped by subagent-state.ts) — "Failed" (error, incl. a stalled
+// child) and "Stopped" (user abort / task_stop) render distinctly from a genuine "Done".
+// `finish` absent on a terminal row (a pre-change event replay) falls back to "Done", the old
+// wording — never a blank continuation.
+const FINISH_LABEL: Record<string, string> = { done: "Done", failed: "Failed", stopped: "Stopped" };
+
 function AgentTreeRow({ agent, isLast }: { agent: AgentRow; isLast: boolean }) {
   const headGutter = isLast ? "└─ " : "├─ ";
   const contGutter = isLast ? "   ⎿  " : "│  ⎿  ";
-  const continuation = agent.status === "done" ? "Done" : (agent.activity ?? "Working…");
+  const continuation = agent.status === "done"
+    ? (FINISH_LABEL[agent.finish ?? "done"] ?? "Done")
+    : (agent.activity ?? "Working…");
   return (
     <Box flexDirection="column">
       <Text>

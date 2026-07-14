@@ -57,4 +57,19 @@ describe("updateSubagents (spec §2, CLI column: lifecycle + tokens, NO time)", 
     expect(s[0]!.activity).toBe("bun test"); // undefined detail keeps the previous activity
     expect(updateSubagents(s, { type: "tool_call", threadId: "main", callId: "c3", name: "bash", argsJson: "{}" })).toBe(s); // main no-op
   });
+
+  // Roster honesty (no-timeout task): `finish` carries HOW the thread ended, off the wire's own
+  // thread_completed.stopReason — while `status` stays "done" for every terminal thread (the
+  // single marker all the `status !== "done"` prune/footer filters and the Swift-lockstep
+  // helpers key off; see the CliSubagent doc comment).
+  test("thread_completed stopReason drives `finish` (end_turn→done, error→failed, aborted→stopped) while status is always 'done'", () => {
+    const finished = updateSubagents(updateSubagents([], spawn), { type: "thread_completed", threadId: "th_a", stopReason: "end_turn" });
+    expect(finished[0]).toMatchObject({ status: "done", finish: "done" });
+
+    const failed = updateSubagents(updateSubagents([], spawn), { type: "thread_completed", threadId: "th_a", stopReason: "error" });
+    expect(failed[0]).toMatchObject({ status: "done", finish: "failed" });
+
+    const stopped = updateSubagents(updateSubagents([], spawn), { type: "thread_completed", threadId: "th_a", stopReason: "aborted" });
+    expect(stopped[0]).toMatchObject({ status: "done", finish: "stopped" });
+  });
 });

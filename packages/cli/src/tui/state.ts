@@ -271,7 +271,12 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
       const parts = [`${toolCalls} tool use${toolCalls === 1 ? "" : "s"}`];
       if (tokens) parts.push(`${tokens} tokens`);
       parts.push(formatElapsed(row?.activeMs ?? 0));
-      const text = `Agent "${label}": Done (${parts.join(" · ")})`;
+      // Roster honesty (no-timeout task): the verb comes from the row's `finish` (the wire's own
+      // thread_completed.stopReason via subagent-state.ts) — a failed/stalled child commits
+      // "Failed", a user-stopped one "Stopped", never a dishonest "Done". Absent finish (a
+      // ghost-threadId row never tracked) falls back to "Done", the pre-change wording.
+      const verb = row?.finish === "failed" ? "Failed" : row?.finish === "stopped" ? "Stopped" : "Done";
+      const text = `Agent "${label}": ${verb} (${parts.join(" · ")})`;
       return { ...withDone, committed: [...withDone.committed, { kind: "note", text }] };
     }
 

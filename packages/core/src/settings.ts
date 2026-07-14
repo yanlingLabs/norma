@@ -92,6 +92,19 @@ export const Settings = z.object({
     // concurrency semaphore at any instant.
     // CC itself allows depth 5, hence the upper bound here.
     maxDepth: z.number().int().min(1).max(5).optional(),
+    /** No-timeout task (user rule 2026-07-12): an EXPLICIT wall-clock cap per subagent run, in
+     *  ms. ABSENT (the default) means NO wall clock at all — subagents are never killed just for
+     *  running long (a legitimate laptop-wide scan died at the old always-on 300s cap; CC has no
+     *  wall-clock subagent timeout either). Hot: read via a live getter (daemon.ts) — an edit
+     *  applies to the very next subagent run, no daemon restart. */
+    timeoutMs: z.number().int().positive().optional(),
+    /** No-timeout task: the progress-STALL watchdog window, in ms — a subagent whose provider
+     *  stream produces NO events for this long is aborted as stalled (its partial output is
+     *  surfaced to the parent). ABSENT means the default 600000 (10 min — deliberately ≥ bash's
+     *  own max per-call timeout, so a tool-bounded silent bash never falsely trips it; env
+     *  override: NORMA_SUBAGENT_STALL_TIMEOUT_MS). Hot, same live-getter semantics as timeoutMs
+     *  above. */
+    stallTimeoutMs: z.number().int().positive().optional(),
   }).optional(),
   /** Peripheral lease v1 (Phase 2f, spec §A1): "Heartbeat 5s / expiry 15s (user-confirmed;
    *  settings-overridable peripheral.heartbeatMs/expiryMs)". Both optional — PeripheralBroker
