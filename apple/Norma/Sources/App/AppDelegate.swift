@@ -45,6 +45,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// never accumulates closed controllers.
     private(set) var detachedWindows: [DetachedWindowController] = []
 
+    /// Lifecycle T3: set to `true` ONLY by the menu-bar "Quit Norma" action (T4 wires that call
+    /// site) — the SOLE true-quit source. ⌘Q and the dock-tile "Quit" both route through
+    /// `applicationShouldTerminate` below, but neither ever sets this: they're intercepted and
+    /// treated as "close the main windows, demote to `.accessory`, keep the menu bar + daemon
+    /// running" instead — the product's ChatGPT/Claude-desktop-style lifecycle contract.
+    var reallyQuitting = false
+
+    /// Promotes the app to `.regular` — the dock icon appears. `NSApp.activate` right after the
+    /// policy flip works around a known macOS quirk: flipping activation policy alone doesn't
+    /// reliably bring the newly-promoted app's window forward.
+    func showDockIcon() {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Demotes back to `.accessory` — `applicationDidFinishLaunching`'s launch-time base state
+    /// below. The dock icon disappears; the menu bar and daemon are untouched.
+    func hideDockIcon() {
+        NSApp.setActivationPolicy(.accessory)
+    }
+
+    /// True while at least one dock-promoting window is open. Deliberately excludes the orb
+    /// (`OrbWindowController`'s `KeyableNonActivatingPanel` — a borderless, non-activating
+    /// `NSPanel`, an accessory surface even while morphed into its own `.window` surface) and the
+    /// menu bar: neither is a "real user-facing window" per the product spec, so neither may
+    /// promote the dock icon.
+    private var hasMainWindow: Bool {
+        !detachedWindows.isEmpty || dashboardWindow != nil
+    }
+
+    /// Syncs the dock icon to `hasMainWindow` — called after every mutation of `detachedWindows`/
+    /// `dashboardWindow` (register, remove, open, close) so promotion/demotion never drifts out of
+    /// step with the registries that define it.
+    private func syncDockPresence() {
+        hasMainWindow ? showDockIcon() : hideDockIcon()
+    }
+
+    /// Closes every open main window (detached chat windows + the Dashboard) — shared by
+    /// `applicationShouldTerminate`'s cancel branch (⌘Q/dock-quit: close windows, keep running)
+    /// and `applicationWillTerminate`'s final teardown below (a real quit: same windows, harder
+    /// stop — spec §5 D9, a closed window must leave nothing running, and termination is harder
+    /// than that).
+    private func closeMainWindows() {
+        detachedWindows.forEach { $0.close() }
+        dashboardWindow?.close()
+    }
+
     /// Test-only seam (DEFECT FIX regression, `StandaloneWindowTests`): `boot()`'s unit-test path
     /// always constructs a degraded (no-token) `AppModel` whose transport never opens — every RPC,
     /// including the very FIRST `createSession`, fails immediately. That makes it impossible to
@@ -63,8 +110,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 2e-iii — the sidebar's own "open in a new window" spawn).
     func registerDetachedWindow(_ controller: DetachedWindowController) {
         detachedWindows.append(controller)
+        syncDockPresence() // Lifecycle T3: a real chat window just opened — promote if it's the first
         controller.onClosed = { [weak self] closed in
             self?.detachedWindows.removeAll { $0 === closed }
+            self?.syncDockPresence() // Lifecycle T3: demote once the LAST main window closes
         }
         // Task 5 (2e-iii): the (Task-6-mounted) sidebar's ⌘-click "open in a new window" — spawns
         // ANOTHER detached window pinned to an explicit sessionId, via the SAME construction path
@@ -188,8 +237,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             frame: centeredDashboardFrame(visibleFrame: visible),
             initialPane: initialPane ?? defaultDashboardPane
         )
-        controller.onClosed = { [weak self] _ in self?.dashboardWindow = nil }
+        controller.onClosed = { [weak self] _ in
+            self?.dashboardWindow = nil
+            self?.syncDockPresence() // Lifecycle T3: demote once the LAST main window closes
+        }
         dashboardWindow = controller
+        syncDockPresence() // Lifecycle T3: the Dashboard is a real main window — promote
         controller.show()
     }
 
@@ -501,13 +554,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // it the best (still not guaranteed) chance to reach the daemon before the connection dies.
         peripheralProvider?.terminate()
         appModel?.stop()
-        // Best-effort: each detached window's own feed/socket must not survive the app (spec §5
-        // D9 — a closed window leaves nothing running; termination is a harder stop than that).
-        detachedWindows.forEach { $0.close() }
-        dashboardWindow?.close()
+        closeMainWindows()
+    }
+
+    /// Lifecycle T3: the source-aware termination gate (product spec — only the menu-bar "Quit
+    /// Norma" is a REAL quit). `terminateDecision` is the pure truth table (see its own doc);
+    /// `hasMainWindow` is read fresh here off the live registries, never cached, so a window
+    /// opened/closed between calls is always reflected. On `.terminateCancel` (⌘Q, dock-tile
+    /// quit, or any other `terminate()` call that isn't the menu-bar Quit) this closes the main
+    /// windows and demotes the dock icon instead of actually quitting. `closeMainWindows()`'s own
+    /// `onClosed` chain already demotes as each window closes (`syncDockPresence()`); the explicit
+    /// `hideDockIcon()` below is belt-and-suspenders for the edge case where `hasMainWindow` was
+    /// already false (nothing to close, so nothing to trigger demotion through those callbacks).
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let reply = terminateDecision(reallyQuitting: reallyQuitting, hasMainWindow: hasMainWindow)
+        if reply == .terminateCancel {
+            closeMainWindows()
+            hideDockIcon()
+        }
+        return reply
+    }
+
+    /// Lifecycle T3: dock-tile / Finder relaunch while Norma is already running (LSUIElement apps
+    /// still receive `reopen` on a Finder double-click even with no dock tile to click). A main
+    /// window is already open: return `true` and let AppKit's own default reopen handling bring it
+    /// forward (including un-minimizing) — the dock icon is already showing in that case, nothing
+    /// else to promote. No main window open: open one ourselves (the same "Open Norma App"
+    /// primitive the menu bar uses, which promotes the dock icon as a side effect of the window it
+    /// spawns) and return `false`, since AppKit has nothing left to do.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard !hasMainWindow else { return true }
+        openStandaloneNormaWindow()
+        return false
     }
 
     static var isRunningUnitTests: Bool {
         NSClassFromString("XCTestCase") != nil
     }
+}
+
+/// Lifecycle T3: pure decision core for `applicationShouldTerminate` — no `NSApp` reference, so the
+/// whole truth table is unit-testable without any AppKit window state (see
+/// `AppLifecycleTests.testTerminateDecision`). `.terminateNow` iff `reallyQuitting` (set ONLY by
+/// the menu-bar "Quit Norma"); otherwise always `.terminateCancel`, regardless of `hasMainWindow` —
+/// the sole gate on a real quit is its SOURCE, never window state. `hasMainWindow` is threaded
+/// through anyway so the call site (`AppDelegate.applicationShouldTerminate`) reads as
+/// self-documenting, not because it changes the branch taken.
+func terminateDecision(reallyQuitting: Bool, hasMainWindow: Bool) -> NSApplication.TerminateReply {
+    reallyQuitting ? .terminateNow : .terminateCancel
 }

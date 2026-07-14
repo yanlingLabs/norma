@@ -1,0 +1,177 @@
+import XCTest
+import AppKit
+import NormaKit
+@testable import Norma
+
+/// Lifecycle T3: the ephemeral dock-icon toggle (activation-policy promote/demote) + the
+/// source-aware termination gate. `terminateDecision` is the pure, AppKit-free core (the
+/// truth-table test below, per the task brief); the rest are AppKit-wiring smoke tests reusing this
+/// target's existing real-window fixtures (`DetachedScriptedTransport` from `DetachedWindowTests`,
+/// `NormaClientTestFactory` from `DashboardTests`).
+///
+/// These tests flip the REAL `NSApp.activationPolicy()` of the xctest host — safe here because the
+/// host launches `.accessory` (see `ScaffoldTests.testActivationPolicyIsAccessory`) and every test
+/// below closes whatever window(s) it opened, so production's own demotion path
+/// (`registerDetachedWindow`'s/`openDashboard`'s `onClosed` → `syncDockPresence`) always restores
+/// `.accessory` by the time the test returns — nothing leaks into a later test.
+@MainActor
+final class AppLifecycleTests: XCTestCase {
+    // MARK: - terminateDecision (PURE — no NSApp reference)
+
+    func testTerminateDecision() {
+        XCTAssertEqual(terminateDecision(reallyQuitting: true, hasMainWindow: true), .terminateNow)
+        XCTAssertEqual(terminateDecision(reallyQuitting: true, hasMainWindow: false), .terminateNow)
+        XCTAssertEqual(terminateDecision(reallyQuitting: false, hasMainWindow: true), .terminateCancel)
+        XCTAssertEqual(terminateDecision(reallyQuitting: false, hasMainWindow: false), .terminateCancel)
+    }
+
+    // MARK: - fixtures
+
+    /// A real `DetachedWindowController` over a scripted transport that never answers the
+    /// handshake — same construction shape `DetachedWindowTests.testShowCreatesNativeChromeWindowAtFrame`
+    /// uses; these tests only care about the window's presence in `AppDelegate`'s registry, never
+    /// its live RPC traffic.
+    private func makeDetachedWindow(sessionId: String = "S1") -> DetachedWindowController {
+        let t = DetachedScriptedTransport()
+        let session = SessionModel()
+        let feed = SessionFeed(makeTransport: { t }, token: "tok", clientName: "orb", mode: .pinned(sessionId: sessionId), session: session)
+        return DetachedWindowController(feed: feed, session: session, frame: NSRect(x: 0, y: 0, width: 400, height: 400), title: "Test")
+    }
+
+    // MARK: - reallyQuitting
+
+    func testReallyQuittingDefaultsFalse() {
+        XCTAssertFalse(AppDelegate().reallyQuitting)
+    }
+
+    // MARK: - showDockIcon / hideDockIcon
+
+    func testShowDockIconSetsRegularHideDockIconRestoresAccessory() {
+        let delegate = AppDelegate()
+        XCTAssertEqual(NSApp.activationPolicy(), .accessory, "the xctest host launches LSUIElement — accessory going in")
+
+        delegate.showDockIcon()
+        XCTAssertEqual(NSApp.activationPolicy(), .regular)
+
+        delegate.hideDockIcon()
+        XCTAssertEqual(NSApp.activationPolicy(), .accessory)
+    }
+
+    // MARK: - registerDetachedWindow: promotion / demotion
+
+    func testRegisteringADetachedWindowPromotesTheDockIcon() {
+        let delegate = AppDelegate()
+        let window = makeDetachedWindow()
+        defer { window.close() }
+
+        delegate.registerDetachedWindow(window)
+
+        XCTAssertEqual(NSApp.activationPolicy(), .regular, "opening a real chat window must show the dock icon")
+    }
+
+    func testClosingTheLastDetachedWindowDemotesTheDockIcon() {
+        let delegate = AppDelegate()
+        let window = makeDetachedWindow()
+        delegate.registerDetachedWindow(window)
+        XCTAssertEqual(NSApp.activationPolicy(), .regular)
+
+        window.close()
+
+        XCTAssertEqual(NSApp.activationPolicy(), .accessory, "closing the last main window must hide the dock icon again")
+    }
+
+    func testClosingOneOfTwoDetachedWindowsKeepsTheDockIconUntilTheOtherAlsoCloses() {
+        let delegate = AppDelegate()
+        let a = makeDetachedWindow(sessionId: "A")
+        let b = makeDetachedWindow(sessionId: "B")
+        delegate.registerDetachedWindow(a)
+        delegate.registerDetachedWindow(b)
+
+        a.close()
+        XCTAssertEqual(NSApp.activationPolicy(), .regular, "one main window is still open — the dock icon must stay")
+
+        b.close()
+        XCTAssertEqual(NSApp.activationPolicy(), .accessory, "the last main window just closed — demote")
+    }
+
+    // MARK: - openDashboard: promotion / demotion
+
+    func testOpeningDashboardPromotesAndClosingItDemotes() {
+        let delegate = AppDelegate()
+        XCTAssertTrue(delegate.boot())
+
+        delegate.openDashboard()
+        XCTAssertEqual(NSApp.activationPolicy(), .regular, "the Dashboard is a real main window — must show the dock icon")
+
+        delegate.dashboardWindow?.close()
+        XCTAssertEqual(NSApp.activationPolicy(), .accessory, "closing the Dashboard with no other main window open must hide the dock icon")
+    }
+
+    /// Mixed registries: the dock icon only demotes once BOTH a detached window and the Dashboard
+    /// have closed — proves `hasMainWindow`/`syncDockPresence` OR the two registries together
+    /// rather than either one alone.
+    func testDetachedWindowAndDashboardTogetherOnlyDemoteAfterBothClose() {
+        let delegate = AppDelegate()
+        XCTAssertTrue(delegate.boot())
+        let window = makeDetachedWindow()
+        delegate.registerDetachedWindow(window)
+        delegate.openDashboard()
+        XCTAssertEqual(NSApp.activationPolicy(), .regular)
+
+        delegate.dashboardWindow?.close()
+        XCTAssertEqual(NSApp.activationPolicy(), .regular, "the detached window is still open — the dock icon must stay")
+
+        window.close()
+        XCTAssertEqual(NSApp.activationPolicy(), .accessory, "both main windows are now closed — demote")
+    }
+
+    // MARK: - applicationShouldTerminate: source-aware quit gate
+
+    func testApplicationShouldTerminateCancelsAndClosesWindowsWhenNotReallyQuitting() {
+        let delegate = AppDelegate()
+        let window = makeDetachedWindow()
+        delegate.registerDetachedWindow(window)
+        XCTAssertEqual(NSApp.activationPolicy(), .regular)
+        XCTAssertFalse(delegate.reallyQuitting, "default — only the menu-bar Quit ever flips this")
+
+        let reply = delegate.applicationShouldTerminate(NSApp)
+
+        XCTAssertEqual(reply, .terminateCancel)
+        XCTAssertTrue(delegate.detachedWindows.isEmpty, "⌘Q/dock-quit must close the main windows, not just cancel silently")
+        XCTAssertEqual(NSApp.activationPolicy(), .accessory, "⌘Q/dock-quit must demote the dock icon back to accessory")
+    }
+
+    func testApplicationShouldTerminateAllowsTerminationAndLeavesWindowsAloneWhenReallyQuitting() {
+        let delegate = AppDelegate()
+        let window = makeDetachedWindow()
+        delegate.registerDetachedWindow(window)
+        defer { window.close() }
+        delegate.reallyQuitting = true
+
+        let reply = delegate.applicationShouldTerminate(NSApp)
+
+        XCTAssertEqual(reply, .terminateNow)
+        XCTAssertFalse(delegate.detachedWindows.isEmpty, "a real quit must not run the cancel-path window teardown — AppKit's own termination handles that")
+        XCTAssertEqual(NSApp.activationPolicy(), .regular, "a real quit doesn't demote — the app is exiting")
+    }
+
+    // MARK: - applicationShouldHandleReopen
+
+    func testApplicationShouldHandleReopenReturnsTrueWhenAMainWindowAlreadyExists() {
+        let delegate = AppDelegate()
+        let window = makeDetachedWindow()
+        delegate.registerDetachedWindow(window)
+        defer { window.close() }
+
+        XCTAssertTrue(delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: true), "a main window is already open — let AppKit's default reopen handling bring it forward")
+    }
+
+    func testApplicationShouldHandleReopenAttemptsToOpenAWindowWhenNoneExistsAndReturnsFalse() {
+        let delegate = AppDelegate() // never booted — openStandaloneNormaWindow no-ops (no appModel)
+
+        let handled = delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: false)
+
+        XCTAssertFalse(handled, "no main window existed — this call must have attempted to open one itself, leaving nothing for AppKit's default handling")
+        XCTAssertTrue(delegate.detachedWindows.isEmpty, "no appModel to open against — the attempt no-ops safely (same guard as openStandaloneNormaWindow's other callers)")
+    }
+}
