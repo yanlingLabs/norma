@@ -1,4 +1,5 @@
 import { join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { existsSync, readFileSync } from "node:fs";
 import { resolveNormaHome, KeychainSecretStore, startDaemon, TOKEN_NAMES, loadSettings } from "@norma/core";
 import type { Settings } from "@norma/core";
@@ -244,11 +245,10 @@ export async function ensureDaemonReachable(deps: {
 }
 
 function appBundlePresent(): boolean {
-  // Spotlight metadata lookup by bundle id: silent (no Finder/UI side effect, unlike `open -Ra`,
-  // which reveals the app in a Finder window even just to check presence) and exit 0 either way,
-  // so "found" is real, non-empty stdout rather than the exit code.
-  const proc = Bun.spawnSync(["mdfind", "kMDItemCFBundleIdentifier == 'com.norma.app'"]);
-  return proc.stdout.toString("utf8").trim().length > 0;
+  // Only a REAL install counts — never a Debug build. mdfind/`open -Ra` also match Xcode
+  // DerivedData Debug builds (Spotlight-indexed), which would auto-launch a dev build and
+  // break the "dev is unaffected" invariant. DerivedData is never under /Applications.
+  return existsSync("/Applications/Norma.app") || existsSync(join(homedir(), "Applications", "Norma.app"));
 }
 
 async function connect(name: string, onEvent: (e: any) => void = () => {}): Promise<NormaClient> {

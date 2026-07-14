@@ -23,4 +23,10 @@ describe("ensureDaemonReachable — the three outcomes", () => {
       launchApp: () => {}, sleepMs: async () => {}, now: () => 0, noAutoLaunch: true });
     expect(r).toBe("no-app");
   });
+  test("no-app when socket down + no bundle installed (dev tree) → never launches", async () => {
+    let launched = 0;
+    const r = await ensureDaemonReachable({ socketExists: () => false, appBundlePresent: () => false,
+      launchApp: () => { launched++; }, sleepMs: async () => {}, now: () => 0, noAutoLaunch: false });
+    expect(r).toBe("no-app"); expect(launched).toBe(0);
+  });
 });
