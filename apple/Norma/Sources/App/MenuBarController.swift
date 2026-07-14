@@ -11,6 +11,12 @@ final class MenuBarController {
     private let openPluginManager: () -> Void
     private let panicAction: () -> Void
     private let quitApplication: () -> Void
+    // Lifecycle T4: arms the ONE true-quit gate (`AppDelegate.reallyQuitting`) — fired BEFORE
+    // `quitApplication()` in `didQuit()` below. An injected closure (not a direct `AppDelegate`
+    // reference) so this controller stays decoupled from the app delegate, same posture as every
+    // other closure in this initializer.
+    private let onReallyQuit: () -> Void
+    private let loginItemController: LoginItemController
     // Task 3 (2e-iv): internal (not private), same stored-`let` pattern as `stateItem` below, so
     // `MenuBarEntryPointsTests` (`@testable import Norma`) can walk `statusItem`'s built menu for
     // order and fire these items' actions via their `target`/`action` directly.
@@ -32,6 +38,9 @@ final class MenuBarController {
     let panicItem = NSMenuItem(title: "Stop Norma's Control", action: #selector(didPanic), keyEquivalent: "")
     private let preQuitSeparator = NSMenuItem.separator()
     private let quitItem = NSMenuItem(title: "Quit Norma", action: #selector(didQuit), keyEquivalent: "q")
+    // Lifecycle T4: the "Launch Norma at login" checkbox, bound to `loginItemController`. `internal`
+    // (not `private`), same testability posture as `openCliItem`/`panicItem` above.
+    let loginItemItem = NSMenuItem(title: "Launch Norma at login", action: #selector(didToggleLoginItem), keyEquivalent: "")
     private var panicMounted = false
 
     init(
@@ -42,8 +51,10 @@ final class MenuBarController {
         openNormaApp: @escaping () -> Void,
         openDashboard: @escaping () -> Void,
         openPluginManager: @escaping () -> Void,
+        loginItemController: LoginItemController,
         panic: @escaping () -> Void,
-        quit: @escaping () -> Void
+        quit: @escaping () -> Void,
+        onReallyQuit: @escaping () -> Void
     ) {
         self.statusLine = statusLine
         self.toggleOrb = toggleOrb
@@ -52,8 +63,10 @@ final class MenuBarController {
         self.openNormaApp = openNormaApp
         self.openDashboard = openDashboard
         self.openPluginManager = openPluginManager
+        self.loginItemController = loginItemController
         self.panicAction = panic
         self.quitApplication = quit
+        self.onReallyQuit = onReallyQuit
     }
 
     func install() {
@@ -78,6 +91,8 @@ final class MenuBarController {
         menu.addItem(dashboardItem)
         pluginManagerItem.target = self
         menu.addItem(pluginManagerItem)
+        loginItemItem.target = self
+        menu.addItem(loginItemItem)
         menu.addItem(preQuitSeparator)
         quitItem.target = self
         menu.addItem(quitItem)
@@ -93,6 +108,11 @@ final class MenuBarController {
 
     func refresh() {
         stateItem.title = statusLine()
+        // Lifecycle T4: the checkbox tracks `SMAppService.mainApp`'s live status (e.g. the user
+        // can flip it from System Settings > Login Items directly, outside this menu entirely),
+        // so it's re-synced on the SAME periodic cadence as the state line above rather than only
+        // right after a click.
+        loginItemItem.state = loginItemController.isEnabled ? .on : .off
     }
 
     func setOrbVisible(_ visible: Bool) {
@@ -125,5 +145,18 @@ final class MenuBarController {
     @objc private func didOpenDashboard() { openDashboard() }
     @objc private func didOpenPluginManager() { openPluginManager() }
     @objc private func didPanic() { panicAction() }
-    @objc private func didQuit() { quitApplication() }
+
+    // Lifecycle T4: `reallyQuitting` MUST be armed before `quitApplication()` runs — reversed
+    // order would let `NSApp.terminate`'s synchronous `applicationShouldTerminate` round-trip read
+    // the still-false flag and cancel the menu-bar Quit itself (the ONE true-quit source, per
+    // `AppDelegate.reallyQuitting`'s doc comment).
+    @objc private func didQuit() {
+        onReallyQuit()
+        quitApplication()
+    }
+
+    @objc private func didToggleLoginItem() {
+        loginItemController.setEnabled(!loginItemController.isEnabled)
+        loginItemItem.state = loginItemController.isEnabled ? .on : .off
+    }
 }

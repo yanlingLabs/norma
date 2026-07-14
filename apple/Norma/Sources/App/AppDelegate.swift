@@ -21,6 +21,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// through `helperClient`'s XPC calls — composed into the SAME `onPeripheralEvent` hook
     /// `peripheralProvider` uses, alongside it, never replacing it.
     private(set) var hardwareBridge: HardwareBridge?
+    /// Lifecycle T4: owns the "Launch Norma at login" `SMAppService.mainApp` registration — read
+    /// by the menu-bar checkbox (`MenuBarController.loginItemItem`). Constructed unconditionally in
+    /// `boot()` (`isEnabled`/`hasUserMadeChoice` are plain reads, safe anytime); the default-on
+    /// first-launch `setEnabled(true)` call is gated behind `!isRunningUnitTests` below, same
+    /// posture as `helper.register()`.
+    private(set) var loginItemController: LoginItemController?
     /// Task 5 (2f-ii): the Dashboard's singleton window controller — `nil` until first opened,
     /// nil'd again via `onClosed` (same one-shot-latch/registry-removal convention as
     /// `registerDetachedWindow`'s `onClosed`). `openDashboard()` below is what enforces the
@@ -325,6 +331,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hardware = HardwareBridge(client: model.client, helperClient: helper)
         hardwareBridge = hardware
 
+        // Lifecycle T4: `SMLoginItem`'s `isEnabled`/`hasUserMadeChoice` are plain reads (no
+        // registration side effect) — safe unconditionally, same posture as `HelperClient()` above.
+        // The real default-on `setEnabled(true)` call is gated below.
+        let loginItem = LoginItemController(service: SMLoginItem())
+        loginItemController = loginItem
+
         model.onPeripheralEvent = { [weak peripheral, weak hardware] event in
             await peripheral?.handle(event)
             await hardware?.handle(event)
@@ -480,6 +492,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // `hardwareBridge`/the dashboard row both already handle.
             helper.register()
 
+            // Lifecycle T4: default-on login item — registers exactly once, on the very first
+            // launch, unless the user has already made an explicit choice (including turning it
+            // off) via the menu-bar checkbox or a prior launch. Real `SMAppService.mainApp`
+            // round-trip — same `!isRunningUnitTests` gate as `helper.register()` above.
+            if !loginItem.hasUserMadeChoice {
+                loginItem.setEnabled(true)
+            }
+
             TriggerHub.shared.didTrigger
                 .sink { [weak orb] in
                     Haptics.gestureRecognized()
@@ -522,8 +542,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             openNormaApp: { [weak self] in self?.openStandaloneNormaWindow() },
             openDashboard: { [weak self] in self?.openDashboard() },
             openPluginManager: { [weak self] in self?.openPluginManager() },
+            loginItemController: loginItem,
             panic: { [weak peripheral] in peripheral?.panic() },
-            quit: { NSApp.terminate(nil) }
+            quit: { NSApp.terminate(nil) },
+            // Lifecycle T4: the ONE true-quit gate — arms `reallyQuitting` so
+            // `applicationShouldTerminate` (T3) lets THIS quit through instead of treating it like
+            // ⌘Q/dock-quit (close windows, keep running).
+            onReallyQuit: { [weak self] in self?.reallyQuitting = true }
         )
         mb.install()
         menuBar = mb

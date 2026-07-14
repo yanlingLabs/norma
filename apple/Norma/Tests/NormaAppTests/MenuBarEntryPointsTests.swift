@@ -19,7 +19,10 @@ final class MenuBarEntryPointsTests: XCTestCase {
         openNormaApp: @escaping () -> Void = {},
         openDashboard: @escaping () -> Void = {},
         openPluginManager: @escaping () -> Void = {},
-        panic: @escaping () -> Void = {}
+        loginItemController: LoginItemController? = nil,
+        panic: @escaping () -> Void = {},
+        quit: @escaping () -> Void = {},
+        onReallyQuit: @escaping () -> Void = {}
     ) -> MenuBarController {
         MenuBarController(
             statusLine: { "idle" },
@@ -29,8 +32,14 @@ final class MenuBarEntryPointsTests: XCTestCase {
             openNormaApp: openNormaApp,
             openDashboard: openDashboard,
             openPluginManager: openPluginManager,
+            // A fresh, uniquely-named `UserDefaults` suite per call — never `UserDefaults.standard`,
+            // so these menu-shape/closure-firing tests (which don't care about login-item
+            // persistence) never leave a stray key behind in the real xctest-host defaults domain.
+            loginItemController: loginItemController
+                ?? LoginItemController(service: FakeLoginItemService(), defaults: UserDefaults(suiteName: "MenuBarEntryPointsTests.\(UUID().uuidString)")!),
             panic: panic,
-            quit: {}
+            quit: quit,
+            onReallyQuit: onReallyQuit
         )
     }
 
@@ -86,9 +95,14 @@ final class MenuBarEntryPointsTests: XCTestCase {
         // Phase 4d-iii Task 2: "Manage Plugins…" is adjacent to Dashboard…, same posture as
         // Dashboard… itself being adjacent to Open Norma App — no separator between them either.
         XCTAssertEqual(pluginManagerIdx, dashboardIdx + 1, "Manage Plugins… must be adjacent to Dashboard…, no separator between them")
-        // The pre-existing pre-Quit separator is preserved between Manage Plugins… and Quit Norma.
-        XCTAssertEqual(quitIdx, pluginManagerIdx + 2)
-        XCTAssertTrue(items[pluginManagerIdx + 1].isSeparatorItem)
+        // Lifecycle T4: "Launch Norma at login" sits between Manage Plugins… and the pre-existing
+        // pre-Quit separator — still no separator between Manage Plugins… and it.
+        guard let loginItemIdx = titles.firstIndex(of: "Launch Norma at login") else {
+            return XCTFail("expected Launch Norma at login present, got \(titles)")
+        }
+        XCTAssertEqual(loginItemIdx, pluginManagerIdx + 1, "Launch Norma at login must be adjacent to Manage Plugins…, no separator between them")
+        XCTAssertEqual(quitIdx, loginItemIdx + 2)
+        XCTAssertTrue(items[loginItemIdx + 1].isSeparatorItem)
     }
 
     func testDashboardItemFiresInjectedClosure() {
@@ -146,6 +160,7 @@ final class MenuBarEntryPointsTests: XCTestCase {
         XCTAssertEqual(titles.filter { $0 == "Open Norma App" }.count, 1)
         XCTAssertEqual(titles.filter { $0 == "Dashboard…" }.count, 1)
         XCTAssertEqual(titles.filter { $0 == "Manage Plugins…" }.count, 1)
+        XCTAssertEqual(titles.filter { $0 == "Launch Norma at login" }.count, 1)
     }
 
     // MARK: - Closure firing
@@ -243,5 +258,57 @@ final class MenuBarEntryPointsTests: XCTestCase {
         NSApp.sendAction(item.action!, to: item.target, from: item)
 
         XCTAssertEqual(fired, 1)
+    }
+
+    // MARK: - Lifecycle T4: reallyQuit arming order
+
+    /// The ONE true-quit contract: `onReallyQuit()` must fire BEFORE `quitApplication()` — a real
+    /// `NSApp.terminate` call synchronously re-enters `applicationShouldTerminate`, so if the order
+    /// were reversed the flag would still read `false` there and the menu-bar Quit itself would be
+    /// cancelled.
+    func testQuitItemFiresOnReallyQuitBeforeQuitApplication() {
+        var order: [String] = []
+        let controller = makeController(
+            quit: { order.append("quit") },
+            onReallyQuit: { order.append("reallyQuit") }
+        )
+        controller.install()
+
+        let item = controller.statusItem?.menu?.items.first { $0.title == "Quit Norma" }
+        XCTAssertNotNil(item)
+        NSApp.sendAction(item!.action!, to: item!.target, from: item!)
+
+        XCTAssertEqual(order, ["reallyQuit", "quit"])
+    }
+
+    // MARK: - Lifecycle T4: "Launch Norma at login" checkbox
+
+    func testLoginItemCheckboxReflectsControllerStateAfterInstall() {
+        let fake = FakeLoginItemService()
+        let controller = LoginItemController(service: fake, defaults: UserDefaults(suiteName: "MenuBarEntryPointsTests.\(UUID().uuidString)")!)
+        let menuBar = makeController(loginItemController: controller)
+
+        menuBar.install()
+        XCTAssertEqual(menuBar.loginItemItem.state, .off)
+
+        controller.setEnabled(true)
+        menuBar.refresh()
+        XCTAssertEqual(menuBar.loginItemItem.state, .on)
+    }
+
+    func testLoginItemCheckboxTogglesTheControllerOnClick() {
+        let fake = FakeLoginItemService()
+        let controller = LoginItemController(service: fake, defaults: UserDefaults(suiteName: "MenuBarEntryPointsTests.\(UUID().uuidString)")!)
+        let menuBar = makeController(loginItemController: controller)
+        menuBar.install()
+
+        let item = menuBar.loginItemItem
+        NSApp.sendAction(item.action!, to: item.target, from: item)
+        XCTAssertTrue(fake.isEnabled)
+        XCTAssertEqual(item.state, .on)
+
+        NSApp.sendAction(item.action!, to: item.target, from: item)
+        XCTAssertFalse(fake.isEnabled)
+        XCTAssertEqual(item.state, .off)
     }
 }

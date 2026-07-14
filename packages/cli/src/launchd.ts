@@ -59,3 +59,34 @@ export async function daemonStatus(): Promise<string> {
   const res = await launchctl("print", `gui/${process.getuid!()}/${LAUNCHD_LABEL}`);
   return res.ok ? "loaded" : "not loaded";
 }
+
+/** Injectable seams for `migrateFromLaunchdAgent` — real filesystem/launchctl by default, fakes in
+ * tests. Never touches a real user's home directory or launchd from a test process. */
+export interface MigrateLaunchdDeps {
+  plistPath?: string;
+  exists?: (path: string) => boolean;
+  remove?: (path: string) => void;
+  bootout?: (label: string) => Promise<void>;
+}
+
+/** Lifecycle T4: tears down the OLD `com.norma.core` launchd agent (superseded by the app's
+ * `DaemonSupervisor` embedding norma-core directly). A leftover `KeepAlive` agent would otherwise
+ * relaunch a daemon the app just killed, defeating the app↔daemon lifecycle coupling entirely — so
+ * this must run before/at app-driven daemon supervision starts. No-op if the plist was never
+ * installed (fresh installs, or a machine already migrated). NEVER throws: a failed bootout/unlink
+ * (e.g. permissions, already gone) must not block the app from starting. */
+export async function migrateFromLaunchdAgent(deps: MigrateLaunchdDeps = {}): Promise<void> {
+  const path = deps.plistPath ?? plistPath();
+  const exists = deps.exists ?? existsSync;
+  const remove = deps.remove ?? unlinkSync;
+  const bootout = deps.bootout ?? (async (label: string) => {
+    await launchctl("bootout", `gui/${process.getuid!()}/${label}`);
+  });
+  try {
+    if (!exists(path)) return; // never installed (or already migrated) — nothing to do
+    await bootout(LAUNCHD_LABEL);
+    remove(path);
+  } catch (error) {
+    console.error(`[launchd] migrateFromLaunchdAgent failed (non-fatal): ${error}`);
+  }
+}
