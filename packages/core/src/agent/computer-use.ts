@@ -111,6 +111,10 @@ export class ComputerUseService {
   private readonly now: () => number;
   private readonly scheduler: CuScheduler;
   private readonly sessions = new Map<string, SessionState>();
+  // hot-settings T5a: count of act() calls currently executing, for inFlight()'s drain gate —
+  // incremented at the top of act(), decremented in a finally around its whole body so it's
+  // accurate across every return path (success, typed error, or a thrown broker call).
+  private activeActs = 0;
 
   constructor(deps: ComputerUseServiceDeps) {
     this.broker = deps.broker;
@@ -123,24 +127,29 @@ export class ComputerUseService {
   /** Run one CU capability call for `sessionId`, ensuring a live lease for `cls` first. The single
    *  entry point the `computer` tool calls. Never throws. */
   async act(sessionId: string, cls: PeripheralClass, payloadJson: string): Promise<CuActResult> {
-    const preState = this.sessions.get(sessionId);
-    if (preState) preState.lastActAt = this.now();
-    const ensured = await this.ensureLease(sessionId, cls);
-    if (!("leaseId" in ensured)) return this.mapLeaseError(ensured);
+    this.activeActs++;
+    try {
+      const preState = this.sessions.get(sessionId);
+      if (preState) preState.lastActAt = this.now();
+      const ensured = await this.ensureLease(sessionId, cls);
+      if (!("leaseId" in ensured)) return this.mapLeaseError(ensured);
 
-    const res = await this.broker.call({ leaseId: ensured.leaseId, token: ensured.token, class: cls, payloadJson });
-    if ("ok" in res) return { ok: true, resultJson: res.resultJson }; // only the success member has `ok`
+      const res = await this.broker.call({ leaseId: ensured.leaseId, token: ensured.token, class: cls, payloadJson });
+      if ("ok" in res) return { ok: true, resultJson: res.resultJson }; // only the success member has `ok`
 
-    // A LEASE-INVALIDATING failure drops the cached lease so the next action re-acquires (and,
-    // under ask, re-cards) — the token/lease is genuinely gone. A provider_error/timeout leaves
-    // the lease intact: the lease is fine, the capability call itself failed (e.g. TCC not granted,
-    // a slow capture), and re-carding on the next action would be pure noise.
-    if (res.code === "not_found" || res.code === "token_mismatch" || res.code === "expired" || res.code === "lease_gone") {
-      this.dropLease(sessionId, cls);
-      return { ok: false, kind: "unavailable", message: CU_UNAVAILABLE_MESSAGE };
+      // A LEASE-INVALIDATING failure drops the cached lease so the next action re-acquires (and,
+      // under ask, re-cards) — the token/lease is genuinely gone. A provider_error/timeout leaves
+      // the lease intact: the lease is fine, the capability call itself failed (e.g. TCC not granted,
+      // a slow capture), and re-carding on the next action would be pure noise.
+      if (res.code === "not_found" || res.code === "token_mismatch" || res.code === "expired" || res.code === "lease_gone") {
+        this.dropLease(sessionId, cls);
+        return { ok: false, kind: "unavailable", message: CU_UNAVAILABLE_MESSAGE };
+      }
+      if (res.code === "timeout") return { ok: false, kind: "timeout", message: "the computer-use action timed out" };
+      return { ok: false, kind: "provider_error", message: res.message };
+    } finally {
+      this.activeActs--;
     }
-    if (res.code === "timeout") return { ok: false, kind: "timeout", message: "the computer-use action timed out" };
-    return { ok: false, kind: "provider_error", message: res.message };
   }
 
   /** Release every lease held for `sessionId` and stop its heartbeat — called by the engine on the
@@ -155,6 +164,25 @@ export class ComputerUseService {
     }
     this.stopTimer(state);
     this.sessions.delete(sessionId);
+  }
+
+  /** Quiesce point for hot-disable (hot-settings T5b calls this once the inFlight() drain gate
+   *  closes): releases EVERY session's held leases and stops their heartbeats, leaving the
+   *  service holding nothing but still usable (a later re-enable calls act() as normal, which
+   *  lazily re-acquires). Reuses releaseSession per session id — idempotent, and a no-op when
+   *  there are no sessions. Snapshots the id list first since releaseSession mutates `sessions`
+   *  (same copy-before-iterate pattern as renewAll's lease loop above). */
+  releaseAll(): void {
+    for (const sessionId of [...this.sessions.keys()]) {
+      this.releaseSession(sessionId);
+    }
+  }
+
+  /** True while ≥1 act() call is currently executing — the drain gate hot-disable waits on before
+   *  calling releaseAll()/tearing the service down, so an in-flight capability call is never
+   *  yanked out from under itself. */
+  inFlight(): boolean {
+    return this.activeActs > 0;
   }
 
   /** True if `sessionId` currently holds any lease (test/introspection helper). */

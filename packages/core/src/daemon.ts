@@ -572,7 +572,14 @@ export async function startDaemon(opts: {
       // ever consulted (see its own doc comment), so no extra defaulting belongs here.
       reviewerClasses: () => settings?.reviewer?.classes,
       titler,
-      computerUse,
+      // hot-settings T5a: EngineConfig.computerUse became a getter (engine.ts) so a LATER task
+      // (T5b) can back it with a live, reassignable holder + SettingsWatcher — that wiring is
+      // explicitly NOT this task's job. This is the minimal mechanical thunk-wrap needed to keep
+      // the interface satisfied; `computerUse` above is still assigned exactly ONCE at boot
+      // (line ~423), so this getter always resolves to that same frozen value — byte-identical to
+      // today's behavior, not yet hot-reloadable. T5b replaces this closure body (and the
+      // surrounding boot-gate above) with a read off its live holder.
+      computerUse: () => computerUse,
       toolSearch: {
         enabled: () => settings?.toolSearch?.enabled,
         deferThreshold: () => settings?.toolSearch?.deferThreshold ?? Number(process.env.NORMA_TOOLSEARCH_THRESHOLD ?? 12),

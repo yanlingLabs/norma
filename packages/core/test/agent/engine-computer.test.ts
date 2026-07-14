@@ -51,7 +51,10 @@ function setup(script: ProviderEvent[][], vision: boolean, broker = new FakeBrok
     gate: new PermissionGate(),
     provider: { provider, model: "m" },
     dirs, assembler, compactor,
-    computerUse,
+    // hot-settings T5a: EngineConfig.computerUse is now a getter (`() => ComputerUseService |
+    // undefined`) — this wraps the plain instance built above, unchanged behavior (always resolves
+    // to the same `computerUse`, exactly like the pre-getter field).
+    computerUse: () => computerUse,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: "auto" });
   return { engine, store, sessionId, provider, broker };
@@ -118,5 +121,63 @@ describe("engine computer-use integration", () => {
     expect(provider.requests[1]!.input.some((i) => i.type === "image")).toBe(false);
     const toolResult = store.read(sessionId).find((e) => e.type === "tool_result");
     expect((toolResult as any).output).toContain("button 'Save'");
+  });
+
+  test("EngineConfig.computerUse getter is read LIVE, not captured at construction — flipping the closed-over value changes what a LATER turn's tool ctx sees", async () => {
+    // hot-settings T5a: the whole point of the getter conversion. `svc` stands in for daemon.ts's
+    // (T5b's) mutable settings-backed holder — the engine must re-read it every turn, not freeze
+    // whatever it resolved to at construction time.
+    const broker = new FakeBroker();
+    broker.callResult = { ok: true, resultJson: JSON.stringify({ text: "#0 window" }) };
+    let svc: ComputerUseService | undefined; // starts undefined — CU boot-disabled
+
+    const home = mkdtempSync(join(tmpdir(), "norma-cu-live-"));
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-cu-live-cwd-")));
+    const store = new SessionStore(home);
+    const hub = new SessionHub(store);
+    const registry = new ToolRegistry();
+    registerComputerTool(registry);
+    const approval = new ApprovalBroker();
+    const models: ModelInfo[] = [{ id: "m", family: "fake", contextWindow: 100_000, supportsVision: true }];
+    const axRound = (): ProviderEvent[] => [{ type: "tool_call", callId: "c1", name: "computer", argsJson: '{"action":"ax_snapshot"}' }, usage, { type: "done", stopReason: "tool_calls" }];
+    const provider = new FakeProvider([axRound(), endRound(), axRound(), endRound(), axRound(), endRound()], models);
+    const dirs = new SessionDirectories(() => [cwd]);
+    const aHome = mkdtempSync(join(tmpdir(), "norma-cu-live-actx-"));
+    const aTrust = new TrustStore(join(aHome, "trust.json"));
+    const assembler = new ContextAssembler({ normaHome: aHome, trust: aTrust, skills: new SkillStore({ normaHome: aHome, trust: aTrust }) });
+    const compactor = new Compactor({ provider: { provider, model: "m" }, store, hub });
+    const engine = new AgentEngine({
+      store, hub, registry, broker: approval,
+      gate: new PermissionGate(),
+      provider: { provider, model: "m" },
+      dirs, assembler, compactor,
+      computerUse: () => svc, // reads the mutable `svc` LIVE on every call, not a snapshot
+    });
+    const sessionId = store.createSession("global", { cwd, approvalPolicy: "auto" });
+
+    // Turn 1: svc is undefined → the computer tool sees ctx.computerUse === undefined → errors.
+    await engine.runTurn(sessionId);
+    let results = store.read(sessionId).filter((e) => e.type === "tool_result");
+    expect(results.length).toBe(1);
+    expect(results[0]).toMatchObject({ isError: true });
+    expect((results[0] as any).output).toContain("not available");
+
+    // Flip the closed-over value to a live service — no engine reconstruction.
+    svc = new ComputerUseService({ broker, scheduler: noTimer });
+
+    // Turn 2 (same engine instance, same getter): now resolves to the real service.
+    await engine.runTurn(sessionId);
+    results = store.read(sessionId).filter((e) => e.type === "tool_result");
+    expect(results.length).toBe(2);
+    expect(results[1]).toMatchObject({ isError: false });
+    expect((results[1] as any).output).toContain("window");
+
+    // Flip back to undefined — a later turn must see the disable too (not a one-way sticky read).
+    svc = undefined;
+    await engine.runTurn(sessionId);
+    results = store.read(sessionId).filter((e) => e.type === "tool_result");
+    expect(results.length).toBe(3);
+    expect(results[2]).toMatchObject({ isError: true });
+    expect((results[2] as any).output).toContain("not available");
   });
 });

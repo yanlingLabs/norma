@@ -325,7 +325,12 @@ export interface EngineConfig {
   // engine (1) exposes it + an image-staging callback on the tool ctx, (2) drains staged screenshots
   // into the turn's input as `{type:"image"}` items at each round's end, and (3) releases the
   // session's held leases when the top-level turn settles (runTurn's finally).
-  computerUse?: ComputerUseService;
+  // hot-settings T5a: getter over the live settings-backed holder (was a plain boot-captured
+  // value) — same T2 pattern/rationale as reviewerEnabled et al. above, so a boot-disabled CU can
+  // be hot-enabled (and vice versa) without rebuilding the engine. `ctx.computerUse`'s type on
+  // ToolContext (registry.ts) is UNCHANGED — it stays a plain `ComputerUseService | undefined`;
+  // only this config field became a getter, resolved to that plain value at each read site below.
+  computerUse?: () => ComputerUseService | undefined;
 }
 
 export class AgentEngine {
@@ -425,6 +430,11 @@ export class AgentEngine {
     this.runningTurns.add(sessionId);
     const ac = new AbortController();
     this.aborters.set(sessionId, ac);
+    // hot-settings T5a: snapshot the getter ONCE for this turn so the finally-release below acts
+    // on the SAME service this turn actually used, even if a hot-disable flips the live holder to
+    // undefined (or a different instance) mid-turn — per-tool-call sites (executeCall) still read
+    // the getter live, which is what lets a mid-turn disable take effect for later tool calls.
+    const cu = this.cfg.computerUse?.();
     try {
       await this.turn(sessionId, ac.signal);
     } finally {
@@ -439,10 +449,10 @@ export class AgentEngine {
       // service's own idle backstop (maxIdleMs, default 60s without a CU action) bounds the hold
       // for that case instead. Guarded so CU-less configs are byte-identical. Runs before the
       // bg-retrigger drain so a follow-up turn starts with a clean lease slate.
-      if (this.cfg.computerUse) {
+      if (cu) {
         const bgRunning = this.cfg.bgAgents?.list(sessionId).some((e) => e.status === "running") ?? false;
         if (!bgRunning) {
-          this.cfg.computerUse.releaseSession(sessionId);
+          cu.releaseSession(sessionId);
           // Teardown sweep for staged-but-undrained screenshots (an abnormal unwind between
           // staging and the round-end drain — e.g. an emit throw mid-dispatch — would otherwise
           // leak the base64 in the map for the daemon's lifetime). Keys are namespaced
@@ -2651,7 +2661,12 @@ export class AgentEngine {
     // `attachImage` closes over this call's namespaced key (session|thread|callId — see the
     // pendingCuImages doc comment for why bare callId is unsafe): a staged screenshot lands in
     // pendingCuImages under that key, drained into `input` at this round's end (drainRoundImages).
-    const attachImage = this.cfg.computerUse
+    // hot-settings T5a: read the getter LIVE here (per tool call), not the runTurn-start snapshot
+    // — a mid-turn hot-disable must make a LATER call in the same turn see `undefined` too. This
+    // is safe unguarded: the drain gate + T5b's tool-unregister mean no NEW `computer` call
+    // dispatches after a disable, so nothing observes a "half disabled" state.
+    const cuNow = this.cfg.computerUse?.();
+    const attachImage = cuNow
       ? (dataUrl: string) => {
           const key = AgentEngine.cuImageKey(sessionId, threadId, call.callId);
           const arr = this.pendingCuImages.get(key) ?? [];
@@ -2668,7 +2683,7 @@ export class AgentEngine {
       builtinDeferral: this.toolSearchEnabled(),
       ask,
       taskEvent,
-      computerUse: this.cfg.computerUse,
+      computerUse: cuNow,
       attachImage,
       visionCapable,
     });
