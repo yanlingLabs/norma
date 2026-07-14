@@ -55,8 +55,8 @@ targets:
         CFBundleDisplayName: Norma
         CFBundleIdentifier: com.norma.app
         CFBundleIconFile: AppIcon
-        CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "0.2.001"
+        CFBundleVersion: "0.2.001"
         LSUIElement: true
         LSMinimumSystemVersion: "26.0"
         NSPrincipalClass: NSApplication

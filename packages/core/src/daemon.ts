@@ -73,8 +73,9 @@ import { SettingsWatcher } from "./settings-watcher";
 import { makeDaemonRoutineRunner } from "./routines/runner";
 import { makeRoutineScheduler } from "./routines/scheduler";
 import type { NewSessionEvent } from "@norma/protocol";
+import { CORE_VERSION } from "./version";
 
-export const CORE_VERSION = "0.0.1";
+export { CORE_VERSION } from "./version";
 
 export interface RunningDaemon {
   socketPath: string;
