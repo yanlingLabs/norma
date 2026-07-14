@@ -52,6 +52,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// running" instead — the product's ChatGPT/Claude-desktop-style lifecycle contract.
     var reallyQuitting = false
 
+    /// Lifecycle T3 review fix: seam for the Apple-Event quit-reason read
+    /// (`isSystemInitiatedQuitEvent()` below the class) — injectable so a unit test can drive the
+    /// systemInitiated axis of `applicationShouldTerminate` without synthesizing a real
+    /// logout/shutdown Apple Event against the xctest host. The real read touches AppKit global
+    /// state (`NSAppleEventManager`), which is exactly why it stays OUT of the pure
+    /// `terminateDecision` and enters only as a bool computed at the delegate boundary.
+    var systemQuitReasonProvider: () -> Bool = isSystemInitiatedQuitEvent
+
     /// Promotes the app to `.regular` — the dock icon appears. `NSApp.activate` right after the
     /// policy flip works around a known macOS quirk: flipping activation policy alone doesn't
     /// reliably bring the newly-promoted app's window forward.
@@ -558,16 +566,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Lifecycle T3: the source-aware termination gate (product spec — only the menu-bar "Quit
-    /// Norma" is a REAL quit). `terminateDecision` is the pure truth table (see its own doc);
-    /// `hasMainWindow` is read fresh here off the live registries, never cached, so a window
-    /// opened/closed between calls is always reflected. On `.terminateCancel` (⌘Q, dock-tile
-    /// quit, or any other `terminate()` call that isn't the menu-bar Quit) this closes the main
-    /// windows and demotes the dock icon instead of actually quitting. `closeMainWindows()`'s own
-    /// `onClosed` chain already demotes as each window closes (`syncDockPresence()`); the explicit
-    /// `hideDockIcon()` below is belt-and-suspenders for the edge case where `hasMainWindow` was
-    /// already false (nothing to close, so nothing to trigger demotion through those callbacks).
+    /// Norma" is a REAL quit). `terminateDecision` is the pure truth table (see its own doc).
+    /// Review fix: a system LOGOUT/RESTART/SHUTDOWN arrives through this SAME delegate call as a
+    /// user ⌘Q — answering it `.terminateCancel` would BLOCK the user's logout indefinitely, so
+    /// `systemQuitReasonProvider` (the Apple-Event quit-reason read, injectable seam above) is the
+    /// second true-quit axis alongside `reallyQuitting`. On `.terminateCancel` (⌘Q, dock-tile
+    /// quit, or any other `terminate()` call that is neither the menu-bar Quit nor
+    /// system-initiated) this closes the main windows and demotes the dock icon instead of
+    /// actually quitting. `closeMainWindows()`'s own `onClosed` chain already demotes as each
+    /// window closes (`syncDockPresence()`); the explicit `hideDockIcon()` below is
+    /// belt-and-suspenders for the edge case where no main window was open (nothing to close, so
+    /// nothing to trigger demotion through those callbacks).
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        let reply = terminateDecision(reallyQuitting: reallyQuitting, hasMainWindow: hasMainWindow)
+        let reply = terminateDecision(reallyQuitting: reallyQuitting, systemInitiated: systemQuitReasonProvider())
         if reply == .terminateCancel {
             closeMainWindows()
             hideDockIcon()
@@ -593,13 +604,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-/// Lifecycle T3: pure decision core for `applicationShouldTerminate` — no `NSApp` reference, so the
-/// whole truth table is unit-testable without any AppKit window state (see
+/// Lifecycle T3: pure decision core for `applicationShouldTerminate` — no `NSApp`/AppleEvent
+/// reference, so the whole truth table is unit-testable without any AppKit state (see
 /// `AppLifecycleTests.testTerminateDecision`). `.terminateNow` iff `reallyQuitting` (set ONLY by
-/// the menu-bar "Quit Norma"); otherwise always `.terminateCancel`, regardless of `hasMainWindow` —
-/// the sole gate on a real quit is its SOURCE, never window state. `hasMainWindow` is threaded
-/// through anyway so the call site (`AppDelegate.applicationShouldTerminate`) reads as
-/// self-documenting, not because it changes the branch taken.
-func terminateDecision(reallyQuitting: Bool, hasMainWindow: Bool) -> NSApplication.TerminateReply {
-    reallyQuitting ? .terminateNow : .terminateCancel
+/// the menu-bar "Quit Norma") OR `systemInitiated` (review fix: the quit Apple Event carries a
+/// logout/restart/shutdown reason — refusing THOSE would block the user's logout indefinitely);
+/// everything else — ⌘Q, dock-tile quit — cancels. Window state never gates a quit: the T3 spec's
+/// original `hasMainWindow` param was truth-table-inert and was dropped when `systemInitiated`
+/// (the real second axis) replaced it.
+func terminateDecision(reallyQuitting: Bool, systemInitiated: Bool) -> NSApplication.TerminateReply {
+    (reallyQuitting || systemInitiated) ? .terminateNow : .terminateCancel
+}
+
+/// Lifecycle T3 review fix: TRUE when the in-flight quit Apple Event carries a system quit reason
+/// — the four reasons macOS stamps on the `kAEQuitApplication` event it sends every app during
+/// logout/restart/shutdown. A user ⌘Q/dock-quit arrives with no quit-reason attribute (and a
+/// programmatic `NSApp.terminate(nil)`, e.g. the menu-bar Quit, has no current Apple Event at
+/// all) — both read as `false` here. AppKit global state, deliberately OUTSIDE the pure
+/// `terminateDecision`; `AppDelegate.systemQuitReasonProvider` is the injectable seam over it.
+func isSystemInitiatedQuitEvent() -> Bool {
+    guard let reason = NSAppleEventManager.shared().currentAppleEvent?
+        .attributeDescriptor(forKeyword: AEKeyword(kAEQuitReason))?.enumCodeValue
+    else { return false }
+    return reason == OSType(kAELogOut)
+        || reason == OSType(kAEReallyLogOut)
+        || reason == OSType(kAEShowRestartDialog)
+        || reason == OSType(kAEShowShutdownDialog)
 }

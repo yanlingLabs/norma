@@ -16,13 +16,17 @@ import NormaKit
 /// `.accessory` by the time the test returns — nothing leaks into a later test.
 @MainActor
 final class AppLifecycleTests: XCTestCase {
-    // MARK: - terminateDecision (PURE — no NSApp reference)
+    // MARK: - terminateDecision (PURE — no NSApp/AppleEvent reference)
 
+    /// T3 review fix: the second axis is `systemInitiated` (the Apple-Event logout/restart/
+    /// shutdown quit reason), not the truth-table-inert `hasMainWindow` the original brief
+    /// threaded through. ONLY (false, false) — a plain user ⌘Q/dock-quit — cancels; refusing a
+    /// system-initiated quit would block the user's logout indefinitely.
     func testTerminateDecision() {
-        XCTAssertEqual(terminateDecision(reallyQuitting: true, hasMainWindow: true), .terminateNow)
-        XCTAssertEqual(terminateDecision(reallyQuitting: true, hasMainWindow: false), .terminateNow)
-        XCTAssertEqual(terminateDecision(reallyQuitting: false, hasMainWindow: true), .terminateCancel)
-        XCTAssertEqual(terminateDecision(reallyQuitting: false, hasMainWindow: false), .terminateCancel)
+        XCTAssertEqual(terminateDecision(reallyQuitting: true, systemInitiated: true), .terminateNow)
+        XCTAssertEqual(terminateDecision(reallyQuitting: true, systemInitiated: false), .terminateNow)
+        XCTAssertEqual(terminateDecision(reallyQuitting: false, systemInitiated: true), .terminateNow)
+        XCTAssertEqual(terminateDecision(reallyQuitting: false, systemInitiated: false), .terminateCancel)
     }
 
     // MARK: - fixtures
@@ -129,6 +133,9 @@ final class AppLifecycleTests: XCTestCase {
 
     func testApplicationShouldTerminateCancelsAndClosesWindowsWhenNotReallyQuitting() {
         let delegate = AppDelegate()
+        // Pin the seam rather than relying on the host's (absent) current Apple Event — this test
+        // is about the plain-⌘Q path, so the system axis must be deterministically false.
+        delegate.systemQuitReasonProvider = { false }
         let window = makeDetachedWindow()
         delegate.registerDetachedWindow(window)
         XCTAssertEqual(NSApp.activationPolicy(), .regular)
@@ -143,6 +150,7 @@ final class AppLifecycleTests: XCTestCase {
 
     func testApplicationShouldTerminateAllowsTerminationAndLeavesWindowsAloneWhenReallyQuitting() {
         let delegate = AppDelegate()
+        delegate.systemQuitReasonProvider = { false }
         let window = makeDetachedWindow()
         delegate.registerDetachedWindow(window)
         defer { window.close() }
@@ -153,6 +161,33 @@ final class AppLifecycleTests: XCTestCase {
         XCTAssertEqual(reply, .terminateNow)
         XCTAssertFalse(delegate.detachedWindows.isEmpty, "a real quit must not run the cancel-path window teardown — AppKit's own termination handles that")
         XCTAssertEqual(NSApp.activationPolicy(), .regular, "a real quit doesn't demote — the app is exiting")
+    }
+
+    /// T3 review fix: a system LOGOUT/RESTART/SHUTDOWN quit (the Apple Event carries a system
+    /// quit reason) must terminate even though `reallyQuitting` is false — the pre-fix code
+    /// answered it `.terminateCancel` and blocked the user's logout indefinitely. Driven through
+    /// the injectable seam; the real Apple-Event read (`isSystemInitiatedQuitEvent`) can't be
+    /// exercised from a unit test without synthesizing a logout event against the host.
+    func testApplicationShouldTerminateAllowsSystemInitiatedQuitEvenWhenNotReallyQuitting() {
+        let delegate = AppDelegate()
+        delegate.systemQuitReasonProvider = { true } // a logout/restart/shutdown is in flight
+        let window = makeDetachedWindow()
+        delegate.registerDetachedWindow(window)
+        defer { window.close() }
+        XCTAssertFalse(delegate.reallyQuitting, "the menu-bar Quit was never involved — this is purely the system axis")
+
+        let reply = delegate.applicationShouldTerminate(NSApp)
+
+        XCTAssertEqual(reply, .terminateNow, "a system logout/shutdown must never be refused")
+        XCTAssertFalse(delegate.detachedWindows.isEmpty, "the cancel-path teardown must not run — applicationWillTerminate owns real-quit teardown")
+    }
+
+    /// The host process has no current quit Apple Event, so the REAL default provider must read
+    /// as user-initiated — proves the default wiring fails toward the cancel path (never toward
+    /// accidentally letting a plain ⌘Q terminate), and covers the no-event branch of
+    /// `isSystemInitiatedQuitEvent` directly.
+    func testIsSystemInitiatedQuitEventIsFalseWithoutAQuitAppleEvent() {
+        XCTAssertFalse(isSystemInitiatedQuitEvent())
     }
 
     // MARK: - applicationShouldHandleReopen
