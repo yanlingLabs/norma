@@ -206,6 +206,35 @@ describe("loadSettings", () => {
     expect(both.subagents).toEqual({ maxConcurrent: 2, maxDepth: 4 });
   });
 
+  // No-timeout task (user rule 2026-07-12): subagents.timeoutMs is the EXPLICIT wall-clock
+  // opt-in (ABSENT = no wall clock at all — the new default); subagents.stallTimeoutMs overrides
+  // the progress-stall watchdog window (ABSENT = the manager's 600000 default). Both hot via
+  // daemon.ts's live getters.
+  test("subagents.timeoutMs + stallTimeoutMs parse (positive ints); absent → undefined (no wall clock / stall default); zero/negative/non-integer rejected", () => {
+    const base = { schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" } };
+
+    const s = Settings.parse({ ...base, subagents: { timeoutMs: 300000, stallTimeoutMs: 900000 } });
+    expect(s.subagents).toEqual({ timeoutMs: 300000, stallTimeoutMs: 900000 });
+
+    // absent fields stay absent — daemon.ts's getters resolve them to undefined, which is what
+    // SubagentManager reads as "no wall clock" / "use the 600s stall default"
+    const bare = Settings.parse({ ...base, subagents: { maxConcurrent: 2 } });
+    expect(bare.subagents?.timeoutMs).toBeUndefined();
+    expect(bare.subagents?.stallTimeoutMs).toBeUndefined();
+
+    // each rejects zero / negative / non-integer (same positive-int idiom as maxConcurrent)
+    expect(() => Settings.parse({ ...base, subagents: { timeoutMs: 0 } })).toThrow();
+    expect(() => Settings.parse({ ...base, subagents: { timeoutMs: -5 } })).toThrow();
+    expect(() => Settings.parse({ ...base, subagents: { timeoutMs: 1.5 } })).toThrow();
+    expect(() => Settings.parse({ ...base, subagents: { stallTimeoutMs: 0 } })).toThrow();
+    expect(() => Settings.parse({ ...base, subagents: { stallTimeoutMs: -5 } })).toThrow();
+    expect(() => Settings.parse({ ...base, subagents: { stallTimeoutMs: 1.5 } })).toThrow();
+
+    // all four subagents knobs coexist
+    const all = Settings.parse({ ...base, subagents: { maxConcurrent: 3, maxDepth: 2, timeoutMs: 120000, stallTimeoutMs: 300000 } });
+    expect(all.subagents).toEqual({ maxConcurrent: 3, maxDepth: 2, timeoutMs: 120000, stallTimeoutMs: 300000 });
+  });
+
   test("legacy migration keeps working with subagents field absent", () => {
     const p = tmpSettings({ legacyCustom: { provider: "disabled" } });
     const s = loadSettings(p);

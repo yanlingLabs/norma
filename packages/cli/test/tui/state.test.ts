@@ -209,6 +209,52 @@ describe("state.ts — THE BUG FIX: bg-agent finish survives the main turn_compl
   });
 });
 
+describe("state.ts — roster honesty: finish note verb from thread_completed.stopReason (no-timeout task)", () => {
+  test("a FAILED child (stopReason 'error' — incl. a stalled one) commits 'Failed (...)', never 'Done'", () => {
+    let s = initialState();
+    s = reduce(s, {
+      type: "thread_started", threadId: "th_f", parentThreadId: "main", agentType: "general-purpose",
+      prompt: "scan the machine", description: "laptop scan",
+    }, T0);
+    s = reduce(s, { type: "turn_started", threadId: "th_f", ts: T0 + 100 }, T0 + 100);
+    s = reduce(s, { type: "thread_completed", threadId: "th_f", stopReason: "error", ts: T0 + 5_100 }, T0 + 5_100);
+
+    const note = s.committed.at(-1) as { kind: string; text: string };
+    expect(note.kind).toBe("note");
+    expect(note.text).toBe('Agent "laptop scan": Failed (0 tool uses · 5s)');
+    expect(note.text).not.toContain("Done");
+    // the live row carries the honest finish too (agent-list.tsx renders it)
+    expect(s.agents.find((a) => a.threadId === "th_f")).toMatchObject({ status: "done", finish: "failed" });
+  });
+
+  test("a STOPPED child (stopReason 'aborted' — ESC cascade / task_stop) commits 'Stopped (...)', never 'Done'", () => {
+    let s = initialState();
+    s = reduce(s, {
+      type: "thread_started", threadId: "th_s", parentThreadId: "main", agentType: "general-purpose",
+      prompt: "long task", description: "long task",
+    }, T0);
+    s = reduce(s, { type: "turn_started", threadId: "th_s", ts: T0 + 100 }, T0 + 100);
+    s = reduce(s, { type: "thread_completed", threadId: "th_s", stopReason: "aborted", ts: T0 + 3_100 }, T0 + 3_100);
+
+    const note = s.committed.at(-1) as { kind: string; text: string };
+    expect(note.text).toBe('Agent "long task": Stopped (0 tool uses · 3s)');
+    expect(note.text).not.toContain("Done");
+    expect(s.agents.find((a) => a.threadId === "th_s")).toMatchObject({ status: "done", finish: "stopped" });
+  });
+
+  test("failed/stopped rows are STILL pruned on the next main turn_started, exactly like done ones (status stays the terminal marker)", () => {
+    let s = initialState();
+    s = reduce(s, {
+      type: "thread_started", threadId: "th_f", parentThreadId: "main", agentType: "general-purpose",
+      prompt: "x", description: "failing agent",
+    }, T0);
+    s = reduce(s, { type: "thread_completed", threadId: "th_f", stopReason: "error", ts: T0 + 100 }, T0 + 100);
+    expect(s.agents).toHaveLength(1);
+    s = reduce(s, { type: "turn_started", threadId: "main" }, T0 + 200);
+    expect(s.agents).toHaveLength(0); // pruned — terminal is terminal, whatever the verb
+  });
+});
+
 describe("state.ts — prune done agents on next main turn_started", () => {
   test("a done agent is dropped from state.agents on the next main turn_started, a still-working agent remains, and its finish note in state.committed survives", () => {
     let s = initialState();

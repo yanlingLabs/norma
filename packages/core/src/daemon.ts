@@ -378,10 +378,17 @@ export async function startDaemon(opts: {
       normaHome, trust: trustStore, baseInstructions: SYSTEM_PROMPT,
       plugins: { disabled: settings?.plugins?.disabled ?? [] },
     });
-    // hot-settings T2: getter over the live `settings` holder (was a boot-captured value) — a
-    // later task's watcher reassigns `settings` in place; this closure re-reads it on the NEXT
-    // acquire(), no SubagentManager reconstruction needed.
-    const subagents = new SubagentManager({ maxConcurrent: () => settings?.subagents?.maxConcurrent });
+    // hot-settings T2: getters over the live `settings` holder (was a boot-captured value) — a
+    // later task's watcher reassigns `settings` in place; these closures re-read it on the NEXT
+    // acquire()/run(), no SubagentManager reconstruction needed. No-timeout task (user rule
+    // 2026-07-12): `timeoutMs` absent from settings → NO wall clock (the manager has no default
+    // one anymore); `stallTimeoutMs` absent → the manager's own 600s progress-stall default.
+    // Both hot — a settings edit applies to the very next subagent run, no daemon restart.
+    const subagents = new SubagentManager({
+      maxConcurrent: () => settings?.subagents?.maxConcurrent,
+      timeoutMs: () => settings?.subagents?.timeoutMs,
+      stallTimeoutMs: () => settings?.subagents?.stallTimeoutMs,
+    });
     // Async spawn (4h-ii-a): tracks DETACHED (`run_in_background:true`) child threads — see
     // bg-agent-registry.ts's own doc comment for why this is separate from `bgRegistry` above
     // (that one owns backgrounded bash processes; this one owns agent threads). Built

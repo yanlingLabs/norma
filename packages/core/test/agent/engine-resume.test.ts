@@ -435,12 +435,13 @@ describe("AgentEngine: spawn_agent resume (4h-ii-b Task 3)", () => {
     expect(bgAgents.get("worker", sessionId)).toMatchObject({ status: "completed", result: "child-out-2" });
   });
 
-  // 4h-ii-c (T1 follow-up): a RESUMED bg run is just as detached as a fresh bg spawn — a
-  // send_message to a finished agent ALWAYS resumes with runInBackground:true, so this path is
-  // mainstream, not an edge. Same policy as the fresh bg spawn branch: `timeoutMs: null`
-  // (untimed; entryAbort/task_stop is the only kill), and `result.timedOut` threads into the
-  // completion so a timed-out resumed agent reports "timeout", never generic "failed".
-  test("(4h-ii-c) a run_in_background resume's subagents.run receives timeoutMs:null (untimed, same as a fresh bg spawn)", async () => {
+  // No-timeout task (superseding the 4h-ii-c T1 follow-up): a RESUMED bg run is just as
+  // detached as a fresh bg spawn — and like the fresh paths, it passes NO timeoutMs override at
+  // all anymore (the manager's default wall clock is retired; the progress-stall watchdog +
+  // task_stop + an explicit settings.subagents.timeoutMs opt-in bound it instead).
+  // `result.timedOut` still threads into the completion so an explicitly-opted-in wall-clock
+  // timeout reports "timeout", never generic "failed".
+  test("a run_in_background resume's subagents.run receives NO timeoutMs override (no wall clock — stall watchdog bounds it, same as a fresh bg spawn)", async () => {
     const { engine, sessionId, bgAgents, subagents } = setup([
       [spawnNamed("s1", "do the task", "worker"), done("tool_calls")], // turn 1: sync spawn
       text("child-out-1"),
@@ -454,7 +455,7 @@ describe("AgentEngine: spawn_agent resume (4h-ii-b Task 3)", () => {
     try {
       await engine.runTurn(sessionId); // turn 2: bg resume — the only run() call the spy sees
       expect(spy.mock.calls.length).toBe(1);
-      expect(spy.mock.calls[0]?.[1]).toMatchObject({ timeoutMs: null });
+      expect(spy.mock.calls[0]?.[1]).not.toHaveProperty("timeoutMs");
       // let the detached resumed run settle before the test ends (no dangling chain)
       for (let i = 0; i < 200 && bgAgents.get("worker", sessionId)?.status === "running"; i++) {
         await new Promise((r) => setTimeout(r, 5));
@@ -474,9 +475,10 @@ describe("AgentEngine: spawn_agent resume (4h-ii-b Task 3)", () => {
       text("parent turn2"), // the resumed child's own run never reaches the provider (run() is mocked below)
     ]);
     await engine.runTurn(sessionId); // turn 1: spawn "worker" sync
-    // Mock the RESUME's run() to resolve as a typed timeout — only reachable in production if a
-    // future config re-adds a bg timeout (the call itself now passes timeoutMs:null), but the
-    // completion mapping must already report it as "timeout", never generic "failed".
+    // Mock the RESUME's run() to resolve as a typed timeout — only reachable in production when
+    // an EXPLICIT wall clock is configured (settings.subagents.timeoutMs; the manager has no
+    // default clock anymore — no-timeout task), but the completion mapping must already report
+    // it as "timeout", never generic "failed".
     const spy = spyOn(subagents!, "run").mockImplementation(
       async () => ({ ok: false as const, error: "timed out after 300s", timedOut: true as const }),
     );
