@@ -27,6 +27,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// first-launch `setEnabled(true)` call is gated behind `!isRunningUnitTests` below, same
     /// posture as `helper.register()`.
     private(set) var loginItemController: LoginItemController?
+    /// Lifecycle T6: owns the bundled `norma-core` daemon's supervised lifecycle — constructed in
+    /// `boot()` (production deps `.live` unless `daemonSupervisorDeps` below overrides them) and
+    /// stopped in `applicationWillTerminate`.
+    private(set) var daemonSupervisor: DaemonSupervisor?
+    /// Lifecycle T6 test seam: overrides the `DaemonSupervisorDeps` `boot()` constructs the
+    /// supervisor with — set BEFORE calling `boot()`. `nil` (production) resolves to `.live`, or to
+    /// `.neverSupervise` under `isRunningUnitTests` (see `boot()`); a test injects a
+    /// `FakeDaemonProcess`-backed spawn instead so nothing real is ever launched from the xctest
+    /// host.
+    var daemonSupervisorDeps: DaemonSupervisorDeps?
+    /// Lifecycle T6 test seam: overrides `boot()`'s call to `migrateFromLaunchdAgent()` — set
+    /// BEFORE calling `boot()`. `nil` (production) runs the REAL migration, gated `!isRunningUnitTests`
+    /// (same posture as `helper.register()`/`loginItem.setEnabled(true)` below) so the real
+    /// launchctl bootout/plist-remove never runs from a test process; a test overrides this with an
+    /// ordering/call-count spy instead — see `AppLifecycleTests.testMigrationRunsBeforeSupervisorSocketProbe`.
+    var launchdMigrationOverride: (() -> Void)?
     /// Task 5 (2f-ii): the Dashboard's singleton window controller — `nil` until first opened,
     /// nil'd again via `onClosed` (same one-shot-latch/registry-removal convention as
     /// `registerDetachedWindow`'s `onClosed`). `openDashboard()` below is what enforces the
@@ -287,6 +303,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// daemon token must not prevent the orb from appearing).
     @discardableResult
     func boot() -> Bool {
+        // Lifecycle T6 (T4 review finding 5f): migration MUST run before the supervisor's
+        // socket-exists probe just below — a leftover `com.norma.core` KeepAlive launchd agent
+        // would otherwise relaunch a daemon the app just killed, permanently defeating "app quit ->
+        // daemon quit" for that user. `launchdMigrationOverride` lets a test drive this exact call
+        // with a spy; `nil` (production) runs the real migration, gated the same
+        // `!isRunningUnitTests` way as `helper.register()`/`loginItem.setEnabled(true)` below.
+        if let launchdMigrationOverride {
+            launchdMigrationOverride()
+        } else if !Self.isRunningUnitTests {
+            migrateFromLaunchdAgent()
+        }
+
+        // Lifecycle T6: construct + start the daemon supervisor. `daemonSupervisorDeps` (nil unless
+        // a test overrides it) resolves to `.live` in production; under unit tests with no override
+        // it resolves to `.neverSupervise` (never a bundled path -> always `.connectOnly` -> spawns
+        // nothing), so the dozens of existing tests that call `boot()` directly never risk spawning
+        // or probing anything real, regardless of what the test host's `Bundle.main` contains.
+        let supervisorDeps = daemonSupervisorDeps ?? (Self.isRunningUnitTests ? .neverSupervise : .live)
+        let supervisor = DaemonSupervisor(deps: supervisorDeps)
+        supervisor.onStateChange = { [weak self] state in
+            self?.menuBar?.setEngineFailed(state == .failed)
+        }
+        supervisor.start()
+        daemonSupervisor = supervisor
+
         // AX permission: stickiness needs it; ask once, run degraded until granted.
         // Never prompt during unit tests (ScaffoldTests drives boot() directly); prompt once in real runs.
         let axTrusted = Self.isRunningUnitTests
@@ -548,7 +589,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Lifecycle T4: the ONE true-quit gate — arms `reallyQuitting` so
             // `applicationShouldTerminate` (T3) lets THIS quit through instead of treating it like
             // ⌘Q/dock-quit (close windows, keep running).
-            onReallyQuit: { [weak self] in self?.reallyQuitting = true }
+            onReallyQuit: { [weak self] in self?.reallyQuitting = true },
+            // Lifecycle T6: the `.failed`-state "engine stopped — Restart" item's action.
+            onRestartDaemon: { [weak self] in self?.daemonSupervisor?.restart() }
         )
         mb.install()
         menuBar = mb
@@ -582,6 +625,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         startTask?.cancel()
+        // Lifecycle T6: stop the supervised daemon FIRST, before the peripheral teardown below —
+        // this is what makes app-quit (and, via T3's terminateNow routing, system shutdown too)
+        // take the daemon down with it. No-op if we're in `.connectOnly` or nothing was spawned.
+        daemonSupervisor?.stop()
         // Task 4 (2f): best-effort revoke-all BEFORE `appModel?.stop()` closes the socket below —
         // `terminate()`'s revoke RPC is fired on an unstructured Task, so ordering it first gives
         // it the best (still not guaranteed) chance to reach the daemon before the connection dies.

@@ -22,7 +22,8 @@ final class MenuBarEntryPointsTests: XCTestCase {
         loginItemController: LoginItemController? = nil,
         panic: @escaping () -> Void = {},
         quit: @escaping () -> Void = {},
-        onReallyQuit: @escaping () -> Void = {}
+        onReallyQuit: @escaping () -> Void = {},
+        onRestartDaemon: @escaping () -> Void = {}
     ) -> MenuBarController {
         MenuBarController(
             statusLine: { "idle" },
@@ -39,7 +40,8 @@ final class MenuBarEntryPointsTests: XCTestCase {
                 ?? LoginItemController(service: FakeLoginItemService(), defaults: UserDefaults(suiteName: "MenuBarEntryPointsTests.\(UUID().uuidString)")!),
             panic: panic,
             quit: quit,
-            onReallyQuit: onReallyQuit
+            onReallyQuit: onReallyQuit,
+            onRestartDaemon: onRestartDaemon
         )
     }
 
@@ -279,6 +281,62 @@ final class MenuBarEntryPointsTests: XCTestCase {
         NSApp.sendAction(item!.action!, to: item!.target, from: item!)
 
         XCTAssertEqual(order, ["reallyQuit", "quit"])
+    }
+
+    // MARK: - Lifecycle T6: ".failed" supervisor state -> "engine stopped — Restart"
+
+    func testSetEngineFailedRepurposesStateItemIntoARestartAction() {
+        var restarted = 0
+        let controller = makeController(onRestartDaemon: { restarted += 1 })
+        controller.install()
+        XCTAssertFalse(controller.stateItem.isEnabled, "the state line is inert (not clickable) by default")
+
+        controller.setEngineFailed(true)
+
+        XCTAssertEqual(controller.stateItem.title, "engine stopped — Restart")
+        XCTAssertTrue(controller.stateItem.isEnabled)
+        XCTAssertNotNil(controller.stateItem.target)
+        XCTAssertNotNil(controller.stateItem.action)
+        NSApp.sendAction(controller.stateItem.action!, to: controller.stateItem.target, from: controller.stateItem)
+        XCTAssertEqual(restarted, 1)
+    }
+
+    func testSetEngineFailedFalseRevertsToTheInertStatusLine() {
+        let controller = makeController()
+        controller.install()
+        controller.setEngineFailed(true)
+
+        controller.setEngineFailed(false)
+
+        XCTAssertEqual(controller.stateItem.title, "idle", "reverts to statusLine()'s current value")
+        XCTAssertFalse(controller.stateItem.isEnabled)
+        XCTAssertNil(controller.stateItem.action)
+    }
+
+    /// `refresh()` runs on a periodic Timer in production — it must never stomp the failed-state
+    /// title/action back to the plain status line before `setEngineFailed(false)` explicitly
+    /// reverts it.
+    func testRefreshDoesNotOverwriteTheFailedStateTitle() {
+        let controller = makeController()
+        controller.install()
+        controller.setEngineFailed(true)
+
+        controller.refresh()
+
+        XCTAssertEqual(controller.stateItem.title, "engine stopped — Restart")
+        XCTAssertTrue(controller.stateItem.isEnabled)
+    }
+
+    func testSetEngineFailedIsIdempotent() {
+        var restarted = 0
+        let controller = makeController(onRestartDaemon: { restarted += 1 })
+        controller.install()
+        controller.setEngineFailed(true)
+        controller.setEngineFailed(true) // repeated true must not re-wire/duplicate anything
+
+        NSApp.sendAction(controller.stateItem.action!, to: controller.stateItem.target, from: controller.stateItem)
+
+        XCTAssertEqual(restarted, 1)
     }
 
     // MARK: - Lifecycle T4: "Launch Norma at login" checkbox

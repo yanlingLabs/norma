@@ -190,6 +190,84 @@ final class AppLifecycleTests: XCTestCase {
         XCTAssertFalse(isSystemInitiatedQuitEvent())
     }
 
+    // MARK: - Lifecycle T6: DaemonSupervisor composed into boot()/applicationWillTerminate
+
+    /// Builds `DaemonSupervisorDeps` that always spawns a `FakeDaemonProcess` (via
+    /// `DaemonSupervisorTests.swift`'s test double) — the SAME seam production `boot()` uses, but
+    /// wired so nothing real is ever launched from the xctest host. `onSpawn` is handed every
+    /// spawned fake so the caller can collect them and drive `simulateExit`/inspect call counts —
+    /// a plain captured-by-reference local `var` in the caller, same posture as
+    /// `DaemonSupervisorTests`' own `procs` arrays.
+    private func fakeSupervisorDeps(
+        onSpawn: @escaping (FakeDaemonProcess) -> Void,
+        socketExists: @escaping () -> Bool = { false }
+    ) -> DaemonSupervisorDeps {
+        DaemonSupervisorDeps(
+            bundledDaemonPath: { "/x/norma-core" },
+            socketExists: socketExists,
+            isDevEnv: { false },
+            spawn: { _ in let p = FakeDaemonProcess(); onSpawn(p); return p },
+            now: { Date() }
+        )
+    }
+
+    /// Task 6 brief, Step 1: `applicationWillTerminate` must stop the daemon supervisor — proven
+    /// via the SAME `DaemonSupervisorDeps` seam `DaemonSupervisorTests` builds its `FakeDaemonProcess`
+    /// spies with, injected through `AppDelegate.daemonSupervisorDeps` BEFORE `boot()`.
+    func testApplicationWillTerminateStopsTheDaemonSupervisor() {
+        var procs: [FakeDaemonProcess] = []
+        let delegate = AppDelegate()
+        delegate.daemonSupervisorDeps = fakeSupervisorDeps(onSpawn: { procs.append($0) })
+        XCTAssertTrue(delegate.boot())
+        XCTAssertEqual(procs.count, 1, "boot() must have spawned exactly once (supervising mode)")
+        XCTAssertEqual(procs[0].terminateGracefullyCallCount, 0)
+
+        delegate.applicationWillTerminate(Notification(name: Notification.Name("test")))
+
+        XCTAssertEqual(procs[0].terminateGracefullyCallCount, 1, "terminate must stop the supervised daemon")
+    }
+
+    /// T4 review finding (5f), embedded in the T6 brief: `migrateFromLaunchdAgent` MUST run before
+    /// `DaemonSupervisor.start()`'s socket-exists probe — a stale launchd-managed daemon's live
+    /// socket would otherwise send the supervisor into `.connectOnly` and permanently defeat "app
+    /// quit -> daemon quit". Proven via an ordering spy threaded through BOTH seams
+    /// (`launchdMigrationOverride` and `daemonSupervisorDeps.socketExists`).
+    func testMigrationRunsBeforeSupervisorSocketProbe() {
+        var order: [String] = []
+        let delegate = AppDelegate()
+        delegate.launchdMigrationOverride = { order.append("migrate") }
+        delegate.daemonSupervisorDeps = fakeSupervisorDeps(
+            onSpawn: { _ in },
+            socketExists: { order.append("socketCheck"); return false }
+        )
+
+        XCTAssertTrue(delegate.boot())
+
+        XCTAssertEqual(order, ["migrate", "socketCheck"], "migration must complete before the socket probe runs")
+    }
+
+    /// A `.failed` supervisor (rapid-respawn cap tripped) must flip the menu-bar state line to the
+    /// actionable "engine stopped — Restart" item, and that item's action must call
+    /// `DaemonSupervisor.restart()` — proving the `onStateChange`/`onRestartDaemon` wiring `boot()`
+    /// installs end-to-end, not just each half in isolation.
+    func testFailedSupervisorStateUpdatesMenuBarAndRestartRecovers() {
+        var procs: [FakeDaemonProcess] = []
+        let delegate = AppDelegate()
+        delegate.daemonSupervisorDeps = fakeSupervisorDeps(onSpawn: { procs.append($0) })
+        XCTAssertTrue(delegate.boot())
+
+        for _ in 0..<6 { procs.last!.simulateExit(intentional: false) } // trips the rapid-respawn cap
+
+        XCTAssertEqual(delegate.daemonSupervisor?.state, .failed)
+        XCTAssertEqual(delegate.menuBar?.stateItem.title, "engine stopped — Restart")
+        XCTAssertTrue(delegate.menuBar?.stateItem.isEnabled ?? false)
+
+        let item = delegate.menuBar!.stateItem
+        NSApp.sendAction(item.action!, to: item.target, from: item)
+
+        XCTAssertEqual(delegate.daemonSupervisor?.state, .running, "the menu item's action must call restart()")
+    }
+
     // MARK: - applicationShouldHandleReopen
 
     func testApplicationShouldHandleReopenReturnsTrueWhenAMainWindowAlreadyExists() {

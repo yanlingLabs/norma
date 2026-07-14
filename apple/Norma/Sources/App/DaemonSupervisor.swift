@@ -1,4 +1,6 @@
+import Darwin
 import Foundation
+import NormaKit
 
 /// Injected seam (mirrors `PeripheralProvider`'s live-vs-fake dependency pattern) so
 /// `DaemonSupervisor`'s tests never launch a real process, stat the real filesystem, or read a
@@ -47,7 +49,14 @@ final class DaemonSupervisor {
 
     /// Decided once, by `start()`; `.connectOnly` until then.
     private(set) var mode: Mode = .connectOnly
-    private(set) var state: State = .idle
+    private(set) var state: State = .idle {
+        didSet { onStateChange?(state) }
+    }
+
+    /// Lifecycle T6: fired on every state transition — the menu bar observes this to flip the
+    /// `stateItem` to "engine stopped — Restart" on `.failed` (and back on recovery). `nil` by
+    /// default (T2's own tests never wire it, and don't need to).
+    var onStateChange: ((State) -> Void)?
 
     private let deps: DaemonSupervisorDeps
     private var daemonPath: String?
@@ -152,4 +161,96 @@ final class DaemonSupervisor {
             self?.handleExit(intentional: intentional)
         }
     }
+}
+
+// -----------------------------------------------------------------------------------------------
+// Production wiring (Task 6) — the real `Process`-backed `DaemonProcess` + the live
+// `DaemonSupervisorDeps` that composes it with the real bundle/filesystem/environment reads.
+// -----------------------------------------------------------------------------------------------
+
+/// The real `Process`-backed `DaemonProcess`: launches the bundled `norma-core` binary as
+/// `norma-core daemon run` (same argv the old launchd plist used — see `LaunchdMigration.swift`).
+///
+/// CONSTRAINT (T2 review, binding): `Process.terminationHandler` fires on an arbitrary background
+/// queue Foundation manages — NOT the main actor. `DaemonSupervisor` is `@MainActor` and its
+/// `onExit` closure mutates main-actor state (`handleExit`), so every `onExit` invocation below
+/// hops to the main actor first (`Task { @MainActor in ... }`); calling it directly from the
+/// termination handler's background thread would be a data race on `DaemonSupervisor`'s state.
+///
+/// Intentional-vs-crash classification: `terminateGracefully()`/`forceStop()` set `stoppedByUs`
+/// BEFORE signaling the process, so whichever exit races in reads back the right flag — a SIGTERM
+/// from an external `kill` would otherwise be indistinguishable from our own.
+final class RealDaemonProcess: DaemonProcess {
+    private let process: Process
+    private var stoppedByUs = false
+    var onExit: ((_ intentional: Bool) -> Void)?
+
+    var isRunning: Bool { process.isRunning }
+
+    init(path: String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = ["daemon", "run"]
+        process = p
+        p.terminationHandler = { [weak self] _ in
+            guard let self else { return }
+            let intentional = self.stoppedByUs
+            Task { @MainActor in self.onExit?(intentional) } // hop off the background termination queue
+        }
+        do {
+            try p.run()
+        } catch {
+            NSLog("[RealDaemonProcess] failed to launch \(path): \(error)")
+            // Never actually started, so the termination handler above will never fire on its own.
+            // Report it as an unintentional exit (a "crash") so DaemonSupervisor's respawn/backoff
+            // logic still engages instead of believing a dead daemon is `.running` forever. Deferred
+            // via Task so `deps.spawn(...)`'s caller (`performSpawn()`) has already assigned `onExit`
+            // by the time this runs (both are on the main actor; the Task body only runs after the
+            // current synchronous call frame yields).
+            Task { @MainActor in self.onExit?(false) }
+        }
+    }
+
+    /// SIGTERM.
+    func terminateGracefully() {
+        stoppedByUs = true
+        process.terminate()
+    }
+
+    /// SIGKILL. Not called anywhere yet (see the protocol doc above) — reserved for a future
+    /// graceful-timeout escalation.
+    func forceStop() {
+        stoppedByUs = true
+        if process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+        }
+    }
+}
+
+extension DaemonSupervisorDeps {
+    /// Production wiring: the real `Bundle.main`-embedded `norma-core` (Release builds only — the
+    /// "Embed norma-core" build script skips Debug/Test, see `project.yml`), the real
+    /// `~/.norma/run/core.sock` stat, the real `NORMA_DEV` env read, and a real `RealDaemonProcess`
+    /// spawn. `AppDelegate.boot()`'s sole production caller.
+    static let live = DaemonSupervisorDeps(
+        bundledDaemonPath: { Bundle.main.path(forResource: "norma-core", ofType: nil) },
+        socketExists: { FileManager.default.fileExists(atPath: NormaPaths.socketPath()) },
+        isDevEnv: { ProcessInfo.processInfo.environment["NORMA_DEV"] != nil },
+        spawn: { path in RealDaemonProcess(path: path) },
+        now: { Date() }
+    )
+
+    /// Defense in depth for unit tests that call `AppDelegate.boot()` WITHOUT overriding
+    /// `daemonSupervisorDeps` (the vast majority — `ScaffoldTests`, `DashboardTests`, etc.):
+    /// `bundledDaemonPath` always resolves `nil`, so `DaemonSupervisor.start()` always lands in
+    /// `.connectOnly` and spawns nothing, regardless of what the test host's `Bundle.main` happens
+    /// to contain — e.g. a Release-configuration test run that DID embed norma-core. Belt-and-
+    /// suspenders on top of `AppDelegate.boot()`'s own `Self.isRunningUnitTests` branch below.
+    static let neverSupervise = DaemonSupervisorDeps(
+        bundledDaemonPath: { nil },
+        socketExists: { false },
+        isDevEnv: { true },
+        spawn: { _ in fatalError("neverSupervise.spawn is unreachable — bundledDaemonPath is always nil") },
+        now: { Date() }
+    )
 }
