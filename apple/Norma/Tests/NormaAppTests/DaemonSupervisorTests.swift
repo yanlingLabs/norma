@@ -60,6 +60,7 @@ final class DaemonSupervisorTests: XCTestCase {
         s.start()
         procs.last!.simulateExit(intentional: false) // crash
         XCTAssertEqual(spawned, 2) // respawned
+        XCTAssertEqual(s.state, .respawning(attempt: 1)) // pins the payload: 1st in-window crash
         s.stop() // intentional
         procs.last!.simulateExit(intentional: true)
         XCTAssertEqual(spawned, 2) // NOT respawned
@@ -79,6 +80,52 @@ final class DaemonSupervisorTests: XCTestCase {
         }
         XCTAssertEqual(spawned, DaemonSupervisor.maxRapidRespawns + 1)
         XCTAssertEqual(s.state, .failed)
+    }
+
+    // MARK: - T2-review regression guards (both green against the shipped logic — guards, not red→green)
+
+    /// `restart()` is the ONLY way back from `.failed`, and it deliberately bypasses the cap AND
+    /// clears crash history — a future "DRY" refactor that routed it through the crash-counting
+    /// path would silently strand the daemon in `.failed` forever. The second crash burst proves
+    /// `recentCrashes` was actually cleared (5 fresh crashes ≤ cap), not merely that one spawn
+    /// happened.
+    func testRestartRecoversFromFailedAndResetsCrashHistory() {
+        var spawned = 0; var procs: [FakeDaemonProcess] = []
+        let s = DaemonSupervisor(deps: .init(bundledDaemonPath: { "/x/norma-core" }, socketExists: { false },
+            isDevEnv: { false }, spawn: { _ in spawned += 1; let p = FakeDaemonProcess(); procs.append(p); return p }, now: { Date() }))
+        s.start()
+        for _ in 0..<6 { // trip the cap (mirrors testRapidRespawnCapTripsFailed)
+            procs.last!.simulateExit(intentional: false)
+        }
+        XCTAssertEqual(s.state, .failed)
+        s.restart()
+        XCTAssertEqual(spawned, DaemonSupervisor.maxRapidRespawns + 2) // == 7: recovery spawn happened
+        XCTAssertEqual(s.state, .running)
+        for _ in 0..<5 { // a full cap's worth of NEW crashes must not trip .failed post-restart
+            procs.last!.simulateExit(intentional: false)
+        }
+        XCTAssertNotEqual(s.state, .failed)
+    }
+
+    /// Spec behavior: an occasional crash hours apart doesn't accumulate toward the cap — crashes
+    /// older than `rapidWindowSeconds` are pruned before counting. `deps.now` exists precisely so
+    /// this is testable; a mutable clock separates crash 1 from the burst by > the window, so the
+    /// burst of 5 alone must stay under the cap (guards the prune predicate against a `>`→`>=` or
+    /// wrong-reference regression that same-instant tests can't see).
+    func testCrashOutsideRapidWindowDoesNotCountTowardCap() {
+        var spawned = 0; var procs: [FakeDaemonProcess] = []
+        var clock = Date()
+        let s = DaemonSupervisor(deps: .init(bundledDaemonPath: { "/x/norma-core" }, socketExists: { false },
+            isDevEnv: { false }, spawn: { _ in spawned += 1; let p = FakeDaemonProcess(); procs.append(p); return p }, now: { clock }))
+        s.start()
+        procs.last!.simulateExit(intentional: false) // crash 1, at t0
+        clock = clock.addingTimeInterval(DaemonSupervisor.rapidWindowSeconds + 1) // t0+11s: crash 1 now outside the window
+        for _ in 0..<5 { // exactly the cap — only trips .failed if the stale crash was wrongly counted
+            procs.last!.simulateExit(intentional: false)
+        }
+        XCTAssertNotEqual(s.state, .failed)
+        XCTAssertEqual(spawned, 7) // initial + all 6 crashes respawned
+        XCTAssertEqual(s.state, .respawning(attempt: 5)) // the in-window count excludes crash 1
     }
 }
 
