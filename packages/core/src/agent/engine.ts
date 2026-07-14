@@ -399,6 +399,11 @@ export class AgentEngine {
   /** True while a turn is executing for the session. */
   isRunning(sessionId: string): boolean { return this.runningTurns.has(sessionId); }
 
+  /** Number of sessions with a turn executing right now (update idle gate). */
+  activeTurnCount(): number {
+    return this.runningTurns.size;
+  }
+
   /** Lazily seeds the main thread entry for a session on first read/turn. */
   private threadList(sessionId: string): ThreadInfo[] {
     let list = this.threads.get(sessionId);
