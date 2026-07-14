@@ -272,14 +272,61 @@ final class RealDaemonProcess: DaemonProcess {
     }
 }
 
+/// Unix-domain-socket LIVENESS probe (whole-branch review). A mere file-presence check
+/// (`FileManager.fileExists`) is NOT enough: a daemon that dies leaves a STALE socket FILE on disk
+/// (the daemon only unlinks it on a graceful stop, never on crash/SIGKILL/hard-shutdown), and
+/// treating that dead file as "reachable" sends `DaemonSupervisor.start()` into `.connectOnly` — so
+/// the app never spawns its bundled daemon, connects to a dead socket, and the engine is
+/// permanently down with no self-heal (the only stale-socket cleanup, `acquireLock`, runs ONLY when
+/// the supervisor actually spawns). A real `connect()` distinguishes live from stale: a listener
+/// accepts; a stale file gives ECONNREFUSED (immediately — the dead case, the important one, is
+/// fast); a missing file gives ENOENT. Only a successful connect reads as live. Non-blocking +
+/// `poll` so a wedged listener can't hang the synchronous `start()`; a brief blocking wait would be
+/// fine too (same posture as the 2s SIGKILL wait), but the bounded `poll` is strictly safer.
+func unixSocketIsLive(path: String, timeoutMs: Int32 = 500) -> Bool {
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { return false }
+    defer { close(fd) }
+
+    // Non-blocking: a stale file returns ECONNREFUSED synchronously; a live listener either
+    // connects synchronously or returns EINPROGRESS, which the `poll` below bounds.
+    let flags = fcntl(fd, F_GETFL, 0)
+    _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = Array(path.utf8)
+    // `sun_path` is a fixed C array — refuse an over-long path rather than truncate into a
+    // different (possibly live) socket. Reserve one byte for the NUL terminator.
+    guard pathBytes.count < MemoryLayout.size(ofValue: addr.sun_path) else { return false }
+    withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+        raw.copyBytes(from: pathBytes) // trailing bytes stay zero → NUL-terminated
+    }
+    let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
+
+    let rc = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, addrLen) }
+    }
+    if rc == 0 { return true }                // connected synchronously → live
+    if errno != EINPROGRESS { return false }  // ECONNREFUSED / ENOENT / ENOTSOCK → not live (fast)
+
+    var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+    guard poll(&pfd, 1, timeoutMs) > 0 else { return false } // timeout or poll error → not live
+    var soErr: Int32 = 0
+    var soLen = socklen_t(MemoryLayout<Int32>.size)
+    guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &soErr, &soLen) == 0 else { return false }
+    return soErr == 0
+}
+
 extension DaemonSupervisorDeps {
     /// Production wiring: the real `Bundle.main`-embedded `norma-core` (Release builds only — the
     /// "Embed norma-core" build script skips Debug/Test, see `project.yml`), the real
-    /// `~/.norma/run/core.sock` stat, the real `NORMA_DEV` env read, and a real `RealDaemonProcess`
-    /// spawn. `AppDelegate.boot()`'s sole production caller.
+    /// `~/.norma/run/core.sock` LIVENESS probe (whole-branch review — a stale socket FILE must read
+    /// as not-reachable so the supervisor spawns and `acquireLock` unlinks it), the real `NORMA_DEV`
+    /// env read, and a real `RealDaemonProcess` spawn. `AppDelegate.boot()`'s sole production caller.
     static let live = DaemonSupervisorDeps(
         bundledDaemonPath: { Bundle.main.path(forResource: "norma-core", ofType: nil) },
-        socketExists: { FileManager.default.fileExists(atPath: NormaPaths.socketPath()) },
+        socketExists: { unixSocketIsLive(path: NormaPaths.socketPath()) },
         isDevEnv: { ProcessInfo.processInfo.environment["NORMA_DEV"] != nil },
         spawn: { path in RealDaemonProcess(path: path) },
         now: { Date() }

@@ -967,8 +967,19 @@ if (import.meta.main) {
 
   switch (cmdKey) {
   case "daemon run": {
-    await startDaemon();
-    break; // keeps running; SIGINT/SIGTERM handled in daemon.ts
+    // Whole-branch review: register the shutdown handlers HERE, not (only) in daemon.ts. daemon.ts's
+    // SIGTERM/SIGINT handlers live under `if (import.meta.main)`, which is FALSE for the compiled
+    // binary and this CLI entry (main.ts is `import.meta.main`, daemon.ts is not) — so without this
+    // block a SIGTERM'd daemon died leaving a STALE socket file, sending the app's DaemonSupervisor
+    // into `.connectOnly` on the next launch (engine permanently down). `daemon.stop()` releases the
+    // lock, which unlinks the socket — the clean-quit path. (SIGKILL/crash still leave a stale
+    // socket, which is why the supervisor's socketExists is also now a liveness probe, not a
+    // presence check.)
+    const daemon = await startDaemon();
+    const shutdown = () => { daemon.stop(); process.exit(0); };
+    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", shutdown);
+    break; // keeps running; the open listening socket keeps the event loop alive
   }
   case "ping": {
     const c = await connect("cli-ping");
