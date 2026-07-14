@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { renderPlist, LAUNCHD_LABEL } from "../src/launchd";
+import { renderPlist, LAUNCHD_LABEL, migrateFromLaunchdAgent } from "../src/launchd";
 
 describe("renderPlist", () => {
   test("contains label, program arguments, keepalive, and log paths", () => {
@@ -24,5 +24,48 @@ describe("renderPlist", () => {
     expect(xml).toContain("/a&amp;b/norma");
     expect(xml).toContain("/home/x&lt;y&gt;/.norma");
     expect(xml).not.toMatch(/<string>[^<]*&(?!amp;|lt;|gt;)/);
+  });
+});
+
+describe("migrateFromLaunchdAgent", () => {
+  const fakePath = "/fake/Library/LaunchAgents/com.norma.core.plist";
+
+  test("unloads an existing com.norma.core plist: bootout(label) then remove(path)", async () => {
+    let bootoutLabel: string | undefined;
+    let removedPath: string | undefined;
+
+    await migrateFromLaunchdAgent({
+      plistPath: fakePath,
+      exists: (p) => p === fakePath,
+      bootout: async (label) => { bootoutLabel = label; },
+      remove: (p) => { removedPath = p; },
+    });
+
+    expect(bootoutLabel).toBe(LAUNCHD_LABEL);
+    expect(removedPath).toBe(fakePath);
+  });
+
+  test("no-ops when the plist is absent: no bootout, no remove call, never throws", async () => {
+    let bootoutCalled = false;
+    let removeCalled = false;
+
+    await expect(migrateFromLaunchdAgent({
+      plistPath: fakePath,
+      exists: () => false,
+      bootout: async () => { bootoutCalled = true; },
+      remove: () => { removeCalled = true; },
+    })).resolves.toBeUndefined();
+
+    expect(bootoutCalled).toBe(false);
+    expect(removeCalled).toBe(false);
+  });
+
+  test("never throws even when bootout or remove fail", async () => {
+    await expect(migrateFromLaunchdAgent({
+      plistPath: fakePath,
+      exists: () => true,
+      bootout: async () => { throw new Error("launchctl bootout failed"); },
+      remove: () => { throw new Error("unlink failed"); },
+    })).resolves.toBeUndefined();
   });
 });

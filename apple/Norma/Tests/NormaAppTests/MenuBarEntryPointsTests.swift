@@ -19,7 +19,11 @@ final class MenuBarEntryPointsTests: XCTestCase {
         openNormaApp: @escaping () -> Void = {},
         openDashboard: @escaping () -> Void = {},
         openPluginManager: @escaping () -> Void = {},
-        panic: @escaping () -> Void = {}
+        loginItemController: LoginItemController? = nil,
+        panic: @escaping () -> Void = {},
+        quit: @escaping () -> Void = {},
+        onReallyQuit: @escaping () -> Void = {},
+        onRestartDaemon: @escaping () -> Void = {}
     ) -> MenuBarController {
         MenuBarController(
             statusLine: { "idle" },
@@ -29,8 +33,15 @@ final class MenuBarEntryPointsTests: XCTestCase {
             openNormaApp: openNormaApp,
             openDashboard: openDashboard,
             openPluginManager: openPluginManager,
+            // A fresh, uniquely-named `UserDefaults` suite per call — never `UserDefaults.standard`,
+            // so these menu-shape/closure-firing tests (which don't care about login-item
+            // persistence) never leave a stray key behind in the real xctest-host defaults domain.
+            loginItemController: loginItemController
+                ?? LoginItemController(service: FakeLoginItemService(), defaults: UserDefaults(suiteName: "MenuBarEntryPointsTests.\(UUID().uuidString)")!),
             panic: panic,
-            quit: {}
+            quit: quit,
+            onReallyQuit: onReallyQuit,
+            onRestartDaemon: onRestartDaemon
         )
     }
 
@@ -86,9 +97,14 @@ final class MenuBarEntryPointsTests: XCTestCase {
         // Phase 4d-iii Task 2: "Manage Plugins…" is adjacent to Dashboard…, same posture as
         // Dashboard… itself being adjacent to Open Norma App — no separator between them either.
         XCTAssertEqual(pluginManagerIdx, dashboardIdx + 1, "Manage Plugins… must be adjacent to Dashboard…, no separator between them")
-        // The pre-existing pre-Quit separator is preserved between Manage Plugins… and Quit Norma.
-        XCTAssertEqual(quitIdx, pluginManagerIdx + 2)
-        XCTAssertTrue(items[pluginManagerIdx + 1].isSeparatorItem)
+        // Lifecycle T4: "Launch Norma at login" sits between Manage Plugins… and the pre-existing
+        // pre-Quit separator — still no separator between Manage Plugins… and it.
+        guard let loginItemIdx = titles.firstIndex(of: "Launch Norma at login") else {
+            return XCTFail("expected Launch Norma at login present, got \(titles)")
+        }
+        XCTAssertEqual(loginItemIdx, pluginManagerIdx + 1, "Launch Norma at login must be adjacent to Manage Plugins…, no separator between them")
+        XCTAssertEqual(quitIdx, loginItemIdx + 2)
+        XCTAssertTrue(items[loginItemIdx + 1].isSeparatorItem)
     }
 
     func testDashboardItemFiresInjectedClosure() {
@@ -146,6 +162,7 @@ final class MenuBarEntryPointsTests: XCTestCase {
         XCTAssertEqual(titles.filter { $0 == "Open Norma App" }.count, 1)
         XCTAssertEqual(titles.filter { $0 == "Dashboard…" }.count, 1)
         XCTAssertEqual(titles.filter { $0 == "Manage Plugins…" }.count, 1)
+        XCTAssertEqual(titles.filter { $0 == "Launch Norma at login" }.count, 1)
     }
 
     // MARK: - Closure firing
@@ -244,4 +261,160 @@ final class MenuBarEntryPointsTests: XCTestCase {
 
         XCTAssertEqual(fired, 1)
     }
+
+    // MARK: - Lifecycle T4: reallyQuit arming order
+
+    /// The ONE true-quit contract: `onReallyQuit()` must fire BEFORE `quitApplication()` — a real
+    /// `NSApp.terminate` call synchronously re-enters `applicationShouldTerminate`, so if the order
+    /// were reversed the flag would still read `false` there and the menu-bar Quit itself would be
+    /// cancelled.
+    func testQuitItemFiresOnReallyQuitBeforeQuitApplication() {
+        var order: [String] = []
+        let controller = makeController(
+            quit: { order.append("quit") },
+            onReallyQuit: { order.append("reallyQuit") }
+        )
+        controller.install()
+
+        let item = controller.statusItem?.menu?.items.first { $0.title == "Quit Norma" }
+        XCTAssertNotNil(item)
+        NSApp.sendAction(item!.action!, to: item!.target, from: item!)
+
+        XCTAssertEqual(order, ["reallyQuit", "quit"])
+    }
+
+    // MARK: - Lifecycle T6: ".failed" supervisor state -> "engine stopped — Restart"
+
+    func testSetEngineFailedRepurposesStateItemIntoARestartAction() {
+        var restarted = 0
+        let controller = makeController(onRestartDaemon: { restarted += 1 })
+        controller.install()
+        XCTAssertFalse(controller.stateItem.isEnabled, "the state line is inert (not clickable) by default")
+
+        controller.setEngineFailed(true)
+
+        XCTAssertEqual(controller.stateItem.title, "engine stopped — Restart")
+        XCTAssertTrue(controller.stateItem.isEnabled)
+        XCTAssertNotNil(controller.stateItem.target)
+        XCTAssertNotNil(controller.stateItem.action)
+        NSApp.sendAction(controller.stateItem.action!, to: controller.stateItem.target, from: controller.stateItem)
+        XCTAssertEqual(restarted, 1)
+    }
+
+    func testSetEngineFailedFalseRevertsToTheInertStatusLine() {
+        let controller = makeController()
+        controller.install()
+        controller.setEngineFailed(true)
+
+        controller.setEngineFailed(false)
+
+        XCTAssertEqual(controller.stateItem.title, "idle", "reverts to statusLine()'s current value")
+        XCTAssertFalse(controller.stateItem.isEnabled)
+        XCTAssertNil(controller.stateItem.action)
+    }
+
+    /// `refresh()` runs on a periodic Timer in production — it must never stomp the failed-state
+    /// title/action back to the plain status line before `setEngineFailed(false)` explicitly
+    /// reverts it.
+    func testRefreshDoesNotOverwriteTheFailedStateTitle() {
+        let controller = makeController()
+        controller.install()
+        controller.setEngineFailed(true)
+
+        controller.refresh()
+
+        XCTAssertEqual(controller.stateItem.title, "engine stopped — Restart")
+        XCTAssertTrue(controller.stateItem.isEnabled)
+    }
+
+    func testSetEngineFailedIsIdempotent() {
+        var restarted = 0
+        let controller = makeController(onRestartDaemon: { restarted += 1 })
+        controller.install()
+        controller.setEngineFailed(true)
+        controller.setEngineFailed(true) // repeated true must not re-wire/duplicate anything
+
+        NSApp.sendAction(controller.stateItem.action!, to: controller.stateItem.target, from: controller.stateItem)
+
+        XCTAssertEqual(restarted, 1)
+    }
+
+    // MARK: - Lifecycle T4: "Launch Norma at login" checkbox
+
+    func testLoginItemCheckboxReflectsControllerStateAfterInstall() {
+        let fake = FakeLoginItemService()
+        let controller = LoginItemController(service: fake, defaults: UserDefaults(suiteName: "MenuBarEntryPointsTests.\(UUID().uuidString)")!)
+        let menuBar = makeController(loginItemController: controller)
+
+        menuBar.install()
+        XCTAssertEqual(menuBar.loginItemItem.state, .off)
+
+        controller.setEnabled(true)
+        menuBar.refresh()
+        XCTAssertEqual(menuBar.loginItemItem.state, .on)
+    }
+
+    func testLoginItemCheckboxTogglesTheControllerOnClick() {
+        let fake = FakeLoginItemService()
+        let controller = LoginItemController(service: fake, defaults: UserDefaults(suiteName: "MenuBarEntryPointsTests.\(UUID().uuidString)")!)
+        let menuBar = makeController(loginItemController: controller)
+        menuBar.install()
+
+        let item = menuBar.loginItemItem
+        NSApp.sendAction(item.action!, to: item.target, from: item)
+        XCTAssertTrue(fake.isEnabled)
+        XCTAssertEqual(item.state, .on)
+
+        NSApp.sendAction(item.action!, to: item.target, from: item)
+        XCTAssertFalse(fake.isEnabled)
+        XCTAssertEqual(item.state, .off)
+    }
+
+    /// Lifecycle T4 review regression: against the REAL `SMLoginItem`, `disable()` fires
+    /// `SMAppService.unregister()` fire-and-forget and returns before it lands, so `isEnabled`
+    /// (a live `SMAppService.mainApp.status` read) is still `.enabled` the instant the click
+    /// handler returns. If the handler read `isEnabled` back synchronously it would immediately
+    /// revert an uncheck to CHECKED. `DeferredLoginItemService` models exactly that async/sync
+    /// mismatch (enable/disable record the request but DON'T flip `isEnabled` until `settle()`),
+    /// so the checkbox must show the REQUESTED state right after the click, before the service
+    /// settles — proving the handler is optimistic, not read-back.
+    func testLoginItemCheckboxShowsRequestedStateImmediatelyEvenWhenServiceIsAsync() {
+        let deferred = DeferredLoginItemService(startEnabled: true)
+        let controller = LoginItemController(service: deferred, defaults: UserDefaults(suiteName: "MenuBarEntryPointsTests.\(UUID().uuidString)")!)
+        let menuBar = makeController(loginItemController: controller)
+        menuBar.install()
+        XCTAssertEqual(menuBar.loginItemItem.state, .on, "install()/refresh() reflect the service's starting enabled state")
+
+        let item = menuBar.loginItemItem
+        NSApp.sendAction(item.action!, to: item.target, from: item) // request: turn OFF
+
+        // The service HASN'T flipped yet — isEnabled still reads true (the exact real-API instant).
+        XCTAssertTrue(deferred.isEnabled, "the async disable() has not landed — service still reads enabled")
+        XCTAssertEqual(item.state, .off, "the checkbox must show the REQUESTED (off) state immediately, not the stale read-back")
+
+        // Once the async work settles and a refresh() runs, the read-back reconciles (unchanged here).
+        deferred.settle()
+        menuBar.refresh()
+        XCTAssertEqual(item.state, .off, "refresh() reconciles to the now-settled service state")
+    }
+}
+
+/// A `LoginItemService` that models the REAL `SMLoginItem`'s async/sync mismatch: `enable()`/
+/// `disable()` record the LAST requested state but do NOT flip `isEnabled` until `settle()` — so a
+/// synchronous read-back after a click still sees the OLD value, exactly like `SMAppService.mainApp.
+/// status` does before a fire-and-forget register/unregister lands.
+final class DeferredLoginItemService: LoginItemService {
+    private(set) var isEnabled: Bool
+    private var pending: Bool
+
+    init(startEnabled: Bool) {
+        isEnabled = startEnabled
+        pending = startEnabled
+    }
+
+    func enable() throws { pending = true }
+    func disable() throws { pending = false }
+
+    /// Applies the last requested state — the "async work landed" moment.
+    func settle() { isEnabled = pending }
 }

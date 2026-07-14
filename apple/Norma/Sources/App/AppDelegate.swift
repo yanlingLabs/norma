@@ -21,6 +21,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// through `helperClient`'s XPC calls — composed into the SAME `onPeripheralEvent` hook
     /// `peripheralProvider` uses, alongside it, never replacing it.
     private(set) var hardwareBridge: HardwareBridge?
+    /// Lifecycle T4: owns the "Launch Norma at login" `SMAppService.mainApp` registration — read
+    /// by the menu-bar checkbox (`MenuBarController.loginItemItem`). Constructed unconditionally in
+    /// `boot()` (`isEnabled`/`hasUserMadeChoice` are plain reads, safe anytime); the default-on
+    /// first-launch `setEnabled(true)` call is gated behind `!isRunningUnitTests` below, same
+    /// posture as `helper.register()`.
+    private(set) var loginItemController: LoginItemController?
+    /// Lifecycle T6: owns the bundled `norma-core` daemon's supervised lifecycle — constructed in
+    /// `boot()` (production deps `.live` unless `daemonSupervisorDeps` below overrides them) and
+    /// stopped in `applicationWillTerminate`.
+    private(set) var daemonSupervisor: DaemonSupervisor?
+    /// Lifecycle T6 test seam: overrides the `DaemonSupervisorDeps` `boot()` constructs the
+    /// supervisor with — set BEFORE calling `boot()`. `nil` (production) resolves to `.live`, or to
+    /// `.neverSupervise` under `isRunningUnitTests` (see `boot()`); a test injects a
+    /// `FakeDaemonProcess`-backed spawn instead so nothing real is ever launched from the xctest
+    /// host.
+    var daemonSupervisorDeps: DaemonSupervisorDeps?
+    /// Lifecycle T6 test seam: overrides `boot()`'s call to `migrateFromLaunchdAgent()` — set
+    /// BEFORE calling `boot()`. `nil` (production) runs the REAL migration, gated `!isRunningUnitTests`
+    /// (same posture as `helper.register()`/`loginItem.setEnabled(true)` below) so the real
+    /// launchctl bootout/plist-remove never runs from a test process; a test overrides this with an
+    /// ordering/call-count spy instead — see `AppLifecycleTests.testMigrationRunsBeforeSupervisorSocketProbe`.
+    var launchdMigrationOverride: (() -> Void)?
     /// Task 5 (2f-ii): the Dashboard's singleton window controller — `nil` until first opened,
     /// nil'd again via `onClosed` (same one-shot-latch/registry-removal convention as
     /// `registerDetachedWindow`'s `onClosed`). `openDashboard()` below is what enforces the
@@ -45,6 +67,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// never accumulates closed controllers.
     private(set) var detachedWindows: [DetachedWindowController] = []
 
+    /// Lifecycle T3: set to `true` ONLY by the menu-bar "Quit Norma" action (T4 wires that call
+    /// site) — the SOLE true-quit source. ⌘Q and the dock-tile "Quit" both route through
+    /// `applicationShouldTerminate` below, but neither ever sets this: they're intercepted and
+    /// treated as "close the main windows, demote to `.accessory`, keep the menu bar + daemon
+    /// running" instead — the product's ChatGPT/Claude-desktop-style lifecycle contract.
+    var reallyQuitting = false
+
+    /// Lifecycle T3 review fix: seam for the Apple-Event quit-reason read
+    /// (`isSystemInitiatedQuitEvent()` below the class) — injectable so a unit test can drive the
+    /// systemInitiated axis of `applicationShouldTerminate` without synthesizing a real
+    /// logout/shutdown Apple Event against the xctest host. The real read touches AppKit global
+    /// state (`NSAppleEventManager`), which is exactly why it stays OUT of the pure
+    /// `terminateDecision` and enters only as a bool computed at the delegate boundary.
+    var systemQuitReasonProvider: () -> Bool = isSystemInitiatedQuitEvent
+
+    /// Promotes the app to `.regular` — the dock icon appears. `NSApp.activate` right after the
+    /// policy flip works around a known macOS quirk: flipping activation policy alone doesn't
+    /// reliably bring the newly-promoted app's window forward.
+    func showDockIcon() {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Demotes back to `.accessory` — `applicationDidFinishLaunching`'s launch-time base state
+    /// below. The dock icon disappears; the menu bar and daemon are untouched.
+    func hideDockIcon() {
+        NSApp.setActivationPolicy(.accessory)
+    }
+
+    /// True while at least one dock-promoting window is open. Deliberately excludes the orb
+    /// (`OrbWindowController`'s `KeyableNonActivatingPanel` — a borderless, non-activating
+    /// `NSPanel`, an accessory surface even while morphed into its own `.window` surface) and the
+    /// menu bar: neither is a "real user-facing window" per the product spec, so neither may
+    /// promote the dock icon.
+    private var hasMainWindow: Bool {
+        !detachedWindows.isEmpty || dashboardWindow != nil
+    }
+
+    /// Syncs the dock icon to `hasMainWindow` — called after every mutation of `detachedWindows`/
+    /// `dashboardWindow` (register, remove, open, close) so promotion/demotion never drifts out of
+    /// step with the registries that define it.
+    private func syncDockPresence() {
+        hasMainWindow ? showDockIcon() : hideDockIcon()
+    }
+
+    /// Closes every open main window (detached chat windows + the Dashboard) — shared by
+    /// `applicationShouldTerminate`'s cancel branch (⌘Q/dock-quit: close windows, keep running)
+    /// and `applicationWillTerminate`'s final teardown below (a real quit: same windows, harder
+    /// stop — spec §5 D9, a closed window must leave nothing running, and termination is harder
+    /// than that).
+    private func closeMainWindows() {
+        detachedWindows.forEach { $0.close() }
+        dashboardWindow?.close()
+    }
+
     /// Test-only seam (DEFECT FIX regression, `StandaloneWindowTests`): `boot()`'s unit-test path
     /// always constructs a degraded (no-token) `AppModel` whose transport never opens — every RPC,
     /// including the very FIRST `createSession`, fails immediately. That makes it impossible to
@@ -63,8 +140,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 2e-iii — the sidebar's own "open in a new window" spawn).
     func registerDetachedWindow(_ controller: DetachedWindowController) {
         detachedWindows.append(controller)
+        syncDockPresence() // Lifecycle T3: a real chat window just opened — promote if it's the first
         controller.onClosed = { [weak self] closed in
             self?.detachedWindows.removeAll { $0 === closed }
+            self?.syncDockPresence() // Lifecycle T3: demote once the LAST main window closes
         }
         // Task 5 (2e-iii): the (Task-6-mounted) sidebar's ⌘-click "open in a new window" — spawns
         // ANOTHER detached window pinned to an explicit sessionId, via the SAME construction path
@@ -188,8 +267,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             frame: centeredDashboardFrame(visibleFrame: visible),
             initialPane: initialPane ?? defaultDashboardPane
         )
-        controller.onClosed = { [weak self] _ in self?.dashboardWindow = nil }
+        controller.onClosed = { [weak self] _ in
+            self?.dashboardWindow = nil
+            self?.syncDockPresence() // Lifecycle T3: demote once the LAST main window closes
+        }
         dashboardWindow = controller
+        syncDockPresence() // Lifecycle T3: the Dashboard is a real main window — promote
         controller.show()
     }
 
@@ -220,6 +303,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// daemon token must not prevent the orb from appearing).
     @discardableResult
     func boot() -> Bool {
+        // Lifecycle T6 (T4 review finding 5f): migration MUST run before the supervisor's
+        // socket-exists probe just below — a leftover `com.norma.core` KeepAlive launchd agent
+        // would otherwise relaunch a daemon the app just killed, permanently defeating "app quit ->
+        // daemon quit" for that user. `launchdMigrationOverride` lets a test drive this exact call
+        // with a spy; `nil` (production) runs the real migration, gated the same
+        // `!isRunningUnitTests` way as `helper.register()`/`loginItem.setEnabled(true)` below.
+        if let launchdMigrationOverride {
+            launchdMigrationOverride()
+        } else if !Self.isRunningUnitTests {
+            migrateFromLaunchdAgent()
+        }
+
+        // Lifecycle T6: construct + start the daemon supervisor. `daemonSupervisorDeps` (nil unless
+        // a test overrides it) resolves to `.live` in production; under unit tests with no override
+        // it resolves to `.neverSupervise` (never a bundled path -> always `.connectOnly` -> spawns
+        // nothing), so the dozens of existing tests that call `boot()` directly never risk spawning
+        // or probing anything real, regardless of what the test host's `Bundle.main` contains.
+        let supervisorDeps = daemonSupervisorDeps ?? (Self.isRunningUnitTests ? .neverSupervise : .live)
+        let supervisor = DaemonSupervisor(deps: supervisorDeps)
+        supervisor.onStateChange = { [weak self] state in
+            self?.menuBar?.setEngineFailed(state == .failed)
+        }
+        supervisor.start()
+        daemonSupervisor = supervisor
+
         // AX permission: stickiness needs it; ask once, run degraded until granted.
         // Never prompt during unit tests (ScaffoldTests drives boot() directly); prompt once in real runs.
         let axTrusted = Self.isRunningUnitTests
@@ -263,6 +371,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         helperClient = helper
         let hardware = HardwareBridge(client: model.client, helperClient: helper)
         hardwareBridge = hardware
+
+        // Lifecycle T4: `SMLoginItem`'s `isEnabled`/`hasUserMadeChoice` are plain reads (no
+        // registration side effect) — safe unconditionally, same posture as `HelperClient()` above.
+        // The real default-on `setEnabled(true)` call is gated below.
+        let loginItem = LoginItemController(service: SMLoginItem())
+        loginItemController = loginItem
 
         model.onPeripheralEvent = { [weak peripheral, weak hardware] event in
             await peripheral?.handle(event)
@@ -419,6 +533,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // `hardwareBridge`/the dashboard row both already handle.
             helper.register()
 
+            // Lifecycle T4: default-on login item — registers exactly once, on the very first
+            // launch, unless the user has already made an explicit choice (including turning it
+            // off) via the menu-bar checkbox or a prior launch. Real `SMAppService.mainApp`
+            // round-trip — same `!isRunningUnitTests` gate as `helper.register()` above.
+            if !loginItem.hasUserMadeChoice {
+                loginItem.setEnabled(true)
+            }
+
             TriggerHub.shared.didTrigger
                 .sink { [weak orb] in
                     Haptics.gestureRecognized()
@@ -461,8 +583,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             openNormaApp: { [weak self] in self?.openStandaloneNormaWindow() },
             openDashboard: { [weak self] in self?.openDashboard() },
             openPluginManager: { [weak self] in self?.openPluginManager() },
+            loginItemController: loginItem,
             panic: { [weak peripheral] in peripheral?.panic() },
-            quit: { NSApp.terminate(nil) }
+            quit: { NSApp.terminate(nil) },
+            // Lifecycle T4: the ONE true-quit gate — arms `reallyQuitting` so
+            // `applicationShouldTerminate` (T3) lets THIS quit through instead of treating it like
+            // ⌘Q/dock-quit (close windows, keep running).
+            onReallyQuit: { [weak self] in self?.reallyQuitting = true },
+            // Lifecycle T6: the `.failed`-state "engine stopped — Restart" item's action.
+            onRestartDaemon: { [weak self] in self?.daemonSupervisor?.restart() }
         )
         mb.install()
         menuBar = mb
@@ -496,18 +625,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         startTask?.cancel()
+        // Lifecycle T6: stop the supervised daemon FIRST, before the peripheral teardown below —
+        // this is what makes app-quit (and, via T3's terminateNow routing, system shutdown too)
+        // take the daemon down with it. No-op if we're in `.connectOnly` or nothing was spawned.
+        daemonSupervisor?.stop()
         // Task 4 (2f): best-effort revoke-all BEFORE `appModel?.stop()` closes the socket below —
         // `terminate()`'s revoke RPC is fired on an unstructured Task, so ordering it first gives
         // it the best (still not guaranteed) chance to reach the daemon before the connection dies.
         peripheralProvider?.terminate()
         appModel?.stop()
-        // Best-effort: each detached window's own feed/socket must not survive the app (spec §5
-        // D9 — a closed window leaves nothing running; termination is a harder stop than that).
-        detachedWindows.forEach { $0.close() }
-        dashboardWindow?.close()
+        closeMainWindows()
+    }
+
+    /// Lifecycle T3: the source-aware termination gate (product spec — only the menu-bar "Quit
+    /// Norma" is a REAL quit). `terminateDecision` is the pure truth table (see its own doc).
+    /// Review fix: a system LOGOUT/RESTART/SHUTDOWN arrives through this SAME delegate call as a
+    /// user ⌘Q — answering it `.terminateCancel` would BLOCK the user's logout indefinitely, so
+    /// `systemQuitReasonProvider` (the Apple-Event quit-reason read, injectable seam above) is the
+    /// second true-quit axis alongside `reallyQuitting`. On `.terminateCancel` (⌘Q, dock-tile
+    /// quit, or any other `terminate()` call that is neither the menu-bar Quit nor
+    /// system-initiated) this closes the main windows and demotes the dock icon instead of
+    /// actually quitting. `closeMainWindows()`'s own `onClosed` chain already demotes as each
+    /// window closes (`syncDockPresence()`); the explicit `hideDockIcon()` below is
+    /// belt-and-suspenders for the edge case where no main window was open (nothing to close, so
+    /// nothing to trigger demotion through those callbacks).
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let reply = terminateDecision(reallyQuitting: reallyQuitting, systemInitiated: systemQuitReasonProvider())
+        if reply == .terminateCancel {
+            closeMainWindows()
+            hideDockIcon()
+        }
+        return reply
+    }
+
+    /// Lifecycle T3: dock-tile / Finder relaunch while Norma is already running (LSUIElement apps
+    /// still receive `reopen` on a Finder double-click even with no dock tile to click). A main
+    /// window is already open: return `true` and let AppKit's own default reopen handling bring it
+    /// forward (including un-minimizing) — the dock icon is already showing in that case, nothing
+    /// else to promote. No main window open: open one ourselves (the same "Open Norma App"
+    /// primitive the menu bar uses, which promotes the dock icon as a side effect of the window it
+    /// spawns) and return `false`, since AppKit has nothing left to do.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard !hasMainWindow else { return true }
+        openStandaloneNormaWindow()
+        return false
     }
 
     static var isRunningUnitTests: Bool {
         NSClassFromString("XCTestCase") != nil
     }
+}
+
+/// Lifecycle T3: pure decision core for `applicationShouldTerminate` — no `NSApp`/AppleEvent
+/// reference, so the whole truth table is unit-testable without any AppKit state (see
+/// `AppLifecycleTests.testTerminateDecision`). `.terminateNow` iff `reallyQuitting` (set ONLY by
+/// the menu-bar "Quit Norma") OR `systemInitiated` (review fix: the quit Apple Event carries a
+/// logout/restart/shutdown reason — refusing THOSE would block the user's logout indefinitely);
+/// everything else — ⌘Q, dock-tile quit — cancels. Window state never gates a quit: the T3 spec's
+/// original `hasMainWindow` param was truth-table-inert and was dropped when `systemInitiated`
+/// (the real second axis) replaced it.
+func terminateDecision(reallyQuitting: Bool, systemInitiated: Bool) -> NSApplication.TerminateReply {
+    (reallyQuitting || systemInitiated) ? .terminateNow : .terminateCancel
+}
+
+/// Lifecycle T3 review fix: TRUE when the in-flight quit Apple Event carries a system quit reason
+/// — the four reasons macOS stamps on the `kAEQuitApplication` event it sends every app during
+/// logout/restart/shutdown. A user ⌘Q/dock-quit arrives with no quit-reason attribute (and a
+/// programmatic `NSApp.terminate(nil)`, e.g. the menu-bar Quit, has no current Apple Event at
+/// all) — both read as `false` here. AppKit global state, deliberately OUTSIDE the pure
+/// `terminateDecision`; `AppDelegate.systemQuitReasonProvider` is the injectable seam over it.
+func isSystemInitiatedQuitEvent() -> Bool {
+    guard let reason = NSAppleEventManager.shared().currentAppleEvent?
+        .attributeDescriptor(forKeyword: AEKeyword(kAEQuitReason))?.enumCodeValue
+    else { return false }
+    return reason == OSType(kAELogOut)
+        || reason == OSType(kAEReallyLogOut)
+        || reason == OSType(kAEShowRestartDialog)
+        || reason == OSType(kAEShowShutdownDialog)
 }

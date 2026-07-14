@@ -32,6 +32,22 @@ targets:
           mkdir -p "${DEST_MACOS}" "${DEST_LAUNCHD}"
           cp "${BUILT_PRODUCTS_DIR}/NormaHelper" "${DEST_MACOS}/NormaHelper"
           cp "${SRCROOT}/HelperResources/com.norma.helper.plist" "${DEST_LAUNCHD}/com.norma.helper.plist"
+      - name: Embed norma-core
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          # Release only — Debug builds stay connect-only (shipped-only coupling; see the plan's
+          # Global Constraints). A missing binary in Debug is expected, not an error.
+          if [ "${CONFIGURATION}" != "Release" ]; then echo "skip norma-core embed (non-Release)"; exit 0; fi
+          DEST_RES="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources"
+          mkdir -p "${DEST_RES}"
+          ( cd "${SRCROOT}/../../packages/cli" && bun run compile:core )
+          cp "${SRCROOT}/../../dist/norma-core" "${DEST_RES}/norma-core"
+          chmod +x "${DEST_RES}/norma-core"
+          # Stable code identity: bun's ad-hoc signature changes every rebuild, which would re-prompt
+          # Keychain access for com.norma.core secrets on each update; the app's team identity is
+          # stable, and the outer app signature runs last, leaving this nested signature intact.
+          codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" "${DEST_RES}/norma-core"
     info:
       path: Support/Info.plist
       properties:

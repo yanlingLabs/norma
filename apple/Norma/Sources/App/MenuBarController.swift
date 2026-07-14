@@ -11,11 +11,27 @@ final class MenuBarController {
     private let openPluginManager: () -> Void
     private let panicAction: () -> Void
     private let quitApplication: () -> Void
+    // Lifecycle T4: arms the ONE true-quit gate (`AppDelegate.reallyQuitting`) — fired BEFORE
+    // `quitApplication()` in `didQuit()` below. An injected closure (not a direct `AppDelegate`
+    // reference) so this controller stays decoupled from the app delegate, same posture as every
+    // other closure in this initializer.
+    private let onReallyQuit: () -> Void
+    // Lifecycle T6: fires `DaemonSupervisor.restart()` — wired to `stateItem` only while
+    // `engineFailed` is true (see `setEngineFailed`/`didRestartDaemon` below).
+    private let onRestartDaemon: () -> Void
+    private let loginItemController: LoginItemController
     // Task 3 (2e-iv): internal (not private), same stored-`let` pattern as `stateItem` below, so
     // `MenuBarEntryPointsTests` (`@testable import Norma`) can walk `statusItem`'s built menu for
     // order and fire these items' actions via their `target`/`action` directly.
     var statusItem: NSStatusItem?
-    private let stateItem = NSMenuItem(title: "starting…", action: nil, keyEquivalent: "")
+    // Lifecycle T6: internal (not private) — `AppLifecycleTests` reads `.title` and fires
+    // `.action`/`.target` directly (same testability posture as `openCliItem`/`panicItem` below)
+    // to assert the `.failed`-state "engine stopped — Restart" wiring.
+    let stateItem = NSMenuItem(title: "starting…", action: nil, keyEquivalent: "")
+    // Lifecycle T6: true while the daemon supervisor is `.failed` — `refresh()`'s periodic
+    // `statusLine()` update is suppressed while this is true, so it never stomps the "engine
+    // stopped — Restart" title/action `setEngineFailed(true)` installs below.
+    private var engineFailed = false
     private let orbItem = NSMenuItem(title: "Hide Orb", action: #selector(didToggleOrb), keyEquivalent: "o")
     private let summonFieldItem = NSMenuItem(title: "Summon Field", action: #selector(didSummonField), keyEquivalent: "")
     let openCliItem = NSMenuItem(title: "Open CLI", action: #selector(didOpenCli), keyEquivalent: "")
@@ -32,6 +48,9 @@ final class MenuBarController {
     let panicItem = NSMenuItem(title: "Stop Norma's Control", action: #selector(didPanic), keyEquivalent: "")
     private let preQuitSeparator = NSMenuItem.separator()
     private let quitItem = NSMenuItem(title: "Quit Norma", action: #selector(didQuit), keyEquivalent: "q")
+    // Lifecycle T4: the "Launch Norma at login" checkbox, bound to `loginItemController`. `internal`
+    // (not `private`), same testability posture as `openCliItem`/`panicItem` above.
+    let loginItemItem = NSMenuItem(title: "Launch Norma at login", action: #selector(didToggleLoginItem), keyEquivalent: "")
     private var panicMounted = false
 
     init(
@@ -42,8 +61,11 @@ final class MenuBarController {
         openNormaApp: @escaping () -> Void,
         openDashboard: @escaping () -> Void,
         openPluginManager: @escaping () -> Void,
+        loginItemController: LoginItemController,
         panic: @escaping () -> Void,
-        quit: @escaping () -> Void
+        quit: @escaping () -> Void,
+        onReallyQuit: @escaping () -> Void,
+        onRestartDaemon: @escaping () -> Void
     ) {
         self.statusLine = statusLine
         self.toggleOrb = toggleOrb
@@ -52,8 +74,11 @@ final class MenuBarController {
         self.openNormaApp = openNormaApp
         self.openDashboard = openDashboard
         self.openPluginManager = openPluginManager
+        self.loginItemController = loginItemController
         self.panicAction = panic
         self.quitApplication = quit
+        self.onReallyQuit = onReallyQuit
+        self.onRestartDaemon = onRestartDaemon
     }
 
     func install() {
@@ -78,6 +103,8 @@ final class MenuBarController {
         menu.addItem(dashboardItem)
         pluginManagerItem.target = self
         menu.addItem(pluginManagerItem)
+        loginItemItem.target = self
+        menu.addItem(loginItemItem)
         menu.addItem(preQuitSeparator)
         quitItem.target = self
         menu.addItem(quitItem)
@@ -92,7 +119,38 @@ final class MenuBarController {
     }
 
     func refresh() {
-        stateItem.title = statusLine()
+        // Lifecycle T6: never overwrite the "engine stopped — Restart" title/action while failed —
+        // this runs on a 2s Timer (`AppDelegate.boot()`), which would otherwise stomp it right back
+        // to the plain status line on the very next tick.
+        if !engineFailed {
+            stateItem.title = statusLine()
+        }
+        // Lifecycle T4: the checkbox tracks `SMAppService.mainApp`'s live status (e.g. the user
+        // can flip it from System Settings > Login Items directly, outside this menu entirely),
+        // so it's re-synced on the SAME periodic cadence as the state line above rather than only
+        // right after a click.
+        loginItemItem.state = loginItemController.isEnabled ? .on : .off
+    }
+
+    /// Lifecycle T6: the daemon supervisor tripped `.failed` (rapid-respawn cap) or recovered —
+    /// repurposes the (normally inert, `isEnabled = false`) state line into an actionable "engine
+    /// stopped — Restart" item wired to `DaemonSupervisor.restart()` via the injected
+    /// `onRestartDaemon` closure — same dependency-inversion posture as every other action in this
+    /// file. Idempotent.
+    func setEngineFailed(_ failed: Bool) {
+        guard failed != engineFailed else { return }
+        engineFailed = failed
+        if failed {
+            stateItem.title = "engine stopped — Restart"
+            stateItem.isEnabled = true
+            stateItem.target = self
+            stateItem.action = #selector(didRestartDaemon)
+        } else {
+            stateItem.isEnabled = false
+            stateItem.target = nil
+            stateItem.action = nil
+            stateItem.title = statusLine()
+        }
     }
 
     func setOrbVisible(_ visible: Bool) {
@@ -125,5 +183,27 @@ final class MenuBarController {
     @objc private func didOpenDashboard() { openDashboard() }
     @objc private func didOpenPluginManager() { openPluginManager() }
     @objc private func didPanic() { panicAction() }
-    @objc private func didQuit() { quitApplication() }
+    @objc private func didRestartDaemon() { onRestartDaemon() }
+
+    // Lifecycle T4: `reallyQuitting` MUST be armed before `quitApplication()` runs — reversed
+    // order would let `NSApp.terminate`'s synchronous `applicationShouldTerminate` round-trip read
+    // the still-false flag and cancel the menu-bar Quit itself (the ONE true-quit source, per
+    // `AppDelegate.reallyQuitting`'s doc comment).
+    @objc private func didQuit() {
+        onReallyQuit()
+        quitApplication()
+    }
+
+    // Lifecycle T4 review: the checkbox is set OPTIMISTICALLY to the requested state, NOT by
+    // reading `isEnabled` back after `setEnabled`. `SMLoginItem.disable()` fires the real
+    // `SMAppService.unregister()` on a fire-and-forget Task and returns before it lands, while
+    // `isEnabled` reads the live `SMAppService.mainApp.status` — still `.enabled` at that instant,
+    // so a read-back would immediately revert an uncheck to CHECKED. `refresh()`'s own `isEnabled`
+    // read is the eventual source of truth and reconciles once the async register/unregister
+    // settles (and corrects the checkbox if it genuinely failed).
+    @objc private func didToggleLoginItem() {
+        let desired = !loginItemController.isEnabled
+        loginItemController.setEnabled(desired)
+        loginItemItem.state = desired ? .on : .off
+    }
 }
