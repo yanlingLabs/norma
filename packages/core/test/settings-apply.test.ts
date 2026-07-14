@@ -212,4 +212,64 @@ describe("makeApply", () => {
     expect(registerLsp).toHaveBeenCalledTimes(1);
     expect(Date.now() - start).toBeLessThan(500); // bounded by the small drainTimeoutMs, not a real hang
   });
+
+  // Whole-branch review F1: one flag's diff throwing must NEITHER reject the aggregate apply NOR
+  // abandon the other flag's diff — otherwise T3 keeps prevSnapshot, re-diffs the SAME flip next
+  // reload, re-throws "duplicate tool", and hot-apply is wedged for the daemon's life. Both flips
+  // fire in ONE apply: CU's registerComputer throws, LSP's registerLsp must still run, and the
+  // atomic swap must still have happened.
+  test("a throwing flag diff does not reject apply, wedge the other flag, or skip the swap", async () => {
+    const registerComputer = mock(() => {
+      throw new Error("boom: registerComputer");
+    });
+    const registerLsp = mock(() => {});
+    const warnings: string[] = [];
+    let swapped: any;
+    const apply = makeApply(
+      baseDeps({
+        setLiveSettings: (s) => {
+          swapped = s;
+        },
+        registerComputer, // CU false→true → this fires → throws
+        registerLsp, // LSP false→true → this must still run despite the CU throw
+        log: (msg) => warnings.push(msg),
+      }),
+    );
+    const prev = { computerUse: { enabled: false }, lsp: { enabled: false } } as any;
+    const next = { computerUse: { enabled: true }, lsp: { enabled: true } } as any;
+
+    // (a) apply() resolves — it does NOT reject even though registerComputer threw.
+    await expect(apply(prev, next)).resolves.toBeUndefined();
+    // (b) the OTHER flag's diff still ran to completion.
+    expect(registerLsp).toHaveBeenCalledTimes(1);
+    // (c) the atomic swap still happened (it's outside both try/catches, first + unconditional).
+    expect(swapped).toBe(next);
+    // and the failure was logged (best-effort-until-next-change, not a silent swallow).
+    expect(registerComputer).toHaveBeenCalledTimes(1);
+    expect(warnings.some((w) => w.includes("computerUse diff-apply failed"))).toBe(true);
+  });
+
+  test("a throwing LSP teardown is likewise isolated — CU flip still applies", async () => {
+    const teardownLsp = mock(() => {
+      throw new Error("boom: teardownLsp");
+    });
+    const registerComputer = mock(() => {});
+    const warnings: string[] = [];
+    const apply = makeApply(
+      baseDeps({
+        teardownLsp, // LSP true→false → this fires → throws
+        registerComputer, // CU false→true → must still run
+        log: (msg) => warnings.push(msg),
+      }),
+    );
+    await expect(
+      apply(
+        { computerUse: { enabled: false }, lsp: { enabled: true } } as any,
+        { computerUse: { enabled: true }, lsp: { enabled: false } } as any,
+      ),
+    ).resolves.toBeUndefined();
+    expect(registerComputer).toHaveBeenCalledTimes(1);
+    expect(teardownLsp).toHaveBeenCalledTimes(1);
+    expect(warnings.some((w) => w.includes("lsp diff-apply failed"))).toBe(true);
+  });
 });

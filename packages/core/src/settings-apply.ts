@@ -3,6 +3,11 @@ import type { ToolRegistry } from "./agent/tools/registry";
 import type { ComputerUseService } from "./agent/computer-use";
 import type { LspManager } from "./agent/lsp/manager";
 
+/** Error → message without assuming the thrown value is an Error (a `throw "str"` must not become
+ *  `undefined`). Mirrors settings-watcher.ts's own `msg` helper — kept local rather than shared
+ *  since the two files have no other coupling. */
+const errMsg = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
 export interface SettingsApplyDeps {
   /** THE atomic swap: `settings = s` in daemon.ts, a single synchronous assignment. Runs FIRST,
    *  before any await, so value-only reads go live immediately even while a drain awaits below. */
@@ -97,6 +102,33 @@ export function makeApply(deps: SettingsApplyDeps): (prev: Settings | null, next
     deps.setLiveSettings(next); // THE ATOMIC SWAP — first, synchronous, one statement.
     // Independent flips: a long CU-disable drain must not stall the LSP re-wire in the same
     // reload, so the two diffs run concurrently.
-    await Promise.all([applyComputerUseDiff(prev, next), applyLspDiff(prev, next)]);
+    //
+    // Whole-branch review F1: each diff runs inside its OWN try/catch so a throw in one can NEITHER
+    // reject the aggregate apply NOR abandon the other diff. Every register/teardown path is
+    // throw-safe today (this is unreachable in practice), but the spec's "never half-applies"
+    // guarantee must be STRUCTURAL, not luck: were a diff to throw and propagate, Promise.all would
+    // reject → T3's watcher keeps prevSnapshot (no advance) → the NEXT reload re-diffs the SAME
+    // flip → re-register throws "duplicate tool" → every subsequent apply throws → CU/LSP hot-apply
+    // is dead for the daemon's life. Catching per-flag makes `apply` always resolve (so prevSnapshot
+    // advances and there's no re-diff-of-same-flip wedge); a hypothetical single-flag failure
+    // degrades to best-effort-until-the-next-change instead of a total permanent wedge. The atomic
+    // swap above is deliberately OUTSIDE both try/catches — it's a single synchronous assignment
+    // that cannot throw, and it must always win regardless of either diff's fate.
+    await Promise.all([
+      (async () => {
+        try {
+          await applyComputerUseDiff(prev, next);
+        } catch (err) {
+          log(`computerUse diff-apply failed (hot-apply left best-effort until the next change): ${errMsg(err)}`);
+        }
+      })(),
+      (async () => {
+        try {
+          await applyLspDiff(prev, next);
+        } catch (err) {
+          log(`lsp diff-apply failed (hot-apply left best-effort until the next change): ${errMsg(err)}`);
+        }
+      })(),
+    ]);
   };
 }

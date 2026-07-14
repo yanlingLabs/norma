@@ -2670,9 +2670,13 @@ export class AgentEngine {
     // pendingCuImages doc comment for why bare callId is unsafe): a staged screenshot lands in
     // pendingCuImages under that key, drained into `input` at this round's end (drainRoundImages).
     // hot-settings T5a: read the getter LIVE here (per tool call), not the runTurn-start snapshot
-    // — a mid-turn hot-disable must make a LATER call in the same turn see `undefined` too. This
-    // is safe unguarded: the drain gate + T5b's tool-unregister mean no NEW `computer` call
-    // dispatches after a disable, so nothing observes a "half disabled" state.
+    // — a mid-turn hot-disable must make a LATER call in the same turn see `undefined` too. Safe
+    // unguarded: during T5b's disable DRAIN window the `computer` tool is still registered and the
+    // getter still resolves live, so a NEW `computer` call CAN still dispatch then — it merely
+    // prolongs the bounded drain (T4's computerInFlight gate waits it out) rather than being
+    // yanked; once teardownComputer runs (unregister + holder cleared) this getter resolves
+    // `undefined` and the tool is gone, so a later call errors cleanly. No "half disabled" state
+    // is ever observed: at every instant the tool's presence and this getter agree.
     const cuNow = this.cfg.computerUse?.();
     const attachImage = cuNow
       ? (dataUrl: string) => {
