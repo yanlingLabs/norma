@@ -9,7 +9,9 @@ describe("SettingsWatcher", () => {
     const w = new SettingsWatcher({
       path: "/x",
       load: () => fileContents,
-      apply: (p, n) => applied.push([p, n]),
+      apply: (p, n) => {
+        applied.push([p, n]);
+      },
       debounceMs: 5,
       watch: (_p, cb) => {
         fire = cb;
@@ -154,5 +156,140 @@ describe("SettingsWatcher", () => {
     fire(second);
     await Bun.sleep(20);
     expect(applied).toBe(1); // stop() fully quiets it
+  });
+
+  test("a REJECTED async apply keeps prevSnapshot and does not crash", async () => {
+    let fileContents = { v: 1 } as any;
+    const applied: any[] = [];
+    let rejectNext = true;
+    let fire = () => {};
+    const w = new SettingsWatcher({
+      path: "/x",
+      load: () => fileContents,
+      apply: (p, n) => {
+        applied.push([p, n]);
+        if (rejectNext) {
+          rejectNext = false;
+          return Promise.reject(new Error("boom")); // async rejection, not a sync throw
+        }
+        return Promise.resolve();
+      },
+      debounceMs: 5,
+      watch: (_p, cb) => {
+        fire = cb;
+        return { close() {} };
+      },
+    });
+    w.start({ v: 0 } as any);
+    fileContents = { v: 1 };
+    fire();
+    await Bun.sleep(20); // apply rejected once — the rejection must be caught, not escape
+    expect(applied.length).toBe(1);
+    expect(applied[0][0]).toEqual({ v: 0 });
+
+    // Subsequent good change: apply now resolves. prev must STILL be the boot snapshot, proving
+    // prevSnapshot did NOT advance past the failed ASYNC apply (keep-last-good re-converges).
+    fileContents = { v: 2 };
+    fire();
+    await Bun.sleep(20);
+    expect(applied.length).toBe(2);
+    expect(applied[1][0]).toEqual({ v: 0 }); // last-known-good, NOT { v: 1 }
+    expect(applied[1][1]).toEqual({ v: 2 });
+  });
+
+  test("prevSnapshot advances only AFTER the apply promise resolves", async () => {
+    let fileContents = { v: 1 } as any;
+    const applied: any[] = [];
+    let applyCount = 0;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let fire = () => {};
+    const w = new SettingsWatcher({
+      path: "/x",
+      load: () => fileContents,
+      apply: (p, n) => {
+        applied.push([p, n]);
+        applyCount++;
+        return applyCount === 1 ? gate : Promise.resolve(); // first apply blocks on the gate
+      },
+      debounceMs: 5,
+      watch: (_p, cb) => {
+        fire = cb;
+        return { close() {} };
+      },
+    });
+    w.start({ v: 0 } as any);
+    fileContents = { v: 1 };
+    fire();
+    await Bun.sleep(20); // apply#1 is now in flight (pending on the gate), prev was { v: 0 }
+    expect(applied.length).toBe(1);
+    expect(applied[0][0]).toEqual({ v: 0 });
+
+    // A change arriving while apply#1 is still pending: single-flighted, no new apply yet.
+    fileContents = { v: 2 };
+    fire();
+    await Bun.sleep(20);
+    expect(applied.length).toBe(1); // prevSnapshot has NOT advanced — the follow-up apply hasn't run
+
+    // Resolve the gate → apply#1 completes → prevSnapshot advances to { v: 1 } → the coalesced
+    // follow-up apply runs with prev = { v: 1 }, proving the advance happened AFTER the resolve.
+    release();
+    await Bun.sleep(20);
+    expect(applied.length).toBe(2);
+    expect(applied[1][0]).toEqual({ v: 1 }); // advanced only after apply#1 resolved
+    expect(applied[1][1]).toEqual({ v: 2 });
+  });
+
+  test("overlapping changes during a slow apply are serialized + coalesced", async () => {
+    let fileContents = { v: 1 } as any;
+    const applied: any[] = [];
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let fire = () => {};
+    const w = new SettingsWatcher({
+      path: "/x",
+      load: () => fileContents,
+      apply: async (p, n) => {
+        concurrent++;
+        maxConcurrent = Math.max(maxConcurrent, concurrent); // must NEVER exceed 1
+        applied.push([p, n]);
+        await gate; // slow apply — stays in flight until released
+        concurrent--;
+      },
+      debounceMs: 5,
+      watch: (_p, cb) => {
+        fire = cb;
+        return { close() {} };
+      },
+    });
+    w.start({ v: 0 } as any);
+    fileContents = { v: 1 };
+    fire();
+    await Bun.sleep(20); // apply A in flight (concurrent === 1)
+    expect(applied.length).toBe(1);
+    expect(maxConcurrent).toBe(1);
+
+    // Two more changes arrive WHILE A is still in flight — must not start a second apply.
+    fileContents = { v: 2 };
+    fire();
+    await Bun.sleep(20);
+    fileContents = { v: 3 };
+    fire();
+    await Bun.sleep(20);
+    expect(applied.length).toBe(1); // still only A — B and C coalesced, no overlap
+    expect(maxConcurrent).toBe(1);
+
+    // Release A → exactly ONE follow-up apply runs, reading the LATEST file ({ v: 3 }).
+    release();
+    await Bun.sleep(20);
+    expect(applied.length).toBe(2); // not three — B and C collapsed into one follow-up
+    expect(applied[1][1]).toEqual({ v: 3 }); // latest contents, not { v: 2 }
+    expect(maxConcurrent).toBe(1); // apply never overlapped another
   });
 });
