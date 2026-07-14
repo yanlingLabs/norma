@@ -155,8 +155,16 @@ final class MenuBarController {
         quitApplication()
     }
 
+    // Lifecycle T4 review: the checkbox is set OPTIMISTICALLY to the requested state, NOT by
+    // reading `isEnabled` back after `setEnabled`. `SMLoginItem.disable()` fires the real
+    // `SMAppService.unregister()` on a fire-and-forget Task and returns before it lands, while
+    // `isEnabled` reads the live `SMAppService.mainApp.status` — still `.enabled` at that instant,
+    // so a read-back would immediately revert an uncheck to CHECKED. `refresh()`'s own `isEnabled`
+    // read is the eventual source of truth and reconciles once the async register/unregister
+    // settles (and corrects the checkbox if it genuinely failed).
     @objc private func didToggleLoginItem() {
-        loginItemController.setEnabled(!loginItemController.isEnabled)
-        loginItemItem.state = loginItemController.isEnabled ? .on : .off
+        let desired = !loginItemController.isEnabled
+        loginItemController.setEnabled(desired)
+        loginItemItem.state = desired ? .on : .off
     }
 }

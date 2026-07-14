@@ -311,4 +311,52 @@ final class MenuBarEntryPointsTests: XCTestCase {
         XCTAssertFalse(fake.isEnabled)
         XCTAssertEqual(item.state, .off)
     }
+
+    /// Lifecycle T4 review regression: against the REAL `SMLoginItem`, `disable()` fires
+    /// `SMAppService.unregister()` fire-and-forget and returns before it lands, so `isEnabled`
+    /// (a live `SMAppService.mainApp.status` read) is still `.enabled` the instant the click
+    /// handler returns. If the handler read `isEnabled` back synchronously it would immediately
+    /// revert an uncheck to CHECKED. `DeferredLoginItemService` models exactly that async/sync
+    /// mismatch (enable/disable record the request but DON'T flip `isEnabled` until `settle()`),
+    /// so the checkbox must show the REQUESTED state right after the click, before the service
+    /// settles — proving the handler is optimistic, not read-back.
+    func testLoginItemCheckboxShowsRequestedStateImmediatelyEvenWhenServiceIsAsync() {
+        let deferred = DeferredLoginItemService(startEnabled: true)
+        let controller = LoginItemController(service: deferred, defaults: UserDefaults(suiteName: "MenuBarEntryPointsTests.\(UUID().uuidString)")!)
+        let menuBar = makeController(loginItemController: controller)
+        menuBar.install()
+        XCTAssertEqual(menuBar.loginItemItem.state, .on, "install()/refresh() reflect the service's starting enabled state")
+
+        let item = menuBar.loginItemItem
+        NSApp.sendAction(item.action!, to: item.target, from: item) // request: turn OFF
+
+        // The service HASN'T flipped yet — isEnabled still reads true (the exact real-API instant).
+        XCTAssertTrue(deferred.isEnabled, "the async disable() has not landed — service still reads enabled")
+        XCTAssertEqual(item.state, .off, "the checkbox must show the REQUESTED (off) state immediately, not the stale read-back")
+
+        // Once the async work settles and a refresh() runs, the read-back reconciles (unchanged here).
+        deferred.settle()
+        menuBar.refresh()
+        XCTAssertEqual(item.state, .off, "refresh() reconciles to the now-settled service state")
+    }
+}
+
+/// A `LoginItemService` that models the REAL `SMLoginItem`'s async/sync mismatch: `enable()`/
+/// `disable()` record the LAST requested state but do NOT flip `isEnabled` until `settle()` — so a
+/// synchronous read-back after a click still sees the OLD value, exactly like `SMAppService.mainApp.
+/// status` does before a fire-and-forget register/unregister lands.
+final class DeferredLoginItemService: LoginItemService {
+    private(set) var isEnabled: Bool
+    private var pending: Bool
+
+    init(startEnabled: Bool) {
+        isEnabled = startEnabled
+        pending = startEnabled
+    }
+
+    func enable() throws { pending = true }
+    func disable() throws { pending = false }
+
+    /// Applies the last requested state — the "async work landed" moment.
+    func settle() { isEnabled = pending }
 }
