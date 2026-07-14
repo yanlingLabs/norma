@@ -378,6 +378,52 @@ describe("read-only denylist — Norma's own credential/runtime dir (task-10)", 
     expect(res.output).toBe("this path is Norma's own credential store and is never readable");
   });
 
+  test("ls of the denied dir's PARENT omits the denied entry name; other entries still listed", async () => {
+    const d = proj();
+    const runDir = denyFixture();
+    const home = dirname(runDir);
+    writeFileSync(join(home, "visible.txt"), "x");
+    mkdirSync(join(home, "runfoo")); // prefix-sibling of the denied name — must survive the filter
+    const r = new ToolRegistry();
+    registerReadTools(r, { deniedPrefixes: [runDir] });
+    const res = await r.execute("ls", { path: home }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(false);
+    // dirs first then files; `run/` (the denied entry) simply doesn't appear
+    expect(res.output).toBe("runfoo/\nvisible.txt");
+  });
+
+  test("prefix boundary: a sibling dir sharing the denied name as a prefix (runfoo vs run) is NOT denied", async () => {
+    const d = proj();
+    const runDir = denyFixture(); // denies <home>/run
+    const sibling = join(dirname(runDir), "runfoo");
+    mkdirSync(sibling);
+    writeFileSync(join(sibling, "ok.txt"), "prefix boundary holds");
+    const r = new ToolRegistry();
+    registerReadTools(r, { deniedPrefixes: [runDir] });
+    // pins the `+ sep` anchor in isDenied: "<home>/runfoo" must not match prefix "<home>/run"
+    const read = await r.execute("read", { path: join(sibling, "ok.txt") }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(read).toEqual({ output: "prefix boundary holds", isError: false });
+    const ls = await r.execute("ls", { path: sibling }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(ls).toEqual({ output: "ok.txt", isError: false });
+  });
+
+  test("an uppercased spelling of the denied dir is still denied on a case-insensitive volume (realpath canonicalization)", async () => {
+    const d = proj();
+    const runDir = denyFixture(); // real casing: <home>/run
+    const upper = join(dirname(runDir), "RUN", "harness-token.secret");
+    const r = new ToolRegistry();
+    registerReadTools(r, { deniedPrefixes: [runDir] });
+    const res = await r.execute("read", { path: upper }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(true);
+    if (res.output !== "this path is Norma's own credential store and is never readable") {
+      // case-SENSITIVE test volume: the uppercase spelling doesn't resolve to anything at all —
+      // the fs itself refuses (ENOENT), so no case-aliased route into the denied dir exists to pin.
+      // On the default case-insensitive APFS volume the branch above is what actually runs: the
+      // denylist's canonAncestor realpaths "RUN" to the on-disk "run" casing and refuses.
+      expect(res.output).toMatch(/no such file|ENOENT/i);
+    }
+  });
+
   test("with no denylist configured, nothing is refused (existing callers unaffected)", async () => {
     const d = proj();
     const r = new ToolRegistry();

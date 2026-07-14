@@ -119,6 +119,9 @@ export function registerReadTools(r: ToolRegistry, opts: ReadToolsConfig = {}): 
       const files: string[] = [];
       for (const entry of readdirSync(target, { withFileTypes: true })) {
         if (patterns.some((g: InstanceType<typeof Bun.Glob>) => g.match(entry.name))) continue;
+        // Denylisted entries simply don't appear (parity with glob/grep's silent skip) — without
+        // this, listing the denied dir's PARENT would leak the bare entry name (task-10 review).
+        if (isDenied(deniedPrefixes, join(target, entry.name))) continue;
         if (entry.isDirectory()) dirs.push(entry.name + "/");
         else files.push(entry.name);
       }
