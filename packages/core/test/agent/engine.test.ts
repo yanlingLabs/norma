@@ -19,7 +19,7 @@ import { SkillStore } from "../../src/agent/skills";
 import { Compactor } from "../../src/agent/compactor";
 import type { ProviderEvent } from "../../src/providers/types";
 
-function setup(script: ProviderEvent[][], policy: "ask" | "auto" = "auto", extraRoots: string[] = []) {
+function setup(script: ProviderEvent[][], policy: "ask" | "auto" = "auto", extraRoots: string[] = [], opts: { grantDeniedPrefixes?: string[] } = {}) {
   const home = mkdtempSync(join(tmpdir(), "norma-engine-"));
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-cwd-")));
   const store = new SessionStore(home);
@@ -44,6 +44,7 @@ function setup(script: ProviderEvent[][], policy: "ask" | "auto" = "auto", extra
     approvalTimeoutMs: 500,
     assembler,
     compactor,
+    grantDeniedPrefixes: opts.grantDeniedPrefixes,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: policy });
   return { engine, store, hub, broker, sessionId, cwd, provider, dirs };
@@ -308,6 +309,110 @@ describe("AgentEngine", () => {
       expect(events2.some((e) => e.type === "approval_requested")).toBe(true); // re-prompted — no free ride off session 1
       expect(dirs.has(sessionId2, outsideDir)).toBe(true); // approved again, granted for THIS session too
       expect(readFileSync(target2, "utf8")).toBe("two");
+    });
+
+    // task-24 review F2: the control plane (daemon.ts passes ~/.norma/run — the run dir holding
+    // the IPC socket/lock/plugin PID files, the SAME denylist the read tools get) must NEVER be
+    // grantable: hard tool error, no card, no directory_added — under BOTH policies. bash's
+    // seatbelt shares the session roots, so a grant would open the dir to bash too.
+    for (const policy of ["ask", "auto"] as const) {
+      test(`denied-prefix (control-plane) target under ${policy}: hard error, no approval card, no grant`, async () => {
+        const runDir = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-rundir-")));
+        const target = join(runDir, "core.sock.d", "evil.txt");
+        const { engine, store, sessionId, dirs } = setup([
+          [{ type: "tool_call", callId: "c1", name: "write", argsJson: JSON.stringify({ path: target, content: "x" }) }, done("tool_calls")],
+          text("blocked"),
+        ], policy, [], { grantDeniedPrefixes: [runDir] });
+        await engine.runTurn(sessionId);
+        const events = store.read(sessionId);
+        expect(events.some((e) => e.type === "approval_requested")).toBe(false); // no card, even under ask
+        expect(events.some((e) => e.type === "directory_added")).toBe(false);
+        const result = events.find((e) => e.type === "tool_result") as any;
+        expect(result.isError).toBe(true);
+        expect(result.output).toMatch(/control plane/);
+        expect(result.output).toMatch(/never be granted/);
+        expect(existsSync(target)).toBe(false);
+        expect(dirs.has(sessionId, runDir)).toBe(false);
+      });
+    }
+
+    test("denied-prefix hardening also blocks granting an ANCESTOR of the control plane (subtree containment would open it through the fence)", async () => {
+      const outer = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-outer-")));
+      const runDir = join(outer, "run"); // the denied prefix lives INSIDE the would-be grant dir
+      const target = join(outer, "adjacent.txt"); // grant dir would be `outer` itself
+      const { engine, store, sessionId, dirs } = setup([
+        [{ type: "tool_call", callId: "c1", name: "write", argsJson: JSON.stringify({ path: target, content: "x" }) }, done("tool_calls")],
+        text("blocked"),
+      ], "auto", [], { grantDeniedPrefixes: [runDir] });
+      await engine.runTurn(sessionId);
+      const events = store.read(sessionId);
+      expect(events.some((e) => e.type === "directory_added")).toBe(false);
+      expect((events.find((e) => e.type === "tool_result") as any).isError).toBe(true);
+      expect(existsSync(target)).toBe(false);
+      expect(dirs.has(sessionId, outer)).toBe(false);
+    });
+
+    // task-24 review F3: a grant whose directory does NOT yet exist (deep new subtree). The fence
+    // realpaths roots (SessionDirectories.canon + resolveWithinAny both tolerate-and-SKIP a root
+    // that doesn't resolve), so a granted-but-nonexistent dir silently dropped out and the
+    // just-approved write still failed. The grant now mkdirs the approved directory first.
+    test("deep not-yet-existing target dirs under auto: grant mkdirs the directory, directory_added emitted, the write lands (task-24 review F3)", async () => {
+      const outside = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-deep-auto-")));
+      const target = join(outside, "newsub", "deeper", "file.txt"); // nothing below `outside` exists
+      const grantDir = join(outside, "newsub", "deeper");
+      const { engine, store, sessionId, dirs } = setup([
+        [{ type: "tool_call", callId: "c1", name: "write", argsJson: JSON.stringify({ path: target, content: "deep" }) }, done("tool_calls")],
+        text("wrote it"),
+      ], "auto");
+      await engine.runTurn(sessionId);
+      const events = store.read(sessionId);
+      expect(events.some((e) => e.type === "directory_added" && (e as any).path === grantDir)).toBe(true);
+      expect((events.find((e) => e.type === "tool_result") as any).isError).toBe(false);
+      expect(readFileSync(target, "utf8")).toBe("deep"); // the approved write actually LANDED
+      expect(dirs.has(sessionId, grantDir)).toBe(true);
+    });
+
+    test("deep not-yet-existing target dirs under ask+approve: same — grant mkdirs, write lands (task-24 review F3)", async () => {
+      const outside = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-deep-ask-")));
+      const target = join(outside, "newsub", "deeper", "file.txt");
+      const grantDir = join(outside, "newsub", "deeper");
+      const { engine, store, hub, broker, sessionId, dirs } = setup([
+        [{ type: "tool_call", callId: "c1", name: "write", argsJson: JSON.stringify({ path: target, content: "deep-ask" }) }, done("tool_calls")],
+        text("wrote it"),
+      ], "ask");
+      const watcher: HubClient = {
+        clientName: "auto-approver",
+        deliver(e) { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, true, "auto-approver"); return true; },
+      };
+      hub.attach(watcher, sessionId, 0);
+      await engine.runTurn(sessionId);
+      const events = store.read(sessionId);
+      expect(events.some((e) => e.type === "directory_added" && (e as any).path === grantDir)).toBe(true);
+      expect((events.find((e) => e.type === "tool_result") as any).isError).toBe(false);
+      expect(readFileSync(target, "utf8")).toBe("deep-ask");
+      expect(dirs.has(sessionId, grantDir)).toBe(true);
+    });
+
+    // task-24 review F4 (engine half — the fence half is pinned in paths.test.ts): an in-root
+    // DANGLING symlink aimed at a nonexistent file in an existing OUTSIDE dir used to write
+    // through silently (reviewer-less, card-less escape). The fence now resolves the leaf's link
+    // chain, so the call classifies as out-of-root and takes the GRANT flow for the REAL target
+    // directory — never a silent escape.
+    test("in-root dangling symlink → outside dir: no longer a silent escape — grant-flows for the REAL (outside) directory under auto", async () => {
+      const outside = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-symlink-out-")));
+      const { engine, store, sessionId, cwd, dirs } = setup([
+        [{ type: "tool_call", callId: "c1", name: "write", argsJson: JSON.stringify({ path: "innocent.txt", content: "PWNED" }) }, done("tool_calls")],
+        text("done"),
+      ], "auto");
+      const { symlinkSync } = await import("node:fs");
+      symlinkSync(join(outside, "pwned.txt"), join(cwd, "innocent.txt")); // dangling — target doesn't exist
+      await engine.runTurn(sessionId);
+      const events = store.read(sessionId);
+      // The grant names the REAL destination directory (the outside dir), not the in-root spelling:
+      expect(events.some((e) => e.type === "directory_added" && (e as any).path === outside)).toBe(true);
+      expect(dirs.has(sessionId, outside)).toBe(true);
+      // The write went through the link INTO the granted dir — visible, granted, never silent:
+      expect(readFileSync(join(outside, "pwned.txt"), "utf8")).toBe("PWNED");
     });
   });
 });

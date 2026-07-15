@@ -632,6 +632,22 @@ export async function startDaemon(opts: {
       store, hub, registry, broker: approvalBroker,
       gate: new PermissionGate(),
       dirs: sessionDirs,
+      // write-permission-flow F2: the out-of-root write/edit grant flow must never silently grant
+      // any part of Norma's OWN home directory. This is BROADER than the READ denylist above
+      // (which locks only `dirs.runDir` — the rest of normaHome stays readable by design) on
+      // purpose: a GRANT is strictly higher-risk than a read — it opens the directory to WRITE,
+      // and because bash's seatbelt shares the session's write roots, to bash too. normaHome holds
+      // the control plane (run/: IPC socket, lock, plugin PID files) AND Norma's managed internal
+      // state (sessions/, logs/, plugins/, and crucially projects/<key>/memory — the per-project
+      // MEMDIR). The MEMDIR is the load-bearing case: when memory is ENABLED it's already a session
+      // BASE root (sessionDirs above), so a write there is in-root and never reaches the grant flow
+      // — but when memory is DISABLED it is deliberately NOT a root, and without this an auto-policy
+      // write could silently re-grant it, quietly defeating the memory-disable gate (and writing
+      // into ~/.norma). The agent never has a legitimate need to be *granted* write access to
+      // Norma's own home — its legitimate MEMDIR access comes from memory being enabled (a base
+      // root), not from a grant. Realpath-hardened in engine.ts's grantDenied, bidirectional
+      // (an ancestor of normaHome is refused too — see grantDenied's doc comment).
+      grantDeniedPrefixes: [normaHome],
       provider: agentProvider,
       assembler,
       compactor,

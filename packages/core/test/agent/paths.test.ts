@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, realpathSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveWithinAny, resolveWithin, canonicalizeForWrite } from "../../src/agent/paths";
+import { resolveWithinAny, resolveWithin, canonicalizeForWrite, resolveLeafSymlinks } from "../../src/agent/paths";
 
 function realDir(): string { return realpathSync(mkdtempSync(join(tmpdir(), "norma-paths-"))); }
 
@@ -48,6 +48,60 @@ describe("resolveWithinAny", () => {
     expect(resolveWithinAny([a, ghost], join(a, "x.txt"))).toBe(join(a, "x.txt"));
     // order shouldn't matter — the ghost root can be first too
     expect(resolveWithinAny([ghost, a], join(a, "x.txt"))).toBe(join(a, "x.txt"));
+  });
+
+  // task-24 review F4 (pre-existing fence hole): a DANGLING in-root symlink whose target is a
+  // nonexistent file in an EXISTING outside directory used to pass containment — realpathSync on
+  // the leaf threw ENOENT, so canonAncestor retreated to the link's (in-root) parent and never
+  // looked at where the link points; the subsequent write then followed the link and landed
+  // OUTSIDE every root, reviewer-less and card-less. The leaf's link chain is now resolved first.
+  describe("dangling-symlink leaf hardening (task-24 review F4)", () => {
+    test("in-root dangling symlink → existing OUTSIDE dir: REJECTED (the exact escape repro)", () => {
+      const root = realDir(); const outside = realDir();
+      symlinkSync(join(outside, "pwned.txt"), join(root, "innocent.txt")); // dangling: pwned.txt doesn't exist
+      expect(() => resolveWithinAny([root], join(root, "innocent.txt"))).toThrow(/outside the allowed directories/);
+      expect(() => resolveWithinAny([root], "innocent.txt")).toThrow(/outside the allowed directories/); // relative spelling too
+    });
+
+    test("in-root dangling symlink → in-root nonexistent target: still allowed (unchanged)", () => {
+      const root = realDir();
+      symlinkSync(join(root, "not-yet.txt"), join(root, "link.txt"));
+      expect(resolveWithinAny([root], join(root, "link.txt"))).toBe(join(root, "link.txt"));
+    });
+
+    test("in-root NON-dangling symlink → in-root existing target: still allowed (unchanged)", () => {
+      const root = realDir();
+      writeFileSync(join(root, "real.txt"), "");
+      symlinkSync(join(root, "real.txt"), join(root, "alias.txt"));
+      expect(resolveWithinAny([root], join(root, "alias.txt"))).toBe(join(root, "alias.txt"));
+    });
+
+    test("link CHAIN to an outside dangling target is followed hop by hop and rejected; a chain past the depth cap is rejected outright (fail-closed)", () => {
+      const root = realDir(); const outside = realDir();
+      // 3-hop chain ending in a dangling link out of root:
+      symlinkSync(join(outside, "gone.txt"), join(root, "c2"));
+      symlinkSync(join(root, "c2"), join(root, "c1"));
+      symlinkSync(join(root, "c1"), join(root, "c0"));
+      expect(() => resolveWithinAny([root], join(root, "c0"))).toThrow(/outside the allowed directories/);
+      // 9-hop chain (cap is 8) — every hop in-root, so ONLY the cap can reject it:
+      symlinkSync(join(root, "deep-missing.txt"), join(root, "d8"));
+      for (let i = 7; i >= 0; i--) symlinkSync(join(root, `d${i + 1}`), join(root, `d${i}`));
+      expect(() => resolveWithinAny([root], join(root, "d0"))).toThrow(/too many levels of symbolic links/);
+      // link CYCLE: a→b→a — terminated by the same cap, not an infinite loop:
+      symlinkSync(join(root, "cycle-b"), join(root, "cycle-a"));
+      symlinkSync(join(root, "cycle-a"), join(root, "cycle-b"));
+      expect(() => resolveWithinAny([root], join(root, "cycle-a"))).toThrow(/too many levels of symbolic links/);
+    });
+
+    test("resolveLeafSymlinks: non-links and wholly nonexistent paths pass through unchanged; relative link text resolves against the link's own directory", () => {
+      const root = realDir();
+      writeFileSync(join(root, "plain.txt"), "");
+      expect(resolveLeafSymlinks(join(root, "plain.txt"))).toBe(join(root, "plain.txt"));
+      expect(resolveLeafSymlinks(join(root, "never-existed.txt"))).toBe(join(root, "never-existed.txt"));
+      mkdirSync(join(root, "sub"));
+      symlinkSync(join("..", "target.txt"), join(root, "sub", "rel-link")); // relative link text
+      expect(resolveLeafSymlinks(join(root, "sub", "rel-link"))).toBe(join(root, "target.txt"));
+    });
   });
 });
 
