@@ -11,6 +11,14 @@
  *  `useInput`, so an answered approval needs an explicit committed record or it would otherwise
  *  vanish with no trace once `pending` clears.
  *
+ *  CHILD TRANSCRIPTS (child-transcript-view T2): a child event (`threadId !== MAIN`) used to be
+ *  routed ONLY to `feedAgents`/`updateSubagents` (roster aggregates) and otherwise discarded. It
+ *  now ALSO accumulates into `childBlocks[threadId]` — a capped, per-thread mirror of `committed`
+ *  built from the SAME block shapes (user/assistant/tool/note/turn-summary/interrupted), via the
+ *  shared `buildToolBlock`/`withChildBlock` helpers below so the main path's byte-for-byte output
+ *  is untouched. `feedAgents`/`updateSubagents` keep running EXACTLY as before — `childBlocks` is
+ *  purely additive, never a replacement for the roster aggregates.
+ *
  *  THE BUG FIX (`Agent "" · 0s`, main.ts:637-649): main.ts's `updateSubagents` prunes the WHOLE
  *  subagent list to `[]` on the MAIN thread's own `turn_completed`
  *  (`subagent-state.ts`'s `case "turn_completed": if (threadId === "main") return items.length ? []
@@ -46,8 +54,14 @@ export type Block =
  *  `CommandCtx.appendNote`) have a way to commit a note block through the SAME reducer/dispatch
  *  path every other transcript line goes through, instead of a separate ad-hoc "local blocks" list
  *  that the transcript/flatten-cache would need to know about too. Pure additive case — reduce's
- *  handling of every real wire event type is completely unaffected. */
-export type LocalEvent = { type: "local_note"; text: string };
+ *  handling of every real wire event type is completely unaffected.
+ *
+ *  `threadId` (child-transcript-view T3, additive/optional): when set to a non-MAIN thread, the
+ *  note commits into THAT child's `childBlocks` entry instead of the main `committed` log — the
+ *  App's child view uses this to surface `thread.send`'s queued/resumed feedback and RPC-error
+ *  notes (unknown agent, resume-refused) right where the user is looking, never crashing the TUI.
+ *  Omitted (main transcript) is the pre-existing behavior, byte-identical. */
+export type LocalEvent = { type: "local_note"; text: string; threadId?: string };
 
 /** `AgentRow` IS `CliSubagent`-shaped (the brief's interface matches it field-for-field) — reuse the
  *  type directly rather than re-declaring an equivalent interface that could drift out of lockstep.
@@ -78,9 +92,23 @@ export interface TuiState {
   inTokens: number;
   outTokens: number;
   pending: PendingCard | null;
+  // child-transcript-view T2: per-child mirror of `committed`, keyed by threadId, capped at
+  // CHILD_BLOCK_CAP (drop-oldest) — a live view, not an archive (T3's consumer surface: read
+  // `childBlocks[threadId] ?? []` to render a selected agent's transcript).
+  childBlocks: Record<string, Block[]>;
+  // One in-flight child tool_call per threadId (mirrors `activeTools`, but per-thread since
+  // multiple children may each have a call outstanding at once) — internal pairing state so the
+  // matching tool_result can build a complete `{kind:"tool",...}` Block; not part of T3's primary
+  // read surface, but exposed on TuiState since `reduce` is pure (no cross-call closures).
+  childPendingTool: Record<string, { name: string; argsJson: string }>;
 }
 
 const MAIN = "main";
+
+/** Live-view cap per child thread (child-transcript-view T2): beyond this many blocks, the OLDEST
+ *  are dropped on append — the durable record is the transcript file (subagent-transcripts
+ *  track), this is just a bounded live view. */
+const CHILD_BLOCK_CAP = 200;
 
 export function initialState(): TuiState {
   return {
@@ -93,6 +121,8 @@ export function initialState(): TuiState {
     inTokens: 0,
     outTokens: 0,
     pending: null,
+    childBlocks: {},
+    childPendingTool: {},
   };
 }
 
@@ -153,10 +183,48 @@ function feedAgents(s: TuiState, e: WireEvent): TuiState {
   return next === s.agents ? s : { ...s, agents: next };
 }
 
+/** Shared tool-`Block` construction (child-transcript-view T2) — the SAME shape the main path's
+ *  `tool_result` case has always built inline, now factored out so a child's own tool_call/
+ *  tool_result pairing (below) produces byte-identical Block shapes without duplicating the
+ *  field list. `call` is whichever pending call (main's `activeTools[0]` or a child's
+ *  `childPendingTool[threadId]`) paired with this result; absent (a stray/ghost result) falls
+ *  back to the same empty-string defaults the main path already tolerated. */
+function buildToolBlock(call: { name: string; argsJson: string } | undefined, output: string, isError: boolean): Block {
+  return { kind: "tool", name: call?.name ?? "", argsJson: call?.argsJson ?? "", output, isError };
+}
+
+/** Appends `block` to `map[threadId]`, dropping the OLDEST entries past `CHILD_BLOCK_CAP` — the
+ *  one mutation site for every child-transcript append below. Always returns a fresh array/map
+ *  (no reference-equality short-circuit needed here: every call site only invokes this when it
+ *  already knows a block is being appended). */
+function withChildBlock(map: Record<string, Block[]>, threadId: string, block: Block): Record<string, Block[]> {
+  const merged = [...(map[threadId] ?? []), block];
+  const capped = merged.length > CHILD_BLOCK_CAP ? merged.slice(merged.length - CHILD_BLOCK_CAP) : merged;
+  return { ...map, [threadId]: capped };
+}
+
+/** Drops `ids` from a per-thread map (`childBlocks` or `childPendingTool`) — shared by the
+ *  roster's existing done-agent prune (`turn_started`, MAIN) so a pruned agent's transcript/
+ *  pending-tool bookkeeping doesn't linger forever (memory hygiene, child-transcript-view T2).
+ *  Referential no-op when none of `ids` are present, matching this file's existing "same
+ *  reference on no change" convention (e.g. `feedAgents`). */
+function pruneChildEntries<T>(map: Record<string, T>, ids: string[]): Record<string, T> {
+  if (!ids.some((id) => id in map)) return map;
+  const next = { ...map };
+  for (const id of ids) delete next[id];
+  return next;
+}
+
 export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
   switch (e.type) {
-    case "user_message":
-      return { ...s, committed: [...s.committed, { kind: "user", text: str(e.text) }] };
+    case "user_message": {
+      // Same Block shape for both destinations (child-transcript-view T2: a steer-drain/thread.send
+      // echo lands here with a non-MAIN threadId — previously silently committed to the MAIN
+      // transcript regardless of thread; now routed to that child's own block list instead).
+      const block: Block = { kind: "user", text: str(e.text) };
+      if (e.threadId !== MAIN) return { ...s, childBlocks: withChildBlock(s.childBlocks, str(e.threadId), block) };
+      return { ...s, committed: [...s.committed, block] };
+    }
 
     case "assistant_delta": {
       if (e.threadId !== MAIN) return feedAgents(s, e); // child deltas: track liveOutputChars only
@@ -164,23 +232,40 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
     }
 
     case "assistant_message": {
-      if (e.threadId !== MAIN) return s; // children run to completion inside the main tool loop —
-      // their assistant_message never needs a separate committed block; the finish note (below)
-      // is what makes a child's work permanent, matching main.ts's own main-only handling.
-      return {
-        ...s,
-        committed: [...s.committed, { kind: "assistant", text: str(e.text) }],
-        activeAssistant: "",
-      };
+      // Same Block shape for both destinations (child-transcript-view T2): children run to
+      // completion inside the main tool loop, so this never needed a separate MAIN-committed
+      // block (the finish note is what makes a child's work permanent there) — but it now feeds
+      // that child's OWN block list instead of being discarded.
+      const block: Block = { kind: "assistant", text: str(e.text) };
+      if (e.threadId !== MAIN) return { ...s, childBlocks: withChildBlock(s.childBlocks, str(e.threadId), block) };
+      return { ...s, committed: [...s.committed, block], activeAssistant: "" };
     }
 
     case "tool_call": {
-      if (e.threadId !== MAIN) return feedAgents(s, e); // child tool calls: just bump toolCalls/activity
+      if (e.threadId !== MAIN) {
+        // Child tool calls still bump toolCalls/activity via feedAgents (unchanged aggregate
+        // path) AND now stash the pending call (name/argsJson) so the matching tool_result
+        // (below) can build a complete Block — same one-in-flight-per-thread invariant as MAIN's
+        // activeTools, just keyed per child threadId since multiple children run concurrently.
+        const fed = feedAgents(s, e);
+        const threadId = str(e.threadId);
+        return { ...fed, childPendingTool: { ...fed.childPendingTool, [threadId]: { name: str(e.name), argsJson: str(e.argsJson) } } };
+      }
       return { ...s, activeTools: [...s.activeTools, { name: str(e.name), argsJson: str(e.argsJson) }] };
     }
 
     case "tool_result": {
-      if (e.threadId !== MAIN) return s; // child tool_result has no wire event of its own to feed here
+      if (e.threadId !== MAIN) {
+        // Pair with the child's own pending call (stashed by tool_call above) and commit into
+        // that child's block list — mirrors MAIN's pairing below via the shared buildToolBlock
+        // helper, so both paths produce byte-identical tool Block shapes.
+        const threadId = str(e.threadId);
+        const call = s.childPendingTool[threadId];
+        const block = buildToolBlock(call, str(e.output), e.isError === true);
+        const childPendingTool = { ...s.childPendingTool };
+        delete childPendingTool[threadId];
+        return { ...s, childPendingTool, childBlocks: withChildBlock(s.childBlocks, threadId, block) };
+      }
       // Main-thread tool_call/tool_result always alternate one at a time — the engine's dispatch
       // loop (packages/core/src/agent/engine.ts's `for (const call of calls)`) emits tool_call,
       // awaits execution, THEN emits that SAME call's tool_result before ever emitting the next
@@ -191,13 +276,7 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
       const next: TuiState = {
         ...s,
         activeTools: s.activeTools.slice(1),
-        committed: [...s.committed, {
-          kind: "tool",
-          name: call?.name ?? "",
-          argsJson: call?.argsJson ?? "",
-          output,
-          isError: e.isError === true,
-        }],
+        committed: [...s.committed, buildToolBlock(call, output, e.isError === true)],
       };
       // phase 5a T3: learn a background child's `name` off this same call/result pairing (see
       // bgSpawnNameMapping above). engine.ts's spawn bridge always emits the child's own
@@ -221,14 +300,40 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
       // turn_completed guard (the `Agent "" · 0s` fix) intact while bounding the pinned live region's
       // height, so a long agent-heavy session can't grow <AgentList> past the terminal and re-hide the
       // composer (whole-branch review, Important). Restores legacy's per-turn roster clear cadence.
-      const agents = s.agents.some((a) => a.status === "done") ? s.agents.filter((a) => a.status !== "done") : s.agents;
-      return { ...s, turnRunning: true, turnStartMs: nowMs, agents };
+      const doneIds = s.agents.filter((a) => a.status === "done").map((a) => a.threadId);
+      const agents = doneIds.length ? s.agents.filter((a) => a.status !== "done") : s.agents;
+      // Memory hygiene (child-transcript-view T2): a pruned agent's own transcript view is gone
+      // (dismissed row falls back to main, per the design's failure modes), so its childBlocks/
+      // childPendingTool entries would otherwise linger forever — drop them alongside the row.
+      const childBlocks = pruneChildEntries(s.childBlocks, doneIds);
+      const childPendingTool = pruneChildEntries(s.childPendingTool, doneIds);
+      return { ...s, turnRunning: true, turnStartMs: nowMs, agents, childBlocks, childPendingTool };
     }
 
     case "turn_completed": {
+      if (e.threadId !== MAIN) {
+        // Child turn_completed (child-transcript-view T2): a multi-turn child gets the SAME kind
+        // of per-turn marker MAIN does (turn-summary/interrupted, below) appended to its OWN block
+        // list, so a busy child's live view shows turn boundaries too — not just its final finish
+        // note (that's thread_completed's job, separately). durationMs is this turn's own span:
+        // the delta in the row's banked `activeMs` across `feedAgents` (which closes the span
+        // using the EVENT's own `ts`, never `nowMs`) rather than a separate per-child turnStartMs
+        // field — reuses subagent-state.ts's existing closeSpan bookkeeping instead of duplicating
+        // it. Absent row (ghost threadId, ordering violation) falls back to 0, same discipline as
+        // MAIN's `turnStartMs === undefined` fallback below.
+        const threadId = str(e.threadId);
+        const before = s.agents.find((a) => a.threadId === threadId);
+        const withDone = feedAgents(s, e);
+        const after = withDone.agents.find((a) => a.threadId === threadId);
+        const durationMs = before && after ? after.activeMs - before.activeMs : 0;
+        const block: Block =
+          e.stopReason === "aborted"
+            ? { kind: "interrupted" }
+            : { kind: "turn-summary", durationMs, inTokens: num(e.inputTokens), outTokens: num(e.outputTokens) };
+        return { ...withDone, childBlocks: withChildBlock(withDone.childBlocks, threadId, block) };
+      }
       // MAIN-thread only — and critically NEVER routed through updateSubagents (see file header):
       // that is the one-line fix for the `Agent "" · 0s` bug.
-      if (e.threadId !== MAIN) return feedAgents(s, e);
       const inTokens = num(e.inputTokens);
       const outTokens = num(e.outputTokens);
       // Commits exactly ONE transcript-visible marker for the just-finished main turn: an
@@ -282,7 +387,15 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
         : row?.finish === "stalled" ? "Stalled"
         : "Done";
       const text = `Agent "${label}": ${verb} (${parts.join(" · ")})`;
-      return { ...withDone, committed: [...withDone.committed, { kind: "note", text }] };
+      // Same note block, TWO destinations (child-transcript-view T2): the roster-wide MAIN
+      // transcript (unchanged) AND this child's own block list, so its live view shows
+      // "done/stalled/failed" inline without the user needing to glance at the main transcript.
+      const block: Block = { kind: "note", text };
+      return {
+        ...withDone,
+        committed: [...withDone.committed, block],
+        childBlocks: withChildBlock(withDone.childBlocks, str(e.threadId), block),
+      };
     }
 
     case "task_updated":
@@ -387,9 +500,13 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
       return { ...s, committed: [...s.committed, { kind: "note", text }] };
     }
 
-    case "local_note":
+    case "local_note": {
       // See the `LocalEvent` doc comment above — App-internal only, never a real wire event.
-      return { ...s, committed: [...s.committed, { kind: "note", text: str(e.text) }] };
+      const block: Block = { kind: "note", text: str(e.text) };
+      const threadId = typeof e.threadId === "string" ? e.threadId : undefined;
+      if (threadId !== undefined && threadId !== MAIN) return { ...s, childBlocks: withChildBlock(s.childBlocks, threadId, block) };
+      return { ...s, committed: [...s.committed, block] };
+    }
 
     default:
       return s; // unknown/unhandled event types are no-ops (both CLI/app already skip unknowns)

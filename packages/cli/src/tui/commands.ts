@@ -298,6 +298,7 @@ export function helpText(): string {
     "Home/End top/bottom (empty input)",
     "ctrl+o expand outputs",
     "ctrl+t tasks",
+    "ctrl+a agents (↑↓ select · enter open · x stop/dismiss · esc back)",
     "ctrl+c/ctrl+d (empty) exit",
     "/ commands",
     "@ files",

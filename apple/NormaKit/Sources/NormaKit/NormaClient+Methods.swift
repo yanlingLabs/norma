@@ -324,6 +324,37 @@ extension NormaClient {
         }
     }
 
+    /// `thread.send {sessionId, agent, text}` (child-transcript-view T1) — message a background
+    /// subagent directly, by agentId or its stable `name`. Mirrors `steer`'s shape (a plain wire
+    /// result, never a typed outcome union — an unresolvable `agent` throws `RpcError`, same
+    /// precedent as `pluginRestart`'s "unknown id" case). `delivered` is `"queued"` (the agent was
+    /// running; `text` lands in its own steer queue at its next round) or `"resumed"` (the agent
+    /// was finished and was just re-run in the background with `text` as its new prompt).
+    /// `agentId` is the stable bg-agent-registry id, even when `agent` addressed it by name.
+    public func sendToThread(sessionId: String, agent: String, text: String) async throws -> (delivered: String, agentId: String) {
+        let r = try await request("thread.send", params: obj([
+            "sessionId": .string(sessionId), "agent": .string(agent), "text": .string(text),
+        ]))
+        guard let delivered = r["delivered"]?.stringValue, let agentId = r["agentId"]?.stringValue else {
+            throw RpcError(code: -3, message: "invalid result from server for thread.send")
+        }
+        return (delivered, agentId)
+    }
+
+    /// `agent.stop {sessionId, agent}` (child-transcript-view T1) — stop a running background
+    /// subagent, or (idempotently) report an already-finished one's status; never an error for a
+    /// resolvable `agent` (task_stop tool parity). `status` is one of `BackgroundAgentRegistry
+    /// .AgentStatus`'s wire strings ("running"/"completed"/"failed"/"stopped"/"timeout") — "running"
+    /// never actually comes back here, since a running agent is always flipped to "stopped".
+    public func agentStop(sessionId: String, agent: String) async throws -> String {
+        guard let status = try await request("agent.stop", params: obj([
+            "sessionId": .string(sessionId), "agent": .string(agent),
+        ]))["status"]?.stringValue else {
+            throw RpcError(code: -3, message: "invalid result from server for agent.stop")
+        }
+        return status
+    }
+
     public func addDir(sessionId: String, path: String, persist: Bool = false) async throws -> [String] {
         let r = try await request("session.addDir", params: obj([
             "sessionId": .string(sessionId), "path": .string(path), "persist": .bool(persist),

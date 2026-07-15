@@ -22,7 +22,7 @@ import { resolveWithinAny, isWithin, canonicalizeForWrite } from "./paths";
 import type { WorktreeManager } from "./worktree";
 import type { SubagentManager } from "./subagents";
 import type { AgentStore } from "./agents";
-import { checkNameNotStale, type BackgroundAgentRegistry, type ResumeContext } from "./bg-agent-registry";
+import { guardAgentName, type AgentStatus, type BackgroundAgentRegistry, type ResumeContext } from "./bg-agent-registry";
 import type { HookResult } from "../plugins/hook-runner";
 import type { ComputerUseService } from "./computer-use";
 import { SubagentTranscripts } from "./subagent-transcript";
@@ -566,6 +566,88 @@ export class AgentEngine {
     const q = this.threadSteerQueue.get(threadId) ?? [];
     q.push(text);
     this.threadSteerQueue.set(threadId, q);
+  }
+
+  /**
+   * child-transcript-view T1 (design doc "Wire"): the `thread.send` RPC's engine half — lets a
+   * HARNESS connection do exactly what the send_message TOOL bridge above does for the MODEL
+   * (resolve `agent` in `bgAgents`, apply the same stale-name guard, running → `sendToThread`,
+   * terminal → `resumeThread` in the background), now user-initiated instead of model-initiated.
+   * Deliberately NOT folded into the bridge's own inline loop above (that code path is
+   * per-tool-call-batch and threads through `opts`/`meta`/`signal` values only a live turn has) —
+   * this is the single shared "resolve + dispatch" surface both a future refactor of that bridge
+   * AND this RPC can call; today only the RPC does, since the bridge's threading-through of the
+   * calling thread's own model/effort/depth/signal must stay byte-identical to before this task.
+   *
+   * A user-initiated resume has no real parent thread/signal: `depth: 0` (same semantics as a
+   * fresh top-level send), `parentThreadId: MAIN_THREAD` (the child re-anchors under the main
+   * thread's thread_started, same as any other resume), and a throwaway `AbortSignal` for
+   * `parentSignal` — irrelevant here since `runInBackground: true` makes `resumeThread` ignore it
+   * (see that method's own doc comment: "A BG resume deliberately ignores it").
+   *
+   * `kind` distinguishes two error buckets (mirrors `memoryErrorCode`/`skillErrorCode`'s
+   * structural split in ipc/server.ts): `"not_found"` — no such agent, or a stale-name-guard
+   * failure (the addressed target is unreachable); `"invalid"` — the agent WAS found and terminal,
+   * but `resumeThread`'s own guards refused it (no resumable history, worktree removed, etc.) —
+   * the caller-facing "clear refusal" the design doc's Failure modes section calls for.
+   */
+  async sendToAgent(sessionId: string, agent: string, text: string): Promise<
+    | { ok: true; delivered: "queued" | "resumed"; agentId: string }
+    | { ok: false; kind: "not_found" | "invalid"; error: string }
+  > {
+    if (!this.cfg.bgAgents) {
+      return { ok: false, kind: "not_found", error: "send_message is not available in this session" };
+    }
+    const entry = this.cfg.bgAgents.get(agent, sessionId);
+    if (!entry) return { ok: false, kind: "not_found", error: `no agent '${agent}' to message` };
+    const guard = guardAgentName(this.cfg.bgAgents, sessionId, agent, entry);
+    if (!guard.ok) return { ok: false, kind: "not_found", error: guard.error };
+    if (entry.status === "running") {
+      this.sendToThread(sessionId, entry.threadId, text);
+      return { ok: true, delivered: "queued", agentId: entry.agentId };
+    }
+    // terminal (completed/failed/stopped/timeout) → resume it in the background, exactly like the
+    // model's own send_message-to-a-finished-agent — see resumeThread's own doc comment for the
+    // full D1-D7 guard set (clean-termination repair, removed-worktree, policy no-widen, ...).
+    const meta = this.cfg.store.meta(sessionId);
+    const sel = this.cfg.provider.live?.() ?? { model: this.cfg.provider.model };
+    const result = await this.resumeThread({
+      sessionId,
+      resumeArg: agent,
+      prompt: text,
+      runInBackground: true,
+      meta,
+      model: sel.model,
+      reasoningEffort: sel.reasoningEffort,
+      depth: 0,
+      parentThreadId: MAIN_THREAD,
+      parentSignal: new AbortController().signal,
+    });
+    if (result.isError) return { ok: false, kind: "invalid", error: result.output };
+    return { ok: true, delivered: "resumed", agentId: entry.agentId };
+  }
+
+  /**
+   * child-transcript-view T1: the `agent.stop` RPC's engine half — a thin, synchronous mirror of
+   * the task_stop TOOL's own agent-stop branch (task-stop.ts), now user-reachable. Stopping a
+   * RUNNING agent aborts it and returns "stopped"; stopping an already-TERMINAL agent is not an
+   * error (idempotent, same as calling task_stop twice) — it just reports whatever status it
+   * already settled at. Only an unresolvable `agent` (unknown id/name, or a stale-name-guard
+   * failure) is an error.
+   */
+  stopAgent(sessionId: string, agent: string): { ok: true; status: AgentStatus } | { ok: false; error: string } {
+    if (!this.cfg.bgAgents) {
+      return { ok: false, error: "background agents are not available in this session" };
+    }
+    const entry = this.cfg.bgAgents.get(agent, sessionId);
+    if (!entry) return { ok: false, error: `no agent '${agent}' to stop` };
+    const guard = guardAgentName(this.cfg.bgAgents, sessionId, agent, entry);
+    if (!guard.ok) return { ok: false, error: guard.error };
+    if (entry.status === "running") {
+      this.cfg.bgAgents.stop(entry.agentId);
+      return { ok: true, status: "stopped" };
+    }
+    return { ok: true, status: entry.status };
   }
 
   private emit(sessionId: string, event: NewSessionEvent): SessionEvent {
@@ -2034,12 +2116,12 @@ export class AgentEngine {
         // checked/tracked — `to !== target.agentId` is exactly that (get() tries the agentId map
         // FIRST, so a hit where `to` equals the returned entry's own agentId was resolved BY ID).
         // A direct by-ID send bypasses this entirely and never updates the tracking map — a stable
-        // identifier that never goes stale needs no guard.
-        if (to !== target.agentId) {
-          const check = checkNameNotStale(this.cfg.bgAgents.firstReached(sessionId, to), target.agentId, to);
-          if (!check.ok) { sendMessageOutcomes.set(call.callId, { output: check.error, isError: true }); continue; }
-          this.cfg.bgAgents.recordReached(sessionId, to, target.agentId);
-        }
+        // identifier that never goes stale needs no guard. child-transcript-view T1: factored into
+        // `guardAgentName` (bg-agent-registry.ts), shared with task_stop and the thread.send/
+        // agent.stop RPCs (`sendToAgent`/`stopAgent` below), so this guard can't drift across its
+        // four call sites.
+        const guard = guardAgentName(this.cfg.bgAgents, sessionId, to, target);
+        if (!guard.ok) { sendMessageOutcomes.set(call.callId, { output: guard.error, isError: true }); continue; }
         if (target.status === "running") {
           this.sendToThread(sessionId, target.threadId, message);
           sendMessageOutcomes.set(call.callId, { output: `message delivered to '${to}'`, isError: false });

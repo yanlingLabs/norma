@@ -50,6 +50,18 @@
  *  land in the composer buffer). Neither that emitter patch nor the composer's own T3 raw side-
  *  channel ever matches \x03/\x04, so neither interferes with the exit hook.
  *
+ *  CHILD-TRANSCRIPT VIEW (child-transcript-view T3, CC sub-agents parity): ctrl+a (intercepted at
+ *  the same emitter patch, since the composer owns ctrl+a-as-Home) toggles roster SELECT MODE while
+ *  agents exist — the composer disables, ↑/↓ move a highlight over `<AgentList>` (its
+ *  `selectedIndex` prop), Enter opens the highlighted agent's CHILD VIEW, `x` stops a running row
+ *  (`agent.stop` RPC) or locally dismisses a finished one, Esc exits select mode. An open child
+ *  view swaps the transcript region to that agent's `childBlocks` under a pinned one-line header;
+ *  the composer re-enables with non-slash submits routed to `thread.send` (slash commands keep
+ *  running in the MAIN session — CC: "built-in commands still run in your main conversation") and
+ *  an empty-buffer Esc closes the view (`Composer.onEscEmpty`, outranking running-interrupt for
+ *  that one case). A pruned roster row auto-closes its view; `x`-dismissals live in App state only
+ *  (never the reducer's aggregates).
+ *
  *  RESUME REPLAY (Task 5): `resumeTargetSeq` (mount.ts ← main.ts, set only on the `norma resume <id>`
  *  Ink route, which attaches from seq 0 instead of the tip) drives a `resuming` flag — true from
  *  mount until an event with `seq >= resumeTargetSeq` is processed (or never true at all if the prop
@@ -66,14 +78,14 @@ import { Box, Text, useInput, useStdin } from "ink";
 import { Chalk } from "chalk";
 import wrapAnsi from "wrap-ansi";
 import { METHODS, type ApprovalPolicy, type SessionEvent } from "@norma/protocol";
-import { initialState, reduce, type AgentRow, type LocalEvent, type PendingCard, type TuiState } from "./state";
+import { initialState, reduce, type AgentRow, type Block, type LocalEvent, type PendingCard, type TuiState } from "./state";
 import { activeTurnLines, makeFlattenCache } from "./flatten-blocks";
 import { scrollBy, scrollToBottom, scrollToTop, viewportSlice, type ViewportState } from "./viewport";
 import { collapseCompleted, sortTasksForDisplay, type TaskRow } from "../task-display";
 import { renderWithCursor, type InputState } from "./input-model";
 import { Spinner } from "./spinner";
 import { TaskList } from "./task-list";
-import { AgentList } from "./agent-list";
+import { AgentList, FINISH_LABEL } from "./agent-list";
 import { Footer, type ExitKey } from "./footer";
 import { Composer } from "./composer";
 import { PendingCards, type AnswerPayload } from "./pending-cards";
@@ -97,6 +109,12 @@ export interface AppClient {
   askUserRespond(params: { sessionId: string; callId: string; answers: Record<string, string>; notes?: Record<string, string> }): unknown;
   planRespond(params: { sessionId: string; callId: string; approved: boolean; autoAccept?: boolean; feedback?: string }): unknown;
   request(method: string, params?: unknown): unknown;
+  /** child-transcript-view T3: the two typed members (unlike the `unknown`-returning callbacks
+   *  above) — App reads `delivered`/`status` off the results to render feedback notes. Declared
+   *  as the STRUCTURAL subset App consumes; the real `NormaClient.sendToThread`/`agentStop`
+   *  results (which also carry `ok: true`) are assignable as-is. */
+  sendToThread(sessionId: string, agent: string, text: string): Promise<{ delivered: "queued" | "resumed"; agentId: string }>;
+  agentStop(sessionId: string, agent: string): Promise<{ status: string }>;
 }
 
 /** Phase 3d T2 — everything the reducer's `dispatch` can be fed: every real wire `SessionEvent`
@@ -149,6 +167,26 @@ function welcomeLines(version: string, model: string, cwd: string): string[] {
     "",
   ];
 }
+
+/** Child-view header (child-transcript-view T3) — the ONE line pinned above the transcript
+ *  viewport while a child view is open: `agent <name|agentId> — <status/finish> · esc back`. Styled
+ *  per the welcome banner's idiom just above (accent-bold identity, dim chrome, fixed-level Chalk
+ *  for the same non-TTY reason). The identity slot is the child's re-taskable `name` when the
+ *  spawn mapping resolved one, else its threadId (== the bg registry's agentId for spawned
+ *  children) — deliberately the ADDRESSABLE handle, not `.label`'s display text, since this header
+ *  captions the view whose composer messages that exact handle. Hard-capped to the FIRST wrapped
+ *  row (wrap-ansi, the file's standard primitive) so `viewH`'s "subtract exactly 1" math can never
+ *  be violated by a long name on a narrow terminal. */
+function childHeaderLine(row: AgentRow, columns: number): string {
+  const ansi = new Chalk({ level: 3 });
+  const statusText = row.status === "done" ? (FINISH_LABEL[row.finish ?? "done"] ?? "Done") : row.status;
+  const styled = `${ansi.dim("agent ")}${ansi.hex(theme.accent).bold(row.name ?? row.threadId)}${ansi.dim(` — ${statusText} · esc back`)}`;
+  return wrapAnsi(styled, Math.max(1, columns), { hard: true, trim: false }).split("\n")[0]!;
+}
+
+/** Stable empty-blocks constant (child-transcript-view T3): the child-view flatten memo's
+ *  dependency is the child's block ARRAY REFERENCE — a fresh `?? []` per render would defeat it. */
+const NO_BLOCKS: Block[] = [];
 
 /** Rendered line count of `<TaskList>` for `tasks`: the count header (1) + the collapsed display
  *  rows + one overflow line when older completed rows were folded away. Logical-row model (assumes
@@ -329,6 +367,60 @@ export function App({
   // Scroll state for the windowed transcript (viewport.ts). Starts stuck to the bottom (auto-follow).
   const [vp, setVp] = useState<ViewportState>(() => scrollToBottom());
 
+  // ---- Live child-transcript view (child-transcript-view T3) -----------------------------------
+  // `agentSel` — roster select mode's highlight index into `visibleAgents` (null = off; toggled by
+  // ctrl+a, intercepted at the emitter patch below). `childViewId` — the open child view's
+  // threadId (null = main transcript). `dismissed` — locally-hidden FINISHED rows (`x` in select
+  // mode): App-local presentation state by design, never a reducer aggregate — the reducer's
+  // `agents` roster stays the honest wire-derived record (its own turn_started prune eventually
+  // drops the rows for real, and the sync effect below then forgets the stale ids).
+  const [agentSel, setAgentSel] = useState<number | null>(null);
+  const [childViewId, setChildViewId] = useState<string | null>(null);
+  const [dismissed, setDismissed] = useState<ReadonlySet<string>>(() => new Set());
+
+  const visibleAgents = useMemo(
+    () => (dismissed.size === 0 ? state.agents : state.agents.filter((a) => !dismissed.has(a.threadId))),
+    [state.agents, dismissed],
+  );
+
+  // Roster-shrink bookkeeping: select mode exits when nothing is left to select; an out-of-range
+  // highlight (a row above it vanished) folds back to the last row — same "fold a clamp back into
+  // state" convention as the viewport's own clampedVp effect below.
+  useEffect(() => {
+    if (agentSel === null) return;
+    if (visibleAgents.length === 0) setAgentSel(null);
+    else if (agentSel > visibleAgents.length - 1) setAgentSel(visibleAgents.length - 1);
+  }, [agentSel, visibleAgents.length]);
+
+  // Prune sync (design doc failure mode): a child view whose roster row vanished (state.ts's
+  // turn_started prune, which also drops its childBlocks) auto-closes back to the main view; and
+  // dismissed ids whose rows are gone are forgotten (memory hygiene — the same reason state.ts
+  // prunes childBlocks/childPendingTool alongside the rows).
+  useEffect(() => {
+    if (childViewId !== null && !state.agents.some((a) => a.threadId === childViewId)) setChildViewId(null);
+    setDismissed((prev) => {
+      if (prev.size === 0) return prev;
+      const kept = [...prev].filter((id) => state.agents.some((a) => a.threadId === id));
+      return kept.length === prev.size ? prev : new Set(kept);
+    });
+  }, [state.agents, childViewId]);
+
+  // Opening/closing a child view re-sticks the viewport to the bottom — a fresh view starts at its
+  // own tail, and returning to main resumes auto-follow (never a stale scroll offset from the
+  // OTHER view's line log).
+  useEffect(() => { setVp(scrollToBottom()); }, [childViewId]);
+
+  // The child view is "open" only while its roster row still exists — the row is the header/status
+  // source, and the auto-close effect above resets `childViewId` on the next tick anyway; gating
+  // the render on the row (not the id alone) just closes the one-render gap in between.
+  const childRow = childViewId !== null ? state.agents.find((a) => a.threadId === childViewId) : undefined;
+  const childOpen = childRow !== undefined;
+  const onCloseChildView = useCallback(() => setChildViewId(null), []);
+
+  // The select-mode highlight, render-clamped (the effect above folds the clamp into state a tick
+  // later; rendering meanwhile must never index past the end).
+  const selIdx = agentSel === null || visibleAgents.length === 0 ? null : Math.min(agentSel, visibleAgents.length - 1);
+
   // Whole-branch review item 2 (spec §5, previously dead): Home/End with an EMPTY composer jump the
   // transcript to its top/bottom. The composer's T3 raw side-channel is the single consumer of those
   // byte sequences, so it calls back through these instead of its cursor ops when its text is empty
@@ -367,7 +459,21 @@ export function App({
   // --- derived per render -------------------------------------------------------------------------
   const welcome = useMemo(() => welcomeLines(version, model, cwd), [version, model, cwd]);
   const bodyLines = cache.lines(state.committed, { columns, verbose, highlight });
-  const lineLog = welcome.concat(bodyLines);
+
+  // Child-view line log (child-transcript-view T3): the transcript region renders the OPEN child's
+  // own block list instead of `state.committed`. Flattened through a FRESH one-shot cache inside
+  // the memo — never the incremental main `cache` above: `childBlocks` is CAP-DROPPED (state.ts's
+  // CHILD_BLOCK_CAP drop-oldest), not append-only, so the incremental cache's index-keyed
+  // memoization would silently serve stale lines once the cap shifts indices. The memo's key is
+  // the child array's REFERENCE (the reducer returns a new array per append), so the full
+  // re-flatten (≤ 200 blocks) runs only when the child's transcript actually changed, never on
+  // clock ticks.
+  const childBlocksArr = childOpen ? state.childBlocks[childRow!.threadId] ?? NO_BLOCKS : null;
+  const childLines = useMemo(
+    () => (childBlocksArr === null ? null : makeFlattenCache().lines(childBlocksArr, { columns, verbose, highlight })),
+    [childBlocksArr, columns, verbose, highlight],
+  );
+  const lineLog = childLines ?? welcome.concat(bodyLines);
 
   const activeCap = Math.ceil(rows / 3);
   const dimToolDot = Math.floor(nowMs / 500) % 2 === 0;
@@ -375,12 +481,14 @@ export function App({
   const atVisible = atAll.slice(-activeCap); // JS tail-slice (HARD CONSTRAINT 2)
 
   const barRows = bottomBarRows({
-    tasksVisible, tasks: state.tasks, agents: state.agents,
+    tasksVisible, tasks: state.tasks, agents: visibleAgents,
     running: state.turnRunning, pending: state.pending, activeTurnRows: atVisible.length,
     columns, composerText: composerState.text, composerCursor: composerState.cursor, resuming,
     menuRows,
   });
-  const viewH = Math.max(1, (rows - 1) - barRows);
+  // The child-view header (childHeaderLine) is pinned ABOVE the viewport, outside both the line
+  // log and the bottom bar — subtract its one row here so the frame stays exactly rows-1 tall.
+  const viewH = Math.max(1, (rows - 1) - barRows - (childOpen ? 1 : 0));
 
   const { visible, vp: clampedVp } = viewportSlice(lineLog, vp, viewH);
 
@@ -390,6 +498,12 @@ export function App({
   const viewHRef = useRef(viewH);
   lineCountRef.current = lineLog.length;
   viewHRef.current = viewH;
+  // Same event-time-read pattern for the emitter patch's ctrl+a branch (child-transcript-view T3):
+  // whether any roster rows exist to select, and whether a pending card owns input right now.
+  const visibleAgentCountRef = useRef(visibleAgents.length);
+  const pendingRef = useRef<PendingCard | null>(state.pending);
+  visibleAgentCountRef.current = visibleAgents.length;
+  pendingRef.current = state.pending;
 
   // Fold back a clamp (e.g. verbose toggle shrank the log under a stored scrollTop) so state stays
   // consistent — no-op when viewportSlice returned the same reference.
@@ -397,11 +511,12 @@ export function App({
     if (clampedVp !== vp) setVp(clampedVp);
   }, [clampedVp, vp]);
 
-  // --- mouse: intercept SGR reports at the shared stdin input emitter, BEFORE any useInput consumer
+  // --- mouse + ctrl+a: intercept at the shared stdin input emitter, BEFORE any useInput consumer
   // (this App's or the composer's) sees them. Ink emits the RAW chunk (ESC intact) on
   // internal_eventEmitter 'input' (its App.js), so parseMouseInput's strict regex matches directly.
   // A wheel report scrolls ±3; every mouse report (wheel or button/motion) is dropped so no mouse
-  // bytes ever reach the composer buffer. Restored on unmount. ---
+  // bytes ever reach the composer buffer. ctrl+a (\x01) toggles roster select mode while agents
+  // exist (child-transcript-view T3 — see the branch's own comment inside). Restored on unmount. ---
   const { internal_eventEmitter: inputEmitter } = useStdin();
   useEffect(() => {
     const em = inputEmitter;
@@ -409,13 +524,25 @@ export function App({
     const orig = em.emit.bind(em) as (event: string, ...args: unknown[]) => boolean;
     const patched = (event: string, ...args: unknown[]): boolean => {
       if (event === "input") {
-        const m = parseMouseInput(String(args[0]));
+        const chunk = String(args[0]);
+        const m = parseMouseInput(chunk);
         if (m.isMouse) {
           if (m.wheel) {
             const delta = m.wheel.dir === "up" ? -3 : 3;
             setVp((cur) => scrollBy(cur, delta, lineCountRef.current, viewHRef.current));
           }
           return true; // swallow — no listener fires for this chunk
+        }
+        // child-transcript-view T3: ctrl+a (\x01) toggles roster select mode — intercepted HERE
+        // (the same pre-useInput surface the mouse reports use) because the composer already binds
+        // ctrl+a as cursor-Home: letting both a composer branch and an App useInput branch see the
+        // keystroke is exactly the double-fire the 3c whole-branch review banned, so the ONE actor
+        // is chosen before Ink dispatches at all. Swallowed ONLY while roster rows exist AND no
+        // pending card owns input — otherwise \x01 falls through untouched (empty roster keeps the
+        // composer's cursor-Home byte-identical; a pending card keeps today's input ownership).
+        if (chunk === "\x01" && pendingRef.current === null && visibleAgentCountRef.current > 0) {
+          setAgentSel((cur) => (cur === null ? 0 : null));
+          return true;
         }
       }
       return orig(event, ...args);
@@ -424,8 +551,54 @@ export function App({
     return () => { em.emit = orig as typeof em.emit; };
   }, [inputEmitter]);
 
-  const onSubmit = (text: string) => { void client.send(sessionId, text); };
-  const onSteer = (text: string) => { void client.steer(sessionId, text); };
+  // child-transcript-view T3: message the OPEN child view's agent (thread.send). Addressed by
+  // threadId — which IS the bg registry's stable agentId for spawned children — so the stale-name
+  // guard is bypassed by construction (a by-ID resolution always is). Feedback per `delivered`
+  // lands as a note IN THE CHILD VIEW via the threadId-routed local_note (state.ts): the typed
+  // text itself arrives as a wire user_message later (steer drain / resume echo), so only the
+  // delivery outcome is noted here — never a locally-faked user block that would duplicate the
+  // echo. RPC errors (unknown agent; T1's "invalid" = resume-refused, e.g. a no-history child)
+  // render as a note the same way — never a crash (design doc failure mode).
+  const sendToChild = (threadId: string, text: string) => {
+    const row = state.agents.find((a) => a.threadId === threadId);
+    const display = row?.name ?? row?.label ?? threadId;
+    client.sendToThread(sessionId, threadId, text)
+      .then((r) => dispatch({
+        type: "local_note", threadId,
+        text: r.delivered === "resumed"
+          ? `agent "${display}" resumed with your message`
+          : `message queued for agent "${display}" — delivered at its next round`,
+      }))
+      .catch((err: unknown) => dispatch({
+        type: "local_note", threadId,
+        text: `message to agent "${display}" failed: ${err instanceof Error ? err.message : String(err)}`,
+      }));
+  };
+
+  // child-transcript-view T3: stop a RUNNING roster row (select-mode `x`). The result note lands in
+  // the MAIN transcript (select mode is a main-view surface); the row's own status flip arrives via
+  // the wire (thread_completed stopReason "aborted") like every other roster update. agent.stop is
+  // idempotent daemon-side, so a race with the child finishing just reports the terminal status.
+  const stopAgent = (row: AgentRow) => {
+    const display = row.name ?? row.label;
+    client.agentStop(sessionId, row.threadId)
+      .then((r) => dispatch({ type: "local_note", text: `agent "${display}" ${r.status === "stopped" ? "stopped" : `already ${r.status}`}` }))
+      .catch((err: unknown) => dispatch({ type: "local_note", text: `agent "${display}" stop failed: ${err instanceof Error ? err.message : String(err)}` }));
+  };
+
+  // child-transcript-view T3 (CC parity): while a child view is open, BOTH the submit and steer
+  // paths route the typed text to THAT agent ("follow-up messages go to that agent") — a running
+  // MAIN turn changes nothing about where the text goes. Slash input never reaches either path
+  // (composer's parseSlashInput branch → onRunCommand → the MAIN session, unchanged — "built-in
+  // commands still run in your main conversation").
+  const onSubmit = (text: string) => {
+    if (childOpen) { sendToChild(childRow!.threadId, text); return; }
+    void client.send(sessionId, text);
+  };
+  const onSteer = (text: string) => {
+    if (childOpen) { sendToChild(childRow!.threadId, text); return; }
+    void client.steer(sessionId, text);
+  };
   // idle-Esc parity: no-op while nothing is running (legacy's idle readLine swallowed Esc).
   const onInterrupt = () => { if (state.turnRunning) void client.interrupt(sessionId); };
   const onCyclePolicy = () => {
@@ -457,6 +630,35 @@ export function App({
       // here too so it never triggers a key branch below. Scrolling is handled by the patch, not here.
       const m = parseMouseInput(input.startsWith("\x1b") ? input : `\x1b${input}`);
       if (m.isMouse) return;
+
+      // child-transcript-view T3 — roster select mode owns ↑/↓/Enter/x/Esc while active. The
+      // composer is DISABLED for select mode's whole duration (see its `disabled` prop below), so
+      // none of these five ever double-fire against history-nav/submit/insert/interrupt — the one
+      // actor per key. Every OTHER key deliberately falls through to the scroll/toggle bindings
+      // below (PgUp/PgDn/ctrl+u/o/t all keep working mid-select), and ctrl+C/ctrl+D stay owned by
+      // the always-active exit hook as ever.
+      if (selIdx !== null) {
+        const row = visibleAgents[selIdx];
+        if (key.upArrow) { setAgentSel(Math.max(0, selIdx - 1)); return; }
+        if (key.downArrow) { setAgentSel(Math.min(visibleAgents.length - 1, selIdx + 1)); return; }
+        if (key.return) {
+          // Enter opens the selected agent's child view (CC parity) and leaves select mode — the
+          // composer re-enables, now routing non-slash submits to this agent.
+          if (row) { setChildViewId(row.threadId); setAgentSel(null); }
+          return;
+        }
+        if (input === "x" && !key.ctrl && !key.meta) {
+          // x: stop a running row (agent.stop RPC — roster status updates arrive via events), or
+          // locally dismiss a finished one (hide from the roster; select mode stays on, the clamp
+          // effect re-targets the highlight).
+          if (row) {
+            if (row.status === "done") setDismissed((prev) => new Set(prev).add(row.threadId));
+            else stopAgent(row);
+          }
+          return;
+        }
+        if (key.escape) { setAgentSel(null); return; }
+      }
 
       const len = lineCountRef.current;
       const vh = viewHRef.current;
@@ -508,6 +710,10 @@ export function App({
 
   return (
     <Box flexDirection="column" height={rows - 1}>
+      {/* child-transcript-view T3: the pinned one-line header captioning the open child view —
+          rendered OUTSIDE the scrolling viewport (always visible, unlike the welcome banner which
+          scrolls off) and pre-counted in viewH's math above. */}
+      {childOpen ? <Text>{childHeaderLine(childRow!, columns)}</Text> : null}
       <Box flexGrow={1} flexDirection="column" overflow="hidden">
         {visible.map((line, i) => (
           <Text key={i}>{line.length > 0 ? line : " "}</Text>
@@ -532,7 +738,10 @@ export function App({
           <Composer
             running={state.turnRunning}
             policy={policy}
-            disabled={!!state.pending}
+            // Select mode disables the composer wholesale (child-transcript-view T3) — its five
+            // keys (↑/↓/Enter/x/Esc) belong to the App's select branch alone while active; the
+            // buffer/cursor are preserved untouched for when select mode exits.
+            disabled={!!state.pending || selIdx !== null}
             onSubmit={onSubmit}
             onSteer={onSteer}
             onInterrupt={onInterrupt}
@@ -547,10 +756,13 @@ export function App({
             columns={columns}
             fileIndex={fileIndex}
             onNeedFileIndex={onNeedFileIndex}
+            // Passed ONLY while a child view is open: an empty-buffer Esc then closes the view
+            // (back to main) instead of any other Esc semantics — see composer.tsx's prop doc.
+            onEscEmpty={childOpen ? onCloseChildView : undefined}
           />
         )}
-        {state.agents.length > 0 ? <AgentList agents={state.agents} nowMs={nowMs} /> : null}
-        <Footer policy={policy} running={state.turnRunning} agents={state.agents} exitArmed={exitArmedKey} />
+        {visibleAgents.length > 0 ? <AgentList agents={visibleAgents} nowMs={nowMs} selectedIndex={selIdx ?? undefined} /> : null}
+        <Footer policy={policy} running={state.turnRunning} agents={visibleAgents} exitArmed={exitArmedKey} />
       </Box>
     </Box>
   );

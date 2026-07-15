@@ -1,7 +1,11 @@
 /** `<Footer>` (Phase 3b Task 5; Phase 3c Task 5 — exit-armed override) — the CC-shaped single dim
  *  hint line beneath the composer: an approval-policy mode indicator (plan/auto, colored per
  *  `theme.planMode`/`theme.autoAccept`), an `esc to interrupt` hint while a turn runs, and an
- *  agents pill (`N agent(s) · ctrl+t`) when any subagents are live — segments joined with `" · "`.
+ *  agents pill (`N agent(s) · ctrl+a`) when any subagents are live — segments joined with `" · "`.
+ *  Live child-transcript view T3: the pill's hint changed from `ctrl+t` to `ctrl+a` — `ctrl+t`
+ *  never opened/selected an agent, it toggles the (unrelated) task-list view; the roster's own
+ *  select-mode toggle (app.tsx) is `ctrl+a`, so this is a truthfulness fix, not a rebind (`ctrl+t`
+ *  keeps its existing task-list behavior, unchanged, just no longer misattributed here).
  *  When none of those render, a fallback `? for shortcuts · shift+tab to cycle modes` hint keeps
  *  the line non-empty (cc-ui-study-chrome.md §1's `PromptInputFooterLeftSide` empty-state hint,
  *  adapted; Phase 3d T4 adds the `? for shortcuts` half, pointing at the composer's own `?`-on-
@@ -63,7 +67,7 @@ export function Footer({ policy, running, agents, exitArmed }: FooterProps) {
     const noun = agents.length === 1 ? "agent" : "agents";
     segments.push(
       <Text key="agents">
-        {agents.length} {noun} · ctrl+t
+        {agents.length} {noun} · ctrl+a
       </Text>,
     );
   }

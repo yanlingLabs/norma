@@ -9,7 +9,7 @@ import {
   SessionSteerParams, SessionInterruptParams, SessionCompactParams, SkillsListParams, McpListParams,
   SkillsReadParams, SkillsWriteParams, SkillsDeleteParams,
   PluginsListParams, AskUserRespondParams, TaskListParams, PlanRespondParams, SessionSetPolicyParams,
-  ThreadListParams,
+  ThreadListParams, ThreadSendParams, AgentStopParams,
   PeripheralLeaseParams, PeripheralRenewParams, PeripheralReleaseParams, PeripheralAdvertiseParams,
   PeripheralRevokeParams, PeripheralRespondParams, DaemonStatusParams, EngineActivityParams, QuotaStateParams,
   TrustListParams, TrustRemoveParams, PluginRevokeTokenParams, PluginRestartParams,
@@ -669,6 +669,29 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       case METHODS.threadList: {
         const p = parseParams(ThreadListParams, params);
         return { ok: true, threads: opts.engine?.threadsFor(p.sessionId) ?? [] };
+      }
+      // ---------------------------------------------------------------------------------------
+      // Live child-transcript view T1 (design doc "Wire"): thread.send / agent.stop — thin RPCs
+      // over AgentEngine.sendToAgent/stopAgent, which mirror the send_message tool bridge /
+      // task_stop tool's own resolve+dispatch logic exactly (see those methods' doc comments in
+      // engine.ts). No engine → typed INTERNAL RpcFailure (same "typed no-op/error, never a
+      // crash" precedent as skills.read/write/delete above) rather than a silent no-op — unlike
+      // session.steer/interrupt's soft `{ok:true, injected:false}` degrade, there is nothing
+      // meaningful to report back for "message an agent" with no engine to hold one.
+      // ---------------------------------------------------------------------------------------
+      case METHODS.threadSend: {
+        const p = parseParams(ThreadSendParams, params);
+        if (!opts.engine) throw new RpcFailure(ERR.INTERNAL, "background agents are not available on this server (no engine configured)");
+        const result = await opts.engine.sendToAgent(p.sessionId, p.agent, p.text);
+        if (!result.ok) throw new RpcFailure(result.kind === "not_found" ? ERR.NOT_FOUND : ERR.INVALID_PARAMS, result.error);
+        return { ok: true, delivered: result.delivered, agentId: result.agentId };
+      }
+      case METHODS.agentStop: {
+        const p = parseParams(AgentStopParams, params);
+        if (!opts.engine) throw new RpcFailure(ERR.INTERNAL, "background agents are not available on this server (no engine configured)");
+        const result = opts.engine.stopAgent(p.sessionId, p.agent);
+        if (!result.ok) throw new RpcFailure(ERR.NOT_FOUND, result.error);
+        return { ok: true, status: result.status };
       }
       case METHODS.planRespond: {
         const p = parseParams(PlanRespondParams, params);

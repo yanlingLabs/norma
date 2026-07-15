@@ -211,6 +211,18 @@ export interface ComposerProps {
    *  idempotent — see its doc), but guarding here too avoids a pointless extra call on every
    *  subsequent "@". Optional so legacy call sites are unaffected. */
   onNeedFileIndex?: () => void;
+  /** child-transcript-view T3: when PROVIDED, an Esc pressed against an EMPTY buffer routes here
+   *  and nothing else runs — App passes it ONLY while a child-transcript view is open, wiring it
+   *  to "close the view, back to main". Presence-gated (same convention as `onScrollTop`/
+   *  `onScrollBottom`'s empty-text Home/End routing above: one owner per key, chosen by the App).
+   *  Deliberately checked BEFORE precedence #1's running-interrupt: closing an open child view
+   *  outranks interrupting the MAIN turn on that keystroke — the footer's "esc to interrupt"
+   *  applies to the main view the user is returning to, and interrupting a running main turn as a
+   *  side effect of leaving a child view would be a destructive surprise. Empty-buffer-only: with
+   *  text in the buffer every existing Esc rule (menu-close, running-interrupt, double-esc-clear)
+   *  is byte-identical, provided or not (a menu can't even be open on an empty buffer — both
+   *  predicates require text). Omitted → all Esc semantics exactly as before. */
+  onEscEmpty?: () => void;
 }
 
 export function Composer({
@@ -233,6 +245,7 @@ export function Composer({
   columns = 80,
   fileIndex,
   onNeedFileIndex,
+  onEscEmpty,
 }: ComposerProps) {
   // `policy` stays a prop (callers/tests still pass it; `<Footer>`, a sibling, is the one that
   // renders it) — this component no longer renders it directly, matching `task-list.tsx`'s
@@ -473,6 +486,15 @@ export function Composer({
       }
 
       if (k === "esc") {
+        // Precedence #0 (child-transcript-view T3): an EMPTY buffer with `onEscEmpty` provided
+        // (App passes it only while a child-transcript view is open) routes the whole keystroke
+        // there — see the prop's doc comment for why this deliberately outranks the running-
+        // interrupt below. Never taken with text in the buffer (or when the prop is absent), so
+        // every pre-existing Esc rule is byte-identical outside an open child view.
+        if (state.text.length === 0 && onEscEmpty) {
+          onEscEmpty();
+          return;
+        }
         // Precedence #1 (UNCHANGED from 3a/3b): a running turn always interrupts on Esc, no matter
         // what's in the buffer.
         if (running) {

@@ -127,7 +127,7 @@ describe("helpText", () => {
     for (const key of [
       "enter send", "esc interrupt", "Esc-Esc clear", "shift+tab cycle modes", "history",
       "PgUp/PgDn scroll", "ctrl+u half-page up", "Home/End", "ctrl+o expand outputs",
-      "ctrl+t tasks", "ctrl+c/ctrl+d", "/ commands", "@ files",
+      "ctrl+t tasks", "ctrl+a agents", "ctrl+c/ctrl+d", "/ commands", "@ files",
     ]) {
       expect(text).toContain(key);
     }

@@ -39,16 +39,16 @@ describe("Footer (e, f, g)", () => {
     expect(lastFrame() ?? "").toContain("esc to interrupt");
   });
 
-  test("(g) 2 agents shows '2 agents · ctrl+t'", () => {
+  test("(g) 2 agents shows '2 agents · ctrl+a'", () => {
     const { lastFrame } = render(
       <Footer policy="ask" running={false} agents={[agent("a"), agent("b")]} />,
     );
-    expect(lastFrame() ?? "").toContain("2 agents · ctrl+t");
+    expect(lastFrame() ?? "").toContain("2 agents · ctrl+a");
   });
 
-  test("1 agent is singular: '1 agent · ctrl+t'", () => {
+  test("1 agent is singular: '1 agent · ctrl+a'", () => {
     const { lastFrame } = render(<Footer policy="ask" running={false} agents={[agent("a")]} />);
-    expect(lastFrame() ?? "").toContain("1 agent · ctrl+t");
+    expect(lastFrame() ?? "").toContain("1 agent · ctrl+a");
   });
 
   test("fallback: no mode/running/agents renders EXACTLY '? for shortcuts · shift+tab to cycle modes' (phase 3d T4)", () => {
@@ -88,7 +88,7 @@ describe("Footer (e, f, g)", () => {
     const frame = lastFrame() ?? "";
     const modeIdx = frame.indexOf("plan mode on (shift+tab to cycle)");
     const interruptIdx = frame.indexOf("esc to interrupt");
-    const agentsIdx = frame.indexOf("1 agent · ctrl+t");
+    const agentsIdx = frame.indexOf("1 agent · ctrl+a");
     expect(modeIdx).toBeGreaterThanOrEqual(0);
     expect(interruptIdx).toBeGreaterThan(modeIdx);
     expect(agentsIdx).toBeGreaterThan(interruptIdx);

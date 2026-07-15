@@ -71,6 +71,45 @@ final class MethodWrapperTests: XCTestCase {
         }
     }
 
+    /// child-transcript-view T1: `thread.send`/`agent.stop` wrappers — proves the method/param
+    /// names and decodes both outcome shapes (`delivered:"queued"|"resumed"`, plus `agent.stop`'s
+    /// status string), mirroring `testRespondersAndControls`'s method/param-shape-only style above
+    /// (no typed outcome union here, unlike the plugin-lifecycle wrappers below — see this file's
+    /// `sendToThread`/`agentStop` doc comments).
+    func testThreadSendAndAgentStopWrappers() async throws {
+        let (client, t) = try await connected()
+
+        let (sendReq, queued) = try await roundTrip(t, sentIndex: 1,
+            result: #"{"ok":true,"delivered":"queued","agentId":"ag_1"}"#
+        ) { try await client.sendToThread(sessionId: "s_1", agent: "worker", text: "keep going") }
+        XCTAssertEqual(sendReq["method"] as? String, "thread.send")
+        let sendParams = sendReq["params"] as? [String: Any]
+        XCTAssertEqual(sendParams?["sessionId"] as? String, "s_1")
+        XCTAssertEqual(sendParams?["agent"] as? String, "worker")
+        XCTAssertEqual(sendParams?["text"] as? String, "keep going")
+        XCTAssertEqual(queued.delivered, "queued")
+        XCTAssertEqual(queued.agentId, "ag_1")
+
+        let (_, resumed) = try await roundTrip(t, sentIndex: 2,
+            result: #"{"ok":true,"delivered":"resumed","agentId":"ag_2"}"#
+        ) { try await client.sendToThread(sessionId: "s_1", agent: "ag_2", text: "one more thing") }
+        XCTAssertEqual(resumed.delivered, "resumed")
+
+        let (stopReq, stopped) = try await roundTrip(t, sentIndex: 3,
+            result: #"{"ok":true,"status":"stopped"}"#
+        ) { try await client.agentStop(sessionId: "s_1", agent: "worker") }
+        XCTAssertEqual(stopReq["method"] as? String, "agent.stop")
+        let stopParams = stopReq["params"] as? [String: Any]
+        XCTAssertEqual(stopParams?["sessionId"] as? String, "s_1")
+        XCTAssertEqual(stopParams?["agent"] as? String, "worker")
+        XCTAssertEqual(stopped, "stopped")
+
+        let (_, finishedStatus) = try await roundTrip(t, sentIndex: 4,
+            result: #"{"ok":true,"status":"completed"}"#
+        ) { try await client.agentStop(sessionId: "s_1", agent: "worker") }
+        XCTAssertEqual(finishedStatus, "completed")
+    }
+
     func testListDecoders() async throws {
         let (client, t) = try await connected()
         let (_, sessions) = try await roundTrip(t, sentIndex: 1, result: #"{"sessions":[{"sessionId":"s_1","scope":"global","createdAt":5,"lastSeq":9}]}"#) {
