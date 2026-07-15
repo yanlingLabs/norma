@@ -498,7 +498,7 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
     // "notification" happens; the CLI just needs a visible trace in the transcript, same class as
     // the CU lease notes above.
     case "notification_requested": {
-      const text = `🔔 ${str(e.title)}: ${str(e.message)}`;
+      const text = `notification: ${str(e.title)}: ${str(e.message)}`;
       return { ...s, committed: [...s.committed, { kind: "note", text }] };
     }
 

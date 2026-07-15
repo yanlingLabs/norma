@@ -503,7 +503,7 @@ describe("state.ts — note one-liners match main.ts's wording (bg-task/worktree
   test("notification_requested", () => {
     let s = initialState();
     s = reduce(s, { type: "notification_requested", threadId: "main", title: "Norma", message: "migration finished" }, T0);
-    expect(s.committed.at(-1)).toEqual({ kind: "note", text: "🔔 Norma: migration finished" });
+    expect(s.committed.at(-1)).toEqual({ kind: "note", text: "notification: Norma: migration finished" });
   });
 
   test("lease_granted / lease_lost (Phase 5 CU) — CU control notes with friendly class labels", () => {
