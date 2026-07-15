@@ -138,4 +138,37 @@ d("BackgroundTaskRegistry", () => {
     expect(() => reg.outputFile("s1", "bg_nope")).toThrow();
     reg.kill("s1", id);
   });
+
+  // Parity-tail review fix: the tee is batched (OutputCoalescer) and byte-capped — on hitting
+  // the cap, ONE "[output file capped at ...]" note line lands and the tee stops for good, while
+  // the ring (bash_output's view) keeps delivering everything past the cap.
+  test("file tee caps: one note line, later output not teed, ring unaffected", async () => {
+    const cwd = realDir();
+    const reg = new BackgroundTaskRegistry({
+      emit: () => {},
+      spawnCtx: () => ({ cwd, roots: [cwd], tmpDir: sessionTmpDir("s_fcap") }),
+      killGraceMs: 300, fileCap: 8, // tiny: the first chunk alone crosses it
+    });
+    // two temporally separated chunks: the first (16 bytes) crosses the 8-byte cap, the second
+    // must land in the ring but never the file:
+    const id = reg.start("s1", "printf 'AAAAAAAAAAAAAAAA'; sleep 0.4; printf 'ZZZZ'");
+    await sleep(1000); // both chunks emitted + task exited (dispose flushed)
+    const onDisk = readFileSync(reg.outputFile("s1", id), "utf8");
+    expect(onDisk).toContain("AAAA"); // the crossing chunk still flushed in full (generous cap)
+    expect(onDisk.split("[output file capped at").length - 1).toBe(1); // exactly one note line
+    expect(onDisk).not.toContain("ZZZZ"); // tee stopped after the cap
+    const { chunk, status } = reg.read("s1", id);
+    expect(chunk).toContain("ZZZZ"); // ring/bash_output keep working past the file cap
+    expect(status).toBe("exited");
+  });
+
+  test("zero-output task: the output file exists (empty) as soon as the task starts", async () => {
+    const cwd = realDir();
+    const { reg } = makeRegistry(cwd);
+    const id = reg.start("s1", "true");
+    const file = reg.outputFile("s1", id);
+    expect(existsSync(file)).toBe(true); // pre-created — the spawn result's path is always readable
+    await sleep(400);
+    expect(readFileSync(file, "utf8")).toBe("");
+  });
 });

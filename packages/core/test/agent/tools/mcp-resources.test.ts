@@ -1,9 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, spyOn } from "bun:test";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdtempSync, realpathSync } from "node:fs";
 import { ToolRegistry, type ToolContext } from "../../../src/agent/tools/registry";
-import { registerMcpResourceTools } from "../../../src/agent/tools/mcp-resources";
+import { registerMcpResourceTools, renderResourceContent } from "../../../src/agent/tools/mcp-resources";
 import { McpManager } from "../../../src/agent/mcp/manager";
 import { TrustStore } from "../../../src/agent/trust";
 
@@ -131,5 +131,56 @@ describe.if(isMac)("list_mcp_resources / read_mcp_resource (CC parity — MCP re
     expect(out.isError).toBe(true);
     expect(out.output).toContain("unknown MCP server");
     mgr.stopAll();
+  });
+});
+
+// Parity-tail review fix: the blob render path is size-capped at the shared bridge seam
+// (attachImageGuarded / IMAGE_MAX_BYTES) and NEVER decodes the base64 — byte counts come from
+// length math (base64DecodedBytes). Tested directly against renderResourceContent (exported for
+// this, web.ts's ssrfGuard/htmlToText precedent) so the oversized case doesn't need a >27MB blob
+// pushed through the fake server's stdio JSON-RPC line protocol.
+describe("renderResourceContent (bridge-level image cap — no decode)", () => {
+  test("oversized image blob → [image omitted: ...] note, no attach, NO base64 decode", () => {
+    const blob = "A".repeat(28 * 1024 * 1024); // decodes (by length) to 21MB > the 20MB cap
+    const attached: string[] = [];
+    const fromSpy = spyOn(Buffer, "from");
+    try {
+      const out = renderResourceContent(
+        { uri: "fake://huge", mimeType: "image/png", blob },
+        ctx({ attachImage: (u) => attached.push(u), visionCapable: true }),
+      );
+      expect(out).toBe("[image omitted: 21.0MB exceeds 20.0MB]");
+      expect(attached).toEqual([]); // never staged
+      // the blob itself was never decoded (or copied into a Buffer at all):
+      expect(fromSpy.mock.calls.some((args) => args[0] === blob)).toBe(false);
+    } finally {
+      fromSpy.mockRestore();
+    }
+  });
+
+  test("oversized NON-image blob → plain binary summary (length-derived), no decode either", () => {
+    const blob = "A".repeat(28 * 1024 * 1024);
+    const fromSpy = spyOn(Buffer, "from");
+    try {
+      const out = renderResourceContent(
+        { uri: "fake://huge-bin", mimeType: "application/zip", blob },
+        ctx({ visionCapable: true }),
+      );
+      expect(out).toBe(`[binary application/zip, ${(28 * 1024 * 1024 * 3) / 4} bytes — base64 omitted]`);
+      expect(fromSpy.mock.calls.some((args) => args[0] === blob)).toBe(false);
+    } finally {
+      fromSpy.mockRestore();
+    }
+  });
+
+  test("normal-size image blob still attaches with the unchanged note", () => {
+    const blob = Buffer.from("tiny png bytes").toString("base64");
+    const attached: string[] = [];
+    const out = renderResourceContent(
+      { uri: "fake://small", mimeType: "image/png", blob },
+      ctx({ attachImage: (u) => attached.push(u), visionCapable: true }),
+    );
+    expect(out).toContain("The image follows this result as the next message.");
+    expect(attached).toEqual([`data:image/png;base64,${blob}`]);
   });
 });

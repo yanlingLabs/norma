@@ -629,6 +629,25 @@ describe("read: notebooks (.ipynb) (multimodal-read T1)", () => {
     expect(res.output).toContain("[image output omitted");
   });
 
+  // Parity-tail review fix: notebook image outputs ride attachImageGuarded — an output whose
+  // decoded size exceeds the shared 20MB IMAGE_MAX_BYTES cap is noted as omitted, never staged.
+  test("OVERSIZED image/png output (>20MB decoded) → [image omitted: ...] note, no attach", async () => {
+    const d = proj();
+    const b64 = "A".repeat(28 * 1024 * 1024); // decodes (by length) to 21MB > the 20MB cap
+    const cells = [{ cell_type: "code", source: ["show()"], outputs: [{ output_type: "display_data", data: { "image/png": b64 } }] }];
+    writeFileSync(join(d, "nb.ipynb"), nb(cells));
+    const attached: string[] = [];
+    const res = await makeRegistry().execute(
+      "read",
+      { path: "nb.ipynb" },
+      { cwd: d, roots: [d], sessionId: "s1", attachImage: (u) => attached.push(u), visionCapable: true },
+    );
+    expect(res.isError).toBe(false);
+    expect(res.output).toContain("[image omitted: 21.0MB exceeds 20.0MB]");
+    expect(res.output).not.toContain("attached as the next message");
+    expect(attached).toEqual([]); // never staged
+  });
+
   test("error outputs render ename/evalue/traceback", async () => {
     const d = proj();
     const cells = [

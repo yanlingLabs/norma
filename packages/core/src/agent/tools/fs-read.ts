@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { getDocumentProxy, extractText } from "unpdf";
 import { canonAncestor, resolveWithinAny } from "../paths";
 import type { ToolContext, ToolRegistry } from "./registry";
+import { IMAGE_MAX_BYTES, attachImageGuarded, humanSize } from "./attach-image";
 
 const LS_MAX_ENTRIES = 1000;
 
@@ -15,22 +16,17 @@ const DENY_MESSAGE = "this path is Norma's own credential store and is never rea
 //
 // `read` dispatches on the (lowercased) file extension. Images and PDFs/notebooks are handled by
 // the helpers below; everything else falls through to the original plain-text path unchanged.
+// IMAGE_MAX_BYTES + humanSize moved to attach-image.ts (parity-tail review): the size cap is now
+// shared with every other base64-image attach path (notebook outputs below, MCP resource blobs).
 
 const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".heic"]);
 const IMAGE_MIME: Record<string, string> = {
   ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
   ".webp": "image/webp", ".bmp": "image/bmp", ".tiff": "image/tiff", ".heic": "image/heic",
 };
-const IMAGE_MAX_BYTES = 20 * 1024 * 1024; // hard refusal cap (source file size)
 const IMAGE_RECOMPRESS_BYTES = 500 * 1024; // above this, re-encode even if dimensions are fine
 const IMAGE_MAX_DIM = 1600; // mirrors the CU screenshotMaxDim precedent (computer-use.ts)
 const IMAGE_JPEG_QUALITY = 80;
-
-function humanSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes}B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
-}
 
 /** Shells out to stock macOS `sips -g` to read pixel dimensions — no image-decoding dependency
  *  needed in-process. Throws a clean message (never a raw spawn/stderr blob) on failure. */
@@ -126,7 +122,10 @@ function nbCap(s: string): string {
 
 /** Renders one cell output. `image/png` outputs attach as a vision image (ctx.attachImage,
  *  gated purely on its OWN presence — the engine only wires it for a vision-capable model, so
- *  this can't disagree with the model's actual capability) or are honestly noted as omitted. */
+ *  this can't disagree with the model's actual capability) or are honestly noted as omitted.
+ *  The attach rides attachImageGuarded (parity-tail review): an output whose decoded size
+ *  exceeds IMAGE_MAX_BYTES renders the guard's "[image omitted: ...]" note instead — nothing
+ *  that large is ever staged into the model's input, from any attach path. */
 function nbRenderOutput(out: NbOutput, ctx: ToolContext): string {
   if (out.output_type === "stream") return nbCap(nbText(out.text));
   if (out.output_type === "execute_result" || out.output_type === "display_data") {
@@ -134,7 +133,8 @@ function nbRenderOutput(out: NbOutput, ctx: ToolContext): string {
     const png = data["image/png"];
     if (typeof png === "string") {
       if (ctx.attachImage) {
-        ctx.attachImage(`data:image/png;base64,${png}`);
+        const note = attachImageGuarded(ctx, { mime: "image/png", base64: png });
+        if (note) return note;
         return "[image output (image/png) — attached as the next message]";
       }
       return "[image output omitted — model cannot view images]";

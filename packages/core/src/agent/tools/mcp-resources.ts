@@ -2,14 +2,15 @@ import { z } from "zod";
 import type { ToolRegistry, ToolContext } from "./registry";
 import type { McpManager } from "../mcp/manager";
 import type { McpResourceInfo, McpResourceContent } from "../mcp/client";
+import { attachImageGuarded, base64DecodedBytes } from "./attach-image";
 
 /**
  * CC parity: `ListMcpResourcesTool` / `ReadMcpResourceTool` — two FIXED built-in tools (NOT
  * `mcp__<server>__<tool>` proxies, so they never ride `isExternalToolName`'s external-count
  * deferral trigger; they're plain built-ins that ride the SAME `deferred: true` mechanism as
- * Norma's other specialized built-ins — e.g. `schedule`, `notebook_edit`, `worktree` — per this
- * codebase's own broader-deferral precedent over CC's eager-fixed-catalogue norm (see
- * `norma-vs-cc-tools.md`; a deliberate, noted divergence, not an oversight).
+ * Norma's other specialized built-ins — e.g. `schedule`, `notebook_edit`, `worktree`. That
+ * broader-than-CC deferral (CC keeps its fixed catalogue eager) is a deliberate, noted
+ * divergence, consistent with how every comparable Norma built-in registers.
  *
  * CONDITIONAL REGISTRATION: CC registers these two tools only when at least one connected server
  * declares resources support. Norma's `ToolRegistry` has no per-tool "is this visible right now"
@@ -88,15 +89,21 @@ function renderServerSection(name: string, resources: McpResourceInfo[]): string
 /** Text verbatim (the registry's own 64KB MAX_OUTPUT still applies on top, exactly like any other
  *  tool output). Blob: binary summary UNLESS it's an image and the model can actually see it
  *  (`ctx.visionCapable` — the same CU-independent bridge multimodal-read's `read` tool rides),
- *  in which case it's attached via `ctx.attachImage` and the returned string never carries the
- *  base64 bytes (bypasses MAX_OUTPUT exactly like a CU screenshot / an image `read`). */
-function renderResourceContent(c: McpResourceContent, ctx: ToolContext): string {
+ *  in which case it rides `attachImageGuarded` (parity-tail review): the shared IMAGE_MAX_BYTES
+ *  cap applies, and an oversized blob renders the guard's "[image omitted: ...]" note WITHOUT
+ *  ever being decoded — all byte counts here come from `base64DecodedBytes` (length math), so an
+ *  arbitrarily large server-sent blob never costs a full Buffer decode just to be refused. When
+ *  the guard attaches, the returned string never carries the base64 bytes (bypasses MAX_OUTPUT
+ *  exactly like a CU screenshot / an image `read`). Exported for direct tests (web.ts's
+ *  ssrfGuard/htmlToText precedent). */
+export function renderResourceContent(c: McpResourceContent, ctx: ToolContext): string {
   if (typeof c.text === "string") return c.text;
   if (typeof c.blob === "string") {
     const mime = c.mimeType ?? "application/octet-stream";
-    const bytes = Buffer.from(c.blob, "base64").length;
+    const bytes = base64DecodedBytes(c.blob);
     if (mime.startsWith("image/") && ctx.visionCapable && ctx.attachImage) {
-      ctx.attachImage(`data:${mime};base64,${c.blob}`);
+      const note = attachImageGuarded(ctx, { mime, base64: c.blob });
+      if (note) return note;
       return `Image resource ${c.uri} (${mime}, ${bytes} bytes). The image follows this result as the next message.`;
     }
     return `[binary ${mime}, ${bytes} bytes — base64 omitted]`;
