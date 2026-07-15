@@ -244,6 +244,39 @@ export const ThreadListParams = z.object({ sessionId: z.string().min(1) });
 export const ThreadListResult = z.object({ ok: z.literal(true), threads: z.array(ThreadInfoSchema) });
 
 // ---------------------------------------------------------------------------------------------
+// Live child-transcript view T1 (design doc 2026-07-15-child-transcript-view-design.md, "Wire"):
+// two new harness-reachable RPCs over primitives the engine already had for the MODEL (the
+// send_message tool bridge / task_stop tool) — now reachable from a live UI so a user can message
+// or stop a running/finished background subagent directly, not just watch it. Both mirror those
+// bridges' exact resolve+dispatch logic (AgentEngine.sendToAgent/stopAgent, core/src/agent/
+// engine.ts) rather than duplicating it — see bg-agent-registry.ts's `guardAgentName` helper,
+// shared by all four call sites (the two tool bridges + these two RPCs' engine methods). No new
+// SessionEvent — the child's own events (assistant_message/tool_call/tool_result/user_message) are
+// already visible over session.attach; this just adds the two missing WRITE paths.
+// ---------------------------------------------------------------------------------------------
+
+export const ThreadSendParams = z.object({ sessionId: z.string(), agent: z.string().min(1), text: z.string().min(1) });
+/** `delivered`: `"queued"` — `agent` was RUNNING; `text` landed in its steer queue (drained at its
+ *  next round boundary — the running-target half `session.steer` already uses for the main
+ *  thread, `AgentEngine.sendToThread` for a child). `"resumed"` — `agent` was TERMINAL and was
+ *  just re-run in the background with `text` as its new prompt (the SAME `resumeThread` a model's
+ *  own send_message-to-a-finished-agent triggers, now user-initiated). `agentId` is always the
+ *  STABLE bg-agent-registry id — never the possibly-transient `agent` the caller may have
+ *  addressed by name — so a caller that sent by name can key its own state off something that
+ *  never goes stale. */
+export const ThreadSendResult = z.object({ ok: z.literal(true), delivered: z.enum(["queued", "resumed"]), agentId: z.string() });
+
+export const AgentStopParams = z.object({ sessionId: z.string(), agent: z.string().min(1) });
+/** Mirrors `BackgroundAgentRegistry.AgentStatus` (core/src/agent/bg-agent-registry.ts) field-for-
+ *  field — kept as a separate literal here (protocol can't import from core) same precedent as
+ *  `ThreadInfoSchema.status` above. Stopping an already-terminal agent is not an error (task_stop
+ *  tool parity, CC SDK `stop_task`/`/tasks` `x` parity): `status` reports whatever it already was
+ *  ("completed"/"failed"/"stopped"/"timeout"); a freshly-stopped RUNNING agent reports "stopped".
+ *  `"running"` never appears in a response — a running agent is always flipped to "stopped" by
+ *  this call, never left running. */
+export const AgentStopResult = z.object({ ok: z.literal(true), status: z.enum(["running", "completed", "failed", "stopped", "timeout"]) });
+
+// ---------------------------------------------------------------------------------------------
 // Peripheral lease v1 (Phase 2f, spec §A2) + dashboard read methods (spec Part B).
 // ---------------------------------------------------------------------------------------------
 
@@ -728,6 +761,8 @@ export const METHODS = {
   planRespond: "plan.respond",
   sessionSetPolicy: "session.setPolicy",
   threadList: "thread.list",
+  threadSend: "thread.send",
+  agentStop: "agent.stop",
   peripheralLease: "peripheral.lease",
   peripheralRenew: "peripheral.renew",
   peripheralRelease: "peripheral.release",

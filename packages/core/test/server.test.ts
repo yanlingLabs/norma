@@ -12,7 +12,8 @@ import { PluginStore } from "../src/agent/plugins";
 import { ToolRegistry } from "../src/agent/tools/registry";
 import { PluginSupervisor } from "../src/plugins/supervisor";
 import { PluginContribRegistry } from "../src/plugins/contrib";
-import type { Provider } from "../src/providers/types";
+import type { Provider, ProviderEvent } from "../src/providers/types";
+import { setup as setupAgentEngine } from "./agent/engine-spawn.test";
 
 /** Minimal raw test client speaking NDJSON JSON-RPC. */
 class TestClient {
@@ -578,6 +579,125 @@ describe("daemon IPC", () => {
     const list = await c.request(METHODS.threadList, { sessionId: created.sessionId });
     expect(list.result).toEqual({ ok: true, threads: [{ threadId: "main", status: "running" }] });
     c.close();
+  });
+
+  // -------------------------------------------------------------------------------------------
+  // child-transcript-view T1: thread.send / agent.stop. Unlike the `boot()`/`startDaemon` fixture
+  // above (whose `RunningDaemon` deliberately hides its AgentEngine/BackgroundAgentRegistry), these
+  // tests need direct access to both — to hand-register a RUNNING/TERMINAL bg-agent entry (the
+  // "if driving that e2e is heavy" allowance the design doc's Testing section calls for, same
+  // precedent as engine-resume.test.ts's own `bgAgents.register()`/`.complete()` fixtures) and to
+  // inspect the engine's private steer queue after a `thread.send`. `setupAgentEngine` (this
+  // file's own `setup()`, exported for engine-resume.test.ts already) builds a real AgentEngine +
+  // BackgroundAgentRegistry directly; this helper just wraps a bare IpcServer around that SAME
+  // instance, mirroring `bootPluginTestServer`'s "self-contained bare server" shape above.
+  // -------------------------------------------------------------------------------------------
+  async function bootAgentServer(script: ProviderEvent[][] = []): Promise<
+    ReturnType<typeof setupAgentEngine> & { socketPath: string; harnessToken: string; stop: () => void }
+  > {
+    const s = setupAgentEngine(script);
+    const home = mkdtempSync(join(tmpdir(), "norma-thread-send-"));
+    const socketPath = join(home, "core.sock");
+    const authority = new TokenAuthority(new FileSecretStore(join(home, "secrets.json")));
+    const tokens = await authority.ensureTokens();
+    const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store: s.store, hub: s.hub, engine: s.engine });
+    return { ...s, socketPath, harnessToken: tokens.harness, stop: () => { server.stop(); s.store.close(); } };
+  }
+
+  describe("thread.send / agent.stop (child-transcript-view T1)", () => {
+    test("thread.send to a RUNNING child → delivered:queued, text lands in the child's own steer queue", async () => {
+      const srv = await bootAgentServer();
+      srv.bgAgents.register({ agentId: "ag_worker", sessionId: srv.sessionId, threadId: "th_worker", name: "worker", abort: new AbortController() });
+
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "sender");
+      const res = await c.request(METHODS.threadSend, { sessionId: srv.sessionId, agent: "worker", text: "keep going" });
+      expect(res.result).toEqual({ ok: true, delivered: "queued", agentId: "ag_worker" });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((srv.engine as any).threadSteerQueue.get("th_worker")).toEqual(["keep going"]);
+      c.close();
+      srv.stop();
+    });
+
+    test("thread.send to a FINISHED child → delivered:resumed, agent transitions running then back to a terminal status", async () => {
+      const spawnNamed: ProviderEvent = {
+        type: "tool_call", callId: "s1", name: "spawn_agent",
+        argsJson: JSON.stringify({ prompt: "do the task", description: "task", name: "worker", run_in_background: false }),
+      };
+      const done = (reason: "end_turn" | "tool_calls"): ProviderEvent => ({ type: "done", stopReason: reason });
+      const text = (t: string): ProviderEvent[] => [{ type: "text_delta", delta: t }, done("end_turn")];
+
+      const srv = await bootAgentServer([
+        [spawnNamed, done("tool_calls")], // main round 0: sync spawn (run_in_background:false)
+        text("child done"),               // the child's own (sync) round + main's continuation clamp to this
+      ]);
+      await srv.engine.runTurn(srv.sessionId);
+      expect(srv.bgAgents.get("worker", srv.sessionId)?.status).toBe("completed");
+      const agentId = srv.bgAgents.get("worker", srv.sessionId)!.agentId;
+
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "sender");
+      const res = await c.request(METHODS.threadSend, { sessionId: srv.sessionId, agent: "worker", text: "one more thing" });
+      expect(res.result).toEqual({ ok: true, delivered: "resumed", agentId });
+      // reopen() flips it back to running before the detached run kicks off, but the FakeProvider's
+      // clamped script resolves near-instantly — poll rather than assert an exact intermediate state.
+      for (let i = 0; i < 200 && srv.bgAgents.get("worker", srv.sessionId)?.status === "running"; i++) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      expect(srv.bgAgents.get("worker", srv.sessionId)?.status).toBe("completed");
+      c.close();
+      srv.stop();
+    });
+
+    test("thread.send to an unknown agent → NOT_FOUND RpcFailure", async () => {
+      const srv = await bootAgentServer();
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "sender");
+      const res = await c.request(METHODS.threadSend, { sessionId: srv.sessionId, agent: "ghost", text: "hi" });
+      expect(res.error.code).toBe(ERR.NOT_FOUND);
+      expect(res.error.message).toContain("ghost");
+      c.close();
+      srv.stop();
+    });
+
+    test("agent.stop on a RUNNING agent → aborts it and reports status:stopped", async () => {
+      const srv = await bootAgentServer();
+      const abort = new AbortController();
+      srv.bgAgents.register({ agentId: "ag_worker", sessionId: srv.sessionId, threadId: "th_worker", name: "worker", abort });
+
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "stopper");
+      const res = await c.request(METHODS.agentStop, { sessionId: srv.sessionId, agent: "worker" });
+      expect(res.result).toEqual({ ok: true, status: "stopped" });
+      expect(abort.signal.aborted).toBe(true);
+      expect(srv.bgAgents.get("worker", srv.sessionId)?.status).toBe("stopped");
+      c.close();
+      srv.stop();
+    });
+
+    test("agent.stop on an already-FINISHED agent → not an error, reports its current status", async () => {
+      const srv = await bootAgentServer();
+      srv.bgAgents.register({ agentId: "ag_worker", sessionId: srv.sessionId, threadId: "th_worker", name: "worker", abort: new AbortController() });
+      srv.bgAgents.complete("ag_worker", { ok: true, result: "done" });
+
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "stopper");
+      const res = await c.request(METHODS.agentStop, { sessionId: srv.sessionId, agent: "worker" });
+      expect(res.result).toEqual({ ok: true, status: "completed" });
+      c.close();
+      srv.stop();
+    });
+
+    test("agent.stop on an unknown agent → NOT_FOUND RpcFailure", async () => {
+      const srv = await bootAgentServer();
+      const c = await TestClient.connect(srv.socketPath);
+      await c.hello(srv.harnessToken, "stopper");
+      const res = await c.request(METHODS.agentStop, { sessionId: srv.sessionId, agent: "ghost" });
+      expect(res.error.code).toBe(ERR.NOT_FOUND);
+      expect(res.error.message).toContain("ghost");
+      c.close();
+      srv.stop();
+    });
   });
 
   test("without a provider, sessions behave as Phase 0 (echo only, no agent events)", async () => {

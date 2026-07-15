@@ -47,6 +47,10 @@ import {
   ThreadInfoSchema,
   ThreadListParams,
   ThreadListResult,
+  ThreadSendParams,
+  ThreadSendResult,
+  AgentStopParams,
+  AgentStopResult,
   PeripheralLeaseParams,
   PeripheralLeaseResult,
   PeripheralRenewParams,
@@ -531,6 +535,41 @@ describe("thread.list schema", () => {
     const r = ThreadListResult.parse({ ok: true, threads: [info] });
     expect(r.threads).toHaveLength(1);
     expect(METHODS.threadList).toBe("thread.list");
+  });
+});
+
+describe("thread.send / agent.stop (child-transcript-view T1)", () => {
+  test("METHODS carries both verbs", () => {
+    expect(METHODS.threadSend).toBe("thread.send");
+    expect(METHODS.agentStop).toBe("agent.stop");
+  });
+
+  test("thread.send params: sessionId/agent/text all required non-empty", () => {
+    const p = ThreadSendParams.parse({ sessionId: "s1", agent: "worker", text: "keep going" });
+    expect(p).toEqual({ sessionId: "s1", agent: "worker", text: "keep going" });
+    expect(() => ThreadSendParams.parse({ sessionId: "s1", agent: "", text: "x" })).toThrow();
+    expect(() => ThreadSendParams.parse({ sessionId: "s1", agent: "worker", text: "" })).toThrow();
+    expect(() => ThreadSendParams.parse({ sessionId: "s1", agent: "worker" })).toThrow();
+  });
+
+  test("thread.send result: delivered is queued|resumed, agentId round-trips", () => {
+    const queued = ThreadSendResult.parse({ ok: true, delivered: "queued", agentId: "ag_1" });
+    expect(queued.delivered).toBe("queued");
+    const resumed = ThreadSendResult.parse({ ok: true, delivered: "resumed", agentId: "ag_2" });
+    expect(resumed.delivered).toBe("resumed");
+    expect(() => ThreadSendResult.parse({ ok: true, delivered: "sent", agentId: "ag_1" })).toThrow();
+  });
+
+  test("agent.stop params: sessionId/agent required non-empty", () => {
+    expect(AgentStopParams.parse({ sessionId: "s1", agent: "worker" })).toEqual({ sessionId: "s1", agent: "worker" });
+    expect(() => AgentStopParams.parse({ sessionId: "s1", agent: "" })).toThrow();
+  });
+
+  test("agent.stop result: status is the full AgentStatus enum (running included, though the handler never returns it)", () => {
+    for (const status of ["running", "completed", "failed", "stopped", "timeout"] as const) {
+      expect(AgentStopResult.parse({ ok: true, status }).status).toBe(status);
+    }
+    expect(() => AgentStopResult.parse({ ok: true, status: "bogus" })).toThrow();
   });
 });
 

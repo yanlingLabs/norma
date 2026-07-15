@@ -100,6 +100,28 @@ export function checkNameNotStale(recorded: string | undefined, resolvedAgentId:
   return { ok: true };
 }
 
+/** child-transcript-view T1: applies the stale-name guard to an ALREADY-RESOLVED entry — factors
+ *  out the exact 5 lines that were duplicated across the send_message tool bridge (engine.ts) and
+ *  the task_stop tool (task-stop.ts), so a THIRD/FOURTH caller (AgentEngine.sendToAgent/stopAgent,
+ *  backing the thread.send/agent.stop RPCs) doesn't duplicate it a third time. Callers still call
+ *  `bgAgents.get(idOrName, sessionId)` themselves first — "not found" handling differs per caller
+ *  (task_stop falls through to a background BASH task lookup before erroring; the RPCs and the
+ *  send_message bridge just error with their own wording) — only the FOUND+guard branch, which is
+ *  byte-identical everywhere, is shared here. A by-ID resolution (`idOrName === entry.agentId`)
+ *  bypasses the guard entirely, same precedent as every existing caller. */
+export function guardAgentName(
+  bgAgents: BackgroundAgentRegistry,
+  sessionId: string,
+  idOrName: string,
+  entry: AgentEntry,
+): NameResolution {
+  if (idOrName === entry.agentId) return { ok: true };
+  const check = checkNameNotStale(bgAgents.firstReached(sessionId, idOrName), entry.agentId, idOrName);
+  if (!check.ok) return check;
+  bgAgents.recordReached(sessionId, idOrName, entry.agentId);
+  return { ok: true };
+}
+
 export class BackgroundAgentRegistry {
   private agents = new Map<string, AgentEntry>();
   // Stale-name guard bookkeeping (checkNameNotStale above): plain storage ONLY — the actual
