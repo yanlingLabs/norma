@@ -150,24 +150,9 @@ describe("PermissionGate v1", () => {
   // 4g Task 6: web_search joins web_fetch in the NETWORK class — same live-network-call posture
   // (read-only research, no arbitrary fs/process mutation, but still a real outbound HTTP call to
   // a third party), so it gets the IDENTICAL plan/ask/auto answer as web_fetch above.
-  // Phase 5b Task 2 (THE USER PIN): memory_write/memory_delete are PLAIN MUTATING — no card under
-  // `auto` (proceeds silently, audit-logged instead), a card under `ask`, denied under `plan` —
-  // exactly mirroring computer/schedule above, deliberately NOT some stricter always-ask class.
-  test("memory_write/memory_delete are mutating: ask under ask-policy, allow under auto-policy, denied under plan (mirrors computer/schedule)", () => {
-    for (const name of ["memory_write", "memory_delete"]) {
-      expect(gate.evaluate(name, "ask")).toBe("ask");
-      expect(gate.evaluate(name, "auto")).toBe("allow");
-      expect(gate.evaluate(name, "plan")).toBe("deny");
-    }
-  });
-
-  // memory_read is read-only: allowed unconditionally, including under `plan` (recalling a saved
-  // fact is research, not a mutation) — same class as task_get/agent_list.
-  test("memory_read is read-only: allowed under ask/auto/plan", () => {
-    expect(gate.evaluate("memory_read", "ask")).toBe("allow");
-    expect(gate.evaluate("memory_read", "auto")).toBe("allow");
-    expect(gate.evaluate("memory_read", "plan")).toBe("allow");
-  });
+  // T1 (file-based memory) note: memory_read/memory_write/memory_delete are DELETED (design doc
+  // `2026-07-15-file-based-memory-design.md`) — a memory-fact read/write now goes through the
+  // plain read/write/edit tools, already covered by their own tests elsewhere in this file.
 
   test("web_search is gate-classed NETWORK: allow under plan and auto, ask under ask", () => {
     const g = new PermissionGate();
@@ -177,7 +162,7 @@ describe("PermissionGate v1", () => {
   });
 
   // Phase 5f Task 3: lsp_diagnostics/lsp_definition/lsp_references only ever query a language
-  // server or read a fence-checked disk preview — same READ_ONLY class as memory_read/task_get,
+  // server or read a fence-checked disk preview — same READ_ONLY class as task_get/agent_list,
   // and must stay allowed under `plan` so a planning session can still look things up.
   test("lsp_diagnostics/lsp_definition/lsp_references are read-only: allowed under ask/auto/plan", () => {
     for (const name of ["lsp_diagnostics", "lsp_definition", "lsp_references"]) {
@@ -191,8 +176,8 @@ describe("PermissionGate v1", () => {
   // the first member of a NEW gate class, ALWAYS_ASK — "a skill is standing instructions, i.e.
   // durable prompt injection into future sessions" — so it is approval-carded under BOTH `ask`
   // AND `auto` (the class-defining assertions: no policy setting silences the card), and denied
-  // under `plan` like any mutation. CONTRAST memory_write above: that one deliberately rides
-  // plain MUTATING (allow-silently-under-auto, audit-instead-of-card); skill_write must NOT.
+  // under `plan` like any mutation. CONTRAST a plain memory-fact `write` above: that one
+  // deliberately rides plain MUTATING (allow-silently-under-auto); skill_write must NOT.
   test("skill_write is ALWAYS_ASK: ask under ask-policy AND under auto-policy, deny under plan", () => {
     expect(gate.evaluate("skill_write", "ask")).toBe("ask");
     expect(gate.evaluate("skill_write", "auto")).toBe("ask");
@@ -207,9 +192,9 @@ describe("PermissionGate v1", () => {
   test("guard: no existing tool joined ALWAYS_ASK — every previously classified tool still allows under auto", () => {
     const classified = [
       // READ_ONLY
-      "read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output", "memory_read", "lsp_diagnostics", "lsp_definition", "lsp_references",
+      "read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output", "lsp_diagnostics", "lsp_definition", "lsp_references",
       // MUTATING
-      "write", "edit", "bash", "notebook_edit", "enter_worktree", "exit_worktree", "computer", "schedule", "memory_write", "memory_delete",
+      "write", "edit", "bash", "notebook_edit", "enter_worktree", "exit_worktree", "computer", "schedule",
       // SELF_GATING + NETWORK + externals
       "request_directory", "web_fetch", "web_search", "mcp__x__y", "plugin__x__y",
     ];

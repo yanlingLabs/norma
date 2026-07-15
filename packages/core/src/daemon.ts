@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { mkdirSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { bootstrapNormaDir, resolveNormaHome } from "./norma-dir";
 import { acquireLock, type Lock } from "./lock";
@@ -7,7 +8,9 @@ import { KeychainSecretStore, type SecretStore } from "./auth/secret-store";
 import { SessionStore } from "./sessions/store";
 import { SessionHub } from "./sessions/hub";
 import { startIpcServer, type IpcServer, type IpcServerOptions } from "./ipc/server";
-import { loadSettings, loadPermissionDirs, hooksEnabledFrom } from "./settings";
+import { loadSettings, loadPermissionDirs, hooksEnabledFrom, memoryEnabledFrom } from "./settings";
+import { memoryDirFor, globalMemoryDirFor } from "./agent/memory-dir";
+import { migrateMemoryStore } from "./agent/memory-migrate";
 import { createProvider } from "./providers/manager";
 import type { Provider } from "./providers/types";
 import { QuotaManager } from "./providers/quota";
@@ -28,7 +31,6 @@ import { registerSpawnAgentTool } from "./agent/tools/spawn";
 import { registerSendMessageTool } from "./agent/tools/send-message";
 import { registerTaskStopTool } from "./agent/tools/task-stop";
 import { registerAgentQueryTools } from "./agent/tools/agent-query";
-import { registerMemoryTools } from "./agent/tools/memory";
 import { registerSkillWriteTool } from "./agent/tools/skill-write";
 import { MemoryStore } from "./agent/memory";
 import { registerScheduleTool } from "./agent/tools/schedule";
@@ -191,18 +193,77 @@ export async function startDaemon(opts: {
   // hotApplyStart/hotApplyStop precedent for "no restart needed" plugin changes.
   const hookRegistry = new HookRegistry();
   const skillStore = new SkillStore({ normaHome, trust: trustStore, plugins: { disabled: settings?.plugins?.disabled ?? [] } });
-  const assembler = new ContextAssembler({ normaHome, trust: trustStore, skills: skillStore });
+  // File-based memory (MEMDIR, T1 — design doc `2026-07-15-file-based-memory-design.md`): a live
+  // getter over the `settings` holder (assigned above; reassigned in place by the hot-settings
+  // watcher below), read fresh by BOTH the write-root join (`sessionDirs`, just below) and the
+  // assembler's injection — a `memory.enabled`/`memory.directory` edit applies to the session's
+  // NEXT tool call / turn, no daemon restart, same shape as `hooksEnabledHot` further down.
+  const memoryEnabledHot = (): boolean => (settings ? memoryEnabledFrom(settings) : true);
+  const memoryDirOf = (cwd: string): string => memoryDirFor(cwd, { normaHome, directory: settings?.memory?.directory });
+  const memoryGlobalDirOf = (): string => globalMemoryDirFor({ normaHome, directory: settings?.memory?.directory });
+  const assembler = new ContextAssembler({
+    normaHome, trust: trustStore, skills: skillStore,
+    memory: { enabled: memoryEnabledHot, dirFor: memoryDirOf },
+  });
+  // T2 (design doc "migration importer"): one-time-per-fact, idempotent best-effort import of
+  // Phase 5b's MemoryStore facts into MEMDIR files, run at boot whenever memory.enabled's
+  // BOOT-TIME value (not hot — this ONE call runs once, here, not re-checked per turn like
+  // `memoryEnabledHot` above) is on. Never touches/deletes the old store (see
+  // memory-migrate.ts's own doc comment) — a later `memory.enabled: false` still finds the
+  // original data untouched. Failure is logged, never fatal to daemon boot (same "degrade, don't
+  // crash" precedent as the settings-load try/catch above). T3 (task-23) added a SECOND,
+  // hot-triggered call site for the SAME idempotent importer — see `makeApply`'s `migrateMemory`
+  // dep below (wired further down, near the `if (agentProvider)` block's settings-watcher setup)
+  // — so a mid-session `memory.enabled` false→true flip no longer waits for a restart either.
+  if (memoryEnabledHot()) {
+    try {
+      migrateMemoryStore({ normaHome, trust: trustStore, directory: settings?.memory?.directory });
+    } catch (err) {
+      console.error(`memory migration skipped: ${(err as Error).message}`);
+    }
+  }
   // Phase 5b Task 2: ONE MemoryStore for the whole daemon (fact-file CRUD is the single-writer
-  // contract §4.8 requires — tool calls below and T3's daemon RPCs must share this exact instance,
-  // never open a second one). Built unconditionally, same "needs only normaHome/trust, no
-  // provider" precedent as skillStore/assembler just above — a provider-disabled daemon (or a
+  // contract §4.8 requires — daemon RPCs (ipc/server.ts's memory.*) must share this exact
+  // instance, never open a second one). Built unconditionally, same "needs only normaHome/trust,
+  // no provider" precedent as skillStore/assembler just above — a provider-disabled daemon (or a
   // future read-only RPC) can still serve memory state.
+  //
+  // T1 (file-based memory) supersedes this store's TOOL surface (memory_read/write/delete are
+  // deleted — see agent/tools/memory.ts's removal) and, whenever `memory.enabled` (above) is on,
+  // the assembler's OWN injection of this store's data (context.ts's legacy branch, which reads
+  // these exact `<normaHome>/memory/MEMORY.md` / `<cwd>/.norma/memory/MEMORY.md` paths, is skipped
+  // in favor of the new per-project MEMDIR). T2 rewires the memory.* RPCs (below, `memoryFiles`)
+  // to read/write MEMDIR files whenever `memory.enabled` is on, falling back to THIS store
+  // unchanged when it's off — the store instance itself and its on-disk data stay untouched
+  // either way (the escape hatch, and the migration importer's source, both need it intact).
   const memoryStore = new MemoryStore({ normaHome, trust: trustStore });
   // Built unconditionally (needs only store, no provider) so the server's session.addDir /
   // setCwd handlers always have live roots to work with, even when the agent is disabled.
   const sessionDirs = new SessionDirectories((sid) => {
     const m = store.meta(sid);
-    return m.cwd ? [m.cwd, ...loadPermissionDirs(normaHome, m.cwd, trustStore.isTrusted(m.cwd))] : [];
+    if (!m.cwd) return [];
+    const roots = [m.cwd, ...loadPermissionDirs(normaHome, m.cwd, trustStore.isTrusted(m.cwd))];
+    // T1 write-root join (design doc: "the tmpDir pattern" — a plain, ungated, auto-provisioned
+    // root, mirroring how `sessionTmpDir` needs no user approval either): whenever file-based
+    // memory is enabled, the session's MEMDIR joins the SAME write-fence `roots` the `write`/`edit`
+    // tools (fs-write.ts) and bash's OS-sandbox writable set (bash.ts) already resolve against —
+    // no new fencing mechanism, just one more entry in the list every other grant here (permission
+    // dirs, `request_directory`, `enter_worktree`) already goes through. `roots(sid)` is
+    // SESSION-scoped (not per-thread): an isolated worktree child gets `rootsOverride` instead,
+    // which REPLACES this list wholesale (engine.ts), so it never sees MEMDIR — but a plain
+    // (non-isolated) child thread shares the session's roots exactly as it already shares every
+    // other grant here; there is no thread-scoped write-fence in this codebase to exclude it
+    // further without a broader refactor (see task-21-report.md's "concerns" for this nuance).
+    // mkdir here (not inside `memoryDirFor`, which stays a pure path computation for easy unit
+    // testing) is the SAME "create on demand, every call, idempotent" precedent session-tmp.ts's
+    // `sessionTmpDir` already sets — cheap relative to the git spawn `memoryDirFor` itself already
+    // memoizes.
+    if (memoryEnabledHot()) {
+      const memDir = memoryDirOf(m.cwd);
+      mkdirSync(memDir, { recursive: true });
+      roots.push(memDir);
+    }
+    return roots;
   });
 
   // Built unconditionally (needs only store/sessionDirs, no provider) so background tasks
@@ -443,12 +504,12 @@ export async function startDaemon(opts: {
     // it's set. Mirrors `cwdOf`/`rootsOf`/`tmpDirOf`'s own lazy-closure-over-a-later-assigned-const
     // shape used for registerLspTools above.
     registerAgentQueryTools(registry, { bgAgents, store, transcriptPathFor: (sid, tid) => engine?.transcriptPathFor(sid, tid) });
-    // Phase 5b Task 2: memory_read/memory_write/memory_delete over the SAME `memoryStore`
-    // instance T3's RPCs will share. `cwdOf` resolves the SESSION's cwd (store.meta(sid).cwd —
-    // the identical source registerRequestDirTool's `projectDir` dep uses below), not `ctx.cwd`:
-    // project-scope memory must gate on the session's real project directory even mid-turn inside
-    // an isolated worktree child, where ctx.cwd is the worktree's own transient path.
-    registerMemoryTools(registry, { memory: memoryStore, cwdOf: (sid) => store.meta(sid).cwd ?? undefined });
+    // T1 (file-based memory, design doc `2026-07-15-file-based-memory-design.md`) DELETES the
+    // memory_read/memory_write/memory_delete tools that used to register here (phase 5b Task 2) —
+    // CC parity: no dedicated memory tools, plain write/edit/read/glob/grep over the per-project
+    // MEMDIR instead (sessionDirs's baseDirs closure above joins it into the write fence; the
+    // ContextAssembler wired above injects the protocol + index). `memoryStore` itself is UNTOUCHED
+    // (still backs ipc/server.ts's memory.* RPCs for the dashboard/CLI — see its own doc comment).
     // Phase 5c Task 2: skill_write over the SAME `skillStore` instance registerSkillTools above
     // reads from — one store, so a skill written here is immediately loadable via Skill with no
     // second handle to keep in sync. ALWAYS_ASK-gated (gate.ts): a card under BOTH ask and auto,
@@ -473,8 +534,8 @@ export async function startDaemon(opts: {
     // NOTE: unlike the SYNCHRONOUS mcp?.stopAll()/pluginSupervisor.stopAll() kills, LspClient's stop
     // is async — so shutdown uses lspManager.killAllNow() (synchronous SIGTERM backstop) BEFORE the
     // graceful `void stopAll()`; see the daemon.stop() body. `cwdOf`/`rootsOf`/`tmpDirOf`
-    // are the SAME session-meta sources registerMemoryTools's `cwdOf` / fs-read.ts's roots+tmpDir
-    // already read: `store.meta(sid).cwd`, `sessionDirs.roots(sid)`, `sessionTmpDir(sid)`.
+    // are the SAME session-meta sources fs-read.ts's roots+tmpDir already read: `store.meta(sid).
+    // cwd`, `sessionDirs.roots(sid)`, `sessionTmpDir(sid)`.
     //
     // Phase 5f Task 4: default ON, same boot-snapshot `cfg?.enabled === false` shape as
     // reviewer/titles above — an explicit `settings.lsp.enabled: false` is the only way to skip
@@ -668,6 +729,16 @@ export async function startDaemon(opts: {
         lspManager = null;
         await m?.stopAll();
       },
+      // File-based memory hot-toggle (T3, design doc follow-up / task-23): the SAME boot-time call
+      // above (`migrateMemoryStore({ normaHome, trust: trustStore, directory: settings?.memory?.directory })`),
+      // re-run whenever `memory.enabled` flips false→true on THIS running daemon — closes T2's
+      // "boot-time only" gap. `settings` here is read at the moment this closure actually RUNS
+      // (fire-and-forget, deferred a tick past `apply()`'s synchronous `setLiveSettings` swap), so
+      // it already reflects `next`'s own `memory.directory` override, exactly like the boot-time
+      // call reflects the settings loaded at THAT time. Failures are logged by settings-apply.ts's
+      // own `.catch` (this closure just re-throws/returns whatever `migrateMemoryStore` does);
+      // never touches/deletes the old store either way (memory-migrate.ts's own contract).
+      migrateMemory: () => { migrateMemoryStore({ normaHome, trust: trustStore, directory: settings?.memory?.directory }); },
       log: (msg) => console.error(`settings-apply: ${msg}`),
     });
     settingsWatcher = new SettingsWatcher({
@@ -758,10 +829,18 @@ export async function startDaemon(opts: {
     // `if (agentProvider)` gate above) and the scheduler (constructed just above this call) both
     // share — one sqlite handle for the whole daemon.
     routines: routineStore,
-    // Phase 5b Task 3: same MemoryStore instance T2's memory_read/write/delete tools (inside the
-    // `if (agentProvider)` gate above) run against — one single-writer promise chain for the
-    // whole daemon (memory.ts's own §4.8 contract).
+    // Phase 5b Task 3: the memory.* RPCs' LEGACY backing store — one single-writer promise chain
+    // for the whole daemon (memory.ts's own §4.8 contract). Read/written whenever `memoryFiles`
+    // below reports disabled (the escape hatch) — the RPCs never open a second store instance.
     memory: memoryStore,
+    // T2 (design doc "dashboard rewire"): the SAME live enabled()/dirFor() getters the write-root
+    // join and the assembler's injection already use (`memoryEnabledHot`/`memoryDirOf` above) —
+    // one settings-derived decision, read hot by every consumer, not re-derived per call site.
+    // `globalDir()` is the "no project" bucket (`globalMemoryDirFor`) the RPCs fall back to for a
+    // cwd-less request (the CLI's `scope:"user"`, no `--project`, never passes one) — see
+    // ipc/server.ts's memory.* handlers and memory-migrate.ts's own doc comment for why this is
+    // the SAME bucket the importer uses for facts that don't map to a project.
+    memoryFiles: { enabled: memoryEnabledHot, dirFor: memoryDirOf, globalDir: memoryGlobalDirOf },
     ...opts.server,
   });
 

@@ -39,19 +39,28 @@ function isValidSlug(name: string): boolean {
  *  and every indexed fact vanishes from the index) — and delete("memory") would unlink the index
  *  itself. Compared case-insensitively even though the slug regex only admits lowercase, as
  *  defense against future regex loosening. (`audit` is NOT reserved: `audit.md` never collides
- *  with `audit.jsonl` — extensions differ even on a case-insensitive fs.) */
-function nameError(name: string): string | null {
+ *  with `audit.jsonl` — extensions differ even on a case-insensitive fs.)
+ *
+ *  Exported (T2): `agent/memory-file-ops.ts` (the RPC rewire's directory-generic fact ops) and
+ *  `agent/memory-migrate.ts` (the 5b→MEMDIR importer) both need the EXACT SAME slug jail this
+ *  store enforces — a fact name valid enough to have been written by the old store must stay
+ *  valid at its new MEMDIR home, and a name the RPC rewire rejects must be rejected identically
+ *  regardless of which backend (store or files) is live. */
+export function nameError(name: string): string | null {
   if (!isValidSlug(name)) return `invalid memory name "${name}"`;
   if (name.toLowerCase() === "memory") return `"memory" is a reserved name (collides with the MEMORY.md index on case-insensitive filesystems)`;
   return null;
 }
 
-interface IndexEntry { name: string; description: string }
+export interface IndexEntry { name: string; description: string }
 
 /** Parses a fact file's frontmatter + body. Tolerant: any missing/malformed piece → null (caller
  *  treats null as "corrupt", never throws). Mirrors the exact serialization in `factFileContent`
- *  so write→read is a byte-exact round trip. */
-function parseFactFile(path: string): MemoryFact | null {
+ *  so write→read is a byte-exact round trip. Exported (T2) — see `nameError`'s doc comment for why
+ *  the directory-generic file ops / migration importer share this exact parser rather than their
+ *  own copy: it's what lets a model-written MEMDIR fact (T1's plain `write` tool) and a
+ *  store-written (or migrated) fact round-trip identically no matter which backend produced it. */
+export function parseFactFile(path: string): MemoryFact | null {
   let raw: string;
   try {
     if (!statSync(path).isFile()) return null; // missing, or a directory of that name
@@ -79,14 +88,17 @@ function parseFactFile(path: string): MemoryFact | null {
 }
 
 /** Serializes a fact to its on-disk form: frontmatter fence, one blank-line separator, then the
- *  body verbatim (no trailing newline forced) — this exact shape is what `parseFactFile` inverts. */
-function factFileContent(fact: MemoryFact, description: string): string {
+ *  body verbatim (no trailing newline forced) — this exact shape is what `parseFactFile` inverts.
+ *  Exported (T2) — see `parseFactFile`'s doc comment. */
+export function factFileContent(fact: MemoryFact, description: string): string {
   return `---\nname: ${fact.name}\ndescription: ${description}\ntype: ${fact.type}\n---\n\n${fact.body}`;
 }
 
 /** MEMORY.md index lines look like `- [name](name.md) — description`; anything else (header,
- *  blank lines, corrupt lines) is ignored on read. */
-function parseIndexEntries(indexPath: string): IndexEntry[] {
+ *  blank lines, corrupt lines) is ignored on read. Exported (T2) — see `parseFactFile`'s doc
+ *  comment; the directory-generic file ops and the migration importer both read/rewrite a
+ *  MEMORY.md index in this exact shape. */
+export function parseIndexEntries(indexPath: string): IndexEntry[] {
   let raw: string;
   try { raw = readFileSync(indexPath, "utf8"); } catch { return []; }
   const out: IndexEntry[] = [];
@@ -98,7 +110,8 @@ function parseIndexEntries(indexPath: string): IndexEntry[] {
   return out;
 }
 
-function serializeIndex(entries: IndexEntry[]): string {
+/** Exported (T2) — see `parseFactFile`'s doc comment. */
+export function serializeIndex(entries: IndexEntry[]): string {
   const lines = ["# Memory index", ""];
   for (const e of entries) lines.push(`- [${e.name}](${e.name}.md) — ${e.description}`);
   return lines.join("\n") + "\n";

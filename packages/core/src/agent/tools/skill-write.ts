@@ -5,13 +5,14 @@ import type { SkillStore } from "../skills";
 /**
  * skill_write (phase 5c Task 2) — the agent-facing surface over SkillStore.writeSelf (durable
  * self-authored skills under ~/.norma/skills/self, `author: norma` stamped by the STORE). PLAIN
- * TOOL, same shape as memory.ts (deps closure at registration, no engine bridge).
+ * TOOL, same shape as agent-query.ts/task-stop.ts (deps closure at registration, no engine bridge).
  *
  * Gate class (gate.ts): ALWAYS_ASK — approval-carded under BOTH `ask` AND `auto`, denied under
  * `plan`. A skill is standing instructions, i.e. durable prompt injection into future sessions,
  * so no policy setting may silence the card — see gate.ts's ALWAYS_ASK comment for the full
- * contrast with memory_write's audit-instead-of-card posture. Also excluded from every child's
- * tool set (engine.ts childExcludeTools — consent-laundering note there).
+ * contrast with a memory-fact write's silent-under-`auto` posture (T1: memory writes now go
+ * through the plain `write`/`edit` tools, no dedicated tool of their own). Also excluded from
+ * every child's tool set (engine.ts childExcludeTools — consent-laundering note there).
  *
  * Throws on a store `ok:false` result (`throw new Error(r.error)`) rather than hand-rolling error
  * text — the store's strings are already precise (slug jail, empty-after-trim description) and

@@ -49,17 +49,73 @@ function readMemory(path: string, maxLines: number, maxBytes: number): string | 
 
 export interface AssemblerCaps { instructionsBytes?: number; memoryLines?: number; memoryBytes?: number }
 
+// File-based memory (MEMDIR, T1). CC's exact numbers (design doc): first 200 lines OR 25KB
+// (binary — 25 * 1024 — matching this file's own existing 24576 = 24 * 1024 convention for the
+// LEGACY cap just below), whichever hits first. Deliberately a SEPARATE constant from
+// `AssemblerCaps.memoryLines/memoryBytes` (200/24576) rather than reusing/retuning them: those
+// still gate the pre-existing phase-5b injection below, byte-for-byte unchanged, so every caller
+// that never opts into the `memory` dep (below) — every existing test included — keeps its exact
+// prior behavior.
+const MEMDIR_INDEX_MAX_LINES = 200;
+const MEMDIR_INDEX_MAX_BYTES = 25 * 1024;
+
+/** Neutralizes a literal closing (or opening) `<system-reminder>` tag inside untrusted file
+ *  content before it's embedded in one — mirrors engine.ts's own `sanitizeForReminder` intent
+ *  (same tag, same "a nested literal tag must not let file content escape the wrapper and read as
+ *  a second, model-authored system instruction" concern) without that helper's newline-collapsing
+ *  (MEMORY.md is a real multi-line markdown list — collapsing it to one line would make the index
+ *  unreadable, and file content isn't attacker-controlled turn-input the way a tool result is, so
+ *  only the tag itself needs neutralizing here). */
+function neutralizeReminderTags(s: string): string {
+  return s.replace(/<\/?system-reminder>/gi, "[tag]");
+}
+
+/** T1's protocol text (design doc §"Protocol text"): what the model is told about the memory
+ *  directory, adapted from the harness's own observable format (CC's exact wording is private).
+ *  Injected UNCONDITIONALLY whenever memory is enabled — independent of whether MEMORY.md exists
+ *  yet (an empty/absent memory dir still needs the model to know it CAN save things there). */
+function memoryProtocol(memDir: string): string {
+  return [
+    "## Memory",
+    `Persistent, per-project memory lives at the absolute path \`${memDir}\` (created on demand). There are NO dedicated memory tools — use the plain \`write\`/\`edit\`/\`read\`/\`glob\`/\`grep\` tools on it like any other directory.`,
+    "Save a fact worth recalling in a FUTURE session (a user preference, a correction the user gave you, a durable project constraint) as its own file there, `<name>.md` where `<name>` is a short kebab-case slug, with frontmatter then the fact:",
+    "```\n---\nname: <name>\ndescription: <one-line summary>\ntype: user | feedback | project | reference\n---\n<the fact — for feedback/project, add a short Why / How to apply it too>\n```",
+    `Then add or update a one-line pointer for it in \`${join(memDir, "MEMORY.md")}\` (create the file if it doesn't exist yet): \`- [<name>](<name>.md) — <description>\`. MEMORY.md's first ${MEMDIR_INDEX_MAX_LINES} lines / ${Math.round(MEMDIR_INDEX_MAX_BYTES / 1024)}KB load into every session automatically — keep it terse; put detail in the fact file itself, not the index line.`,
+    "Update a fact by overwriting its file (and its MEMORY.md line) instead of writing a near-duplicate under a new name. Delete a fact (and its MEMORY.md line) once you learn it is wrong or no longer true. Never save something the repo itself already records — code, config, docs, and NORMA.md are already durable; memory is for facts ABOUT the user or project that live outside the repo.",
+  ].join("\n");
+}
+
+/** Hot getters over a live settings holder, mirroring engine.ts's `EngineConfig` getter
+ *  convention (e.g. `reviewerEnabled: () => settings?.reviewer?.enabled`) — daemon.ts supplies
+ *  these as closures over its own `let settings` so a `memory.enabled`/`memory.directory` edit
+ *  applies to the NEXT `assemble()` call, no ContextAssembler reconstruction. Deliberately
+ *  optional/absent in every test that doesn't pass it: absence means "behave exactly as before
+ *  T1" (the legacy phase-5b injection below), not "memory disabled" — see `assemble()`'s branch. */
+export interface MemoryContextConfig {
+  enabled(): boolean;
+  dirFor(cwd: string): string;
+}
+
 export class ContextAssembler {
   private readonly normaHome: string;
   private readonly trust: TrustStore;
   private readonly skills: SkillStore;
   private readonly basePrompt: string;
   private readonly caps: Required<AssemblerCaps>;
-  constructor(deps: { normaHome: string; trust: TrustStore; skills: SkillStore; basePrompt?: string; caps?: AssemblerCaps }) {
+  private readonly memory?: MemoryContextConfig;
+  constructor(deps: {
+    normaHome: string;
+    trust: TrustStore;
+    skills: SkillStore;
+    basePrompt?: string;
+    caps?: AssemblerCaps;
+    memory?: MemoryContextConfig;
+  }) {
     this.normaHome = deps.normaHome;
     this.trust = deps.trust;
     this.skills = deps.skills;
     this.basePrompt = deps.basePrompt ?? BASE_PROMPT;
+    this.memory = deps.memory;
     this.caps = {
       instructionsBytes: deps.caps?.instructionsBytes ?? 32768,
       memoryLines: deps.caps?.memoryLines ?? 200,
@@ -88,14 +144,36 @@ export class ContextAssembler {
       if (projInstr) sections.push(`## Project instructions (NORMA.md)\n${projInstr}`);
     }
 
-    const mem: string[] = [];
-    const userMem = readMemory(join(this.normaHome, "memory", "MEMORY.md"), this.caps.memoryLines, this.caps.memoryBytes);
-    if (userMem) mem.push(`### User memory\n${userMem}`);
-    if (cwd && trusted) {
-      const projMem = readMemory(join(cwd, ".norma", "memory", "MEMORY.md"), this.caps.memoryLines, this.caps.memoryBytes);
-      if (projMem) mem.push(`### Project memory\n${projMem}`);
+    // File-based memory (MEMDIR, T1): supersedes the tool-based phase-5b memory below WHENEVER
+    // (a) a `memory` config was supplied (daemon.ts always supplies one in production — only
+    // tests that don't care about memory omit it) AND (b) it's enabled AND (c) there's a cwd to
+    // derive a project dir from (no cwd → no project to key off; same "nothing to inject" outcome
+    // the legacy branch reaches for its own project-scoped half when `cwd` is null). Absent config
+    // (deliberately no `else memory.enabled() === false` special case — see MemoryContextConfig's
+    // own doc comment) or a null cwd falls through to the UNCHANGED legacy branch, so every
+    // existing caller/test keeps its exact prior behavior.
+    if (this.memory && cwd && this.memory.enabled()) {
+      const memDir = this.memory.dirFor(cwd);
+      sections.push(memoryProtocol(memDir));
+      const idx = readMemory(join(memDir, "MEMORY.md"), MEMDIR_INDEX_MAX_LINES, MEMDIR_INDEX_MAX_BYTES);
+      // Absent MEMORY.md (a fresh project, or one with no saved facts yet) → skip this section
+      // entirely, zero cost — the protocol block above is injected regardless, so the model still
+      // knows the mechanism exists even with nothing yet to recall.
+      if (idx) {
+        sections.push(
+          `<system-reminder>\nProject memory index (auto-loaded from ${join(memDir, "MEMORY.md")}; capped at the first ${MEMDIR_INDEX_MAX_LINES} lines / ${Math.round(MEMDIR_INDEX_MAX_BYTES / 1024)}KB):\n${neutralizeReminderTags(idx)}\n</system-reminder>`,
+        );
+      }
+    } else {
+      const mem: string[] = [];
+      const userMem = readMemory(join(this.normaHome, "memory", "MEMORY.md"), this.caps.memoryLines, this.caps.memoryBytes);
+      if (userMem) mem.push(`### User memory\n${userMem}`);
+      if (cwd && trusted) {
+        const projMem = readMemory(join(cwd, ".norma", "memory", "MEMORY.md"), this.caps.memoryLines, this.caps.memoryBytes);
+        if (projMem) mem.push(`### Project memory\n${projMem}`);
+      }
+      if (mem.length) sections.push(`## Memory\n${mem.join("\n\n")}`);
     }
-    if (mem.length) sections.push(`## Memory\n${mem.join("\n\n")}`);
 
     const metas = this.skills.list({ cwd });
     const capLines: string[] = ["## Available capabilities"];

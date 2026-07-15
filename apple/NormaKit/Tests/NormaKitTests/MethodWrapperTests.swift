@@ -573,6 +573,26 @@ final class MethodWrapperTests: XCTestCase {
         XCTAssertEqual(lines[1].description, "UI preference")
     }
 
+    /// T3 (file-based memory, task-23): `cwd` is additive/optional on `memory.audit` — omitted
+    /// (every pre-T3 call site, e.g. `MemoryPaneModel`) is dropped from the wire params entirely
+    /// (not sent as JSON null), same convention every other optional param in this file already
+    /// follows; supplied, it's sent verbatim so a project-aware caller can target that project's
+    /// own `.audit.jsonl` (see methods.ts's `MemoryAuditParams` doc comment for the server-side
+    /// resolution). Decoding is unaffected either way — the wire result shape didn't change.
+    func testMemoryAuditCwdParamOmittedByDefaultSentWhenProvided() async throws {
+        let (client, t) = try await connected()
+
+        let (reqNoCwd, _) = try await roundTrip(t, sentIndex: 1, result: #"{"ok":true,"lines":[]}"#) {
+            try await client.memoryAudit(limit: 5)
+        }
+        XCTAssertNil((reqNoCwd["params"] as? [String: Any])?["cwd"])
+
+        let (reqWithCwd, _) = try await roundTrip(t, sentIndex: 2, result: #"{"ok":true,"lines":[]}"#) {
+            try await client.memoryAudit(limit: 5, cwd: "/repo/project")
+        }
+        XCTAssertEqual((reqWithCwd["params"] as? [String: Any])?["cwd"] as? String, "/repo/project")
+    }
+
     // MARK: - Phase 5c Task 4: skills.* wrappers (Dashboard SkillsPane)
 
     /// `skills.list` now decodes every `SkillMetaSchema` field (methods.ts) — the prior wrapper

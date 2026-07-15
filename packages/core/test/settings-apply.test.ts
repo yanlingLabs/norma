@@ -19,6 +19,16 @@ function baseDeps(overrides: Partial<SettingsApplyDeps> = {}): SettingsApplyDeps
   };
 }
 
+/** Flushes the microtask queue past `applyMemoryMigrationDiff`'s `Promise.resolve().then(...)`
+ *  chain — that diff is deliberately fire-and-forget (never awaited by `apply()` itself, see its
+ *  own doc comment in settings-apply.ts), so a test asserting on `migrateMemory`'s call count must
+ *  yield back to the microtask queue at least once after `await apply(...)` resolves before
+ *  reading that count. */
+async function flushMicrotasks(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
 describe("makeApply", () => {
   test("swap happens first, before any tool re-wire", async () => {
     const order: string[] = [];
@@ -271,5 +281,89 @@ describe("makeApply", () => {
     expect(registerComputer).toHaveBeenCalledTimes(1);
     expect(teardownLsp).toHaveBeenCalledTimes(1);
     expect(warnings.some((w) => w.includes("lsp diff-apply failed"))).toBe(true);
+  });
+
+  // File-based memory hot-toggle (T3, design doc follow-up / task-23): closes T2's "boot-time
+  // only" migration gap — a `memory.enabled` false→true flip on an ALREADY-RUNNING daemon must
+  // re-run the (idempotent) importer immediately, not wait for the next restart.
+  describe("memory.enabled hot-toggle re-runs the migration importer", () => {
+    test("false -> true triggers migrateMemory exactly once", async () => {
+      const migrateMemory = mock(() => {});
+      const apply = makeApply(baseDeps({ migrateMemory }));
+      await apply({ memory: { enabled: false } } as any, { memory: { enabled: true } } as any);
+      await flushMicrotasks();
+      expect(migrateMemory).toHaveBeenCalledTimes(1);
+    });
+
+    test("true -> false does NOT trigger migrateMemory", async () => {
+      const migrateMemory = mock(() => {});
+      const apply = makeApply(baseDeps({ migrateMemory }));
+      await apply({ memory: { enabled: true } } as any, { memory: { enabled: false } } as any);
+      await flushMicrotasks();
+      expect(migrateMemory).not.toHaveBeenCalled();
+    });
+
+    test("no flip (both enabled, incl. the default both-absent case) does NOT trigger migrateMemory", async () => {
+      const migrateMemory = mock(() => {});
+      const apply = makeApply(baseDeps({ migrateMemory }));
+      // both explicitly enabled — a value-only change elsewhere.
+      await apply({ memory: { enabled: true }, provider: { model: "a" } } as any, { memory: { enabled: true }, provider: { model: "b" } } as any);
+      await flushMicrotasks();
+      expect(migrateMemory).not.toHaveBeenCalled();
+
+      // memory is default-ON (opt-out, same polarity as lsp) — absent on both sides is ALSO a
+      // no-flip, the common real-world case (no memory block in settings.json at all).
+      await apply({ provider: { model: "a" } } as any, { provider: { model: "b" } } as any);
+      await flushMicrotasks();
+      expect(migrateMemory).not.toHaveBeenCalled();
+    });
+
+    test("absent -> {enabled:false} does NOT trigger migrateMemory (true -> false crossing the absent-field boundary)", async () => {
+      const migrateMemory = mock(() => {});
+      const apply = makeApply(baseDeps({ migrateMemory }));
+      await apply({ provider: { model: "a" } } as any, { memory: { enabled: false } } as any);
+      await flushMicrotasks();
+      expect(migrateMemory).not.toHaveBeenCalled();
+    });
+
+    test("{enabled:false} -> absent DOES trigger migrateMemory (false -> true crossing the absent-field boundary)", async () => {
+      const migrateMemory = mock(() => {});
+      const apply = makeApply(baseDeps({ migrateMemory }));
+      await apply({ memory: { enabled: false } } as any, { provider: { model: "a" } } as any);
+      await flushMicrotasks();
+      expect(migrateMemory).toHaveBeenCalledTimes(1);
+    });
+
+    test("no migrateMemory dep wired (every pre-T3 caller/test): a false -> true flip is a silent no-op, never throws", async () => {
+      const apply = makeApply(baseDeps());
+      await expect(apply({ memory: { enabled: false } } as any, { memory: { enabled: true } } as any)).resolves.toBeUndefined();
+    });
+
+    test("apply() itself resolves without waiting for migrateMemory (fire-and-forget, never blocks)", async () => {
+      let resolveMigrate!: () => void;
+      const migrateMemory = mock(() => new Promise<void>((resolve) => { resolveMigrate = resolve; }));
+      const apply = makeApply(baseDeps({ migrateMemory }));
+      const start = Date.now();
+      await apply({ memory: { enabled: false } } as any, { memory: { enabled: true } } as any);
+      expect(Date.now() - start).toBeLessThan(100); // did not wait on migrateMemory's never-resolved promise
+      expect(migrateMemory).toHaveBeenCalledTimes(1);
+      resolveMigrate(); // let the still-pending promise settle so it doesn't leak into the next test
+    });
+
+    test("a throwing/rejecting migrateMemory is logged, never rejects apply() or the OTHER flags' diffs", async () => {
+      const migrateMemory = mock(() => { throw new Error("boom: migrateMemory"); });
+      const registerLsp = mock(() => {});
+      const warnings: string[] = [];
+      const apply = makeApply(baseDeps({ migrateMemory, registerLsp, log: (msg) => warnings.push(msg) }));
+      await expect(
+        apply(
+          { memory: { enabled: false }, lsp: { enabled: false } } as any,
+          { memory: { enabled: true }, lsp: { enabled: true } } as any,
+        ),
+      ).resolves.toBeUndefined();
+      expect(registerLsp).toHaveBeenCalledTimes(1); // unrelated flag's diff still ran
+      await flushMicrotasks();
+      expect(warnings.some((w) => w.includes("memory migration on hot-toggle failed"))).toBe(true);
+    });
   });
 });

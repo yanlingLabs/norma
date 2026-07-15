@@ -25,6 +25,7 @@ import {
 import type { TokenAuthority } from "../auth/tokens";
 import type { RoutineStore } from "../routines/store";
 import type { MemoryStore, MemoryErrorKind } from "../agent/memory";
+import { listMemoryDir, readMemoryDir, writeMemoryDir, deleteMemoryDir, auditTailMemDir } from "../agent/memory-file-ops";
 import type { SessionStore } from "../sessions/store";
 import { SessionHub, type HubClient } from "../sessions/hub";
 import type { AgentEngine } from "../agent/engine";
@@ -142,6 +143,20 @@ export interface IpcServerOptions {
   // memory.read/write/delete fail hard with a typed INTERNAL RpcFailure — a mutation (or a
   // single-fact read a caller acts on) silently no-oping would mask a wiring bug.
   memory?: MemoryStore;
+  // T2 (design doc "dashboard rewire"), extended by T3 to memory.audit: when `enabled()` is true,
+  // memory.list/read/write/delete/audit below operate on MEMDIR files (`dirFor(cwd)` for a
+  // request that carries a `cwd` — the CLI's `--project`; `globalDir()` for one that doesn't, the
+  // CLI's default "user" scope, which never passes a cwd) INSTEAD OF `memory` above — the SAME
+  // live decision (and the SAME `dirFor`/`globalDir` computation) the write-root join and the
+  // context assembler's injection already use (daemon.ts's
+  // `memoryEnabledHot`/`memoryDirOf`/`memoryGlobalDirOf`), so a toggle applies to the very next
+  // RPC call, no daemon restart. Optional — a server built without it (every pre-T2 test, and any
+  // server that only ever wants the legacy store) keeps calling into `memory` unconditionally,
+  // byte-for-byte the T1 behavior. `scope` itself is NOT consulted once this path is taken: MEMDIR
+  // has no user/project split, only "does this request carry a cwd" — see memory-migrate.ts's doc
+  // comment for why a cwd-less request's target (`globalDir()`) is the SAME bucket the migration
+  // importer uses for facts that don't map to a project.
+  memoryFiles?: { enabled(): boolean; dirFor(cwd: string): string; globalDir(): string };
   providerInfo?: { id: string; model: string } | null; // active LLM provider identity; daemon.status
   startedAt?: number;        // daemon process start time (Date.now()); daemon.status uptimeMs
   helloTimeoutMs?: number;   // default 5000
@@ -163,6 +178,16 @@ class RpcFailure extends Error { constructor(public code: number, message: strin
  *  name like "why is this not found" is an INVALID name), so it must never be string-matched. */
 function memoryErrorCode(failure: { kind?: MemoryErrorKind }): number {
   return failure.kind === "not_found" ? ERR.NOT_FOUND : ERR.INVALID_PARAMS;
+}
+
+/** Resolves WHICH MEMDIR a memory.* request targets once the file-backed path is taken (T2): a
+ *  `cwd` (the CLI's `--project`, or any future caller that supplies one) resolves the requester's
+ *  OWN project directory via `dirFor` (`memoryDirFor`, memory-dir.ts — git-repo-root keyed); no
+ *  `cwd` (the CLI's default "user" scope) falls back to `globalDir()`, the same "no project"
+ *  bucket the migration importer uses for facts that don't map to one. `scope` itself is never
+ *  consulted here — see `IpcServerOptions.memoryFiles`'s own doc comment for why. */
+function memoryFileDir(files: { dirFor(cwd: string): string; globalDir(): string }, cwd?: string): string {
+  return cwd ? files.dirFor(cwd) : files.globalDir();
 }
 
 /** Maps a `SkillStore` failure's structural `kind` to a JSON-RPC code, for the skills.* handlers
@@ -757,16 +782,23 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       }
 
       // -----------------------------------------------------------------------------------------
-      // Memory (Phase 5b Task 3, design doc §4): the management surface over `MemoryStore` — the
-      // SAME instance T2's memory_read/write/delete tools run against (daemon.ts). Role-gated
-      // exactly like routines.* above (harness AND admin; a plugin-role connection never reaches
-      // this switch for any of these five). RPC-sourced mutations pass `source:"rpc"` and no
-      // `sessionId` (there is no session context on this connection) — mirrors the tools' own
-      // `source:"tool"` + real sessionId (agent/tools/memory.ts). A store `ok:false` becomes a
-      // thrown RpcFailure via `memoryErrorCode` above, never a typed result union.
+      // Memory (Phase 5b Task 3 / T2 design doc §4 / T3 task-23): the management surface over
+      // EITHER backend. Role-gated exactly like routines.* above (harness AND admin; a plugin-role
+      // connection never reaches this switch for any of these five). Every verb below — INCLUDING
+      // memory.audit as of T3 (see its own comment for the audit-line shape mapping) — checks
+      // `opts.memoryFiles?.enabled()` FIRST: true → MEMDIR files (`memoryFileDir` below resolves
+      // WHICH directory from `p.cwd`), regardless of `p.scope`; false, or `memoryFiles` absent
+      // entirely (every pre-T2 test) → the legacy `MemoryStore` path, byte-for-byte T1's behavior
+      // (scope/cwd/trust-gating all still apply there). A store `ok:false` becomes a thrown
+      // RpcFailure via `memoryErrorCode` above either way — same structural mapping, since
+      // `memory-file-ops.ts`'s `MemoryResult`s use the identical `kind` union. RPC-sourced
+      // legacy-store mutations pass `source:"rpc"` and no `sessionId` (there is no session context
+      // on this connection) — mirrors the (now-deleted) tools' own `source:"tool"` + real
+      // sessionId.
       // -----------------------------------------------------------------------------------------
       case METHODS.memoryList: {
         const p = parseParams(MemoryListParams, params);
+        if (opts.memoryFiles?.enabled()) return { facts: listMemoryDir(memoryFileDir(opts.memoryFiles, p.cwd)) };
         if (!opts.memory) return { facts: [] }; // degrades like memory.audit below / routines.list above
         const res = opts.memory.list(p.scope, p.cwd);
         if (!res.ok) throw new RpcFailure(memoryErrorCode(res), res.error);
@@ -774,6 +806,11 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       }
       case METHODS.memoryRead: {
         const p = parseParams(MemoryReadParams, params);
+        if (opts.memoryFiles?.enabled()) {
+          const res = readMemoryDir(memoryFileDir(opts.memoryFiles, p.cwd), p.name);
+          if (!res.ok) throw new RpcFailure(memoryErrorCode(res), res.error);
+          return { fact: res.value };
+        }
         if (!opts.memory) throw new RpcFailure(ERR.INTERNAL, "memory is not available on this server (no MemoryStore configured)");
         const res = opts.memory.read(p.scope, p.name, p.cwd);
         if (!res.ok) throw new RpcFailure(memoryErrorCode(res), res.error);
@@ -781,6 +818,11 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       }
       case METHODS.memoryWrite: {
         const p = parseParams(MemoryWriteParams, params);
+        if (opts.memoryFiles?.enabled()) {
+          const res = writeMemoryDir(memoryFileDir(opts.memoryFiles, p.cwd), { name: p.name, description: p.description, type: p.type, body: p.body });
+          if (!res.ok) throw new RpcFailure(memoryErrorCode(res), res.error);
+          return {};
+        }
         if (!opts.memory) throw new RpcFailure(ERR.INTERNAL, "memory is not available on this server (no MemoryStore configured)");
         const res = await opts.memory.write(
           p.scope, { name: p.name, description: p.description, type: p.type, body: p.body }, { source: "rpc" }, p.cwd,
@@ -790,6 +832,11 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       }
       case METHODS.memoryDelete: {
         const p = parseParams(MemoryDeleteParams, params);
+        if (opts.memoryFiles?.enabled()) {
+          const res = deleteMemoryDir(memoryFileDir(opts.memoryFiles, p.cwd), p.name);
+          if (!res.ok) throw new RpcFailure(memoryErrorCode(res), res.error);
+          return {};
+        }
         if (!opts.memory) throw new RpcFailure(ERR.INTERNAL, "memory is not available on this server (no MemoryStore configured)");
         const res = await opts.memory.delete(p.scope, p.name, { source: "rpc" }, p.cwd);
         if (!res.ok) throw new RpcFailure(memoryErrorCode(res), res.error);
@@ -797,9 +844,32 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       }
       case METHODS.memoryAudit: {
         const p = parseParams(MemoryAuditParams, params);
-        // Store contract is newest-LAST (memory.ts's own doc comment); the wire contract (design
-        // doc §4) is newest-FIRST — reversed here, once, rather than pushing that inversion onto
-        // every caller (dashboard/CLI) of this RPC.
+        // T3 (design doc follow-up / task-23): closes T2's documented limitation above by giving
+        // this verb the SAME `cwd` targeting memory.list/read/write/delete already have —
+        // `memoryFileDir` (this file, above) resolves cwd present -> the caller's own project
+        // MEMDIR, absent -> the global bucket, EXACTLY the same resolution those four verbs use.
+        // Only reached when files-mode is on; files-mode off (or `memoryFiles` absent — every
+        // pre-T3 test) falls through to the UNCHANGED legacy central-log path below regardless of
+        // whether `cwd` was supplied (a files-mode param is meaningless against the legacy store).
+        // The file-backed audit line (`MemDirAuditLine`/`appendMemDirAudit`, memory-file-ops.ts)
+        // only ever carries `{ts, op, name}` — no sessionId/source/scope/description, since MEMDIR
+        // itself has no scope concept (T2's own doc comment) and only the RPC delete path is
+        // audited at all. Mapped onto the wire's `MemoryAuditLineSchema` shape here: `source:"rpc"`
+        // (only the RPC delete path is ever audited), `scope` synthesized from whether `cwd` was
+        // supplied ("project" vs "user") purely for display parity with the legacy shape — it is
+        // NOT read back to resolve anything. `auditTailMemDir` mirrors `MemoryStore.auditTail`'s
+        // own newest-LAST/limit contract; reversed to newest-FIRST here, same as the legacy branch.
+        if (opts.memoryFiles?.enabled()) {
+          const dir = memoryFileDir(opts.memoryFiles, p.cwd);
+          const lines = auditTailMemDir(dir, p.limit)
+            .slice()
+            .reverse()
+            .map((l) => ({ ts: l.ts, source: "rpc" as const, scope: p.cwd ? ("project" as const) : ("user" as const), action: l.op, name: l.name }));
+          return { lines };
+        }
+        // Legacy central-log path (T1/T2, unchanged): store contract is newest-LAST (memory.ts's
+        // own doc comment); the wire contract (design doc §4) is newest-FIRST — reversed here,
+        // once, rather than pushing that inversion onto every caller.
         const lines = (opts.memory?.auditTail(p.limit) ?? []).slice().reverse();
         return { lines };
       }

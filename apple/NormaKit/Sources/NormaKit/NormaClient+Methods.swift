@@ -588,9 +588,14 @@ extension NormaClient {
         _ = try await request("memory.delete", params: obj(["scope": .string(scope), "name": .string(name), "cwd": cwd.map { .string($0) }]))
     }
 
-    /// `memory.audit {limit?}` — newest-first (see `MemoryAuditLine`'s own doc comment).
-    public func memoryAudit(limit: Int? = nil) async throws -> [MemoryAuditLine] {
-        let r = try await request("memory.audit", params: obj(["limit": limit.map { .number(Double($0)) }]))
+    /// `memory.audit {limit?, cwd?}` — newest-first (see `MemoryAuditLine`'s own doc comment).
+    /// `cwd` (task-23, T3) is additive/optional: omitted (every existing call site, e.g.
+    /// `MemoryPaneModel`'s user-scope-only pane) targets the SAME central/global bucket as before;
+    /// a caller with project context can pass it to read that project's own `.audit.jsonl`
+    /// (memory-file-ops.ts's `deleteMemoryDir`, files-mode only — see methods.ts's
+    /// `MemoryAuditParams` doc comment for the full resolution, ignored under the legacy backend).
+    public func memoryAudit(limit: Int? = nil, cwd: String? = nil) async throws -> [MemoryAuditLine] {
+        let r = try await request("memory.audit", params: obj(["limit": limit.map { .number(Double($0)) }, "cwd": cwd.map { .string($0) }]))
         return (r["lines"]?.arrayValue ?? []).compactMap { l in
             guard let ts = l["ts"]?.intValue, let source = l["source"]?.stringValue, let scope = l["scope"]?.stringValue,
                   let action = l["action"]?.stringValue, let n = l["name"]?.stringValue else { return nil }
