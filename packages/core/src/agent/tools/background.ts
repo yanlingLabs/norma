@@ -7,7 +7,7 @@ export function registerBackgroundTools(r: ToolRegistry, deps: { bgRegistry: Bac
 
   r.register({
     name: "bash_output",
-    description: "Read new output from a background bash task started with bash's runInBackground option. Returns only output produced since the last read, plus the task's current status.",
+    description: "Read new output from a background bash task started with bash's runInBackground option. Returns only output produced since the last read, plus the task's current status. Prefer read/grep on the task's output_file (from the bash spawn result) for large output — this tool is best for a quick incremental check.",
     args: z.object({
       taskId: z.string().min(1),
       filter: z.string().max(256).optional(),

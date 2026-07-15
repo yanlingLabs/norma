@@ -123,4 +123,16 @@ d("bash tool (sandboxed)", () => {
     expect(res.isError).toBe(false);
     expect(res.output).toContain("hi"); // command ran; justification did not affect execution
   });
+
+  // Background bash tasks tee to <sessionTmpDir>/bash/<taskId>.log (bg-registry.ts) — the
+  // FOREGROUND path never touches BackgroundTaskRegistry at all, so it must never create that
+  // directory, and its result must never mention output_file (that's background-only).
+  test("foreground bash creates no bg output file/dir and mentions no output_file", async () => {
+    const cwd = proj();
+    const tmpDir = sessionTmpDir("s_fg_only");
+    const res = await reg().execute("bash", { command: "echo hi" }, { cwd, roots: [cwd], tmpDir, sessionId: "s1" });
+    expect(res.isError).toBe(false);
+    expect(res.output).not.toContain("output_file");
+    expect(existsSync(join(tmpDir, "bash"))).toBe(false);
+  });
 });

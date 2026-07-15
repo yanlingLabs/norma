@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { realpathSync, mkdirSync, appendFileSync } from "node:fs";
+import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { buildSeatbeltProfile, sandboxAvailable } from "./sandbox";
 import { OutputCoalescer } from "./bg-coalescer";
@@ -13,6 +14,11 @@ interface Task {
   child: ChildProcess; status: "running" | "exited" | "killed"; exitCode: number | null;
   ring: string; cursor: number; ringDropped: boolean; dropNoted: boolean; startedAt: number;
   coalescer: OutputCoalescer;
+  // CC parity (TaskOutput deprecated in favor of Read on the task's output file): the FULL,
+  // untruncated combined stdout+stderr for this task, teed alongside `ring` (which is capped/
+  // evicted for the in-memory bash_output view). Lazily created — the `bash/` subdir under the
+  // session tmp dir is mkdir'd only when a background task actually starts, not for every session.
+  outFile: string;
 }
 
 export interface BgDeps {
@@ -64,14 +70,21 @@ export class BackgroundTaskRegistry {
       cwd: realCwd, stdio: ["ignore", "pipe", "pipe"], detached: true, env: { ...process.env, TMPDIR: scratch },
     });
     const taskId = `bg_${randomBytes(6).toString("hex")}`;
+    // CC parity (TaskOutput deprecated in favor of Read on the task's output file): lazily create
+    // <sessionTmpDir>/bash/ (only when a bg task actually starts — every OTHER session never gets
+    // one) and tee this task's full, untruncated output there under <taskId>.log.
+    const bashDir = join(scratch, "bash");
+    mkdirSync(bashDir, { recursive: true });
+    const outFile = join(bashDir, `${taskId}.log`);
     const coalescer = new OutputCoalescer((chunk) =>
       this.emit(sessionId, { type: "bg_task_output", sessionId, threadId: "main", taskId, chunk }));
-    const task: Task = { taskId, sessionId, command, child, status: "running", exitCode: null, ring: "", cursor: 0, ringDropped: false, dropNoted: false, startedAt: Date.now(), coalescer };
+    const task: Task = { taskId, sessionId, command, child, status: "running", exitCode: null, ring: "", cursor: 0, ringDropped: false, dropNoted: false, startedAt: Date.now(), coalescer, outFile };
     this.tasks.set(taskId, task);
 
     const onData = (d: Buffer) => {
       const s = d.toString("utf8").replace(DEPRECATION_RE, "");
       if (s.length === 0) return;
+      try { appendFileSync(task.outFile, s); } catch { /* best-effort — a disk error here must never break bg output/ring delivery */ }
       task.ring += s;
       if (task.ring.length > this.ringCap) {
         const trimmed = task.ring.length - this.ringCap; // bytes actually dropped from the front
@@ -103,6 +116,13 @@ export class BackgroundTaskRegistry {
     t.cursor = t.ring.length;
     if (t.ringDropped && !t.dropNoted) { t.dropNoted = true; chunk = "[background output ring full — oldest output dropped]\n" + chunk; }
     return { chunk, status: t.status, exitCode: t.exitCode };
+  }
+
+  /** The full-output log path this task tees to (CC parity — `bash`'s background-spawn result
+   *  surfaces this so the model can Read/grep it directly instead of polling bash_output).
+   *  Throws for an unknown/foreign task, same as read()/kill(). */
+  outputFile(sessionId: string, taskId: string): string {
+    return this.own(sessionId, taskId).outFile;
   }
 
   kill(sessionId: string, taskId: string): void {
