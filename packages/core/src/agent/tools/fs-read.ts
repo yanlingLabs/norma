@@ -3,6 +3,7 @@ import { readFileSync, readdirSync, realpathSync, statSync, unlinkSync } from "n
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
+import { getDocumentProxy, extractText } from "unpdf";
 import { canonAncestor, resolveWithinAny } from "../paths";
 import type { ToolContext, ToolRegistry } from "./registry";
 
@@ -172,6 +173,65 @@ function renderNotebook(raw: string, ctx: ToolContext): string | undefined {
   return nb.cells.map((c, i) => nbRenderCell(c, i + 1, ctx)).join("\n\n");
 }
 
+// --- PDFs ----------------------------------------------------------------------------------------
+
+const PDF_WHOLE_MAX_PAGES = 10; // ≤ this many pages, and no `pages` given → read the whole document
+const PDF_RANGE_MAX_PAGES = 20; // a `pages` range may span at most this many pages per request
+
+/** Parses the `pages` arg ("5" or "1-5") against the PDF's real page count. Every rejection names
+ *  the actual total so the model can retry with a valid range instead of guessing. */
+function parsePageRange(pagesStr: string, totalPages: number): { start: number; end: number } {
+  const m = /^\s*(\d+)(?:\s*-\s*(\d+))?\s*$/.exec(pagesStr);
+  if (!m) throw new Error(`invalid pages "${pagesStr}" — expected a page number or range like "1-5"`);
+  const start = Number(m[1]);
+  const end = m[2] ? Number(m[2]) : start;
+  if (start < 1 || end < start) throw new Error(`invalid pages "${pagesStr}" — expected a page number or range like "1-5"`);
+  if (end > totalPages) {
+    throw new Error(`pages "${pagesStr}" is out of range — this PDF has ${totalPages} page${totalPages === 1 ? "" : "s"}`);
+  }
+  if (end - start + 1 > PDF_RANGE_MAX_PAGES) {
+    throw new Error(`pages "${pagesStr}" spans ${end - start + 1} pages — max ${PDF_RANGE_MAX_PAGES} pages per request`);
+  }
+  return { start, end };
+}
+
+/** PDFs: text-extract per page via `unpdf` (a self-contained, zero-runtime-dependency pdf.js
+ *  build — see the task report for why this was chosen over a hand-rolled parser or a compiled
+ *  Swift/PDFKit helper). ≤10 pages with no `pages` arg reads the whole document; a bigger PDF
+ *  requires `pages` (error names the real page count); a `pages` range is capped at 20 pages per
+ *  request. Per-page `— page N —` headers. All-blank extracted text (every requested page) reports
+ *  the honest scanned/no-text message instead of a wall of empty headers. */
+async function readPdf(target: string, pagesStr: string | undefined): Promise<string> {
+  const bytes = new Uint8Array(readFileSync(target));
+  let totalPages: number;
+  let allText: string[];
+  try {
+    const pdf = await getDocumentProxy(bytes);
+    ({ totalPages, text: allText } = await extractText(pdf, { mergePages: false }));
+  } catch (e) {
+    throw new Error(`could not parse PDF ${basename(target)}: ${(e as Error).message}`);
+  }
+
+  let start: number, end: number;
+  if (pagesStr !== undefined) {
+    ({ start, end } = parsePageRange(pagesStr, totalPages));
+  } else if (totalPages > PDF_WHOLE_MAX_PAGES) {
+    throw new Error(
+      `${basename(target)} has ${totalPages} pages — pass \`pages\` (e.g. "1-10") to read up to ${PDF_RANGE_MAX_PAGES} pages at a time`,
+    );
+  } else {
+    start = 1;
+    end = totalPages;
+  }
+
+  const slice = allText.slice(start - 1, end);
+  if (slice.every((t) => t.trim() === "")) {
+    return `no extractable text in ${basename(target)} (scanned image PDF?); page-image rendering is a follow-up`;
+  }
+  const body = slice.map((t, i) => `— page ${start + i} —\n${t}`).join("\n\n");
+  return pagesStr !== undefined ? `Showing pages ${start}-${end} of ${totalPages}:\n\n${body}` : body;
+}
+
 /**
  * Reads-unrestricted (user rule, memory/reads-unrestricted.md, task-10): read/ls/glob/grep have NO
  * path fence — the write fence (fs-write.ts) is a completely separate, unchanged mechanism. The
@@ -247,19 +307,21 @@ export function registerReadTools(r: ToolRegistry, opts: ReadToolsConfig = {}): 
     name: "read",
     description:
       "Read a file's contents. Path may be relative to the session directory or an absolute path anywhere on disk. Optional offset (1-based start line) and limit (line count) read part of a large text file — outputs over 64KB truncate, so page large files with offset/limit. " +
-      "Type-aware: image files (.png/.jpg/.jpeg/.gif/.webp/.bmp/.tiff/.heic) are shown to the model as an image (needs a vision-capable model); .ipynb notebooks render all cells with their outputs (image outputs shown as images too). Everything else returns plain text without line numbers.",
+      "Type-aware: image files (.png/.jpg/.jpeg/.gif/.webp/.bmp/.tiff/.heic) are shown to the model as an image (needs a vision-capable model); .ipynb notebooks render all cells with their outputs (image outputs shown as images too); .pdf files extract text per page — pass `pages` (e.g. \"1-5\") for PDFs over 10 pages, at most 20 pages per request. Everything else returns plain text without line numbers.",
     args: z.object({
       path: z.string().min(1),
       offset: z.number().int().min(1).optional(),
       limit: z.number().int().positive().optional(),
+      pages: z.string().min(1).optional(),
     }),
-    async run({ path, offset = 1, limit }, ctx) {
+    async run({ path, offset = 1, limit, pages }, ctx) {
       const { roots } = ctx;
       const target = isAbsolute(path) ? resolve(path) : resolve(roots[0]!, path);
       if (isDenied(deniedPrefixes, target)) throw new Error(DENY_MESSAGE);
       const ext = extname(target).toLowerCase();
 
       if (IMAGE_EXTS.has(ext)) return readImage(target, ext, ctx);
+      if (ext === ".pdf") return await readPdf(target, pages);
 
       const content = readFileSync(target, "utf8");
       if (ext === ".ipynb") {

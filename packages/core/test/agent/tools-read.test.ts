@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { resolveWithin } from "../../src/agent/paths";
 import { ToolRegistry } from "../../src/agent/tools/registry";
 import { registerReadTools } from "../../src/agent/tools/fs-read";
-import { makePng } from "./read-fixtures";
+import { makePdf, makePng } from "./read-fixtures";
 
 function proj(): string {
   const d = realpathSync(mkdtempSync(join(tmpdir(), "norma-tools-")));
@@ -678,5 +678,95 @@ describe("read: notebooks (.ipynb) (multimodal-read T1)", () => {
     writeFileSync(join(d, "notreal.ipynb"), content);
     const res = await makeRegistry().execute("read", { path: "notreal.ipynb" }, { cwd: d, roots: [d], sessionId: "s1" });
     expect(res).toEqual({ output: content, isError: false });
+  });
+});
+
+// multimodal-read T2: PDFs ------------------------------------------------------------------------
+describe("read: PDFs (multimodal-read T2)", () => {
+  function makeRegistry(): ToolRegistry {
+    const r = new ToolRegistry();
+    registerReadTools(r);
+    return r;
+  }
+
+  test("a small (≤10 page) PDF is read whole, with per-page headers, no `pages` needed", async () => {
+    const d = proj();
+    writeFileSync(join(d, "small.pdf"), makePdf(["Hello from page one.", "Second page content here."]));
+    const res = await makeRegistry().execute("read", { path: "small.pdf" }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(false);
+    expect(res.output).toContain("— page 1 —");
+    expect(res.output).toContain("Hello from page one.");
+    expect(res.output).toContain("— page 2 —");
+    expect(res.output).toContain("Second page content here.");
+  });
+
+  test("a >10 page PDF without `pages` is refused, naming the real page count", async () => {
+    const d = proj();
+    const pages = Array.from({ length: 12 }, (_, i) => `Text on page ${i + 1}.`);
+    writeFileSync(join(d, "big.pdf"), makePdf(pages));
+    const res = await makeRegistry().execute("read", { path: "big.pdf" }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(true);
+    expect(res.output).toContain("12 pages");
+    expect(res.output).toContain("pages");
+  });
+
+  test("`pages` selects a range, headers scoped to it, and notes it's a partial view", async () => {
+    const d = proj();
+    const pages = Array.from({ length: 12 }, (_, i) => `Text on page ${i + 1}.`);
+    writeFileSync(join(d, "big.pdf"), makePdf(pages));
+    const res = await makeRegistry().execute("read", { path: "big.pdf", pages: "3-5" }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(false);
+    expect(res.output).toContain("Showing pages 3-5 of 12");
+    expect(res.output).toContain("— page 3 —");
+    expect(res.output).toContain("Text on page 3.");
+    expect(res.output).toContain("— page 5 —");
+    expect(res.output).toContain("Text on page 5.");
+    expect(res.output).not.toContain("— page 1 —");
+    expect(res.output).not.toContain("Text on page 6.");
+  });
+
+  test("`pages` accepts a single page number", async () => {
+    const d = proj();
+    const pages = Array.from({ length: 12 }, (_, i) => `Text on page ${i + 1}.`);
+    writeFileSync(join(d, "big.pdf"), makePdf(pages));
+    const res = await makeRegistry().execute("read", { path: "big.pdf", pages: "7" }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(false);
+    expect(res.output).toContain("— page 7 —");
+    expect(res.output).toContain("Text on page 7.");
+  });
+
+  test("a `pages` range spanning more than 20 pages is rejected", async () => {
+    const d = proj();
+    const pages = Array.from({ length: 30 }, (_, i) => `Text on page ${i + 1}.`);
+    writeFileSync(join(d, "huge.pdf"), makePdf(pages));
+    const res = await makeRegistry().execute("read", { path: "huge.pdf", pages: "1-25" }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(true);
+    expect(res.output).toContain("25 pages");
+    expect(res.output).toContain("max 20 pages");
+  });
+
+  test("a `pages` range outside the real page count is rejected, naming the actual count", async () => {
+    const d = proj();
+    writeFileSync(join(d, "small.pdf"), makePdf(["Only page."]));
+    const res = await makeRegistry().execute("read", { path: "small.pdf", pages: "1-5" }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(true);
+    expect(res.output).toContain("this PDF has 1 page");
+  });
+
+  test("a scanned/no-text PDF gets the honest message, not empty page headers", async () => {
+    const d = proj();
+    writeFileSync(join(d, "scanned.pdf"), makePdf(["", ""]));
+    const res = await makeRegistry().execute("read", { path: "scanned.pdf" }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(false);
+    expect(res.output).toContain("no extractable text");
+    expect(res.output).not.toContain("— page 1 —");
+  });
+
+  test("a malformed PDF is a clean tool error, not a throw", async () => {
+    const d = proj();
+    writeFileSync(join(d, "garbage.pdf"), "this is not a pdf at all");
+    const res = await makeRegistry().execute("read", { path: "garbage.pdf" }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(true);
+    expect(res.output).toContain("could not parse PDF");
   });
 });

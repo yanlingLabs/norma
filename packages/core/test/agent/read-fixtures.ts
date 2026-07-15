@@ -1,6 +1,7 @@
-// Shared fixture builders for the multimodal-read tests (T1): a hand-rolled PNG encoder (no image
-// library dependency — mirrors the product code's own "no new image dep" choice for the image
-// path). Deliberately tiny/uncompressed — just enough to be a real, sips-readable file.
+// Shared fixture builders for the multimodal-read tests (T1/T2): a hand-rolled PNG encoder (no
+// image library dependency — mirrors the product code's own "no new image dep" choice) and a
+// hand-built minimal PDF writer (objects/xref/trailer written by hand, no PDF-authoring library).
+// Both are deliberately tiny/uncompressed — just enough to be real, sips/unpdf-readable files.
 
 import { deflateSync } from "node:zlib";
 
@@ -57,4 +58,51 @@ export function makePng(width: number, height: number, opts?: { rgb?: [number, n
   const idat = pngChunk("IDAT", deflateSync(raw, opts?.noisy ? { level: 0 } : undefined));
   const iend = pngChunk("IEND", Buffer.alloc(0));
   return Buffer.concat([sig, ihdr, idat, iend]);
+}
+
+/** Builds a minimal valid PDF with one page per entry in `pageTexts` (each rendered as a single
+ *  `Tj` text-show operator in a Helvetica content stream — no compression, no xref STREAM, just
+ *  the classic object/xref-table/trailer shape every PDF reader (incl. pdf.js/unpdf) accepts). An
+ *  empty string produces a page with NO text operators at all (simulates a scanned/image-only
+ *  page for the "no extractable text" test). */
+export function makePdf(pageTexts: string[]): Buffer {
+  const n = pageTexts.length;
+  // Object numbering: 1=Catalog, 2=Pages, 3..(2+n)=Page objects, (3+n)..(2+2n)=Content streams,
+  // (3+2n)=Font.
+  const pageObjNum = (i: number) => 3 + i;
+  const contentObjNum = (i: number) => 3 + n + i;
+  const fontObjNum = 3 + 2 * n;
+  const total = fontObjNum;
+
+  const objs: string[] = [];
+  const kids = Array.from({ length: n }, (_, i) => `${pageObjNum(i)} 0 R`).join(" ");
+  objs[1] = `1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n`;
+  objs[2] = `2 0 obj\n<< /Type /Pages /Kids [${kids}] /Count ${n} >>\nendobj\n`;
+  for (let i = 0; i < n; i++) {
+    objs[pageObjNum(i)] =
+      `${pageObjNum(i)} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ` +
+      `/Resources << /Font << /F1 ${fontObjNum} 0 R >> >> /Contents ${contentObjNum(i)} 0 R >>\nendobj\n`;
+  }
+  for (let i = 0; i < n; i++) {
+    const text = pageTexts[i]!;
+    const content = text.length ? `BT /F1 18 Tf 72 700 Td (${escapePdfText(text)}) Tj ET` : "";
+    objs[contentObjNum(i)] = `${contentObjNum(i)} 0 obj\n<< /Length ${content.length} >>\nstream\n${content}\nendstream\nendobj\n`;
+  }
+  objs[fontObjNum] = `${fontObjNum} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n`;
+
+  let pdf = "%PDF-1.4\n";
+  const offsets: number[] = [0];
+  for (let i = 1; i <= total; i++) {
+    offsets[i] = Buffer.byteLength(pdf, "latin1");
+    pdf += objs[i];
+  }
+  const xrefOffset = Buffer.byteLength(pdf, "latin1");
+  pdf += `xref\n0 ${total + 1}\n0000000000 65535 f \n`;
+  for (let i = 1; i <= total; i++) pdf += `${String(offsets[i]).padStart(10, "0")} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${total + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+  return Buffer.from(pdf, "latin1");
+}
+
+function escapePdfText(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
 }
