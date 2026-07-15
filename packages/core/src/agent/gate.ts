@@ -37,11 +37,13 @@ export type SessionApprovalPolicy = "ask" | "auto" | "plan";
 // task_stop is read-only too (4h-ii-c Task 2): orchestration like spawn_agent/send_message — it
 // only aborts Norma's OWN child work (a bg agent's AbortController, or a bg bash task it started)
 // and never touches anything external on its own; CC's TaskStop prompts no approval either.
-// REVIEWER NOTE: bash_kill (below) sits in MUTATING, not here — that distinction is deliberate,
-// not an oversight: bash_kill's target is an OS process the user may independently care about
-// (any bash caller can reach the exact same kill via bash_kill under ITS OWN gate), whereas
-// task_stop's primary target is Norma's own subagent bookkeeping. Flagged here explicitly so a
-// whole-branch review adjudicates the split rather than silently accepting it.
+// CC-parity cleanup (removal of the redundant standalone `bash_kill` tool): task_stop's bash-task
+// branch is now the ONLY way to kill a background bash task — there is no longer a separate
+// MUTATING-gated `bash_kill` path a bash caller could reach for the exact same kill. This was
+// flagged here for review while both tools existed (the READ_ONLY/MUTATING split for the same
+// underlying OS-process-kill action); it's resolved in favor of matching CC, whose single
+// TaskStop also prompts no approval — task_stop's target is Norma's own bookkeeping (a bg agent
+// or a bg bash task IT started), not an arbitrary external process, so READ_ONLY stands.
 // agent_list/agent_output (phase 5a Task 1) are read-only too, per the plan's own global
 // constraint ("New tools are READ_ONLY ... they only read registry/store state"): both only ever
 // read BackgroundAgentRegistry/SessionStore state (agent_output never flips `notified`) — same
@@ -79,7 +81,7 @@ const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill",
 // new, stricter "always ask regardless of policy" class of its own; it must be classified
 // identically to computer/schedule above, not more cautiously. Project-scope trust is still a hard
 // gate (untrusted cwd → typed store error), independent of and prior to this policy gate.
-const MUTATING = new Set(["write", "edit", "bash", "bash_kill", "notebook_edit", "enter_worktree", "exit_worktree", "computer", "schedule", "memory_write", "memory_delete"]);
+const MUTATING = new Set(["write", "edit", "bash", "notebook_edit", "enter_worktree", "exit_worktree", "computer", "schedule", "memory_write", "memory_delete"]);
 const SELF_GATING = new Set(["request_directory"]);
 // web_fetch (4g Task 5, T6 adds web_search here) is Norma's ONLY network-capable tool — it does NOT
 // belong in READ_ONLY (it makes a live outbound request; the response bytes are DATA that could

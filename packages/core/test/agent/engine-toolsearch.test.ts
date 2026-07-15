@@ -207,11 +207,13 @@ describe("engine: built-in deferral + state pins (4g-i)", () => {
     expect(names).toContain("exit_plan_mode"); // pinned visible even though never loaded
   });
 
-  test("PIN (bg task): a live bg task pins bash_output/bash_kill into specs; the pin releases once the task exits (sticky set untouched — they don't leak into the next turn)", async () => {
+  test("PIN (bg task): a live bg task pins bash_output/task_stop into specs; the pin releases once the task exits (sticky set untouched — they don't leak into the next turn)", async () => {
     const registry = new ToolRegistry();
     registerToolSearchTool(registry);
     registry.register({ name: "bash_output", description: "read bg output", args: z.object({ taskId: z.string() }), deferred: true, run: () => "stub" });
-    registry.register({ name: "bash_kill", description: "kill a bg task", args: z.object({ taskId: z.string() }), deferred: true, run: () => "stub" });
+    // task_stop is the one generic stop tool (CC parity: the standalone bash_kill tool was
+    // removed) — its bash-unify path is what gets pinned here alongside bash_output.
+    registry.register({ name: "task_stop", description: "stop a bg agent or bg task", args: z.object({ task_id: z.string() }), deferred: true, run: () => "stub" });
 
     let status: "running" | "exited" = "running";
     const bgRegistry = { list: () => [{ status }] };
@@ -225,16 +227,16 @@ describe("engine: built-in deferral + state pins (4g-i)", () => {
     await engine.runTurn(sessionId); // turn 1
     const turn1Names = provider.requests[0]!.tools?.map((t) => t.name) ?? [];
     expect(turn1Names).toContain("bash_output");
-    expect(turn1Names).toContain("bash_kill");
+    expect(turn1Names).toContain("task_stop");
 
     status = "exited";
     await engine.runTurn(sessionId); // turn 2
-    // If bash_output/bash_kill had leaked into the STICKY loadedTools set (rather than being a
+    // If bash_output/task_stop had leaked into the STICKY loadedTools set (rather than being a
     // per-round pin), they'd still be present here even with no live task — this is the proof
     // that pinnedTools never touched the sticky set.
     const turn2Names = provider.requests[1]!.tools?.map((t) => t.name) ?? [];
     expect(turn2Names).not.toContain("bash_output");
-    expect(turn2Names).not.toContain("bash_kill");
+    expect(turn2Names).not.toContain("task_stop");
   });
 
   test("BYTE-IDENTICAL: toolSearch unset → specs identical whether or not built-ins carry deferred:true", async () => {

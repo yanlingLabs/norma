@@ -362,7 +362,7 @@ export async function startDaemon(opts: {
     // read the daemon's own control-plane files through the tool the daemon itself hosts.
     registerReadTools(registry, { deniedPrefixes: [dirs.runDir] });
     registerWriteTools(registry);
-    registerBashTool(registry, { bgRegistry }); // bash itself is NEVER deferred — only its background-poll pair below
+    registerBashTool(registry, { bgRegistry }); // bash itself is NEVER deferred — only its background-poll tool below (bash_output; task_stop, below, is the sole way to kill one)
     registerBackgroundTools(registry, { bgRegistry }, { deferred: true });
     registerSkillTools(registry, { skills: skillStore });
     registerToolSearchTool(registry);
@@ -429,7 +429,8 @@ export async function startDaemon(opts: {
     // `bgAgents`/`bgRegistry` instances the engine cfg gets below, so a stop here is visible to
     // the engine's own pin/completion-reminder bookkeeping. Unlike spawn_agent/send_message this
     // is a PLAIN TOOL (no engine bridge — see task-stop.ts's own doc comment), deferred like
-    // bash_kill (registerBackgroundTools above).
+    // bash_output (registerBackgroundTools above) — CC parity: one generic stop tool, no separate
+    // bash_kill (removed; task_stop's bash-unify path is now the only way to kill a bg bash task).
     registerTaskStopTool(registry, { bgAgents, bgRegistry, deferred: true });
     // phase 5a Task 1: agent_list/agent_output — the read-only "collect your subagents"
     // counterpart to spawn_agent/send_message/task_stop above, same bgAgents instance so what

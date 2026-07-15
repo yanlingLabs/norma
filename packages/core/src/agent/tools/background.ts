@@ -28,15 +28,4 @@ export function registerBackgroundTools(r: ToolRegistry, deps: { bgRegistry: Bac
       return `${body}\n${suffix}`;
     },
   });
-
-  r.register({
-    name: "bash_kill",
-    description: "Stop a running background bash task started with bash's runInBackground option.",
-    args: z.object({ taskId: z.string().min(1) }),
-    deferred: opts?.deferred,
-    run({ taskId }, { sessionId }) {
-      bgRegistry.kill(sessionId, taskId);
-      return `killed ${taskId}`;
-    },
-  });
 }

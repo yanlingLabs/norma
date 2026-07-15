@@ -189,8 +189,10 @@ describe("task_stop tool (4h-ii-c Task 2)", () => {
 
 // -------------------------------------------------------------------------------------------
 // (d) bash-task path: task_stop falls through to BackgroundTaskRegistry.kill() when no bgAgents
-// entry matches. Mirrors tools-background.test.ts's own bash_kill test — gated on sandboxAvailable
-// since it spawns a real sandbox-exec process, same precedent as every other bg-registry test here.
+// entry matches — this is the ONLY way to kill a bg bash task now that the standalone bash_kill
+// tool has been removed (CC parity: task_stop is the one generic stop tool). Mirrors
+// tools-background.test.ts's own task_stop test — gated on sandboxAvailable since it spawns a
+// real sandbox-exec process, same precedent as every other bg-registry test here.
 // -------------------------------------------------------------------------------------------
 const d = sandboxAvailable() ? describe : describe.skip;
 d("task_stop tool: bash-task path (4h-ii-c Task 2)", () => {
@@ -202,7 +204,7 @@ d("task_stop tool: bash-task path (4h-ii-c Task 2)", () => {
     return { r, cwd, bgRegistry };
   }
 
-  test("(d) task_stop kills a running background bash task — 'killed <taskId>' wording, mirrors bash_kill", async () => {
+  test("(d) task_stop kills a running background bash task — 'killed <taskId>' wording (the removed bash_kill tool's own wording)", async () => {
     const { r, cwd, bgRegistry } = bgTaskSetup();
     const taskId = bgRegistry.start("s1", "sleep 30");
     await sleep(200);
@@ -353,7 +355,7 @@ describe("AgentEngine: task_stop E2E (4h-ii-c Task 2)", () => {
     expect(notified).toBeUndefined();
   });
 
-  // PIN coverage: daemon.ts registers task_stop `deferred: true` (mirrors bash_kill) — in
+  // PIN coverage: daemon.ts registers task_stop `deferred: true` (same as bash_output) — in
   // production, the engine's per-round pin (engine.ts:~347/352) is the ONLY thing that makes it
   // visible while a bg agent is running, short of an explicit ToolSearch load. Exercises the
   // `this.cfg.bgAgents?.list(sessionId).some(e => e.status === "running")` pin directly — distinct

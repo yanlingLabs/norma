@@ -12,9 +12,11 @@ import type { BackgroundTaskRegistry } from "../bg-registry";
  *
  * Resolution order mirrors CC: (1) a bg AGENT match wins — running → stop it; terminal → report
  * its status (idempotent-friendly, NOT an error, same as calling TaskStop twice in CC). (2) else a
- * bg bash TASK match — kill it (mirrors bash_kill's own wording/behavior exactly; this tool's
- * bash-unify path is a convenience alias for a caller that doesn't know/care which kind of
- * background work `task_id` refers to). (3) else a typed not-found error.
+ * bg bash TASK match — kill it via the SAME BackgroundTaskRegistry.kill() call the (now-removed)
+ * standalone `bash_kill` tool used to make; this tool's bash-unify path is a convenience alias for
+ * a caller that doesn't know/care which kind of background work `task_id` refers to, and is the
+ * ONLY way to stop a background bash task (CC parity: one generic stop tool, not two). (3) else a
+ * typed not-found error.
  *
  * `entry.notified = true` (mirrors the sync-spawn `complete(..., {notified:true})` reasoning in
  * bg-agent-registry.ts): the CALLER of task_stop receives this tool_result directly, in the SAME

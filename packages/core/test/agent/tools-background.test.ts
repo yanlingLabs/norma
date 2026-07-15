@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { ToolRegistry } from "../../src/agent/tools/registry";
 import { registerBashTool } from "../../src/agent/tools/bash";
 import { registerBackgroundTools } from "../../src/agent/tools/background";
+import { registerTaskStopTool } from "../../src/agent/tools/task-stop";
 import { BackgroundTaskRegistry } from "../../src/agent/bg-registry";
 import { sandboxAvailable } from "../../src/agent/sandbox";
 import { sessionTmpDir } from "../../src/agent/session-tmp";
@@ -20,6 +21,7 @@ d("background tools", () => {
     const r = new ToolRegistry();
     registerBashTool(r, { bgRegistry: bg });
     registerBackgroundTools(r, { bgRegistry: bg });
+    registerTaskStopTool(r, { bgRegistry: bg }); // the sole way to kill a bg bash task (bash_kill removed, CC parity)
     return { r, cwd };
   }
   const ctx = (cwd: string) => ({ cwd, roots: [cwd], tmpDir: sessionTmpDir("s_bgt"), sessionId: "s1" });
@@ -38,12 +40,14 @@ d("background tools", () => {
     expect(out.output).toMatch(/\[status: exited, exit 0\]/);
   });
 
-  test("bash_kill stops a running background task", async () => {
+  // Standalone bash_kill was removed (CC parity: task_stop is the one generic stop tool) —
+  // task_stop's bash-unify path is exercised end-to-end in task-stop.test.ts's own "(d)" test.
+  test("task_stop stops a running background task (bash_kill's replacement)", async () => {
     const { r, cwd } = setup();
     const started = await r.execute("bash", { command: "sleep 30", runInBackground: true }, ctx(cwd));
     const taskId = started.output.match(/bg_[0-9a-f]+/)![0];
     await sleep(200);
-    const killed = await r.execute("bash_kill", { taskId }, ctx(cwd));
+    const killed = await r.execute("task_stop", { task_id: taskId }, ctx(cwd));
     expect(killed.isError).toBe(false);
     await sleep(600);
     const out = await r.execute("bash_output", { taskId }, ctx(cwd));
@@ -56,14 +60,14 @@ d("background tools", () => {
     expect(out.isError).toBe(true);
   });
 
-  test("bash_output/bash_kill on another session's task are errors (tool-layer session scoping)", async () => {
+  test("bash_output/task_stop on another session's task are errors (tool-layer session scoping)", async () => {
     const { r, cwd } = setup();
     const started = await r.execute("bash", { command: "sleep 5", runInBackground: true }, ctx(cwd)); // ctx = sessionId "s1"
     const taskId = started.output.match(/bg_[0-9a-f]+/)![0];
     const foreignCtx = { cwd, roots: [cwd], tmpDir: sessionTmpDir("s_bgt"), sessionId: "s2" };
     expect((await r.execute("bash_output", { taskId }, foreignCtx)).isError).toBe(true);
-    expect((await r.execute("bash_kill", { taskId }, foreignCtx)).isError).toBe(true);
-    await r.execute("bash_kill", { taskId }, ctx(cwd)); // clean up as the real owner
+    expect((await r.execute("task_stop", { task_id: taskId }, foreignCtx)).isError).toBe(true);
+    await r.execute("task_stop", { task_id: taskId }, ctx(cwd)); // clean up as the real owner (was bash_kill)
   });
 
   test("bash_output filter keeps only matching lines", async () => {

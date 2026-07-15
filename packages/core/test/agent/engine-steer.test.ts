@@ -49,7 +49,7 @@ export function setupEngine(provider: Provider, opts?: {
   // pre-existing engine test. worktrees mirrors daemon.ts's real WorktreeManager wiring;
   // bgRegistry is any BgTaskLister-shaped object (a real BackgroundTaskRegistry or a lightweight
   // test fake — see engine-toolsearch.test.ts's PIN tests) so tests don't need to spawn a real
-  // sandboxed background process just to exercise the bash_output/bash_kill pin.
+  // sandboxed background process just to exercise the bash_output/task_stop pin.
   worktrees?: WorktreeManager;
   bgRegistry?: BgTaskLister;
 }) {

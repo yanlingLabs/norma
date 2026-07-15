@@ -282,8 +282,8 @@ export interface EngineConfig {
   // also persists via store.setCwd/dirs.add so the NEXT turn sees it too.
   worktrees?: WorktreeManager;
   // State pin (4g-i): per-session live background-task listing, consulted ONLY by pinnedTools
-  // (below) to force bash_output/bash_kill visible while a task is running, without touching the
-  // sticky loadedTools set. Absent → that pin never fires (bash_output/bash_kill, if registered
+  // (below) to force bash_output/task_stop visible while a task is running, without touching the
+  // sticky loadedTools set. Absent → that pin never fires (bash_output/task_stop, if registered
   // deferred:true, stay hidden until ToolSearch-loaded like any other deferred built-in).
   bgRegistry?: BgTaskLister;
   // Subagents (1d-iv): both optional, and both absent leaves spawn_agent at its own placeholder
@@ -710,9 +710,10 @@ export class AgentEngine {
     if (meta.approvalPolicy === "plan") pins.add("exit_plan_mode");
     if (this.cfg.worktrees?.active(sessionId)) pins.add("exit_worktree");
     const bgTasks = this.cfg.bgRegistry?.list(sessionId) ?? [];
-    // 4h-ii-c Task 2: task_stop can kill a running bg TASK too (its bash-unify path, mirroring
-    // bash_kill) — pinned alongside bash_output/bash_kill whenever one is running.
-    if (bgTasks.some((t) => t.status === "running")) { pins.add("bash_output"); pins.add("bash_kill"); pins.add("task_stop"); }
+    // 4h-ii-c Task 2: task_stop can kill a running bg TASK too (its bash-unify path — the ONLY
+    // way to do so now that the standalone bash_kill tool is gone) — pinned alongside bash_output
+    // whenever one is running.
+    if (bgTasks.some((t) => t.status === "running")) { pins.add("bash_output"); pins.add("task_stop"); }
     // task_stop is ALSO pinned whenever a bg AGENT is running (independent of any bg bash task) —
     // that's its primary target (CC TaskStop parity: stop a running background agent).
     if (this.cfg.bgAgents?.list(sessionId).some((e) => e.status === "running")) pins.add("task_stop");

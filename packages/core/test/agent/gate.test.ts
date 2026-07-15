@@ -50,10 +50,10 @@ describe("PermissionGate v1", () => {
     }
   });
 
-  test("bash_kill is mutating: ask under ask-policy, allow under auto-policy", () => {
-    expect(gate.evaluate("bash_kill", "ask")).toBe("ask");
-    expect(gate.evaluate("bash_kill", "auto")).toBe("allow");
-  });
+  // bash_kill (the standalone kill-a-bg-bash-task tool) was removed — CC parity: task_stop is now
+  // the ONE generic stop tool (see the "task_stop is read-only too" note above). Its old MUTATING
+  // classification test is gone with it; task_stop's own read-only classification is covered by
+  // the "guard" test at the bottom of this file (task_stop is a READ_ONLY member there).
 
   test("computer (Phase 5 CU) is mutating: ask under ask, allow under auto, deny under plan", () => {
     expect(gate.evaluate("computer", "ask")).toBe("ask");
@@ -119,12 +119,12 @@ describe("PermissionGate v1", () => {
     }
   });
 
-  test("plan matrix: read-only + exit_plan_mode + ask_user + task_* allow; write/edit/bash/bash_kill/mcp/plugin deny; unclassified deny", () => {
+  test("plan matrix: read-only + exit_plan_mode + ask_user + task_* allow; write/edit/bash/mcp/plugin deny; unclassified deny", () => {
     const g = new PermissionGate();
     for (const t of ["read", "glob", "grep", "ls", "Skill", "ToolSearch", "ask_user", "task_create", "task_list", "exit_plan_mode", "request_directory"]) {
       expect(g.evaluate(t, "plan")).toBe("allow");
     }
-    for (const t of ["write", "edit", "bash", "bash_kill", "mcp__x__y", "plugin__x__y", "frobnicate"]) {
+    for (const t of ["write", "edit", "bash", "mcp__x__y", "plugin__x__y", "frobnicate"]) {
       expect(g.evaluate(t, "plan")).toBe("deny");
     }
   });
@@ -209,7 +209,7 @@ describe("PermissionGate v1", () => {
       // READ_ONLY
       "read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output", "memory_read", "lsp_diagnostics", "lsp_definition", "lsp_references",
       // MUTATING
-      "write", "edit", "bash", "bash_kill", "notebook_edit", "enter_worktree", "exit_worktree", "computer", "schedule", "memory_write", "memory_delete",
+      "write", "edit", "bash", "notebook_edit", "enter_worktree", "exit_worktree", "computer", "schedule", "memory_write", "memory_delete",
       // SELF_GATING + NETWORK + externals
       "request_directory", "web_fetch", "web_search", "mcp__x__y", "plugin__x__y",
     ];

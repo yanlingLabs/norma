@@ -10,7 +10,7 @@ import type { SessionStore } from "../../sessions/store";
  * `ctx.sessionId` at run time) — nothing here needs the engine's dispatch loop, so there is no
  * bridge to intercept these calls. `deferred: true` unconditionally (unlike task_stop, whose
  * deferral is caller-supplied) — daemon.ts always registers these behind ToolSearch, same as
- * bash_output/bash_kill/task_stop.
+ * bash_output/task_stop.
  *
  * Deliberately READ-ONLY: neither tool ever writes `entry.notified` — task_stop and the detached
  * chain's own `takeForNotification` claim (engine.ts's settle-time completion-notice persistence)
