@@ -520,6 +520,19 @@ describe("state.ts — note one-liners match main.ts's wording (bg-task/worktree
     expect(s.pending).toBeNull();
   });
 
+  // child-transcript-view T3: a threadId-routed local_note lands in THAT child's block list, not
+  // the main transcript — App's child view uses this for thread.send feedback/error notes. A
+  // threadId of "main" (defensive) or absent keeps the pre-existing main-committed behavior.
+  test("local_note with a child threadId commits into childBlocks, never committed (T3)", () => {
+    let s = initialState();
+    s = reduce(s, { type: "local_note", text: "message queued", threadId: "th_1" }, T0);
+    expect(s.committed).toEqual([]);
+    expect(s.childBlocks["th_1"]).toEqual([{ kind: "note", text: "message queued" }]);
+    s = reduce(s, { type: "local_note", text: "main note", threadId: "main" }, T0);
+    expect(s.committed).toEqual([{ kind: "note", text: "main note" }]);
+    expect(s.childBlocks["main"]).toBeUndefined();
+  });
+
   // Phase 5e T1 (reviewer maturity, the wire-vocabulary/5c lesson): `tool_review` is a NEW
   // SessionEvent variant this reducer has no dedicated case for — confirms the existing `default:
   // return s` (no exhaustive switch on `e.type` here, unlike NormaKit's Swift accessor switches)

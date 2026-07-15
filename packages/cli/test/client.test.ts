@@ -63,6 +63,23 @@ describe("NormaClient", () => {
     client.close();
   });
 
+  // Live child-transcript view T3: the two thin wrappers over thread.send/agent.stop. Full
+  // queued/resumed/unknown-agent coverage already lives at the protocol/core level (T1's
+  // server.test.ts) — this just pins the CLIENT's own round-trip (request + zod-validated
+  // result), same "unknown agent -> clear rejection" shape client.test.ts already exercises for
+  // other RPCs above (no bg-agent fixture is reachable through this file's plain `startDaemon`).
+  test("sendToThread/agentStop against an unknown agent reject with a clear error (client-side round-trip)", async () => {
+    await boot();
+    const client = await NormaClient.connect({
+      socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "cli", onEvent: () => {},
+    });
+    const { sessionId } = await client.createSession("global");
+    await client.attach(sessionId);
+    await expect(client.sendToThread(sessionId, "ghost", "hi")).rejects.toThrow(/ghost/);
+    await expect(client.agentStop(sessionId, "ghost")).rejects.toThrow(/ghost/);
+    client.close();
+  });
+
   test("createSession returns trusted; trustDir makes a later create trusted", async () => {
     await boot();
     const client = await NormaClient.connect({ socketPath: daemon.socketPath, token: daemon.tokens.harness, clientName: "t", onEvent: () => {} });

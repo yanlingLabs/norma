@@ -26,7 +26,14 @@
  *  Phase 5a Task 3: `agent.name` (a background child's re-taskable handle, mapped by state.ts's
  *  spawn_agent tool_call/tool_result pairing — see `AgentRow`'s own doc comment in state.ts) takes
  *  `.label`'s place in the head row's parenthetical when present, falling back to `.label`
- *  otherwise — a label swap only, the row shape/layout above is unchanged. */
+ *  otherwise — a label swap only, the row shape/layout above is unchanged.
+ *
+ *  Live child-transcript view T3: an optional `selectedIndex` prop (app.tsx's roster select mode)
+ *  highlights ONE row — the head gutter swaps to a `▶ ` pointer (a plain-ASCII fingerprint,
+ *  independent of ANSI, so tests don't need to parse escape codes) and BOTH of that row's lines
+ *  render `inverse` (same reverse-video idiom composer.tsx's cursor cell already uses). Every
+ *  other row's layout/gutter is completely unaffected — `undefined` (the default) renders
+ *  byte-identical to before this task. */
 
 import React from "react";
 import { Box, Text } from "ink";
@@ -43,25 +50,25 @@ function pluralizeToolUse(n: number): string {
 // never folded into "Failed") each render distinctly from a genuine "Done". `finish` absent on a
 // terminal row (a pre-change event replay) falls back to "Done", the old wording — never a blank
 // continuation.
-const FINISH_LABEL: Record<string, string> = { done: "Done", failed: "Failed", stopped: "Stopped", stalled: "Stalled" };
+export const FINISH_LABEL: Record<string, string> = { done: "Done", failed: "Failed", stopped: "Stopped", stalled: "Stalled" };
 
-function AgentTreeRow({ agent, isLast }: { agent: AgentRow; isLast: boolean }) {
-  const headGutter = isLast ? "└─ " : "├─ ";
+function AgentTreeRow({ agent, isLast, isSelected }: { agent: AgentRow; isLast: boolean; isSelected: boolean }) {
+  const headGutter = isSelected ? "▶  " : isLast ? "└─ " : "├─ ";
   const contGutter = isLast ? "   ⎿  " : "│  ⎿  ";
   const continuation = agent.status === "done"
     ? (FINISH_LABEL[agent.finish ?? "done"] ?? "Done")
     : (agent.activity ?? "Working…");
   return (
     <Box flexDirection="column">
-      <Text>
-        <Text dimColor>{headGutter}</Text>
+      <Text inverse={isSelected}>
+        <Text dimColor={!isSelected}>{headGutter}</Text>
         <Text bold>{agent.agentType}</Text>
         {/* phase 5a T3: a mapped `name` (re-taskable handle) takes the label's place here — same
             slot, same layout; `.label` is the fallback whenever no mapping exists. */}
         {` (${agent.name ?? agent.label})`}
         {` · ${pluralizeToolUse(agent.toolCalls)}`}
       </Text>
-      <Text dimColor>
+      <Text inverse={isSelected} dimColor={!isSelected}>
         {contGutter}
         {continuation}
       </Text>
@@ -69,13 +76,13 @@ function AgentTreeRow({ agent, isLast }: { agent: AgentRow; isLast: boolean }) {
   );
 }
 
-export function AgentList({ agents, nowMs }: { agents: AgentRow[]; nowMs: number }) {
+export function AgentList({ agents, nowMs, selectedIndex }: { agents: AgentRow[]; nowMs: number; selectedIndex?: number }) {
   void nowMs;
   if (agents.length === 0) return null;
   return (
     <Box flexDirection="column">
       {agents.map((a, i) => (
-        <AgentTreeRow key={a.threadId} agent={a} isLast={i === agents.length - 1} />
+        <AgentTreeRow key={a.threadId} agent={a} isLast={i === agents.length - 1} isSelected={i === selectedIndex} />
       ))}
     </Box>
   );

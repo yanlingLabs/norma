@@ -26,6 +26,9 @@ function fakeClient() {
   return {
     send: rec(), steer: rec(), interrupt: rec(), setPolicy: rec(),
     askUserRespond: rec(), planRespond: rec(), request: rec(),
+    // child-transcript-view T3 (AppClient's two typed members):
+    sendToThread: () => Promise.resolve({ delivered: "queued" as const, agentId: "x" }),
+    agentStop: () => Promise.resolve({ status: "stopped" }),
   };
 }
 

@@ -54,8 +54,14 @@ export type Block =
  *  `CommandCtx.appendNote`) have a way to commit a note block through the SAME reducer/dispatch
  *  path every other transcript line goes through, instead of a separate ad-hoc "local blocks" list
  *  that the transcript/flatten-cache would need to know about too. Pure additive case — reduce's
- *  handling of every real wire event type is completely unaffected. */
-export type LocalEvent = { type: "local_note"; text: string };
+ *  handling of every real wire event type is completely unaffected.
+ *
+ *  `threadId` (child-transcript-view T3, additive/optional): when set to a non-MAIN thread, the
+ *  note commits into THAT child's `childBlocks` entry instead of the main `committed` log — the
+ *  App's child view uses this to surface `thread.send`'s queued/resumed feedback and RPC-error
+ *  notes (unknown agent, resume-refused) right where the user is looking, never crashing the TUI.
+ *  Omitted (main transcript) is the pre-existing behavior, byte-identical. */
+export type LocalEvent = { type: "local_note"; text: string; threadId?: string };
 
 /** `AgentRow` IS `CliSubagent`-shaped (the brief's interface matches it field-for-field) — reuse the
  *  type directly rather than re-declaring an equivalent interface that could drift out of lockstep.
@@ -494,9 +500,13 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
       return { ...s, committed: [...s.committed, { kind: "note", text }] };
     }
 
-    case "local_note":
+    case "local_note": {
       // See the `LocalEvent` doc comment above — App-internal only, never a real wire event.
-      return { ...s, committed: [...s.committed, { kind: "note", text: str(e.text) }] };
+      const block: Block = { kind: "note", text: str(e.text) };
+      const threadId = typeof e.threadId === "string" ? e.threadId : undefined;
+      if (threadId !== undefined && threadId !== MAIN) return { ...s, childBlocks: withChildBlock(s.childBlocks, threadId, block) };
+      return { ...s, committed: [...s.committed, block] };
+    }
 
     default:
       return s; // unknown/unhandled event types are no-ops (both CLI/app already skip unknowns)

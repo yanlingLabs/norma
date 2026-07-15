@@ -115,6 +115,39 @@ describe("Composer", () => {
     expect(interrupts).toBe(1);
   });
 
+  // child-transcript-view T3: `onEscEmpty` (precedence #0) — provided + EMPTY buffer routes the
+  // whole Esc there, outranking even the running-interrupt (see the prop's doc comment); with text
+  // in the buffer it never fires and precedence #1 wins exactly as in (c2) above.
+  test("(c3) Esc with onEscEmpty + empty buffer fires it INSTEAD of interrupt; text restores the old rules", async () => {
+    let interrupts = 0;
+    let closed = 0;
+    const { stdin } = render(
+      <Composer
+        running
+        policy="ask"
+        onSubmit={() => {}}
+        onSteer={() => {}}
+        onInterrupt={() => { interrupts += 1; }}
+        onCyclePolicy={() => {}}
+        nowMs={0}
+        historyPath={historyPath()}
+        onEscEmpty={() => { closed += 1; }}
+      />,
+    );
+    await wait();
+    stdin.write("\x1b"); // esc on EMPTY buffer -> onEscEmpty only
+    await wait();
+    expect(closed).toBe(1);
+    expect(interrupts).toBe(0);
+
+    stdin.write("draft");
+    await wait();
+    stdin.write("\x1b"); // esc with TEXT -> precedence #1 (running-interrupt), onEscEmpty untouched
+    await wait();
+    expect(interrupts).toBe(1);
+    expect(closed).toBe(1);
+  });
+
   test("(d) Shift+Tab calls onCyclePolicy", async () => {
     let cycles = 0;
     const { stdin } = render(

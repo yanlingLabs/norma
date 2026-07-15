@@ -42,6 +42,16 @@ function fakeClient() {
     askUserRespond: rec("askUserRespond"),
     planRespond: rec("planRespond"),
     request: rec("request"),
+    // child-transcript-view T3: typed results (AppClient reads `delivered`/`status` off these);
+    // per-test overrides spread over this base for the resumed/rejected variants.
+    sendToThread: (...args: unknown[]) => {
+      calls.push({ method: "sendToThread", args });
+      return Promise.resolve({ delivered: "queued" as const, agentId: "th_1" });
+    },
+    agentStop: (...args: unknown[]) => {
+      calls.push({ method: "agentStop", args });
+      return Promise.resolve({ status: "stopped" });
+    },
   };
 }
 
@@ -749,6 +759,261 @@ describe("App — command + mention e2e wiring (Phase 3d T4)", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("App — child transcript view (child-transcript-view T3)", () => {
+  // Seeds one WORKING roster row per (threadId, description): thread_started (queued) +
+  // turn_started (working) — the same event pair test (b) above uses.
+  const pushAgent = (bridge: ReturnType<typeof makeEventBridge>, threadId: string, description: string) => {
+    bridge.push(ev({ type: "thread_started", threadId, agentType: "general-purpose", description, ts: 500 }));
+    bridge.push(ev({ type: "turn_started", threadId, ts: 1000 }));
+  };
+  // The select-mode pointer glyph — AgentList's plain-text highlight fingerprint.
+  const POINTER = "▶";
+  const selectedLine = (frame: string) => frame.split("\n").find((l) => l.includes(POINTER)) ?? "";
+
+  test("(t1) ctrl+a with NO agents never enters select mode — it stays the composer's cursor-Home", async () => {
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={makeEventBridge()} {...baseProps} />);
+    await wait();
+    stdin.write("bc");
+    await wait();
+    stdin.write("\x01"); // ctrl+a — no roster: falls through to the composer (cursor to 0)
+    await wait();
+    expect(lastFrame() ?? "").not.toContain(POINTER); // no select mode
+    stdin.write("a"); // inserts AT the cursor — proves the ctrl+a really reached the composer
+    await wait();
+    // Buffer is now "abc" with the inverse cursor sitting ON "b" (insert landed at 0, cursor 1) —
+    // the same ANSI-fingerprint idiom test (z) above uses, since the cursor codes split the text.
+    expect(lastFrame() ?? "").toContain("❯ a\x1b[7mb\x1b[27mc");
+  });
+
+  test("(t2) ctrl+a toggles select mode; ↑/↓ move with bounds; Esc exits; other keys still work", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    pushAgent(bridge, "th_1", "scout");
+    pushAgent(bridge, "th_2", "helper");
+    await wait();
+
+    stdin.write("\x01"); // ctrl+a -> select mode, first row highlighted
+    await wait();
+    expect(selectedLine(lastFrame() ?? "")).toContain("(scout)");
+
+    stdin.write("\x1b[B"); // down -> second row
+    await wait();
+    expect(selectedLine(lastFrame() ?? "")).toContain("(helper)");
+
+    stdin.write("\x1b[B"); // down at the end -> stays (bound)
+    await wait();
+    expect(selectedLine(lastFrame() ?? "")).toContain("(helper)");
+
+    stdin.write("\x1b[A"); // up -> back to first
+    await wait();
+    stdin.write("\x1b[A"); // up at the top -> stays (bound)
+    await wait();
+    expect(selectedLine(lastFrame() ?? "")).toContain("(scout)");
+
+    stdin.write("\x14"); // ctrl+t (tasks toggle) passes through untouched mid-select — no crash, still selected
+    await wait();
+    expect(lastFrame() ?? "").toContain(POINTER);
+
+    stdin.write("\x1b"); // Esc -> exit select mode
+    await wait();
+    expect(lastFrame() ?? "").not.toContain(POINTER);
+    expect(client.calls).toEqual([]); // pure UI navigation — no RPC ever fired
+  });
+
+  test("(t3) Enter opens the child view: pinned header + childBlocks replace the main transcript, live-updating", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: "MAIN-ONLY-MARKER" }));
+    pushAgent(bridge, "th_1", "scout");
+    bridge.push(ev({ type: "assistant_message", threadId: "th_1", text: "child says hi" }));
+    await wait();
+    expect(lastFrame() ?? "").toContain("MAIN-ONLY-MARKER"); // main view first
+
+    stdin.write("\x01"); // select mode
+    await wait();
+    stdin.write("\r"); // Enter -> open th_1's child view
+    await wait();
+
+    let frame = lastFrame() ?? "";
+    expect(frame).toContain("th_1"); // header identity (no name mapping -> threadId)
+    expect(frame).toContain("working · esc back"); // header status + hint
+    expect(frame).toContain("child says hi"); // childBlocks rendered
+    expect(frame).not.toContain("MAIN-ONLY-MARKER"); // main committed log swapped out
+    expect(frame).not.toContain(POINTER); // select mode exited on open
+
+    bridge.push(ev({ type: "assistant_message", threadId: "th_1", text: "second child line" }));
+    await wait();
+    frame = lastFrame() ?? "";
+    expect(frame).toContain("second child line"); // live-updates as the reducer appends
+  });
+
+  test("(t4) child-view input routing: text -> sendToThread(threadId) + queued feedback; slash -> MAIN runCommand; send/steer never fire", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    pushAgent(bridge, "th_1", "scout");
+    await wait();
+    stdin.write("\x01");
+    await wait();
+    stdin.write("\r"); // open child view
+    await wait();
+
+    stdin.write("hello agent");
+    await wait();
+    stdin.write("\r");
+    await wait();
+    expect(client.calls).toEqual([{ method: "sendToThread", args: ["s1", "th_1", "hello agent"] }]);
+    expect(lastFrame() ?? "").toContain('message queued for agent "scout"'); // delivered:"queued" feedback, in the child view
+
+    stdin.write("/help"); // built-in command: runs in the MAIN conversation (CC parity)
+    await wait();
+    stdin.write("\r");
+    await wait();
+    expect(client.calls).toHaveLength(1); // no send/steer/sendToThread for the slash input
+    expect(lastFrame() ?? "").not.toContain("Keys:"); // its note landed in MAIN, not the open child view
+
+    stdin.write("\x1b"); // Esc (empty composer) -> back to main
+    await wait();
+    const frame = lastFrame() ?? "";
+    expect(frame).not.toContain("working · esc back"); // header gone (the /help note's own "esc back" text may remain)
+    expect(frame).toContain("Keys:"); // the /help note was committed to the MAIN transcript all along
+  });
+
+  test("(t5) delivered:'resumed' renders the resumed feedback note", async () => {
+    const bridge = makeEventBridge();
+    const client = { ...fakeClient(), sendToThread: async () => ({ delivered: "resumed" as const, agentId: "th_1" }) };
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    pushAgent(bridge, "th_1", "scout");
+    bridge.push(ev({ type: "thread_completed", threadId: "th_1", ts: 2000, stopReason: "end_turn" }));
+    await wait();
+    stdin.write("\x01");
+    await wait();
+    stdin.write("\r");
+    await wait();
+    stdin.write("try again with flag X");
+    await wait();
+    stdin.write("\r");
+    await wait();
+    expect(lastFrame() ?? "").toContain('agent "scout" resumed with your message');
+  });
+
+  test("(t6) a thread.send RPC error renders as a note in the child view — never a crash", async () => {
+    const bridge = makeEventBridge();
+    const client = { ...fakeClient(), sendToThread: async () => { throw new Error("cannot resume: no history (code invalid)"); } };
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    pushAgent(bridge, "th_1", "scout");
+    await wait();
+    stdin.write("\x01");
+    await wait();
+    stdin.write("\r");
+    await wait();
+    stdin.write("hi");
+    await wait();
+    stdin.write("\r");
+    await wait();
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain('message to agent "scout" failed: cannot resume: no history (code invalid)');
+    expect(frame).toContain("working · esc back"); // view intact, app alive
+  });
+
+  test("(t7) Esc on an empty composer closes the child view WITHOUT interrupting a running main turn", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    bridge.push(ev({ type: "turn_started", threadId: "main" })); // main turn RUNNING
+    bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: "MAIN-ONLY-MARKER" }));
+    pushAgent(bridge, "th_1", "scout");
+    await wait();
+    stdin.write("\x01");
+    await wait();
+    stdin.write("\r"); // open child view
+    await wait();
+    expect(lastFrame() ?? "").toContain("working · esc back");
+
+    stdin.write("\x1b"); // Esc, empty composer -> close the view, do NOT interrupt
+    await wait();
+    const frame = lastFrame() ?? "";
+    expect(frame).not.toContain("working · esc back");
+    expect(frame).toContain("MAIN-ONLY-MARKER"); // main transcript back
+    expect(client.calls.filter((c) => c.method === "interrupt")).toEqual([]); // running turn untouched
+
+    stdin.write("\x1b"); // next Esc (main view, running) -> the normal interrupt semantics resume
+    await wait();
+    expect(client.calls.filter((c) => c.method === "interrupt")).toHaveLength(1);
+  });
+
+  test("(t8) x on a RUNNING row calls agent.stop and notes the result; the row stays until events say otherwise", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    pushAgent(bridge, "th_1", "scout");
+    await wait();
+    stdin.write("\x01");
+    await wait();
+    stdin.write("x");
+    await wait();
+    expect(client.calls).toEqual([{ method: "agentStop", args: ["s1", "th_1"] }]);
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain('agent "scout" stopped'); // the RPC result note (main transcript)
+    expect(frame).toContain("(scout)"); // roster row NOT locally removed — status flips via events
+  });
+
+  test("(t9) x on a FINISHED row dismisses it locally (no RPC); footer count follows", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    pushAgent(bridge, "th_1", "scout");
+    pushAgent(bridge, "th_2", "helper");
+    bridge.push(ev({ type: "thread_completed", threadId: "th_1", ts: 2000, stopReason: "end_turn" }));
+    await wait();
+    expect(lastFrame() ?? "").toContain("2 agents · ctrl+a"); // the truthful pill (T3)
+
+    stdin.write("\x01"); // select mode — first row (the finished scout) highlighted
+    await wait();
+    stdin.write("x"); // finished row -> local dismiss, never agent.stop
+    await wait();
+    const frame = lastFrame() ?? "";
+    expect(client.calls).toEqual([]); // no RPC
+    expect(frame).not.toContain("(scout)"); // roster row hidden (its finish NOTE may still mention scout)
+    expect(frame).toContain("(helper)"); // the other row survives
+    expect(frame).toContain("1 agent · ctrl+a"); // footer pill counts only visible rows
+    expect(selectedLine(frame)).toContain("(helper)"); // highlight re-clamped, select mode still on
+  });
+
+  test("(t10) a pruned roster row auto-closes its open child view back to main", async () => {
+    const bridge = makeEventBridge();
+    const client = fakeClient();
+    const { stdin, lastFrame } = render(<App client={client} bridge={bridge} {...baseProps} />);
+    await wait();
+    bridge.push(ev({ type: "bg_task_output", taskId: "t", chunk: "MAIN-ONLY-MARKER" }));
+    pushAgent(bridge, "th_1", "scout");
+    bridge.push(ev({ type: "thread_completed", threadId: "th_1", ts: 2000, stopReason: "end_turn" }));
+    await wait();
+    stdin.write("\x01");
+    await wait();
+    stdin.write("\r"); // open the DONE child's view
+    await wait();
+    expect(lastFrame() ?? "").toContain("Done · esc back");
+
+    bridge.push(ev({ type: "turn_started", threadId: "main" })); // state.ts prunes done rows here
+    await wait();
+    const frame = lastFrame() ?? "";
+    expect(frame).not.toContain("Done · esc back"); // view auto-closed
+    expect(frame).toContain("MAIN-ONLY-MARKER"); // main transcript restored
   });
 });
 

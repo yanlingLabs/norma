@@ -286,6 +286,25 @@ describe("AgentList — tree rows (phase 3b Task 6, c)", () => {
     const { lastFrame } = render(<AgentList agents={[row]} nowMs={0} />);
     expect(lastFrame() ?? "").toContain("(scout)");
   });
+
+  // child-transcript-view T3: App's roster select mode highlights ONE row via `selectedIndex` —
+  // that row's head gutter swaps to a "▶" pointer; every other row keeps its tree gutter. Omitted
+  // renders byte-identical to before (no pointer anywhere) — the tests above all pin that already.
+  test("selectedIndex swaps the highlighted row's gutter to the ▶ pointer, others untouched", () => {
+    const first = agent({ threadId: "th_1", label: "first agent", status: "working" });
+    const last = agent({ threadId: "th_2", label: "second agent", status: "working" });
+    const frame = render(<AgentList agents={[first, last]} nowMs={0} selectedIndex={1} />).lastFrame() ?? "";
+    const lines = frame.split("\n");
+    expect(lines.some((l) => l.includes("▶") && l.includes("second agent"))).toBe(true);
+    expect(lines.some((l) => l.includes("├─") && l.includes("first agent"))).toBe(true); // unselected keeps its gutter
+    expect(lines.some((l) => l.includes("▶") && l.includes("first agent"))).toBe(false);
+  });
+
+  test("selectedIndex undefined renders no pointer at all", () => {
+    const rows = [agent({ threadId: "th_1", label: "a" }), agent({ threadId: "th_2", label: "b" })];
+    const frame = render(<AgentList agents={rows} nowMs={0} />).lastFrame() ?? "";
+    expect(frame).not.toContain("▶");
+  });
 });
 
 // The Ink <StatusLine> component was removed in Phase 3b Task 7 — the Spinner (turn chrome) + Footer

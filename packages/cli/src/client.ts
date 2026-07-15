@@ -4,6 +4,7 @@ import {
   SessionAddDirResult, SessionSetCwdResult, TrustDirResult,
   BgListResult, BgPeekResult, BgKillResult, BgKillAllResult,
   SessionSteerResult, SessionInterruptResult, SessionCompactResult, SkillsListResult,
+  ThreadSendResult, AgentStopResult,
   PluginsListResult, AskUserRespondResult, TaskListResult, ThreadListResult,
   PlanRespondResult, SessionSetPolicyResult, type ApprovalPolicy,
   DaemonStatusResult, QuotaStateResult, TrustListResult, TrustRemoveResult,
@@ -154,6 +155,19 @@ export class NormaClient {
   async interrupt(sessionId: string): Promise<{ wasRunning: boolean }> {
     const r = this.validated(SessionInterruptResult, await this.request(METHODS.sessionInterrupt, { sessionId }), METHODS.sessionInterrupt);
     return { wasRunning: r.wasRunning };
+  }
+  /** Live child-transcript view T3: thin wrapper over `thread.send` (same idiom as `send`/`steer`
+   *  above) — the TUI's roster-select "message this agent" surface. `agent` is `agentId|name`; the
+   *  running-vs-terminal dispatch (steer-queue vs. auto-resume) is entirely the daemon's call (see
+   *  protocol/src/methods.ts's `ThreadSendResult` doc) — this method just round-trips it. */
+  async sendToThread(sessionId: string, agent: string, text: string): Promise<{ ok: true; delivered: "queued" | "resumed"; agentId: string }> {
+    return this.validated(ThreadSendResult, await this.request(METHODS.threadSend, { sessionId, agent, text }), METHODS.threadSend);
+  }
+  /** Live child-transcript view T3: thin wrapper over `agent.stop` — the roster-select `x` on a
+   *  running row. Stopping an already-terminal agent is not an error (see `AgentStopResult`'s doc);
+   *  the caller (app.tsx) renders whatever `status` comes back either way. */
+  async agentStop(sessionId: string, agent: string): Promise<{ ok: true; status: "running" | "completed" | "failed" | "stopped" | "timeout" }> {
+    return this.validated(AgentStopResult, await this.request(METHODS.agentStop, { sessionId, agent }), METHODS.agentStop);
   }
   async compact(sessionId: string): Promise<{ compacted: boolean; uptoSeq: number; summaryChars: number }> {
     const r = this.validated(SessionCompactResult, await this.request(METHODS.sessionCompact, { sessionId }), METHODS.sessionCompact);
