@@ -68,6 +68,13 @@ const fixtures: Record<string, unknown> = {
   worktree_exited: { type: "worktree_exited", sessionId: "s_1", threadId: "t_1", seq: 16, ts: 1700000000006, name: "fix-auth", action: "keep", removed: false },
   thread_started: { type: "thread_started", sessionId: "s_1", threadId: "th_child1", seq: 17, ts: 1700000000007, parentThreadId: "main", agentType: "researcher", prompt: "Summarize the auth module" },
   thread_completed: { type: "thread_completed", sessionId: "s_1", threadId: "th_child1", seq: 18, ts: 1700000000008, stopReason: "end_turn" },
+  // task-16 (Stalled roster verb, CC-parity follow-up): "stalled" is a NEW VALUE on the EXISTING
+  // thread_completed shape (not a new field, not a new variant) — a dedicated fixture (distinct
+  // from thread_completed.json above, which stays "end_turn") so Swift round-trips a
+  // stopReason:"stalled" thread_completed. stopReason decodes as a plain String on the Swift side
+  // (SessionEvent.swift's ThreadCompleted), so this fixture proves the new VALUE survives
+  // round-trip rather than proving a new enum CASE compiles.
+  thread_completed_stalled: { type: "thread_completed", sessionId: "s_1", threadId: "th_child2", seq: 32, ts: 1700000000022, stopReason: "stalled" },
   session_titled: { type: "session_titled", seq: 9, sessionId: "s_1", ts: 5, threadId: "main", title: "Fixing the login flow" },
   lease_granted: { type: "lease_granted", sessionId: "s_1", threadId: "main", seq: 19, ts: 1700000000009, leaseId: "lease_1", class: "screenshot", holder: { kind: "session", id: "s_1" }, expiresAt: 1700000000024, tokenHash: "9aefbca72caebab86c15bc0c60c8b7c3de90040152b1be9d9ada3769dedde18d" },
   lease_lost: { type: "lease_lost", sessionId: "s_1", threadId: "main", seq: 20, ts: 1700000000010, leaseId: "lease_1", class: "screenshot", holder: { kind: "session", id: "s_1" }, reason: "expired" },

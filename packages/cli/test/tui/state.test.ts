@@ -242,6 +242,26 @@ describe("state.ts — roster honesty: finish note verb from thread_completed.st
     expect(s.agents.find((a) => a.threadId === "th_s")).toMatchObject({ status: "done", finish: "stopped" });
   });
 
+  // task-16 (Stalled roster verb, CC-parity follow-up): a subagent killed by the progress-stall
+  // watchdog used to reach the wire as stopReason "error", rendering as a flat "Failed" —
+  // indistinguishable from a genuine crash even though a stall is resumable and carries partial
+  // output. It now gets its own distinct verb.
+  test("a STALLED child (stopReason 'stalled' — progress-stall watchdog) commits 'Stalled (...)', never 'Done' or 'Failed'", () => {
+    let s = initialState();
+    s = reduce(s, {
+      type: "thread_started", threadId: "th_st", parentThreadId: "main", agentType: "general-purpose",
+      prompt: "scan the machine", description: "laptop scan",
+    }, T0);
+    s = reduce(s, { type: "turn_started", threadId: "th_st", ts: T0 + 100 }, T0 + 100);
+    s = reduce(s, { type: "thread_completed", threadId: "th_st", stopReason: "stalled", ts: T0 + 4_100 }, T0 + 4_100);
+
+    const note = s.committed.at(-1) as { kind: string; text: string };
+    expect(note.text).toBe('Agent "laptop scan": Stalled (0 tool uses · 4s)');
+    expect(note.text).not.toContain("Done");
+    expect(note.text).not.toContain("Failed");
+    expect(s.agents.find((a) => a.threadId === "th_st")).toMatchObject({ status: "done", finish: "stalled" });
+  });
+
   test("failed/stopped rows are STILL pruned on the next main turn_started, exactly like done ones (status stays the terminal marker)", () => {
     let s = initialState();
     s = reduce(s, {

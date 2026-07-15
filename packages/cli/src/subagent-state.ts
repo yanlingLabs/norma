@@ -13,15 +13,16 @@ export interface CliSubagent {
   label: string;
   status: string; // "queued" | "working" | "done"
   // Roster honesty (no-timeout task): HOW the thread finished, derived from the wire's own
-  // thread_completed.stopReason (end_turn → "done", error → "failed", aborted → "stopped").
-  // ADDITIVE alongside `status` — `status` stays "done" for EVERY terminal thread on purpose:
-  // it is the single terminal marker all the prune/footer filters (`status !== "done"`) and the
-  // Swift-lockstep helpers (subagent-display.ts subagentGlyph/anySubagentAlive) key off, and
-  // those must not fork per finish kind. Renderers that want the honest verb (agent-list.tsx's
-  // continuation row, tui/state.ts's finish note) read `finish` instead; a STALLED child arrives
-  // as stopReason "error" → "failed" (the wire carries no distinct stall reason — protocol
-  // change deferred, see the no-timeout task report).
-  finish?: "done" | "failed" | "stopped";
+  // thread_completed.stopReason (end_turn → "done", error → "failed", aborted → "stopped",
+  // stalled → "stalled" — task-16, CC-parity follow-up). ADDITIVE alongside `status` — `status`
+  // stays "done" for EVERY terminal thread on purpose: it is the single terminal marker all the
+  // prune/footer filters (`status !== "done"`) and the Swift-lockstep helpers (subagent-display.ts
+  // subagentGlyph/anySubagentAlive) key off, and those must not fork per finish kind. Renderers
+  // that want the honest verb (agent-list.tsx's continuation row, tui/state.ts's finish note)
+  // read `finish` instead. A stall-killed child now arrives as its OWN distinct stopReason
+  // ("stalled") rather than being folded into "error" — it's resumable and carries partial
+  // output, unlike a genuine crash.
+  finish?: "done" | "failed" | "stopped" | "stalled";
   inputTokens?: number; // latest child turn_completed.inputTokens — unknown until the first
   outputTokens: number; // banked sum of child turn_completed.outputTokens
   liveOutputChars: number; // child assistant_delta chars since the last reconcile (↓ estimate /4)
@@ -79,7 +80,10 @@ export function updateSubagents(items: CliSubagent[], e: WireEvent): CliSubagent
       return patch(items, threadId, (s) => ({
         ...s,
         status: "done",
-        finish: e.stopReason === "error" ? "failed" : e.stopReason === "aborted" ? "stopped" : "done",
+        finish: e.stopReason === "error" ? "failed"
+          : e.stopReason === "aborted" ? "stopped"
+          : e.stopReason === "stalled" ? "stalled"
+          : "done",
         ...closeSpan(s, e),
       }));
     case "tool_call": {

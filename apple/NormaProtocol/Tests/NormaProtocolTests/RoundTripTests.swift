@@ -4,7 +4,7 @@ import XCTest
 final class RoundTripTests: XCTestCase {
     func fixtureURLs() throws -> [URL] {
         let urls = Bundle.module.urls(forResourcesWithExtension: "json", subdirectory: "Fixtures") ?? []
-        XCTAssertEqual(urls.count, 42, "expected 42 fixtures — regenerate via pnpm protocol:generate")
+        XCTAssertEqual(urls.count, 43, "expected 43 fixtures — regenerate via pnpm protocol:generate")
         return urls
     }
 
@@ -102,5 +102,21 @@ final class RoundTripTests: XCTestCase {
         let withoutData = try Data(contentsOf: withoutURL)
         guard case .approvalRequested(let without) = try JSONDecoder().decode(SessionEvent.self, from: withoutData) else { return XCTFail() }
         XCTAssertNil(without.reviewerReason)
+    }
+
+    /// task-16 (Stalled roster verb, CC-parity follow-up): `ThreadCompleted.stopReason` is a plain
+    /// `String` (not a Swift enum) — see this struct's own field in SessionEvent.swift — so adding
+    /// the new "stalled" wire value needs no case addition and breaks no exhaustive switch. This
+    /// proves the new VALUE decodes intact via the TS-generated `thread_completed_stalled.json`
+    /// fixture (testAllFixturesRoundTrip above already covers its generic round-trip; this asserts
+    /// the specific stopReason content, mirroring testToolReviewDecodes' new-variant pattern
+    /// adapted for a new-value-not-variant case).
+    func testThreadCompletedStalledDecodes() throws {
+        guard let url = Bundle.module.url(forResource: "thread_completed_stalled", withExtension: "json", subdirectory: "Fixtures") else {
+            return XCTFail("missing thread_completed_stalled.json fixture")
+        }
+        let data = try Data(contentsOf: url)
+        guard case .threadCompleted(let v) = try JSONDecoder().decode(SessionEvent.self, from: data) else { return XCTFail() }
+        XCTAssertEqual(v.stopReason, "stalled")
     }
 }

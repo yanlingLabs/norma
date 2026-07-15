@@ -271,11 +271,16 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
       const parts = [`${toolCalls} tool use${toolCalls === 1 ? "" : "s"}`];
       if (tokens) parts.push(`${tokens} tokens`);
       parts.push(formatElapsed(row?.activeMs ?? 0));
-      // Roster honesty (no-timeout task): the verb comes from the row's `finish` (the wire's own
-      // thread_completed.stopReason via subagent-state.ts) — a failed/stalled child commits
-      // "Failed", a user-stopped one "Stopped", never a dishonest "Done". Absent finish (a
-      // ghost-threadId row never tracked) falls back to "Done", the pre-change wording.
-      const verb = row?.finish === "failed" ? "Failed" : row?.finish === "stopped" ? "Stopped" : "Done";
+      // Roster honesty (no-timeout task, extended by task-16): the verb comes from the row's
+      // `finish` (the wire's own thread_completed.stopReason via subagent-state.ts) — a genuinely
+      // failed child commits "Failed", a user-stopped one "Stopped", a stall-killed one "Stalled"
+      // (task-16: its own distinct verb — resumable, partial output, never a flat "Failed"),
+      // never a dishonest "Done". Absent finish (a ghost-threadId row never tracked) falls back to
+      // "Done", the pre-change wording.
+      const verb = row?.finish === "failed" ? "Failed"
+        : row?.finish === "stopped" ? "Stopped"
+        : row?.finish === "stalled" ? "Stalled"
+        : "Done";
       const text = `Agent "${label}": ${verb} (${parts.join(" · ")})`;
       return { ...withDone, committed: [...withDone.committed, { kind: "note", text }] };
     }
