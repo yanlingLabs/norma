@@ -1,6 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { join } from "node:path";
-import { LspClient, LspTimeoutError, LspServerExitedError } from "../../../src/agent/lsp/client";
+import { LspClient, LspTimeoutError, LspServerExitedError, LspNotSupportedError } from "../../../src/agent/lsp/client";
 
 const FIXTURE = join(import.meta.dir, "fake-server.ts");
 const isMac = process.platform === "darwin";
@@ -188,5 +188,196 @@ describe.if(isMac)("LspClient", () => {
     expect(c.alive).toBe(true);
     await c.stop();
     expect(c.alive).toBe(false);
+  });
+
+  // --- lsp consolidation T1: hover/documentSymbols/workspaceSymbols/implementation -------------
+
+  test("hover(): MarkupContent {kind,value} renders its value", async () => {
+    await withEnv({ NORMA_LSP_FAKE_HOVER: JSON.stringify({ contents: { kind: "markdown", value: "**const** x: number" } }) }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      await c.start();
+      const out = await c.hover("file:///workspace/a.ts", "const x = 1;", 0, 6);
+      expect(out).toBe("**const** x: number");
+      await c.stop();
+    });
+  });
+
+  test("hover(): a bare string `contents` renders as-is", async () => {
+    await withEnv({ NORMA_LSP_FAKE_HOVER: JSON.stringify({ contents: "plain string hover" }) }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      await c.start();
+      const out = await c.hover("file:///workspace/a.ts", "const x = 1;", 0, 6);
+      expect(out).toBe("plain string hover");
+      await c.stop();
+    });
+  });
+
+  test("hover(): an array of MarkedString (string + {language,value}) joins them", async () => {
+    await withEnv({ NORMA_LSP_FAKE_HOVER: JSON.stringify({ contents: ["line one", { language: "ts", value: "const x: number" }] }) }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      await c.start();
+      const out = await c.hover("file:///workspace/a.ts", "const x = 1;", 0, 6);
+      expect(out).toBe("line one\nconst x: number");
+      await c.stop();
+    });
+  });
+
+  test("hover(): a null result renders \"no hover info\"", async () => {
+    await withEnv({ NORMA_LSP_FAKE_HOVER: "null" }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      await c.start();
+      const out = await c.hover("file:///workspace/a.ts", "const x = 1;", 0, 6);
+      expect(out).toBe("no hover info");
+      await c.stop();
+    });
+  });
+
+  test("hover(): a server answering -32601 (method not found) rejects with LspNotSupportedError", async () => {
+    await withEnv({ NORMA_LSP_FAKE_UNSUPPORTED: "textDocument/hover" }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      await c.start();
+      await expect(c.hover("file:///workspace/a.ts", "const x = 1;", 0, 6)).rejects.toThrow(LspNotSupportedError);
+      await c.stop();
+    });
+  });
+
+  test("hover(): rides ensureParsed — the target document is opened/parsed before the query", async () => {
+    await withEnv({ NORMA_LSP_FAKE_HOVER: JSON.stringify({ contents: "opened ok" }) }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI, diagSettleMs: 100 });
+      await c.start();
+      // `ensureParsed` is private; spyOn works against the instance regardless (TS privacy is
+      // compile-time only) — this pins that hover() actually rides it (like definition/references
+      // do), not that the fake server enforces it (NORMA_LSP_FAKE_REQUIRE_OPEN only gates the
+      // definition/references/implementation cases below).
+      const spy = spyOn(c as unknown as { ensureParsed: () => Promise<void> }, "ensureParsed");
+      const out = await c.hover("file:///workspace/a.ts", "const x = 1;", 0, 6);
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(out).toBe("opened ok");
+      await c.stop();
+    });
+  });
+
+  test("documentSymbols(): flat SymbolInformation[] renders name/kind/line", async () => {
+    await withEnv({
+      NORMA_LSP_FAKE_DOCUMENT_SYMBOLS: JSON.stringify([
+        { name: "Foo", kind: 5, location: { uri: "file:///workspace/a.ts", range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } } } },
+        { name: "bar", kind: 12, location: { uri: "file:///workspace/a.ts", range: { start: { line: 4, character: 0 }, end: { line: 4, character: 1 } } } },
+      ]),
+    }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      await c.start();
+      const out = await c.documentSymbols("file:///workspace/a.ts", "class Foo {}\n");
+      expect(out).toBe("Class Foo — line 1\nFunction bar — line 5");
+      await c.stop();
+    });
+  });
+
+  test("documentSymbols(): hierarchical DocumentSymbol[] renders children indented under their parent", async () => {
+    await withEnv({
+      NORMA_LSP_FAKE_DOCUMENT_SYMBOLS: JSON.stringify([
+        {
+          name: "Foo", kind: 5,
+          range: { start: { line: 0, character: 0 }, end: { line: 5, character: 1 } },
+          selectionRange: { start: { line: 0, character: 6 }, end: { line: 0, character: 9 } },
+          children: [
+            { name: "bar", kind: 6, range: { start: { line: 1, character: 2 }, end: { line: 1, character: 20 } }, selectionRange: { start: { line: 1, character: 2 }, end: { line: 1, character: 5 } } },
+          ],
+        },
+      ]),
+    }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      await c.start();
+      const out = await c.documentSymbols("file:///workspace/a.ts", "class Foo {\n  bar() {}\n}\n");
+      expect(out).toBe("Class Foo — line 1\n  Method bar — line 2");
+      await c.stop();
+    });
+  });
+
+  test("documentSymbols(): empty array renders \"no symbols found\"", async () => {
+    await withEnv({ NORMA_LSP_FAKE_DOCUMENT_SYMBOLS: "[]" }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      await c.start();
+      const out = await c.documentSymbols("file:///workspace/a.ts", "");
+      expect(out).toBe("no symbols found");
+      await c.stop();
+    });
+  });
+
+  test("documentSymbols(): -32601 rejects with LspNotSupportedError", async () => {
+    await withEnv({ NORMA_LSP_FAKE_UNSUPPORTED: "textDocument/documentSymbol" }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      await c.start();
+      await expect(c.documentSymbols("file:///workspace/a.ts", "")).rejects.toThrow(LspNotSupportedError);
+      await c.stop();
+    });
+  });
+
+  test("workspaceSymbols(): renders name/kind/path:line:character across the workspace, no didOpen required", async () => {
+    await withEnv({
+      NORMA_LSP_FAKE_WORKSPACE_SYMBOLS: JSON.stringify([
+        { name: "target", kind: 12, location: { uri: "file:///workspace/target.ts", range: { start: { line: 3, character: 9 } } } },
+      ]),
+    }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      await c.start();
+      const spy = spyOn(c as unknown as { ensureParsed: () => Promise<void> }, "ensureParsed");
+      const out = await c.workspaceSymbols("target");
+      expect(spy).not.toHaveBeenCalled(); // workspace/symbol is project-wide — no per-file didOpen gate
+      expect(out).toBe("Function target — /workspace/target.ts:4:10");
+      await c.stop();
+    });
+  });
+
+  test("workspaceSymbols(): empty array renders \"no symbols found\"", async () => {
+    await withEnv({ NORMA_LSP_FAKE_WORKSPACE_SYMBOLS: "[]" }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      await c.start();
+      const out = await c.workspaceSymbols("nothing");
+      expect(out).toBe("no symbols found");
+      await c.stop();
+    });
+  });
+
+  test("workspaceSymbols(): -32601 rejects with LspNotSupportedError", async () => {
+    await withEnv({ NORMA_LSP_FAKE_UNSUPPORTED: "workspace/symbol" }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      await c.start();
+      await expect(c.workspaceSymbols("target")).rejects.toThrow(LspNotSupportedError);
+      await c.stop();
+    });
+  });
+
+  test("implementation(): round-trips the canned location, 0-based through (same shape as definition)", async () => {
+    await withEnv({ NORMA_LSP_FAKE_IMPLEMENTATION: JSON.stringify([
+      { uri: "file:///workspace/impl.ts", range: { start: { line: 14, character: 2 }, end: { line: 14, character: 8 } } },
+    ]) }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      await c.start();
+      const locs = await c.implementation("file:///workspace/a.ts", "const x = 1;", 4, 6);
+      expect(locs).toEqual([{ path: "/workspace/impl.ts", line: 14, character: 2 }]);
+      await c.stop();
+    });
+  });
+
+  test("implementation(): rides ensureParsed — a server that only answers for open docs still resolves", async () => {
+    await withEnv({
+      NORMA_LSP_FAKE_REQUIRE_OPEN: "1",
+      NORMA_LSP_FAKE_IMPLEMENTATION: JSON.stringify([{ uri: "file:///workspace/target.ts", range: { start: { line: 7, character: 0 } } }]),
+    }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI, diagSettleMs: 100 });
+      await c.start();
+      const impl = await c.implementation("file:///workspace/src.ts", "const y = 1;", 0, 6);
+      expect(impl).toEqual([{ path: "/workspace/target.ts", line: 7, character: 0 }]);
+      await c.stop();
+    });
+  });
+
+  test("implementation(): -32601 rejects with LspNotSupportedError", async () => {
+    await withEnv({ NORMA_LSP_FAKE_UNSUPPORTED: "textDocument/implementation" }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      await c.start();
+      await expect(c.implementation("file:///workspace/a.ts", "x", 0, 0)).rejects.toThrow(LspNotSupportedError);
+      await c.stop();
+    });
   });
 });

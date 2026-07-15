@@ -38,6 +38,13 @@ export class LspServerExitedError extends Error { constructor(message: string) {
 export class LspNotRunningError extends Error { constructor(message = "lsp server is not running") { super(message); this.name = "LspNotRunningError"; } }
 /** The server answered a request with a JSON-RPC `error` object. */
 export class LspRequestError extends Error { constructor(message: string, public readonly code?: number) { super(message); this.name = "LspRequestError"; } }
+/** The server does not implement the requested capability — JSON-RPC code -32601 ("method not
+ *  found"), the standard signal a conforming LSP server sends for an OPTIONAL method it never
+ *  registered (hover/documentSymbol/workspace-symbol/implementation are all optional per the LSP
+ *  spec, unlike definition/references/diagnostics, which every server this repo targets
+ *  implements — see `requestCapable` below, the ONLY place this is thrown). Callers (tools/lsp.ts)
+ *  render this as a clean "not supported" result, never a crash. */
+export class LspNotSupportedError extends Error { constructor(message: string) { super(message); this.name = "LspNotSupportedError"; } }
 
 function withTimeout<T>(p: Promise<T>, ms: number, onTimeout: () => Error): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -88,6 +95,107 @@ function toDiagnostics(raw: unknown): LspDiagnostic[] {
   }));
 }
 
+// -------------------------------------------------------------------------------------------
+// lsp consolidation T1: hover/documentSymbols/workspaceSymbols render straight to a MODEL-FACING
+// string (unlike definition/references/diagnostics/implementation, which return raw 0-based
+// structured data — LspLocation[]/LspDiagnostic[] — for tools/lsp.ts to format with fence-checked
+// disk previews and caps). That split is deliberate: hover/symbols content has no further
+// arithmetic done on it by any caller, so there's no "0-based throughout" contract to uphold for
+// it the way there is for locations a caller adds 1 to before display — the line/character numbers
+// baked into these rendered strings are 1-based, matching the SAME human/model convention every
+// other display surface in this codebase uses (tools/lsp.ts's own "POSITION CONVENTION" doc
+// comment), not this client's own 0-based wire-level convention.
+// -------------------------------------------------------------------------------------------
+
+const SYMBOLS_CAP = 200; // token-conscious cap, parity with tools/lsp.ts's diagnostics/references/definition caps
+
+// LSP SymbolKind (1-26, textDocument/documentSymbol + workspace/symbol share this enum).
+const SYMBOL_KIND_NAMES: Record<number, string> = {
+  1: "File", 2: "Module", 3: "Namespace", 4: "Package", 5: "Class", 6: "Method", 7: "Property",
+  8: "Field", 9: "Constructor", 10: "Enum", 11: "Interface", 12: "Function", 13: "Variable",
+  14: "Constant", 15: "String", 16: "Number", 17: "Boolean", 18: "Array", 19: "Object", 20: "Key",
+  21: "Null", 22: "EnumMember", 23: "Struct", 24: "Event", 25: "Operator", 26: "TypeParameter",
+};
+function symbolKindName(kind: unknown): string {
+  return SYMBOL_KIND_NAMES[Number(kind)] ?? "Symbol"; // defensive: a nonconforming server's out-of-range kind
+}
+
+// Caller contract: `lines` is always non-empty here — both call sites below already return the
+// "no symbols found" sentinel before ever building `lines`, so this only ever caps a real list.
+function capLines(lines: string[], cap: number): string {
+  if (lines.length <= cap) return lines.join("\n");
+  return `${lines.slice(0, cap).join("\n")}\n+${lines.length - cap} more`;
+}
+
+// textDocument/hover's `contents` is MarkupContent ({kind,value}) | MarkedString | MarkedString[]
+// (MarkedString itself is `string | {language, value}` — deprecated but still emitted by some
+// servers). This normalizes every shape to plain text.
+function renderMarkedString(v: unknown): string {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "object" && "value" in (v as Record<string, unknown>)) return String((v as Record<string, unknown>).value ?? "");
+  return String(v);
+}
+
+function renderHover(res: unknown): string {
+  const contents = (res as { contents?: unknown } | null)?.contents;
+  if (contents == null) return "no hover info";
+  const rendered = Array.isArray(contents)
+    ? contents.map(renderMarkedString).filter((s) => s.length > 0).join("\n")
+    : renderMarkedString(contents);
+  return rendered.trim().length > 0 ? rendered : "no hover info";
+}
+
+// textDocument/documentSymbol answers with EITHER the hierarchical DocumentSymbol[] (name/kind/
+// range/selectionRange/children?, no `location`) or the flat, older SymbolInformation[] (name/
+// kind/location{uri,range}) — servers pick one shape for the whole response, never mixed, so a
+// single check on the FIRST element decides how to render the rest.
+function isFlatSymbolInformation(items: unknown[]): boolean {
+  const first = items[0] as Record<string, unknown> | undefined;
+  return !!first && typeof first === "object" && "location" in first;
+}
+
+function renderDocumentSymbolNode(sym: Record<string, unknown>, depth: number, lines: string[]): void {
+  const range = (sym.range ?? sym.selectionRange) as { start?: { line?: number } } | undefined;
+  const line0 = range?.start?.line ?? 0;
+  lines.push(`${"  ".repeat(depth)}${symbolKindName(sym.kind)} ${sym.name} — line ${line0 + 1}`);
+  const children = Array.isArray(sym.children) ? (sym.children as Record<string, unknown>[]) : [];
+  for (const child of children) renderDocumentSymbolNode(child, depth + 1, lines);
+}
+
+function renderDocumentSymbols(res: unknown): string {
+  if (!Array.isArray(res) || res.length === 0) return "no symbols found";
+  const lines: string[] = [];
+  if (isFlatSymbolInformation(res)) {
+    for (const sym of res as Record<string, unknown>[]) {
+      const loc = sym.location as { range?: { start?: { line?: number } } } | undefined;
+      const line0 = loc?.range?.start?.line ?? 0;
+      lines.push(`${symbolKindName(sym.kind)} ${sym.name} — line ${line0 + 1}`);
+    }
+  } else {
+    for (const sym of res as Record<string, unknown>[]) renderDocumentSymbolNode(sym, 0, lines);
+  }
+  return capLines(lines, SYMBOLS_CAP);
+}
+
+// workspace/symbol answers are always flat (SymbolInformation[] or, per LSP 3.17, WorkspaceSymbol[]
+// — same location shape for this repo's purposes) — no hierarchy, but each item carries its OWN
+// file (unlike documentSymbols, which is scoped to one already-known file), so the path is part of
+// the rendered line.
+function renderWorkspaceSymbols(res: unknown): string {
+  if (!Array.isArray(res) || res.length === 0) return "no symbols found";
+  const lines = (res as Record<string, unknown>[]).map((sym) => {
+    const loc = sym.location as { uri?: string; targetUri?: string; range?: { start?: { line?: number; character?: number } }; targetSelectionRange?: { start?: { line?: number; character?: number } } } | undefined;
+    const uri = loc?.uri ?? loc?.targetUri;
+    const range = loc?.range ?? loc?.targetSelectionRange;
+    const line0 = range?.start?.line ?? 0;
+    const char0 = range?.start?.character ?? 0;
+    const path = uri ? uriToPath(uri) : "?";
+    return `${symbolKindName(sym.kind)} ${sym.name} — ${path}:${line0 + 1}:${char0 + 1}`;
+  });
+  return capLines(lines, SYMBOLS_CAP);
+}
+
 interface Settler<T> { resolve: (v: T) => void; reject: (e: Error) => void }
 
 /** One diagnostics() call awaiting a SETTLED result for its URI. `latest` accumulates across
@@ -121,6 +229,9 @@ export class LspClient {
   private openUris = new Set<string>();
   private stderrTail = "";
   private _dead = false;
+  // Captured from InitializeResult.serverInfo.name (absent on some servers) — used purely to name
+  // the offending server in an LspNotSupportedError message; never consulted for routing/behavior.
+  private serverName: string | undefined;
 
   constructor(private readonly cfg: { command: string; args?: string[]; rootUri: string; startTimeoutMs?: number; diagSettleMs?: number; diagTimeoutMs?: number }) {}
 
@@ -138,12 +249,13 @@ export class LspClient {
       this.stderrTail = (this.stderrTail + s).slice(-STDERR_TAIL_MAX);
     });
 
-    await this.request("initialize", {
+    const initResult = await this.request("initialize", {
       processId: process.pid,
       rootUri: this.cfg.rootUri,
       capabilities: { textDocument: { publishDiagnostics: {}, definition: {}, references: {} } },
       workspaceFolders: [{ uri: this.cfg.rootUri, name: "root" }],
     }, timeoutMs);
+    this.serverName = initResult?.serverInfo?.name;
     this.notify("initialized", {});
   }
 
@@ -197,6 +309,82 @@ export class LspClient {
       DEFAULT_REQUEST_TIMEOUT_MS,
     );
     return toLocations(res);
+  }
+
+  /** textDocument/hover — type/doc info for the symbol at a position. Rides `ensureParsed` like
+   *  `definition`/`references` (a server only answers position queries for an open, parsed doc).
+   *  Returns an already-rendered string (see this file's own T1 doc comment above `renderHover`):
+   *  a null/empty result renders "no hover info", never a thrown error — that's a legitimate,
+   *  common answer (most positions have nothing to hover), not a capability gap. hover IS an
+   *  optional LSP capability, though: a server that has never registered it answers -32601, which
+   *  this rejects as a typed `LspNotSupportedError` instead (see `requestCapable`). */
+  async hover(fileUri: string, text: string, line: number, character: number): Promise<string> {
+    await this.ensureParsed(fileUri, text);
+    const res = await this.requestCapable(
+      "textDocument/hover",
+      { textDocument: { uri: fileUri }, position: { line, character } },
+      DEFAULT_REQUEST_TIMEOUT_MS,
+      "hover",
+    );
+    return renderHover(res);
+  }
+
+  /** textDocument/documentSymbol — every symbol declared in one file. Rides `ensureParsed`: this
+   *  is scoped to a specific open document just like a position query, even though it takes no
+   *  line/character of its own. Handles BOTH response shapes a server may return (see
+   *  `renderDocumentSymbols`'s own doc comment) and renders hierarchy as indentation. Optional
+   *  capability → `LspNotSupportedError` on -32601. */
+  async documentSymbols(fileUri: string, text: string): Promise<string> {
+    await this.ensureParsed(fileUri, text);
+    const res = await this.requestCapable(
+      "textDocument/documentSymbol",
+      { textDocument: { uri: fileUri } },
+      DEFAULT_REQUEST_TIMEOUT_MS,
+      "document symbols",
+    );
+    return renderDocumentSymbols(res);
+  }
+
+  /** workspace/symbol — search symbols BY NAME across the whole workspace. Deliberately does NOT
+   *  call `ensureParsed`/`didOpen`: this isn't scoped to any one document, so there is no doc to
+   *  open first (real servers answer this against their own project-wide index). Optional
+   *  capability → `LspNotSupportedError` on -32601. */
+  async workspaceSymbols(query: string): Promise<string> {
+    const res = await this.requestCapable("workspace/symbol", { query }, DEFAULT_REQUEST_TIMEOUT_MS, "workspace symbol search");
+    return renderWorkspaceSymbols(res);
+  }
+
+  /** textDocument/implementation — same request/response shape as `definition` (Location |
+   *  Location[] | LocationLink[] | null), so it returns the SAME `LspLocation[]` for tools/lsp.ts
+   *  to format identically (fence-checked preview, cap, "no X found"). Rides `ensureParsed` like
+   *  `definition`/`references`. Optional capability → `LspNotSupportedError` on -32601. */
+  async implementation(fileUri: string, text: string, line: number, character: number): Promise<LspLocation[]> {
+    await this.ensureParsed(fileUri, text);
+    const res = await this.requestCapable(
+      "textDocument/implementation",
+      { textDocument: { uri: fileUri }, position: { line, character } },
+      DEFAULT_REQUEST_TIMEOUT_MS,
+      "implementation",
+    );
+    return toLocations(res);
+  }
+
+  /** Wraps `request()` for the four OPTIONAL capabilities above (hover/documentSymbol/workspace-
+   *  symbol/implementation): a server that never registered `method` answers with a JSON-RPC
+   *  -32601 ("method not found") error — the standard signal per the LSP spec's capability
+   *  negotiation model. That specific code is translated into a typed `LspNotSupportedError`
+   *  naming the capability and (when known) the server; every OTHER rejection (timeout, a
+   *  different RPC error, server death) passes through unchanged, since only -32601 means
+   *  "unsupported" — anything else is a genuine failure the caller must still see as such. */
+  private async requestCapable(method: string, params: unknown, timeoutMs: number, capability: string): Promise<any> {
+    try {
+      return await this.request(method, params, timeoutMs);
+    } catch (e) {
+      if (e instanceof LspRequestError && e.code === -32601) {
+        throw new LspNotSupportedError(`${capability} not supported by ${this.serverName ?? "this language server"}`);
+      }
+      throw e;
+    }
   }
 
   /** Guarantees the server has `fileUri` OPEN and PARSED before a position query. If it's already
