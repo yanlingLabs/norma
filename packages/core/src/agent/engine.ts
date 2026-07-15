@@ -294,9 +294,11 @@ export interface EngineConfig {
   // GRANT flow must never grant, in EITHER direction — a computed grant dir under one of these
   // prefixes, or one that CONTAINS a prefix (granting an ancestor would make the denied dir
   // reachable through the fence, since fence containment is subtree-based). Hard tool-error, no
-  // card, under BOTH ask and auto. daemon.ts supplies normaHome's runDir — the SAME (and sole)
-  // production denylist registerReadTools gets — so the control plane that reads can't see,
-  // grants can't open. Raw paths; realpath-canonicalized at check time (mirrors fs-read.ts's
+  // card, under BOTH ask and auto. daemon.ts supplies [normaHome] — deliberately BROADER than
+  // registerReadTools' runDir-only read denylist: a grant opens WRITE (and bash's seatbelt via
+  // shared session roots), and a runDir-only list would let an auto write silently re-grant the
+  // MEMDIR while memory.enabled:false, defeating that gate (review F2 ruling — do NOT narrow
+  // this back to runDir). Raw paths; realpath-canonicalized at check time (mirrors fs-read.ts's
   // canonicalizeDenylist). Boot-constant like registerReadTools' own list, not a hot getter.
   grantDeniedPrefixes?: string[];
   reviewer?: BashReviewer; // safety review for auto-policy bash/fs/external calls (undefined → no review, unchanged behavior)
