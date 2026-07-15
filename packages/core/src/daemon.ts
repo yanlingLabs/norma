@@ -38,6 +38,8 @@ import { registerComputerTool } from "./agent/tools/computer";
 import { ComputerUseService } from "./agent/computer-use";
 import { McpManager } from "./agent/mcp/manager";
 import { registerMcpResourceTools } from "./agent/tools/mcp-resources";
+import { registerPushNotificationTool } from "./agent/tools/push-notification";
+import { notifyHeadless } from "./agent/notify-fallback";
 import { registerLspTools } from "./agent/tools/lsp";
 import { LspManager } from "./agent/lsp/manager";
 import { PermissionGate } from "./agent/gate";
@@ -434,6 +436,7 @@ export async function startDaemon(opts: {
     plans = new PlanBroker();
     registerPlanTool(registry, { deferred: true });
     registerNotebookTool(registry, { deferred: true });
+    registerPushNotificationTool(registry); // task-30: deferred:true is baked into the tool's own registration
     // hot-settings T2: getter over the live `settings` holder (was a boot-captured value) — a
     // later task's watcher reassigns `settings` in place; this closure re-reads it on the NEXT
     // enter_worktree/spawn isolation call, no WorktreeManager reconstruction needed.
@@ -720,6 +723,11 @@ export async function startDaemon(opts: {
       // whatever else this session's tools already write there (web_fetch's saved pages, bg-task
       // output), inside the SAME sandbox-readable root.
       tmpDirOf,
+      // task-30 (push-notification track): the real osascript-shelling implementation — the
+      // engine's `notify` bridge only calls this when hub.attachedCount(sessionId) === 0 at
+      // emission time (see engine.ts's executeCall). Boot-constant (no settings gate — v1 keeps
+      // this always-on, matching the task's "keep it simple" design).
+      notifyFallback: notifyHeadless,
     });
 
     // hot-settings T5b (final task of the hot-settings track): compose T2's live getters (already

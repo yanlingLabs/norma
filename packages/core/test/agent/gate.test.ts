@@ -165,6 +165,15 @@ describe("PermissionGate v1", () => {
     expect(gate.evaluate("lsp", "plan")).toBe("allow");
   });
 
+  // task-30 (push-notification track): push_notification only emits an event + a fixed, argv-safe
+  // osascript call — same READ_ONLY class as ask_user (gating "tell the user something" behind an
+  // approval card would defeat the point). Must stay allowed under `plan` too.
+  test("push_notification is read-only: allowed under ask/auto/plan", () => {
+    expect(gate.evaluate("push_notification", "ask")).toBe("allow");
+    expect(gate.evaluate("push_notification", "auto")).toBe("allow");
+    expect(gate.evaluate("push_notification", "plan")).toBe("allow");
+  });
+
   // Phase 5c Task 2 (THE SKETCH PIN, phase-5-intelligence-design-sketch.md §5c): skill_write is
   // the first member of a NEW gate class, ALWAYS_ASK — "a skill is standing instructions, i.e.
   // durable prompt injection into future sessions" — so it is approval-carded under BOTH `ask`
@@ -186,7 +195,7 @@ describe("PermissionGate v1", () => {
   test("guard: no existing tool joined ALWAYS_ASK — every previously classified tool still allows under auto", () => {
     const classified = [
       // READ_ONLY
-      "read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output", "lsp",
+      "read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output", "lsp", "push_notification",
       // MUTATING
       "write", "edit", "bash", "notebook_edit", "enter_worktree", "exit_worktree", "computer", "schedule",
       // NETWORK + externals
