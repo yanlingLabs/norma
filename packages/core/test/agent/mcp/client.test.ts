@@ -35,4 +35,29 @@ describe.if(isMac)("McpStdioClient", () => {
     expect(c.tools().map((t) => t.name)).toEqual(["echo"]);
     c.stop();
   });
+
+  test("resourcesCapable() is false when the server's initialize capabilities omit resources", async () => {
+    const c = new McpStdioClient({ command: "bun", args: ["run", FIXTURE] });
+    await c.start();
+    expect(c.resourcesCapable()).toBe(false);
+    c.stop();
+  });
+
+  test("resourcesCapable() is true, listResources/readResource work, when the fixture opts in", async () => {
+    const c = new McpStdioClient({ command: "bun", args: ["run", FIXTURE], env: { NORMA_FAKE_RESOURCES: "1" } });
+    await c.start();
+    expect(c.resourcesCapable()).toBe(true);
+    const resources = await c.listResources();
+    expect(resources).toEqual([
+      { uri: "fake://greeting", name: "greeting", description: "A greeting text resource", mimeType: "text/plain" },
+      { uri: "fake://pixel", name: "pixel", description: "A tiny PNG", mimeType: "image/png" },
+    ]);
+    const text = await c.readResource("fake://greeting");
+    expect(text).toEqual([{ uri: "fake://greeting", mimeType: "text/plain", text: "hello from fake resource" }]);
+    const image = await c.readResource("fake://pixel");
+    expect(image[0]!.mimeType).toBe("image/png");
+    expect(typeof image[0]!.blob).toBe("string");
+    await expect(c.readResource("fake://nope")).rejects.toThrow();
+    c.stop();
+  });
 });
