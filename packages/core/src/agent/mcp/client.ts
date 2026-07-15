@@ -1,6 +1,10 @@
 import { spawn, type ChildProcess } from "node:child_process";
 
 export interface McpToolInfo { name: string; description: string; inputSchema: Record<string, unknown> }
+// MCP resources (CC parity: ListMcpResourcesTool/ReadMcpResourceTool) — standard `resources/list`
+// / `resources/read` result shapes.
+export interface McpResourceInfo { uri: string; name?: string; description?: string; mimeType?: string }
+export interface McpResourceContent { uri: string; mimeType?: string; text?: string; blob?: string }
 
 function abortPromise(signal: AbortSignal): Promise<never> {
   return new Promise((_, rej) => {
@@ -16,10 +20,14 @@ export class McpStdioClient {
   private buf = "";
   private _tools: McpToolInfo[] = [];
   private _dead = false;
+  // Set from the initialize handshake's OWN result.capabilities.resources — presence (even `{}`)
+  // means the server declares resources support, per the MCP spec. Absent (undefined) → false.
+  private _resourcesCapable = false;
   constructor(private readonly cfg: { command: string; args?: string[]; env?: Record<string, string> }) {}
 
   get dead(): boolean { return this._dead; }
   tools(): McpToolInfo[] { return this._tools; }
+  resourcesCapable(): boolean { return this._resourcesCapable; }
 
   async start(timeoutMs = Number(process.env.NORMA_MCP_START_TIMEOUT_MS ?? 10000)): Promise<void> {
     const child = spawn(this.cfg.command, this.cfg.args ?? [], { env: { ...process.env, ...this.cfg.env }, stdio: ["pipe", "pipe", "pipe"] });
@@ -33,7 +41,8 @@ export class McpStdioClient {
     child.stderr!.on("data", () => { /* could log to daemon log */ });
 
     const handshake = (async () => {
-      await this.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "norma", version: "0.0.1" } });
+      const initRes = await this.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "norma", version: "0.0.1" } });
+      this._resourcesCapable = !!(initRes && typeof initRes === "object" && initRes.capabilities && typeof initRes.capabilities === "object" && "resources" in initRes.capabilities);
       this.notify("notifications/initialized", {});
       const res = await this.request("tools/list", {});
       this._tools = (res?.tools ?? []).map((t: any) => ({ name: String(t.name), description: String(t.description ?? ""), inputSchema: (t.inputSchema ?? { type: "object" }) as Record<string, unknown> }));
@@ -50,6 +59,32 @@ export class McpStdioClient {
     const content: any[] = res?.content ?? [];
     const text = content.map((c) => (c?.type === "text" ? String(c.text ?? "") : "[non-text content omitted]")).join("");
     return text || (res?.isError ? "[mcp tool error]" : "");
+  }
+
+  async listResources(signal?: AbortSignal): Promise<McpResourceInfo[]> {
+    if (this._dead) throw new Error("mcp server is not running");
+    const p = this.request("resources/list", {});
+    const res = signal ? await Promise.race([p, abortPromise(signal)]) : await p;
+    const resources: any[] = res?.resources ?? [];
+    return resources.map((r) => ({
+      uri: String(r?.uri ?? ""),
+      name: r?.name !== undefined ? String(r.name) : undefined,
+      description: r?.description !== undefined ? String(r.description) : undefined,
+      mimeType: r?.mimeType !== undefined ? String(r.mimeType) : undefined,
+    }));
+  }
+
+  async readResource(uri: string, signal?: AbortSignal): Promise<McpResourceContent[]> {
+    if (this._dead) throw new Error("mcp server is not running");
+    const p = this.request("resources/read", { uri });
+    const res = signal ? await Promise.race([p, abortPromise(signal)]) : await p;
+    const contents: any[] = res?.contents ?? [];
+    return contents.map((c) => ({
+      uri: String(c?.uri ?? uri),
+      mimeType: c?.mimeType !== undefined ? String(c.mimeType) : undefined,
+      text: typeof c?.text === "string" ? c.text : undefined,
+      blob: typeof c?.blob === "string" ? c.blob : undefined,
+    }));
   }
 
   stop(): void { try { this.child?.stdin?.end(); this.child?.kill("SIGTERM"); } catch { /* ignore */ } this.die(new Error("stopped")); }

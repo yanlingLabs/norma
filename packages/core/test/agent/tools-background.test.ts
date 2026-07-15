@@ -6,6 +6,7 @@ import { ToolRegistry } from "../../src/agent/tools/registry";
 import { registerBashTool } from "../../src/agent/tools/bash";
 import { registerBackgroundTools } from "../../src/agent/tools/background";
 import { registerTaskStopTool } from "../../src/agent/tools/task-stop";
+import { registerReadTools } from "../../src/agent/tools/fs-read";
 import { BackgroundTaskRegistry } from "../../src/agent/bg-registry";
 import { sandboxAvailable } from "../../src/agent/sandbox";
 import { sessionTmpDir } from "../../src/agent/session-tmp";
@@ -79,5 +80,36 @@ d("background tools", () => {
     expect(out.output).toContain("apple");
     expect(out.output).toContain("apricot");
     expect(out.output).not.toContain("banana"); // filtered out
+  });
+
+  // CC parity: bash's background-spawn RESULT carries the output file path (CC deprecated its
+  // retrieval tool in favor of Read on the task's output file) — bash_output stays working too.
+  test("background spawn result carries output_file: <path> + a read/grep pointer", async () => {
+    const { r, cwd } = setup();
+    const started = await r.execute("bash", { command: "echo hi", runInBackground: true }, ctx(cwd));
+    expect(started.isError).toBe(false);
+    expect(started.output).toContain("output_file: ");
+    expect(started.output.toLowerCase()).toContain("read");
+    const fileMatch = started.output.match(/output_file: (\S+)/);
+    expect(fileMatch).toBeTruthy();
+    expect(fileMatch![1]).toMatch(/\/bash\/bg_[0-9a-f]+\.log$/);
+  });
+
+  test("output_file is readable via the read tool and matches bash_output's view exactly", async () => {
+    const { r, cwd } = setup();
+    registerReadTools(r);
+    const started = await r.execute("bash", { command: "echo alpha; echo beta; sleep 0.3; echo gamma", runInBackground: true }, ctx(cwd));
+    const outputFile = started.output.match(/output_file: (\S+)/)![1]!;
+    const taskId = started.output.match(/bg_[0-9a-f]+/)![0];
+    await sleep(700);
+    const viaBashOutput = await r.execute("bash_output", { taskId }, ctx(cwd));
+    const viaRead = await r.execute("read", { path: outputFile }, ctx(cwd));
+    expect(viaRead.isError).toBe(false);
+    expect(viaRead.output).toContain("alpha");
+    expect(viaRead.output).toContain("beta");
+    expect(viaRead.output).toContain("gamma");
+    // bash_output appends a one-line "[status: ...]" suffix the raw file never gets:
+    const bashOutputBody = viaBashOutput.output.replace(/\n\[status:[^\]]*\]$/, "");
+    expect(viaRead.output).toBe(bashOutputBody);
   });
 });

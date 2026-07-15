@@ -15,7 +15,7 @@ const ProjectMcpConfig = z.object({
     env: z.record(z.string(), z.string()).optional(),
   })).optional(),
 });
-type ProjectState = { kind: "none" } | { kind: "started"; servers: McpServerStatus[]; clients: McpStdioClient[]; toolNames: string[] };
+type ProjectState = { kind: "none" } | { kind: "started"; servers: McpServerStatus[]; clients: Array<{ name: string; client: McpStdioClient }>; toolNames: string[] };
 type StartOneResult = { status: "connected" | "failed"; toolNames: string[]; client?: McpStdioClient };
 
 export class McpManager {
@@ -151,7 +151,7 @@ export class McpManager {
         label: "project server",
         context: ` (${dir})`,
       });
-      if (client) state.clients.push(client);
+      if (client) state.clients.push({ name, client });
       for (const t of toolNames) state.toolNames.push(`mcp__${name}__${t}`);
       state.servers.push({ name, status, toolNames, source: "project" });
     }));
@@ -225,12 +225,52 @@ export class McpManager {
     return out;
   }
 
+  /**
+   * The same three-source union `list(cwd)` reports statuses for, but paired with the actual
+   * client each entry is addressed by (`list_mcp_resources`/`read_mcp_resource`'s `server` arg) —
+   * user servers by their config name, a trusted+started project's servers by their config name
+   * (scoped to `cwd`, same "started" gate as `list()`), plugin servers by their `display`
+   * ("<plugin>:<server>") since that's the only name a caller of THIS manager instance has to
+   * address them by. Live/SYNC — no spawning, mirrors `list()`.
+   */
+  private visibleClients(cwd?: string): Array<{ name: string; client: McpStdioClient }> {
+    const out: Array<{ name: string; client: McpStdioClient }> = [];
+    for (const [name, client] of this.clients) out.push({ name, client });
+    if (cwd) {
+      let dir: string;
+      try { dir = realpathSync(cwd); } catch { dir = cwd; }
+      const state = this.projects.get(dir);
+      if (state?.kind === "started") out.push(...state.clients);
+    }
+    for (const p of this.pluginState) if (p.client) out.push({ name: p.display, client: p.client });
+    return out;
+  }
+
+  /**
+   * Resource-capable, currently-alive servers visible for `cwd` (MCP resources — CC parity:
+   * ListMcpResourcesTool's "across every resource-capable connected server" fan-out when its
+   * `server` arg is omitted). A dead client (crashed after connecting) is excluded — same "not
+   * currently usable" bar `execute()`'s own dead-client callTool would eventually hit.
+   */
+  resourceServers(cwd?: string): Array<{ name: string; client: McpStdioClient }> {
+    return this.visibleClients(cwd).filter((e) => !e.client.dead && e.client.resourcesCapable());
+  }
+
+  /**
+   * Look up ANY visible server by name (regardless of resource capability) — lets
+   * list_mcp_resources/read_mcp_resource's scoped (`server` given) path distinguish "unknown
+   * server" from "server has no resources" instead of collapsing both into one message.
+   */
+  findServer(cwd: string | undefined, name: string): McpStdioClient | undefined {
+    return this.visibleClients(cwd).find((e) => e.name === name && !e.client.dead)?.client;
+  }
+
   stopAll(): void {
     for (const c of this.clients.values()) c.stop();
     this.clients.clear();
     for (const state of this.projects.values()) {
       if (state.kind === "started") {
-        for (const c of state.clients) c.stop();
+        for (const { client } of state.clients) client.stop();
         for (const n of state.toolNames) this.deps.registry.unregister(n);
       }
     }

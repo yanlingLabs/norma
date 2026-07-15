@@ -37,6 +37,7 @@ import { registerWebTools } from "./agent/tools/web";
 import { registerComputerTool } from "./agent/tools/computer";
 import { ComputerUseService } from "./agent/computer-use";
 import { McpManager } from "./agent/mcp/manager";
+import { registerMcpResourceTools } from "./agent/tools/mcp-resources";
 import { registerLspTools } from "./agent/tools/lsp";
 import { LspManager } from "./agent/lsp/manager";
 import { PermissionGate } from "./agent/gate";
@@ -554,6 +555,13 @@ export async function startDaemon(opts: {
       registerLspTools(registry, { lsp: lspManager, cwdOf, rootsOf, tmpDirOf });
     }
     mcp = new McpManager({ registry, trust: trustStore, log: (m) => console.error(m) });
+    // MCP resources (CC parity: ListMcpResourcesTool/ReadMcpResourceTool) — registered
+    // unconditionally here (not per-server-connect: see mcp-resources.ts's own doc comment for why
+    // a live conditional-registration mirror of CC isn't cheap with this registry's shape) so it
+    // exists across every later startAll/ensureProject/startPlugins call this `mcp` instance ever
+    // makes. Deferred like schedule/notebook_edit/worktree above — specialized, not needed most
+    // turns.
+    registerMcpResourceTools(registry, { mcp }, { deferred: true });
     await mcp.startAll(settings?.mcpServers ?? {});
     // Plugin MCP servers start only with explicit settings consent (mcpEnabled = enabled &&
     // !disabled); a plugin's skills are always live (SkillStore above), but its MCP/manifest

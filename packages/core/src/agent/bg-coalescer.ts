@@ -6,10 +6,12 @@ export class OutputCoalescer {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private readonly persistCap: number;
   private readonly flushMs: number;
+  private readonly truncationNote: string;
 
-  constructor(private readonly onFlush: (chunk: string) => void, opts: { persistCap?: number; flushMs?: number } = {}) {
+  constructor(private readonly onFlush: (chunk: string) => void, opts: { persistCap?: number; flushMs?: number; truncationNote?: string } = {}) {
     this.persistCap = opts.persistCap ?? 256 * 1024;
     this.flushMs = opts.flushMs ?? 250;
+    this.truncationNote = opts.truncationNote ?? "[output truncated]";
   }
 
   push(s: string): void {
@@ -31,7 +33,7 @@ export class OutputCoalescer {
     this.flushed += chunk.length;
     if (this.flushed >= this.persistCap) {
       this.truncated = true;
-      this.onFlush("[output truncated]");
+      this.onFlush(this.truncationNote);
     }
   }
 

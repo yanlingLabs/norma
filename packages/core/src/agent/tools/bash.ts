@@ -23,7 +23,9 @@ export function registerBashTool(r: ToolRegistry, deps: { bgRegistry?: Backgroun
     async run({ command, timeoutMs, runInBackground }, { cwd, roots, tmpDir, sessionId, signal }) {
       if (runInBackground) {
         if (!deps.bgRegistry) throw new Error("background tasks are not available in this context");
-        return `background task ${deps.bgRegistry.start(sessionId, command)} started`;
+        const taskId = deps.bgRegistry.start(sessionId, command);
+        const outputFile = deps.bgRegistry.outputFile(sessionId, taskId);
+        return `background task ${taskId} started\noutput_file: ${outputFile}\nRead or grep that file for the full output as it accumulates — prefer it over bash_output for large output.`;
       }
       if (!sandboxAvailable()) {
         throw new Error("bash is unavailable: macOS sandbox-exec not found on this host");
