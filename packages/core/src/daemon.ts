@@ -8,7 +8,7 @@ import { KeychainSecretStore, type SecretStore } from "./auth/secret-store";
 import { SessionStore } from "./sessions/store";
 import { SessionHub } from "./sessions/hub";
 import { startIpcServer, type IpcServer, type IpcServerOptions } from "./ipc/server";
-import { loadSettings, loadPermissionDirs, hooksEnabledFrom, memoryEnabledFrom } from "./settings";
+import { loadSettings, loadPermissionDirs, hooksEnabledFrom, memoryEnabledFrom, lspAutoDiagnosticsEnabledFrom } from "./settings";
 import { memoryDirFor, globalMemoryDirFor } from "./agent/memory-dir";
 import { migrateMemoryStore } from "./agent/memory-migrate";
 import { createProvider } from "./providers/manager";
@@ -628,6 +628,10 @@ export async function startDaemon(opts: {
     // settings.json at boot, or a test injecting `agentProvider` directly) — `true` there is the
     // SAME fail-open default the pre-collapse disk-read-failure catch used.
     const hooksEnabledHot = (): boolean => (settings ? hooksEnabledFrom(settings) : true);
+    // lsp-consolidation T3: same live-getter shape as `hooksEnabledHot`/`memoryEnabledHot` above —
+    // `settings` can still be null (malformed settings.json at boot, or a test that injects
+    // `agentProvider` directly), `true` there is the same fail-open default those two use.
+    const lspAutoDiagnosticsHot = (): boolean => (settings ? lspAutoDiagnosticsEnabledFrom(settings) : true);
     const hookFacade = new HookFacade({ registry: hookRegistry, runner: new HookRunner(), hooksEnabled: hooksEnabledHot });
     engine = new AgentEngine({
       store, hub, registry, broker: approvalBroker,
@@ -689,6 +693,14 @@ export async function startDaemon(opts: {
       // T5a — now resolves LIVE: a hot enable/disable is visible on this session's NEXT tool ctx
       // with no engine reconstruction.
       computerUse: () => computerUse,
+      // lsp-consolidation T3: mirrors `computerUse`'s own getter-over-a-hot-rebuilt-holder shape —
+      // `lspManager` is the SAME `let` binding registerLsp/teardownLsp (settings-apply.ts, below)
+      // reassign on an `lsp.enabled` hot flip, so this resolves live: a disable is invisible to a
+      // NEW tool call the instant teardownLsp clears the holder, no engine reconstruction. `??
+      // undefined` just normalizes the `LspManager | null` holder to EngineConfig's `| undefined`
+      // field type (the getter itself, not the holder, is what's optional on EngineConfig).
+      lsp: () => lspManager ?? undefined,
+      autoDiagnosticsEnabled: lspAutoDiagnosticsHot,
       toolSearch: {
         enabled: () => settings?.toolSearch?.enabled,
         deferThreshold: () => settings?.toolSearch?.deferThreshold ?? Number(process.env.NORMA_TOOLSEARCH_THRESHOLD ?? 12),

@@ -27,6 +27,8 @@ import type { HookResult } from "../plugins/hook-runner";
 import type { ComputerUseService } from "./computer-use";
 import { SubagentTranscripts } from "./subagent-transcript";
 import { resolveModelAlias } from "./model-aliases";
+import type { LspManager } from "./lsp/manager";
+import { autoDiagnosticsSuffix, AUTO_DIAG_TOOL_NAMES } from "./lsp/auto-diagnostics";
 
 /** Structural narrowing of BackgroundTaskRegistry (bg-registry.ts) to just what pinnedTools
  *  (below) needs — lets the engine (and tests) work with anything shaped like a per-session task
@@ -398,6 +400,20 @@ export interface EngineConfig {
   // filesystem — every surface that would show a path (bg spawn tool_result, task_notification,
   // the sync trailer, agent_output) simply omits it, byte-identical to before this feature.
   tmpDirOf?: (sessionId: string) => string | undefined;
+  // Auto-diagnostics after edit (lsp-consolidation T3, design doc `2026-07-15-lsp-consolidation-
+  // design.md` §2) — CC parity: "after each file edit, it automatically reports type errors and
+  // warnings so Claude can fix issues without a separate build step." Both getters, same hot-
+  // settings T2/T5 shape as `computerUse`/`reviewerEnabled` above: `lsp` mirrors daemon.ts's own
+  // `let lspManager` holder (rebuilt on an `lsp.enabled` hot flip — settings-apply.ts's registerLsp/
+  // teardownLsp reassign that SAME holder this getter closes over), so a disable is visible on the
+  // very next tool call with no engine reconstruction. Absent (every test/config that never wires
+  // this) → executeCall's post-write/edit/notebook_edit hook below never fires, byte-identical to
+  // pre-T3 behavior. `autoDiagnosticsEnabled` gates the hook independently of `lsp` itself being
+  // present — settings.lsp.autoDiagnostics (default true; see settings.ts's
+  // lspAutoDiagnosticsEnabledFrom) lets a user keep the on-demand `lsp` tool while opting OUT of
+  // the automatic post-edit append.
+  lsp?: () => LspManager | undefined;
+  autoDiagnosticsEnabled?: () => boolean | undefined;
 }
 
 export class AgentEngine {
@@ -3111,7 +3127,7 @@ export class AgentEngine {
     }
   }
 
-  private executeCall(
+  private async executeCall(
     call: { callId: string; name: string; argsJson: string },
     cwd: string,
     sessionId: string,
@@ -3216,7 +3232,7 @@ export class AgentEngine {
           this.pendingCuImages.set(key, arr);
         }
       : undefined;
-    return this.cfg.registry.execute(call.name, args, {
+    const result = await this.cfg.registry.execute(call.name, args, {
       cwd, roots, tmpDir, sessionId, signal, markSkillLoaded,
       markToolLoaded,
       loadedTools: effectiveLoaded,
@@ -3229,5 +3245,23 @@ export class AgentEngine {
       attachImage,
       visionCapable,
     });
+    // Auto-diagnostics after edit (lsp-consolidation T3): ONLY a SUCCESSFUL write/edit/
+    // notebook_edit ever reaches this — `result.isError` gates it BEFORE any LSP call, so a
+    // failed write never triggers a diagnostics run at all (not merely "runs but is discarded").
+    // Both gates are read LIVE, per call (hot-settings shape, mirrors `cuNow` above): `cfg.lsp`
+    // resolves `undefined` the instant `lsp.enabled` is hot-disabled (daemon.ts's `let lspManager`
+    // holder), and `autoDiagnosticsEnabled` resolves the live `settings.lsp.autoDiagnostics`
+    // (default true) so a mid-session toggle applies to the very next edit, no engine
+    // reconstruction. `autoDiagnosticsSuffix` itself is NEVER-FAIL (see its own doc comment) — a
+    // dead/slow/unsupported server or an unmatched extension resolves to "", leaving `result`
+    // (and thus the model-visible tool_result) untouched.
+    if (!result.isError && AUTO_DIAG_TOOL_NAMES.has(call.name)) {
+      const mgr = this.cfg.lsp?.();
+      if (mgr && this.cfg.autoDiagnosticsEnabled?.() !== false) {
+        const suffix = await autoDiagnosticsSuffix({ lsp: mgr, toolName: call.name, args, cwd, roots });
+        if (suffix) return { ...result, output: result.output + suffix };
+      }
+    }
+    return result;
   }
 }

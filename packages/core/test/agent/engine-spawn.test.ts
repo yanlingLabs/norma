@@ -27,6 +27,7 @@ import { SubagentManager } from "../../src/agent/subagents";
 import { BackgroundAgentRegistry } from "../../src/agent/bg-agent-registry";
 import { WorktreeManager } from "../../src/agent/worktree";
 import { sessionTmpDir } from "../../src/agent/session-tmp";
+import type { LspManager } from "../../src/agent/lsp/manager";
 import type { ModelInfo, Provider, ProviderEvent, TurnRequest } from "../../src/providers/types";
 
 export function setup(
@@ -61,6 +62,19 @@ export function setup(
     // unconditional sessionTmpDir call already does for other reasons). Pass true to wire the SAME
     // sessionTmpDir daemon.ts uses, for tests that specifically exercise transcript surfacing.
     withTranscripts?: boolean;
+    // lsp-consolidation T3 (auto-diagnostics after edit): both undefined (default) → EngineConfig.
+    // lsp/autoDiagnosticsEnabled both absent, matching every pre-existing test in this file (the
+    // post-write/edit/notebook_edit hook never fires, byte-identical to before this feature).
+    // `lsp` is a plain LspManager instance (real or a duck-typed test double cast to the type,
+    // same "cast a minimal fake" precedent as auto-diagnostics.test.ts's own untouchableLsp) —
+    // wrapped in a constant getter here since EngineConfig.lsp is a live-read function, mirroring
+    // daemon.ts's own `() => lspManager ?? undefined` shape (this harness has no hot-rebuild story
+    // to exercise, so a fixed instance per `setup()` call is enough). `autoDiagnosticsEnabled` is
+    // instead taken AS a getter directly (not a plain boolean) so a hot-toggle test can hand in a
+    // closure over a mutable flag and flip it BETWEEN two calls in the same test, exactly mirroring
+    // EngineConfig's own getter shape — no extra wrapping needed at this boundary.
+    lsp?: LspManager;
+    autoDiagnosticsEnabled?: () => boolean | undefined;
   } = {},
 ) {
   const withSubagents = opts.withSubagents !== false;
@@ -132,6 +146,8 @@ export function setup(
         }
       : undefined,
     tmpDirOf: opts.withTranscripts ? sessionTmpDir : undefined,
+    lsp: opts.lsp ? () => opts.lsp : undefined,
+    autoDiagnosticsEnabled: opts.autoDiagnosticsEnabled,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: opts.approvalPolicy ?? "auto" });
   const events: SessionEvent[] = [];

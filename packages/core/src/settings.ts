@@ -154,10 +154,19 @@ export const Settings = z.object({
    *  When off, the tool is never registered, so a model's query for it is the registry's
    *  ordinary "unknown tool" error — no special-cased denial path. `idleShutdownMs` threads
    *  straight into `new LspManager({idleShutdownMs})`; absent means the manager's own default
-   *  (300_000 — 5 min, agent/lsp/manager.ts's DEFAULT_SCHEDULER-adjacent constant). */
+   *  (300_000 — 5 min, agent/lsp/manager.ts's DEFAULT_SCHEDULER-adjacent constant).
+   *  `autoDiagnostics` (lsp-consolidation T3, design doc §2 — CC parity: "after each file edit, it
+   *  automatically reports type errors and warnings so Claude can fix issues without a separate
+   *  build step") is ALSO default-ON, same `!== false` shape — see `lspAutoDiagnosticsEnabledFrom`
+   *  below, the one place that decision is made. Read LIVE (hot, per
+   *  [[no-daemon-restart-for-settings]]) by engine.ts's post-write/edit/notebook_edit hook — a
+   *  toggle applies to the session's NEXT edit, no restart. Independent of `enabled`: turning THIS
+   *  off still leaves the on-demand `lsp` tool (action: diagnostics) usable; only the automatic
+   *  post-edit append is skipped. */
   lsp: z.object({
     enabled: z.boolean().optional(),
     idleShutdownMs: z.number().int().positive().optional(),
+    autoDiagnostics: z.boolean().optional(),
   }).optional(),
   /** Auto-update channel. "beta" additionally receives beta-tagged appcast items;
    *  absent/stable = stable only. Read live by the app at each update check (hot — no restart). */
@@ -194,6 +203,12 @@ export const hooksEnabledFrom = (s: Settings): boolean => s.hooks?.enabled !== f
  *  decision is made — daemon.ts's write-root join and context.ts's injection gate both call this
  *  (via a live getter over the `settings` holder) rather than re-deriving it inline. */
 export const memoryEnabledFrom = (s: Settings): boolean => s.memory?.enabled !== false;
+
+/** Same default-ON shape as `memoryEnabledFrom`/`hooksEnabledFrom` above: absent block, absent
+ *  field, or `true` all mean auto-diagnostics-after-edit is on; only an explicit `false` turns it
+ *  off. The single place THIS decision is made — engine.ts's post-write/edit/notebook_edit hook
+ *  calls this (via a live getter over the `settings` holder) rather than re-deriving it inline. */
+export const lspAutoDiagnosticsEnabledFrom = (s: Settings): boolean => s.lsp?.autoDiagnostics !== false;
 
 // gpt-5.4 was the pre-deprecation default; fully deprecated per the 2026-07-10 user decision
 // (packages/core/src/providers/codex-config.ts) — a fresh v1→v2 migration must not persist a
