@@ -50,6 +50,13 @@ describe("NONTTY_FINISH_LINE — thread_completed non-TTY line", () => {
     expect(NONTTY_FINISH_LINE("error")).toBe(`${DIM}✓ subagent done (error)${RESET}\n`);
     expect(NONTTY_FINISH_LINE("aborted")).toBe("\x1b[2m✓ subagent done (aborted)\x1b[0m\n");
   });
+
+  // task-16 (Stalled roster verb): this helper is generic over the stopReason string — it already
+  // renders any non-"end_turn" value parenthetically, no code change needed for the new "stalled"
+  // wire value. This pins that guarantee explicitly.
+  test("the new 'stalled' stop reason (task-16) appends it in parens too, with no special-casing needed", () => {
+    expect(NONTTY_FINISH_LINE("stalled")).toBe(`${DIM}✓ subagent done (stalled)${RESET}\n`);
+  });
 });
 
 // question_asked has NO non-TTY line at all — unlike task_updated/thread_started/thread_completed

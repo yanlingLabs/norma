@@ -223,6 +223,16 @@ describe("AgentList — tree rows (phase 3b Task 6, c)", () => {
     expect(frame).not.toContain("Done");
   });
 
+  // task-16 (Stalled roster verb, CC-parity follow-up): a stall-killed agent gets its own
+  // distinct continuation-row verb, never the generic "Failed" a real crash gets.
+  test("a STALLED agent's continuation row reads 'Stalled', not 'Done' or 'Failed'", () => {
+    const row = agent({ status: "done", finish: "stalled", toolCalls: 0 });
+    const frame = render(<AgentList agents={[row]} nowMs={0} />).lastFrame() ?? "";
+    expect(frame).toContain("Stalled");
+    expect(frame).not.toContain("Done");
+    expect(frame).not.toContain("Failed");
+  });
+
   test("a terminal row with NO finish recorded (pre-change replay) falls back to 'Done'", () => {
     const row = agent({ status: "done", toolCalls: 1 }); // finish deliberately absent
     const frame = render(<AgentList agents={[row]} nowMs={0} />).lastFrame() ?? "";

@@ -2148,8 +2148,59 @@ describe("AgentEngine: no-default-wall-clock — ESC cascade + stall watchdog (n
     expect(out).toContain("partial output before stall:");
     expect(out).toContain("PARTIAL-FINDINGS: found 3 candidate dirs so far");
 
+    // task-16 (Stalled roster verb, CC-parity follow-up): a stall-killed child gets its OWN
+    // distinct wire stopReason — "stalled" — never the generic "error" a genuine provider/tool
+    // failure reports. Before this task both cases wired identically, so the TUI rendered a
+    // stalled (resumable, partial-output) child as a flat "Failed" indistinguishable from a real
+    // crash.
     const completed = events.find((e) => e.type === "thread_completed");
-    expect(completed).toMatchObject({ stopReason: "error" });
+    expect(completed).toMatchObject({ stopReason: "stalled" });
+  });
+
+  test("(task-16) run_in_background:true child that STALLS (no provider events at all) → thread_completed stopReason 'stalled', not 'error' — registry status is UNCHANGED ('failed')", async () => {
+    class HangForeverBgChildProvider implements Provider {
+      readonly id = "fake";
+      private parentRound = 0;
+      models(): ModelInfo[] { return [{ id: "fake-1", family: "fake", contextWindow: 100_000, supportsVision: false }]; }
+      async *streamTurn(req: TurnRequest): AsyncIterable<ProviderEvent> {
+        const first = req.input[0] as { type?: string; content?: unknown } | undefined;
+        if (first?.type === "message" && first.content === "bg task") {
+          // the child's only round: total silence forever — only the stall watchdog (40ms below)
+          // ends this.
+          await new Promise<never>(() => {});
+          return;
+        }
+        const n = this.parentRound++;
+        if (n === 0) {
+          yield spawnCall("s1", "bg task", { run_in_background: true });
+          yield done("tool_calls");
+          return;
+        }
+        yield { type: "text_delta", delta: "parent wrap-up" };
+        yield done("end_turn");
+      }
+    }
+    const { engine, store, sessionId, bgAgents } = setup([], {
+      provider: new HangForeverBgChildProvider(),
+      subagentsOpts: { stallTimeoutMs: 40 },
+    });
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+    const started = events.find((e) => e.type === "thread_started") as Extract<SessionEvent, { type: "thread_started" }>;
+    const childId = started.threadId;
+
+    // poll for the detached stall-abort to land
+    for (let i = 0; i < 50 && bgAgents.get(childId)?.status === "running"; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    // Registry semantics are DELIBERATELY unchanged by this task — a stalled bg child still
+    // reports "failed" (no `timedOut` flag ever gets set for a stall), only the WIRE stopReason
+    // gains the distinct value.
+    expect(bgAgents.get(childId)?.status).toBe("failed");
+
+    const eventsAfter = store.read(sessionId);
+    const completed = eventsAfter.find((e) => e.type === "thread_completed" && e.threadId === childId);
+    expect(completed).toMatchObject({ stopReason: "stalled" });
   });
 
   test("progress pings genuinely reach the watchdog: a child streaming events SLOWER than the stall window in total (but faster per-event) completes fine — the chokepoint resets the window per provider event", async () => {

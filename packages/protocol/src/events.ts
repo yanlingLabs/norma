@@ -167,7 +167,16 @@ export const ThreadStartedEvent = ThreadBase.extend({
   description: z.string().optional(),
 });
 export const ThreadCompletedEvent = ThreadBase.extend({
-  type: z.literal("thread_completed"), stopReason: z.enum(["end_turn", "aborted", "error"]),
+  // "stalled" (task-16, CC-parity follow-up — the no-timeout task's own deferred item): a
+  // subagent killed by the progress-stall watchdog (SubagentStallError, core/agent/subagents.ts)
+  // used to reach the wire as "error", rendering as a plain "Failed" — indistinguishable from a
+  // genuine provider/tool error even though a stall is resumable and carries partial output. This
+  // value is engine-emitted ONLY for that specific kill path (engine.ts distinguishes
+  // `SubagentResult.stalled` before falling back to "error") — a real error still reports "error".
+  // Deliberately NOT added to `turn_completed`'s own (separate) stopReason enum above — a stall
+  // only ever aborts a CHILD thread from the outside; the main thread's own turn never stalls this
+  // way (it has no watchdog of its own).
+  type: z.literal("thread_completed"), stopReason: z.enum(["end_turn", "aborted", "error", "stalled"]),
 });
 
 /** Background-agent completion notice (CC parity: <task-notification>), persisted and replayed as a

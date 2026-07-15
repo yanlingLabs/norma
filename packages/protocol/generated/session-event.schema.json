@@ -1367,7 +1367,8 @@
           "enum": [
             "end_turn",
             "aborted",
-            "error"
+            "error",
+            "stalled"
           ]
         }
       },

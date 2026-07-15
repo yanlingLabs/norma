@@ -445,8 +445,11 @@ export class AgentEngine {
     this.threadList(sessionId).push(info);
   }
 
-  /** Marks a thread (main or child) completed with its stop reason, in place. */
-  private completeThread(sessionId: string, threadId: string, stopReason: "end_turn" | "aborted" | "error"): void {
+  /** Marks a thread (main or child) completed with its stop reason, in place. `"stalled"`
+   *  (task-16, CC-parity follow-up) is only ever passed for a CHILD thread — the progress-stall
+   *  watchdog can only abort a thread it's watching from the outside (a subagent's own
+   *  `SubagentManager.run()` call), which the main thread never goes through. */
+  private completeThread(sessionId: string, threadId: string, stopReason: "end_turn" | "aborted" | "error" | "stalled"): void {
     const t = this.threadList(sessionId).find((t) => t.threadId === threadId);
     if (t) { t.status = "completed"; t.stopReason = stopReason; }
   }
@@ -1757,7 +1760,11 @@ export class AgentEngine {
               // in (the manager's own constructor getter — applies here like everywhere else).
             })
               .then((result) => {
-                const stopReason = result.ok ? result.value.stopReason : "error";
+                // task-16 (Stalled roster verb): `result.stalled` is set ONLY by the stall
+                // watchdog's own SubagentStallError (subagents.ts) — pool saturation, an explicit
+                // wall-clock timeout, and a thrown fn all leave it undefined and still report
+                // "error" here, unchanged.
+                const stopReason = result.ok ? result.value.stopReason : result.stalled ? "stalled" : "error";
                 this.emit(sessionId, { type: "thread_completed", sessionId, threadId: childId, stopReason });
                 this.completeThread(sessionId, childId, stopReason);
                 // Same outcome shape as the synchronous path's spawnOutcomes.set below (Defect 2,
@@ -1925,7 +1932,8 @@ export class AgentEngine {
                 onProgress: progress,
               });
             }, { reentrant: opts.depth > 0 });
-            const stopReason = result.ok ? result.value.stopReason : "error";
+            // task-16 (Stalled roster verb): see the bg `.then` handler's identical comment above.
+            const stopReason = result.ok ? result.value.stopReason : result.stalled ? "stalled" : "error";
             this.emit(sessionId, { type: "thread_completed", sessionId, threadId: childId, stopReason });
             this.completeThread(sessionId, childId, stopReason);
             // Defect 2 (4e gate F10): a child that ran to completion (result.ok) but whose OWN
@@ -2494,7 +2502,9 @@ export class AgentEngine {
         reentrant: depth > 0,
       })
         .then((result) => {
-          const stopReason = result.ok ? result.value.stopReason : "error";
+          // task-16 (Stalled roster verb): see the fresh bg spawn's `.then` handler's identical
+          // comment above.
+          const stopReason = result.ok ? result.value.stopReason : result.stalled ? "stalled" : "error";
           this.emit(sessionId, { type: "thread_completed", sessionId, threadId: entry.threadId, stopReason });
           this.completeThread(sessionId, entry.threadId, stopReason);
           this.cfg.bgAgents!.complete(entry.agentId, !result.ok
@@ -2528,7 +2538,8 @@ export class AgentEngine {
     }
 
     const result = await this.cfg.subagents!.run(async (childSignal, progress) => runResumed(childSignal, progress), { reentrant: depth > 0 });
-    const stopReason = result.ok ? result.value.stopReason : "error";
+    // task-16 (Stalled roster verb): see the fresh sync spawn's identical comment above.
+    const stopReason = result.ok ? result.value.stopReason : result.stalled ? "stalled" : "error";
     this.emit(sessionId, { type: "thread_completed", sessionId, threadId: entry.threadId, stopReason });
     this.completeThread(sessionId, entry.threadId, stopReason);
     // Mirrors the fresh sync spawn's outcome branch exactly (no-timeout task): a stall routes
