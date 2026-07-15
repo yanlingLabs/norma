@@ -795,6 +795,44 @@ export class AgentEngine {
     return this.normalizeReplayOrder(input);
   }
 
+  /** task-15 (CC parity: resume an abnormally-ended agent) — repairs a trailing ORPHANED
+   *  function_call (a tool_call the engine dispatched — see the per-call dispatch loop's own
+   *  `this.emit(...{type:"tool_call"}...)`, which always fires BEFORE the awaited execution — whose
+   *  matching tool_result never got persisted because the child stalled, was ESC-aborted, or
+   *  errored while that tool was still in flight) by splicing a SYNTHETIC `tool_result` in
+   *  immediately after it, so the provider never sees a function_call with no matching output —
+   *  CC's own stated invariant ("the transcript must not contain a tool result without its tool
+   *  use, or vice versa; append a synthetic error/cancel result when required").
+   *
+   *  ONLY ever called (by resumeThread, above) once the clean-termination guard has already
+   *  confirmed the reconstructed history's last REAL item (past any trailing reasoning) IS a
+   *  function_call — so `history` here is guaranteed to end that way. Walks back from the tail
+   *  collecting the CONTIGUOUS run of trailing function_call items (defensive: the per-call
+   *  dispatch loop is sequential — `for (const call of calls) { emit tool_call; await execute; emit
+   *  tool_result; }` — so a call only starts once the PRIOR call's own result was already emitted;
+   *  in practice at most one trailing orphan is ever reachable, but repairing a run costs nothing
+   *  extra) and inserts one synthetic cancellation tool_result right after EACH, preserving order.
+   *  A NEW array — `history` itself (and the store) is never mutated; this repair is purely an
+   *  in-memory transform of the reconstructed input for THIS resume's request. */
+  private repairOrphanedTail(history: TurnInputItem[]): TurnInputItem[] {
+    let idx = history.length - 1;
+    while (idx >= 0 && history[idx]!.type === "reasoning") idx--;
+    let firstOrphanIdx = idx;
+    while (firstOrphanIdx >= 0 && history[firstOrphanIdx]!.type === "function_call") firstOrphanIdx--;
+    firstOrphanIdx++;
+    const repaired = history.slice();
+    for (let i = idx; i >= firstOrphanIdx; i--) {
+      const orphan = repaired[i] as Extract<TurnInputItem, { type: "function_call" }>;
+      repaired.splice(i + 1, 0, {
+        type: "tool_result",
+        callId: orphan.callId,
+        output: "[cancelled: the agent ended before this tool call completed]",
+        isError: true,
+      });
+    }
+    return repaired;
+  }
+
   /** No-timeout task: builds the `subagent (type) ...` failure text for a `!result.ok` spawn
    *  outcome — shared by the sync and detached (bg) spawn paths so a stalled child's partial
    *  output surfaces identically either way. A stall (`result.stalled`) additionally appends the
@@ -2262,16 +2300,37 @@ export class AgentEngine {
     // registered by a caller that never built one — such an agent is simply not resumable.
     if (!rc) return { output: `agent '${resumeArg}' has no saved context to resume`, isError: true };
 
-    // T3 REVIEW (IMPORTANT) — CLEAN-TERMINATION guard, by HISTORY SHAPE, not by status. Reconstruct
-    // the child's PRE-EXISTING stored history HERE (before the reopen / thread_started re-emit /
-    // user_message persist below, so it reflects the child's TRUE end state) and require it to END ON
-    // AN ASSISTANT TURN. This directly enforces D1's alternation invariant regardless of status: a
-    // cleanly COMPLETED or cleanly STOPPED child ends on an assistant_message and IS resumable; a
-    // capped / failed / mid-tool child ends on a tool_result or an orphan function_call (or has no
-    // history) and is NOT — resuming it would persist user(newPrompt) after that trailing item and
-    // hand the provider [...tool_result, user] (non-standard adjacency) or [...function_call, user]
-    // (orphan call → near-certain hard reject), since openai-compatible.ts mapInput is a blind 1:1
-    // map with no coalescing/validation.
+    // task-15 (CC parity: resume an ABNORMALLY-ended agent) — REPAIR-BY-HISTORY-SHAPE, not a
+    // clean-termination refusal. Reconstruct the child's PRE-EXISTING stored history HERE (before
+    // the reopen / thread_started re-emit / user_message persist below, so it reflects the child's
+    // TRUE end state). CC itself resumes stall-aborted/ESC-aborted/errored agents by repairing a
+    // broken transcript rather than refusing it ("the transcript must not contain a tool result
+    // without its tool use, or vice versa; append a synthetic error/cancel result when required") —
+    // this guard now mirrors that:
+    //   - ends on an ASSISTANT message (a cleanly completed/stopped child) → resumable as-is.
+    //   - ends on a PAIRED tool_result (a capped or human-denied child's last round — the call
+    //     already got its result, just no closing assistant text) → resumable AS-IS, no repair.
+    //     Verified against BOTH providers: codex-oauth.ts's streamTurn calls buildRequestBody,
+    //     which is openai-compatible.ts's OWN buildRequestBody (the identical function — there is
+    //     only one input-mapping codepath in this codebase), whose mapInput is a blind,
+    //     order-agnostic 1:1 map with NO adjacency validation at all. And this exact
+    //     [...,function_call,function_call_output,message(user)] shape is not hypothetical — it's
+    //     what a capped or human-denied MAIN-thread turn already sends to the SAME endpoint on its
+    //     very next turn today (historyInput has no clean-termination guard whatsoever), in
+    //     production, unconditionally. The old comment here calling this "non-standard adjacency"
+    //     was an unverified assumption; it is not the fix — a REAL provider reject.
+    //   - ends on an ORPHAN function_call (the call was dispatched — its tool_call event persisted
+    //     at engine.ts's per-call dispatch loop — but its tool_result never was: the child
+    //     stalled/aborted/errored while the tool was still in flight) → REPAIRED below
+    //     (repairOrphanedTail), never refused. The repair is an IN-MEMORY transform of the
+    //     reconstructed input only — never persisted as a fake store event (the store must stay a
+    //     truthful record of what actually happened).
+    //   - no history at all (child aborted before its very first event ever persisted — a fresh
+    //     spawn's opening prompt is never itself stored, see childHistoryInput's KNOWN GAP note) →
+    //     still refused, just with a clearer message.
+    //   - anything else that isn't an assistant turn (e.g. a trailing BARE user message — only
+    //     reachable if a PRIOR resume of this same child itself ended before producing anything new)
+    //     stays refused with the original message — out of this fix's scope, unchanged behavior.
     //   A STATUS CHECK IS INSUFFICIENT — status is orthogonal to last-event shape (verified against
     // this file): the tool-iteration cap path (~:1362) returns stopReason:"error" → the completion
     // fork (~:1188) maps that to isError:true → complete(ok:false) → status "failed" (NOT
@@ -2279,20 +2338,28 @@ export class AgentEngine {
     // stopReason:"end_turn" → isError:false → complete(ok:true) → status "completed" YET its last
     // child event is a tool_result; and a cleanly-stopped child is status "stopped" yet ends on an
     // assistant turn and SHOULD resume. So neither `=== "completed"` nor `!== "failed"` gets this
-    // right — only the last-event shape does. "Resume a capped agent for more turns" is a headline
-    // use case, so reject it GRACEFULLY here rather than let a malformed provider input through.
+    // right — only the last-event shape does.
     const priorHistory = this.childHistoryInput(sessionId, entry.threadId);
     // whole-branch #3: a cleanly-finished child whose FINAL round emitted a reasoning item then
     // ended the turn with EMPTY assistant text (see runThread's `if (textBuf.length > 0)` — no
     // assistant_message persisted) leaves a TRAILING reasoning item as its last reconstructed item.
     // Reasoning is opaque, ORDER-TRANSPARENT state (it always PRECEDES the item it reasons for), so
     // it must not count as the terminal shape: walk back past any trailing reasoning items to the
-    // last REAL item, then apply the assistant-turn check on THAT. A [tool_result, reasoning] tail
-    // (mid-tool + stray reasoning) still lands on the tool_result → correctly still rejected.
+    // last REAL item, then apply the shape check on THAT. A [tool_result, reasoning] tail (mid-tool,
+    // cleanly paired, + a stray reasoning item) still lands on the tool_result → allowed (below);
+    // a [function_call, reasoning] tail (a stray reasoning item after an orphan) still lands on the
+    // orphan function_call → still repaired (below).
     let lastIdx = priorHistory.length - 1;
     while (lastIdx >= 0 && priorHistory[lastIdx]!.type === "reasoning") lastIdx--;
     const lastPrior = priorHistory[lastIdx];
-    if (!lastPrior || !(lastPrior.type === "message" && lastPrior.role === "assistant")) {
+    if (!lastPrior) {
+      return {
+        output: `agent '${resumeArg}' has no resumable history (it ended before producing anything) — spawn a fresh agent instead`,
+        isError: true,
+      };
+    }
+    const needsOrphanRepair = lastPrior.type === "function_call";
+    if (!needsOrphanRepair && lastPrior.type !== "tool_result" && !(lastPrior.type === "message" && lastPrior.role === "assistant")) {
       return { output: `agent '${resumeArg}' didn't finish cleanly and can't be resumed`, isError: true };
     }
 
@@ -2356,10 +2423,20 @@ export class AgentEngine {
     // NOT re-persist its input, so this event is written exactly once (pinned by an engine test).
     this.emit(sessionId, { type: "user_message", sessionId, threadId: entry.threadId, text: prompt, clientName: "resume" });
     // Reconstruct: opening prompt (the fresh spawn never persisted it) + the child's OWN stored
-    // history (now ending with the prompt just persisted).
+    // history (now ending with the prompt just persisted). task-15: when the guard above found an
+    // orphaned function_call at the tail, repair it HERE — on this fresh reconstruction, not the
+    // earlier `priorHistory` — by splicing a synthetic cancellation tool_result in ahead of the
+    // just-persisted new-prompt user_message (always the last item post-persist), never touching
+    // the store. `needsOrphanRepair` was decided once, above, off the SAME shape this reconstructs
+    // (nothing else can append to this child's thread between the two reads — this function never
+    // awaits anything in between), so it still applies unchanged here.
+    const reconstructedChild = this.childHistoryInput(sessionId, entry.threadId);
+    const childHistory = needsOrphanRepair
+      ? [...this.repairOrphanedTail(reconstructedChild.slice(0, -1)), reconstructedChild[reconstructedChild.length - 1]!]
+      : reconstructedChild;
     const input: TurnInputItem[] = [
       { type: "message", role: "user", content: rc.openingPrompt },
-      ...this.childHistoryInput(sessionId, entry.threadId),
+      ...childHistory,
     ];
 
     // D5 — replay the EXACT runThread args captured at spawn (fresh Sets from the arrayified

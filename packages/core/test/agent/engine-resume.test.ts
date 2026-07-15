@@ -1,7 +1,9 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import { z } from "zod";
 import type { ModelInfo, Provider, ProviderEvent, TurnRequest } from "../../src/providers/types";
 import type { SessionEvent } from "@norma/protocol";
 import { FakeProvider } from "../../src/agent/fake-provider";
+import { ToolRegistry } from "../../src/agent/tools/registry";
 import { setupEngine } from "./engine-steer.test";
 import { setup } from "./engine-spawn.test";
 
@@ -495,50 +497,55 @@ describe("AgentEngine: spawn_agent resume (4h-ii-b Task 3)", () => {
     }
   });
 
-  // FINDING 1 (T3 review, IMPORTANT): resuming a child whose stored history does NOT end on an
-  // assistant turn (a capped/failed/mid-tool child — its last event is a tool_result or an orphan
-  // function_call) must be REJECTED with a typed error BEFORE any side effect, never handed to the
-  // provider as [...tool_result, user(newPrompt)] (a non-standard adjacency; the orphan-function_call
-  // variant is a near-certain hard provider reject — openai-compatible mapInput is a blind 1:1 map).
-  // This is a HISTORY-SHAPE check, not a status check: status is orthogonal to last-event shape (a
-  // human-denied child is `completed` yet ends on a tool_result; a capped child is `failed`; a
-  // cleanly-stopped child is `stopped` yet ends on an assistant turn and SHOULD resume). Seed the
-  // child's stored history to END ON A TOOL_RESULT. Doubles as the tool-interleaving coverage the
-  // review flagged as missing.
-  test("(F1) resume a child whose history ends on a tool_result → typed isError, no ghost thread, no persist", async () => {
+  // FINDING 1 (T3 review) / task-15 (CC parity, case 2 flips refuse → allow): a child whose stored
+  // history ends on a PAIRED tool_result (a trailing tool_call + its OWN tool_result, with no
+  // closing assistant_message — the shape a capped or human-denied child leaves behind) is now
+  // RESUMABLE AS-IS, no repair needed. Verified legal against both providers (they share ONE
+  // mapInput — a blind, order-agnostic 1:1 map with no adjacency validation) — and this exact
+  // [...,function_call,function_call_output,message(user)] shape is what a capped/denied
+  // MAIN-thread turn already sends on its very next turn today, unconditionally (see
+  // resumeThread's guard doc comment). This test used to pin the OLD refuse-on-tool_result-tail
+  // behavior (a real regression before this fix — CC resumes exactly this shape); it now pins the
+  // corrected positive behavior instead. Doubles as the tool-interleaving coverage the original
+  // T3 review flagged as missing.
+  test("(F1) resume a child whose history ends on a PAIRED tool_result (no closing assistant turn) → ALLOWED, resumes as-is", async () => {
     const { engine, store, sessionId, provider, bgAgents } = setup([
       [spawnNamed("s1", "do the task", "worker"), done("tool_calls")], // turn 1: spawn (completes clean)
       text("child-out-1"),                                             // child run 1 (ends on assistant)
       text("parent turn1"),
-      [resumeCall("r1", "worker", "continue"), done("tool_calls")],    // turn 2: resume attempt → guard fires
-      text("parent turn2"),                                           // main continuation after the isError
+      [resumeCall("r1", "worker", "continue"), done("tool_calls")],    // turn 2: resume — guard now ALLOWS
+      text("child-out-2"),                                            // the resumed child's own run
+      text("parent turn2"),                                           // main continuation
     ]);
     await engine.runTurn(sessionId); // turn 1: spawn worker, it completes cleanly
     const worker = bgAgents.get("worker", sessionId)!;
 
-    // Make the child's stored history END ON A TOOL_RESULT — a trailing tool_call + tool_result with
-    // no closing assistant_message (the shape a capped / mid-tool child leaves behind).
-    store.append(sessionId, { type: "tool_call", sessionId, threadId: worker.threadId, callId: "orphan", name: "read", argsJson: "{}" });
-    store.append(sessionId, { type: "tool_result", sessionId, threadId: worker.threadId, callId: "orphan", output: "partial", isError: false });
+    // Make the child's stored history END ON A PAIRED TOOL_RESULT — a trailing tool_call + its OWN
+    // tool_result with no closing assistant_message (the shape a capped / human-denied child leaves
+    // behind — "capped", not "orphan": the call already got its result).
+    store.append(sessionId, { type: "tool_call", sessionId, threadId: worker.threadId, callId: "capped", name: "read", argsJson: "{}" });
+    store.append(sessionId, { type: "tool_result", sessionId, threadId: worker.threadId, callId: "capped", output: "partial", isError: false });
 
-    await engine.runTurn(sessionId); // turn 2: resume "worker" with "continue" → clean-termination guard fires
+    await engine.runTurn(sessionId); // turn 2: resume "worker" with "continue" → guard passes, no repair
 
+    const fp = provider as FakeProvider;
+    // the resumed child's own provider request EXISTS (proof the guard passed) and carries the
+    // paired tool_result VERBATIM — no synthetic item inserted — followed by the new prompt.
+    const resumed = fp.requests.find((r) => isChildRun(r.input, "do the task") && lastUserOf(r.input) === "continue");
+    expect(resumed).toBeDefined();
+    expect(resumed!.input).toEqual([
+      M("user", "do the task"),      // opening prompt, prepended
+      M("assistant", "child-out-1"), // the child's OWN prior reply
+      { type: "function_call", callId: "capped", name: "read", argsJson: "{}" },
+      { type: "tool_result", callId: "capped", output: "partial", isError: false },
+      M("user", "continue"),         // the new instruction, last
+    ]);
+
+    // exactly TWO thread_started for the child: the original spawn + this resume's re-emit — no
+    // ghost thread, and the resume genuinely proceeded (not short-circuited).
     const events = store.read(sessionId);
-    const result = events.find((e) => e.type === "tool_result" && e.callId === "r1");
-    expect(result).toMatchObject({ isError: true });
-    expect((result as Extract<SessionEvent, { type: "tool_result" }>).output).toContain("didn't finish cleanly");
-
-    // no ghost thread: the guard fired BEFORE the thread_started re-emit → still exactly ONE
-    // thread_started for the child (the spawn), not a second one for the aborted resume.
     const childStarts = events.filter((e) => e.type === "thread_started" && e.threadId === worker.threadId);
-    expect(childStarts.length).toBe(1);
-
-    // guard fired BEFORE the user_message persist → the new prompt was NOT appended to the child's history
-    const childUserMsgs = events.filter((e) => e.type === "user_message" && e.threadId === worker.threadId);
-    expect(childUserMsgs.some((e) => (e as Extract<SessionEvent, { type: "user_message" }>).text === "continue")).toBe(false);
-
-    // the child never re-ran — only turn 1's 3 calls + turn 2's 2 parent rounds hit the provider
-    expect((provider as FakeProvider).requests.length).toBe(5);
+    expect(childStarts.length).toBe(2);
   });
 
   // FINDING 2 (T3 review, MINOR): an isolation:"worktree" child's worktree is torn down on clean
@@ -607,34 +614,144 @@ describe("AgentEngine: spawn_agent resume (4h-ii-b Task 3)", () => {
     ]);
   });
 
-  // whole-branch #3: skipping trailing reasoning must NOT rescue a genuinely-unclean child. A child
-  // ending [tool_result, reasoning] (mid-tool, no closing assistant, then a stray reasoning item) has
-  // a TOOL_RESULT as its last REAL item → STILL rejected.
-  test("(#3b) resume a child whose history ends [tool_result, reasoning] → STILL rejected", async () => {
+  // whole-branch #3 / task-15 (case 2 flips refuse → allow): skipping trailing reasoning must still
+  // land on the last REAL item — here a PAIRED tool_result behind a stray trailing reasoning item,
+  // which is legal (case 2) and now resumes cleanly, with the reasoning item replaying verbatim
+  // ahead of the new prompt. This test used to pin the OLD refuse-on-tool_result-tail behavior; it
+  // now pins the corrected positive behavior instead (see the (F1) test above for the same flip
+  // without the trailing reasoning item).
+  test("(#3b) resume a child whose history ends [tool_result, reasoning] → ALLOWED (paired tool_result, case 2), reasoning replays", async () => {
     const recJson = (ec: string) => JSON.stringify({ type: "reasoning", summary: [], encrypted_content: ec });
+    const REAS = (ec: string) => ({ type: "reasoning" as const, itemJson: recJson(ec) });
     const { engine, store, sessionId, provider, bgAgents } = setup([
       [spawnNamed("s1", "do the task", "worker"), done("tool_calls")], // turn 1: spawn (completes clean)
       text("child-out-1"),
       text("parent turn1"),
-      [resumeCall("r1", "worker", "continue"), done("tool_calls")],    // turn 2: resume attempt → guard fires
+      [resumeCall("r1", "worker", "continue"), done("tool_calls")],    // turn 2: resume — guard now ALLOWS
+      text("child-out-2"),                                            // the resumed child's own run
       text("parent turn2"),
     ]);
     await engine.runTurn(sessionId);
     const worker = bgAgents.get("worker", sessionId)!;
 
-    // child history ends on a tool_result FOLLOWED BY a trailing reasoning item: the last REAL item is
-    // a tool_result → NOT resumable, even though the very last item is reasoning.
-    store.append(sessionId, { type: "tool_call", sessionId, threadId: worker.threadId, callId: "orphan", name: "read", argsJson: "{}" });
-    store.append(sessionId, { type: "tool_result", sessionId, threadId: worker.threadId, callId: "orphan", output: "partial", isError: false });
+    // child history ends on a PAIRED tool_result FOLLOWED BY a trailing reasoning item.
+    store.append(sessionId, { type: "tool_call", sessionId, threadId: worker.threadId, callId: "capped", name: "read", argsJson: "{}" });
+    store.append(sessionId, { type: "tool_result", sessionId, threadId: worker.threadId, callId: "capped", output: "partial", isError: false });
     store.append(sessionId, { type: "reasoning_item", sessionId, threadId: worker.threadId, itemJson: recJson("EC1") });
 
-    await engine.runTurn(sessionId); // turn 2: resume → clean-termination guard STILL fires
+    await engine.runTurn(sessionId); // turn 2: resume → guard passes, no repair (case 2)
+
+    const fp = provider as FakeProvider;
+    const resumed = fp.requests.find((r) => isChildRun(r.input, "do the task") && lastUserOf(r.input) === "continue");
+    expect(resumed).toBeDefined();
+    expect(resumed!.input).toEqual([
+      M("user", "do the task"),
+      M("assistant", "child-out-1"),
+      { type: "function_call", callId: "capped", name: "read", argsJson: "{}" },
+      { type: "tool_result", callId: "capped", output: "partial", isError: false },
+      REAS("EC1"),
+      M("user", "continue"),
+    ]);
+  });
+
+  // task-15 case 3: a child that stall-aborted before producing ANYTHING AT ALL (its first round
+  // never yielded a single provider event) has NO stored history whatsoever for its thread — a
+  // fresh spawn's opening prompt is never itself persisted (see childHistoryInput's KNOWN GAP
+  // note), so priorHistory reconstructs empty. Still refused (there's nothing to repair or
+  // replay), but with the improved, CC-parity-worded message instead of the old generic one.
+  test("(task-15) resume a child with NO stored history at all (stalled before its first event) → improved refusal message", async () => {
+    class HangImmediatelyProvider implements Provider {
+      readonly id = "fake";
+      private call = 0;
+      models(): ModelInfo[] { return [{ id: "fake-1", family: "fake", contextWindow: 100_000, supportsVision: false }]; }
+      async *streamTurn(): AsyncIterable<ProviderEvent> {
+        const n = this.call++;
+        if (n === 0) { yield spawnNamed("s1", "do the task", "worker"); yield done("tool_calls"); return; } // turn 1: spawn
+        if (n === 1) { await new Promise<never>(() => {}); return; } // child's FIRST round: total silence forever
+        if (n === 2) { yield { type: "text_delta", delta: "parent turn1" }; yield done("end_turn"); return; } // turn 1: parent continuation after the stall
+        if (n === 3) { yield resumeCall("r1", "worker", "continue"); yield done("tool_calls"); return; } // turn 2: resume attempt → empty-history refusal
+        yield { type: "text_delta", delta: "parent turn2" }; yield done("end_turn"); // turn 2: parent continuation after the isError
+      }
+    }
+    const { engine, store, sessionId, bgAgents } = setup([], {
+      provider: new HangImmediatelyProvider(),
+      subagentsOpts: { stallTimeoutMs: 40 },
+    });
+    await engine.runTurn(sessionId); // turn 1: spawn "worker" — stalls before its first event
+    const worker = bgAgents.get("worker", sessionId)!;
+    expect(worker.status).toBe("failed");
+    // Non-conversational bookkeeping events (thread_started/turn_started/thread_completed) DO get
+    // persisted even though the child produced nothing — childHistoryInput's mapper (eventToInput)
+    // has no case for any of them, so the reconstructed input is still genuinely empty.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const priorHistory = (engine as any).childHistoryInput(sessionId, worker.threadId);
+    expect(priorHistory).toEqual([]); // truly nothing resumable stored for this child's thread
+
+    await engine.runTurn(sessionId); // turn 2: resume "worker" → empty-history refusal
 
     const events = store.read(sessionId);
     const result = events.find((e) => e.type === "tool_result" && e.callId === "r1");
     expect(result).toMatchObject({ isError: true });
-    expect((result as Extract<SessionEvent, { type: "tool_result" }>).output).toContain("didn't finish cleanly");
-    // no child re-run: only turn 1's 3 calls + turn 2's 2 parent rounds hit the provider
-    expect((provider as FakeProvider).requests.length).toBe(5);
+    expect((result as Extract<SessionEvent, { type: "tool_result" }>).output).toBe(
+      "agent 'worker' has no resumable history (it ended before producing anything) — spawn a fresh agent instead",
+    );
+  });
+
+  // THE FIX'S HEADLINE CASE (task-15, case 1): a child that stalls MID-TOOL — its tool_call is
+  // ALREADY persisted (engine.ts's per-call dispatch loop always emits tool_call BEFORE awaiting
+  // the tool's execution), but the tool itself never resolves, so its tool_result is NEVER
+  // persisted — used to be permanently unresumable ("didn't finish cleanly and can't be
+  // resumed"). Now the orphaned function_call is repaired with a synthetic cancellation
+  // tool_result (an IN-MEMORY transform of just this resume's request — never persisted to the
+  // store), and the resume proceeds with the new prompt riding after it.
+  test("(task-15) resume a child stall-aborted MID-TOOL: the orphaned function_call is repaired with a synthetic cancelled tool_result", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "hang",
+      description: "test-only: a tool whose run() never resolves — simulates a tool still in flight when the stall watchdog gives up on it",
+      args: z.object({}),
+      run: () => new Promise<string>(() => { /* never resolves */ }),
+    });
+    const { engine, store, sessionId, provider, bgAgents } = setup(
+      [
+        [spawnNamed("s1", "do the task", "worker"), done("tool_calls")], // turn 1 round 0: spawn
+        [{ type: "tool_call", callId: "hang1", name: "hang", argsJson: "{}" }, done("tool_calls")], // child's only round: calls "hang", then stalls mid-tool
+        text("parent turn1"),                                            // main continuation (sees the spawn's "stalled" tool_result)
+        [resumeCall("r1", "worker", "now do Y"), done("tool_calls")],     // turn 2 round 0: resume — guard REPAIRS instead of refusing
+        text("child-out-2"),                                             // the resumed child's own run
+        text("parent turn2"),                                            // main continuation
+      ],
+      { registry, subagentsOpts: { stallTimeoutMs: 40 } },
+    );
+    await engine.runTurn(sessionId); // turn 1: spawn "worker" — it stalls mid-tool
+    const worker = bgAgents.get("worker", sessionId)!;
+    expect(worker.status).toBe("failed");
+
+    // the child's OWN stored history really did end on an orphaned function_call — no tool_result
+    // for "hang1" was ever persisted (the tool never resolved).
+    const childEventsBefore = store.read(sessionId).filter((e) => "threadId" in e && e.threadId === worker.threadId);
+    expect(childEventsBefore.some((e) => e.type === "tool_call" && e.callId === "hang1")).toBe(true);
+    expect(childEventsBefore.some((e) => e.type === "tool_result" && e.callId === "hang1")).toBe(false);
+
+    await engine.runTurn(sessionId); // turn 2: resume "worker" — previously refused; now repairs + resumes
+
+    const fp = provider as FakeProvider;
+    const resumed = fp.requests.find((r) => isChildRun(r.input, "do the task") && lastUserOf(r.input) === "now do Y");
+    expect(resumed).toBeDefined();
+    expect(resumed!.input).toEqual([
+      M("user", "do the task"),                                                // opening prompt, prepended
+      { type: "function_call", callId: "hang1", name: "hang", argsJson: "{}" }, // the orphaned call, replayed from the store
+      {                                                                         // the SYNTHETIC repair, paired to "hang1"
+        type: "tool_result", callId: "hang1",
+        output: "[cancelled: the agent ended before this tool call completed]",
+        isError: true,
+      },
+      M("user", "now do Y"),                                                   // the new resume prompt, last
+    ]);
+
+    // the repair is NEVER persisted — "hang1" still has no stored tool_result even after a
+    // successful resume; the synthetic item existed only in this one request's input.
+    const childEventsAfter = store.read(sessionId).filter((e) => "threadId" in e && e.threadId === worker.threadId);
+    expect(childEventsAfter.some((e) => e.type === "tool_result" && e.callId === "hang1")).toBe(false);
   });
 });
