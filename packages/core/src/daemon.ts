@@ -207,11 +207,14 @@ export async function startDaemon(opts: {
   });
   // T2 (design doc "migration importer"): one-time-per-fact, idempotent best-effort import of
   // Phase 5b's MemoryStore facts into MEMDIR files, run at boot whenever memory.enabled's
-  // BOOT-TIME value (not hot — this runs once, here, not re-checked per turn like
+  // BOOT-TIME value (not hot — this ONE call runs once, here, not re-checked per turn like
   // `memoryEnabledHot` above) is on. Never touches/deletes the old store (see
   // memory-migrate.ts's own doc comment) — a later `memory.enabled: false` still finds the
   // original data untouched. Failure is logged, never fatal to daemon boot (same "degrade, don't
-  // crash" precedent as the settings-load try/catch above).
+  // crash" precedent as the settings-load try/catch above). T3 (task-23) added a SECOND,
+  // hot-triggered call site for the SAME idempotent importer — see `makeApply`'s `migrateMemory`
+  // dep below (wired further down, near the `if (agentProvider)` block's settings-watcher setup)
+  // — so a mid-session `memory.enabled` false→true flip no longer waits for a restart either.
   if (memoryEnabledHot()) {
     try {
       migrateMemoryStore({ normaHome, trust: trustStore, directory: settings?.memory?.directory });
@@ -726,6 +729,16 @@ export async function startDaemon(opts: {
         lspManager = null;
         await m?.stopAll();
       },
+      // File-based memory hot-toggle (T3, design doc follow-up / task-23): the SAME boot-time call
+      // above (`migrateMemoryStore({ normaHome, trust: trustStore, directory: settings?.memory?.directory })`),
+      // re-run whenever `memory.enabled` flips false→true on THIS running daemon — closes T2's
+      // "boot-time only" gap. `settings` here is read at the moment this closure actually RUNS
+      // (fire-and-forget, deferred a tick past `apply()`'s synchronous `setLiveSettings` swap), so
+      // it already reflects `next`'s own `memory.directory` override, exactly like the boot-time
+      // call reflects the settings loaded at THAT time. Failures are logged by settings-apply.ts's
+      // own `.catch` (this closure just re-throws/returns whatever `migrateMemoryStore` does);
+      // never touches/deletes the old store either way (memory-migrate.ts's own contract).
+      migrateMemory: () => { migrateMemoryStore({ normaHome, trust: trustStore, directory: settings?.memory?.directory }); },
       log: (msg) => console.error(`settings-apply: ${msg}`),
     });
     settingsWatcher = new SettingsWatcher({

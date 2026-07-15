@@ -1,4 +1,5 @@
 import type { Settings } from "./settings";
+import { memoryEnabledFrom } from "./settings";
 import type { ToolRegistry } from "./agent/tools/registry";
 import type { ComputerUseService } from "./agent/computer-use";
 import type { LspManager } from "./agent/lsp/manager";
@@ -22,6 +23,17 @@ export interface SettingsApplyDeps {
   buildLspManager: (s: Settings) => LspManager;
   registerLsp: (mgr: LspManager) => void; // registerLspTools(registry, {...})
   teardownLsp: () => Promise<void> | void; // unregister the 3 lsp tools + lspManager.stopAll()
+  // File-based memory hot-toggle (T3, design doc follow-up / task-23): re-runs the T2 migration
+  // importer (`migrateMemoryStore`, agent/memory-migrate.ts) the moment `memory.enabled` flips
+  // false→true on an ALREADY-RUNNING daemon — closing the gap T2 left (boot-time-only migration,
+  // per that task's own "Concerns carried forward" #3): without this, a mid-session flip makes the
+  // RPCs/write-root hot immediately (daemon.ts's `memoryEnabledHot` closures) but leaves the OLD
+  // 5b store's facts unmigrated until the next restart, which grates against the project's
+  // no-daemon-restart-for-settings rule. Optional (default no-op) so every pre-T3 `SettingsApplyDeps`
+  // literal (this file's own test helper included) keeps compiling unchanged. Called fire-and-forget
+  // (see `applyMemoryMigrationDiff` below) — migration walks every trusted dir + spawns `git` per
+  // dir (repoRootFor), never worth making the settings-watcher's single-flight apply() wait on it.
+  migrateMemory?: () => void | Promise<void>;
   drainTimeoutMs?: number; // default 10000 — cap on the CU-disable drain wait
   drainIntervalMs?: number; // default 50 — poll interval while draining
   sleep?: (ms: number) => Promise<void>; // injectable clock (default Bun.sleep) so the cap test never waits real seconds
@@ -52,6 +64,10 @@ export function makeApply(deps: SettingsApplyDeps): (prev: Settings | null, next
   //     convention as hooks/reviewer) — absent block ⇒ registered. `lspEnabled(null)` ⇒ true.
   const cuEnabled = (s: Settings | null) => !!s?.computerUse?.enabled;
   const lspEnabled = (s: Settings | null) => s?.lsp?.enabled !== false;
+  // memory: default-ON / opt-out, same polarity as lsp — mirrors daemon.ts's own
+  // `memoryEnabledHot` (`settings ? memoryEnabledFrom(settings) : true`) rather than re-deriving
+  // the `!== false` shape locally, so the two can never drift apart.
+  const memoryEnabled = (s: Settings | null) => (s ? memoryEnabledFrom(s) : true);
 
   async function applyComputerUseDiff(prev: Settings | null, next: Settings): Promise<void> {
     const wasEnabled = cuEnabled(prev);
@@ -98,8 +114,31 @@ export function makeApply(deps: SettingsApplyDeps): (prev: Settings | null, next
     }
   }
 
+  /** Fires (never awaits) `deps.migrateMemory` on exactly a `memory.enabled` false→true flip —
+   *  true→false and no-flip (incl. both-absent/both-true, the common case) are no-ops, and a
+   *  missing `deps.migrateMemory` (every pre-T3 test/caller) is a no-op too. Deliberately NOT
+   *  folded into the `Promise.all` below alongside the CU/LSP diffs: unlike those two (which the
+   *  settings-watcher's single-flight `apply()` SHOULD wait on — they gate whether a tool is
+   *  registered before the next turn), migration is a best-effort background catch-up with no
+   *  caller waiting on its completion, so blocking `apply()` on it would only slow down every other
+   *  hot-reload for no benefit. `Promise.resolve().then(...)` (rather than a bare call) also catches
+   *  a SYNCHRONOUS throw from `migrateMemory` (today's `migrateMemoryStore` is sync), not just a
+   *  rejected promise, so the one `.catch` below covers both call shapes. */
+  function applyMemoryMigrationDiff(prev: Settings | null, next: Settings): void {
+    const wasEnabled = memoryEnabled(prev);
+    const isEnabled = memoryEnabled(next);
+    if (wasEnabled || !isEnabled) return; // only a false→true flip re-runs the importer
+    if (!deps.migrateMemory) return;
+    Promise.resolve()
+      .then(() => deps.migrateMemory!())
+      .catch((err) => log(`memory migration on hot-toggle failed (best-effort, will retry next boot): ${errMsg(err)}`));
+  }
+
   return async function apply(prev: Settings | null, next: Settings): Promise<void> {
     deps.setLiveSettings(next); // THE ATOMIC SWAP — first, synchronous, one statement.
+    // Fire-and-forget, NOT awaited and NOT inside the Promise.all below — see the function's own
+    // doc comment for why this diff is treated differently from CU/LSP.
+    applyMemoryMigrationDiff(prev, next);
     // Independent flips: a long CU-disable drain must not stall the LSP re-wire in the same
     // reload, so the two diffs run concurrently.
     //

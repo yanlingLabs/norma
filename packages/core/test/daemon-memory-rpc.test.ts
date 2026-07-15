@@ -151,6 +151,24 @@ describe("memory.* RPCs (Phase 5b Task 3) — legacy store (memory.enabled: fals
     c.close();
   });
 
+  // T3 (task-23): `cwd` is now an accepted (additive/optional) param on memory.audit's wire
+  // schema even under the legacy backend — it's simply never consulted there (the central
+  // audit.jsonl has no per-project split), so passing it must be a complete no-op.
+  test("memory.audit accepts (but ignores) a cwd param under the legacy backend", async () => {
+    await boot();
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "memory-tester");
+    await c.request(METHODS.memoryWrite, { scope: "user", name: "a", description: "d", body: "b" });
+    await c.request(METHODS.memoryDelete, { scope: "user", name: "a" });
+
+    const withoutCwd = await c.request(METHODS.memoryAudit, {});
+    const projectDir = mkdtempSync(join(tmpdir(), "norma-memory-legacy-audit-cwd-"));
+    const withCwd = await c.request(METHODS.memoryAudit, { cwd: projectDir });
+    expect(withCwd.error).toBeUndefined();
+    expect(withCwd.result.lines).toEqual(withoutCwd.result.lines);
+    c.close();
+  });
+
   test("project scope on an untrusted cwd -> INVALID_PARAMS for every verb, nothing persisted", async () => {
     await boot();
     const c = await TestClient.connect(daemon.socketPath);
@@ -399,7 +417,12 @@ describe("memory.* RPCs (T2) — file-backed (memory.enabled: true, default)", (
     c.close();
   });
 
-  test("memory.audit is a documented limitation on this path: it still reads the LEGACY store's central audit.jsonl, so a files-mode delete does not appear there", async () => {
+  // T3 (task-23) closes T2's documented limitation (this test used to assert memory.audit always
+  // read the legacy store's central log and so saw nothing here — see task-22-report.md). Now
+  // memory.audit gets the SAME cwd targeting memory.list/read/write/delete already have: no cwd
+  // resolves to the global bucket, exactly the directory a cwd-less memory.write/delete already
+  // lands in above.
+  test("memory.audit with no cwd reads the GLOBAL bucket's .audit.jsonl", async () => {
     await boot();
     const c = await TestClient.connect(daemon.socketPath);
     await c.hello(harnessToken, "memory-files-tester");
@@ -408,7 +431,35 @@ describe("memory.* RPCs (T2) — file-backed (memory.enabled: true, default)", (
 
     const audit = await c.request(METHODS.memoryAudit, {});
     expect(audit.error).toBeUndefined();
-    expect(audit.result.lines).toEqual([]); // no protocol param carries a cwd/dir for this verb to target
+    expect(audit.result.lines).toEqual([
+      { ts: expect.any(Number), source: "rpc", scope: "user", action: "delete", name: "a" },
+    ]);
+    c.close();
+  });
+
+  test("memory.audit with a cwd reads that PROJECT's own .audit.jsonl, not the global bucket (and vice versa)", async () => {
+    await boot();
+    const c = await TestClient.connect(daemon.socketPath);
+    await c.hello(harnessToken, "memory-files-tester");
+    const projectDir = mkdtempSync(join(tmpdir(), "norma-memory-files-audit-project-"));
+
+    // A project-scope delete lands in that project's own MEMDIR .audit.jsonl...
+    await c.request(METHODS.memoryWrite, { scope: "project", name: "x", description: "d", body: "b", cwd: projectDir });
+    await c.request(METHODS.memoryDelete, { scope: "project", name: "x", cwd: projectDir });
+    // ...while a separate cwd-less delete lands in the global bucket instead.
+    await c.request(METHODS.memoryWrite, { scope: "user", name: "y", description: "d", body: "b" });
+    await c.request(METHODS.memoryDelete, { scope: "user", name: "y" });
+
+    const projectAudit = await c.request(METHODS.memoryAudit, { cwd: projectDir });
+    expect(projectAudit.error).toBeUndefined();
+    expect(projectAudit.result.lines).toEqual([
+      { ts: expect.any(Number), source: "rpc", scope: "project", action: "delete", name: "x" },
+    ]);
+
+    const globalAudit = await c.request(METHODS.memoryAudit, {});
+    expect(globalAudit.result.lines).toEqual([
+      { ts: expect.any(Number), source: "rpc", scope: "user", action: "delete", name: "y" },
+    ]);
     c.close();
   });
 

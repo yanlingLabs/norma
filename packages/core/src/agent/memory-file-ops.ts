@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   nameError, parseFactFile, parseIndexEntries, serializeIndex, factFileContent,
@@ -111,4 +111,28 @@ export function deleteMemoryDir(dir: string, name: string, nowMs: () => number =
   } catch (err) {
     return { ok: false, error: `failed to delete memory fact "${name}": ${err instanceof Error ? err.message : String(err)}` };
   }
+}
+
+/** T3 (design doc follow-up / task-23): read `<dir>/.audit.jsonl` back — the per-directory twin of
+ *  `MemoryStore.auditTail`, same contract (newest LAST/file order; corrupt lines skipped, never
+ *  thrown; `limit` — `undefined` -> everything, `<= 0` -> `[]` since `slice(-0)` would otherwise
+ *  return the FULL array, `> 0` -> the last N). A missing file (no deletes have happened in this
+ *  directory yet) is `[]`, not an error, same as a missing dir in `listMemoryDir`. Only ever
+ *  produces `{ts, op:"delete", name}` lines today (the only writer, `appendMemDirAudit` above, only
+ *  ever appends `op:"delete"`) — the `op === "delete"` guard below is forward-defensive, not
+ *  currently reachable any other way. */
+export function auditTailMemDir(dir: string, limit?: number): MemDirAuditLine[] {
+  let raw: string;
+  try { raw = readFileSync(join(dir, ".audit.jsonl"), "utf8"); } catch { return []; }
+  const out: MemDirAuditLine[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const obj = JSON.parse(line) as Partial<MemDirAuditLine>;
+      if (typeof obj.ts === "number" && typeof obj.name === "string" && obj.op === "delete") {
+        out.push({ ts: obj.ts, op: "delete", name: obj.name });
+      }
+    } catch { /* corrupt line — skip */ }
+  }
+  return limit === undefined ? out : limit <= 0 ? [] : out.slice(-limit);
 }

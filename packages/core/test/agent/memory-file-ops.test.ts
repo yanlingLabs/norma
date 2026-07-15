@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { listMemoryDir, readMemoryDir, writeMemoryDir, deleteMemoryDir, type MemDirAuditLine } from "../../src/agent/memory-file-ops";
+import { listMemoryDir, readMemoryDir, writeMemoryDir, deleteMemoryDir, auditTailMemDir, type MemDirAuditLine } from "../../src/agent/memory-file-ops";
 import type { MemoryFact } from "../../src/agent/memory";
 
 function realDir(): string { return realpathSync(mkdtempSync(join(tmpdir(), "norma-memfileops-"))); }
@@ -155,5 +155,46 @@ describe("memory-file-ops: deleteMemoryDir", () => {
     mkdirSync(dir, { recursive: true });
     deleteMemoryDir(dir, "ghost");
     expect(existsSync(join(dir, ".audit.jsonl"))).toBe(false);
+  });
+});
+
+// T3 (design doc follow-up / task-23): `auditTailMemDir` is the per-directory twin of
+// `MemoryStore.auditTail` — same newest-LAST/limit contract (memory-store.test.ts's own
+// "auditTail(limit)" test is mirrored here), used by ipc/server.ts's memory.audit handler once
+// files-mode + a resolved directory (dirFor(cwd) or globalDir()) are in play.
+describe("memory-file-ops: auditTailMemDir", () => {
+  test("missing .audit.jsonl -> [], no throw", () => {
+    const dir = join(realDir(), "does-not-exist");
+    expect(auditTailMemDir(dir)).toEqual([]);
+  });
+
+  test("reads back lines written by deleteMemoryDir, newest LAST (file order), corrupt lines skipped", () => {
+    const dir = realDir();
+    writeMemoryDir(dir, fact({ name: "a" }));
+    writeMemoryDir(dir, fact({ name: "b" }));
+    deleteMemoryDir(dir, "a", () => 1000);
+    deleteMemoryDir(dir, "b", () => 1001);
+
+    // inject a corrupt line between the two valid ones
+    const auditPath = join(dir, ".audit.jsonl");
+    const lines = readFileSync(auditPath, "utf8").trim().split("\n");
+    writeFileSync(auditPath, [lines[0], "not json at all", lines[1]].join("\n") + "\n");
+
+    const tail = auditTailMemDir(dir);
+    expect(tail).toEqual([
+      { ts: 1000, op: "delete", name: "a" },
+      { ts: 1001, op: "delete", name: "b" },
+    ]);
+  });
+
+  test("limit: 1 -> last 1 newest-last; 0 -> [] (slice(-0) trap); undefined -> all", () => {
+    const dir = realDir();
+    for (let i = 0; i < 5; i++) writeMemoryDir(dir, fact({ name: `f${i}` }));
+    for (let i = 0; i < 5; i++) deleteMemoryDir(dir, `f${i}`, () => i);
+
+    expect(auditTailMemDir(dir, 1)).toEqual([{ ts: 4, op: "delete", name: "f4" }]);
+    expect(auditTailMemDir(dir, 0)).toEqual([]);
+    expect(auditTailMemDir(dir, undefined)).toHaveLength(5);
+    expect(auditTailMemDir(dir)).toHaveLength(5);
   });
 });

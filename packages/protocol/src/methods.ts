@@ -727,7 +727,16 @@ export const MemoryWriteResult = z.object({});
 export const MemoryDeleteParams = z.object({ scope: MemoryScopeSchema, name: z.string().min(1), cwd: AbsoluteDirPath.optional() });
 export const MemoryDeleteResult = z.object({});
 
-export const MemoryAuditParams = z.object({ limit: z.number().int().nonnegative().optional() });
+// T3 (file-based memory, design doc follow-up / task-23): `cwd` is additive/optional — every
+// existing caller (the Swift dashboard's user-scope-only pane, task-22's tests) omits it and gets
+// EXACTLY the prior behavior. It exists so a files-mode caller (CLI `--project`, or a future
+// project-aware dashboard view) can target a SPECIFIC project's `.audit.jsonl` (memory-file-ops.ts
+// `deleteMemoryDir`'s audit trail, T2) instead of only ever reading the legacy central log — see
+// ipc/server.ts's `memory.audit` handler for the resolution (mirrors `memory.list`/etc.'s own
+// `memoryFileDir(opts.memoryFiles, cwd)`: present -> that project's MEMDIR; absent -> the global
+// bucket). Under the legacy backend (`memoryFiles` disabled) `cwd` is accepted but ignored — the
+// central `audit.jsonl` has no per-project split to filter by.
+export const MemoryAuditParams = z.object({ limit: z.number().int().nonnegative().optional(), cwd: AbsoluteDirPath.optional() });
 /** Newest FIRST (design doc §4) — the inverse of `MemoryStore.auditTail`'s own newest-LAST
  *  contract; the handler reverses the store's slice before returning it. */
 export const MemoryAuditResult = z.object({ lines: z.array(MemoryAuditLineSchema) });
