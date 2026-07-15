@@ -18,6 +18,15 @@
  * --dry-run. `--resume-publish` (non-dry-run only): an existing release is expected — upload
  * only assets missing from it and skip the appcast commit/tag if already done.
  *
+ * Whole-branch review fix (F1/F2, see .superpowers/sdd/progress-release.md): the appcast
+ * `<item>` insert decision is `appcastInsertPlan` (release-lib.ts, unit-tested) — under
+ * --dry-run it writes ONLY a preview at out/release/<v>/appcast-preview.xml, mirroring the
+ * cask's out/ render; the TRACKED releases/appcast.xml is written only from inside the
+ * publish tail's `if (!DRY_RUN)` block, never before. The insert is also idempotent: an
+ * `<item>` whose `<sparkle:version>` already matches the release version is skipped rather than
+ * duplicated, so --resume-publish after a partial failure (or a stray re-run) can't double-
+ * insert or get blocked by a self-inflicted dirty tree.
+ *
  * T1 findings this script carries (see .superpowers/sdd/task-11-report.md):
  *  - CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO is REQUIRED — without it Xcode injects
  *    get-task-allow=true and notarization silently auto-rejects.
@@ -46,7 +55,15 @@ import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ROOT, readCanonical } from "./version-lib";
-import { GH_REPO, appcastItem, caskFrom, dmgStagePlan, preflight, publishGuard } from "./release-lib";
+import {
+  GH_REPO,
+  appcastInsertPlan,
+  appcastItem,
+  caskFrom,
+  dmgStagePlan,
+  preflight,
+  publishGuard,
+} from "./release-lib";
 
 const TEAM_ID = "37N77U9RSZ";
 const NOTARY_PROFILE = "norma-notary";
@@ -109,7 +126,7 @@ const pre = preflight({
       const line = `production Sparkle key missing — run: .tools/sparkle/bin/generate_keys   (60 seconds; back it up with -x)`;
       if (DRY_RUN) {
         console.warn(
-          `WARNING: ${line}\n  (dry-run: downgraded to a warning — a real release still needs it before T3's appcast-signing step)`,
+          `WARNING: ${line}\n  (dry-run: downgraded to a warning — a real release still needs it for appcast signing)`,
         );
         return null;
       }
@@ -448,9 +465,17 @@ function assertValidXml(xml: string, label: string) {
   }
 }
 
+// appcastPath is the ONE tracked file this whole script may ever mutate — reading it here is
+// safe (read-only) under any flag combination, but WRITING it must never happen before the
+// --dry-run boundary (section 12's `if (!DRY_RUN)`). F1 fix (release whole-branch review): the
+// previous code wrote here unconditionally, so a --dry-run permanently dirtied the committed
+// appcast with a test-key-signed item — never reverted, and a second dry-run then failed its
+// own tree-clean preflight. `appcastInsertPlan` (release-lib.ts, unit-tested) decides target +
+// action; only `preview` is ever actually written here — the `repo` write is deferred to the
+// publish tail below.
 const appcastPath = join(ROOT, "releases", "appcast.xml");
+const appcastPreviewPath = join(OUT, "appcast-preview.xml");
 const appcastXml = readFileSync(appcastPath, "utf8");
-if (!appcastXml.includes("</channel>")) fail(`${appcastPath} is missing </channel> — cannot insert the item`);
 const item = appcastItem({
   version,
   zipName: `Norma-${version}.zip`,
@@ -459,12 +484,30 @@ const item = appcastItem({
   beta: BETA,
   minSystem: MIN_SYSTEM,
 });
-const updatedAppcastXml = appcastXml.replace("</channel>", `${item}\n  </channel>`);
-assertValidXml(updatedAppcastXml, "releases/appcast.xml (with new item)");
-writeFileSync(appcastPath, updatedAppcastXml);
-console.log(
-  `Appcast entry inserted into ${appcastPath}${signResult.testKey ? " [DRY-RUN: test key — NOT publishable]" : ""}.`,
-);
+let appcastPlan: ReturnType<typeof appcastInsertPlan>;
+try {
+  appcastPlan = appcastInsertPlan({ dryRun: DRY_RUN, version, appcastXml, item });
+} catch (e) {
+  fail(`${appcastPath}: ${(e as Error).message}`);
+}
+if (appcastPlan.action === "insert") {
+  assertValidXml(appcastPlan.updatedXml!, "appcast (with new item)");
+}
+if (appcastPlan.target === "preview") {
+  // --dry-run: releases/appcast.xml is NEVER touched (F1) — preview only, mirroring the cask's
+  // out/ render (section 11, below).
+  if (appcastPlan.action === "insert") {
+    writeFileSync(appcastPreviewPath, appcastPlan.updatedXml!);
+    console.log(
+      `Appcast entry previewed at ${appcastPreviewPath} (dry-run: ${appcastPath} NOT touched)` +
+        `${signResult.testKey ? " [DRY-RUN: test key — NOT publishable]" : ""}.`,
+    );
+  } else {
+    console.log(`Appcast already carries ${version} — skipping insert (dry-run: ${appcastPath} NOT touched).`);
+  }
+}
+// appcastPlan.target === "repo" (a real, non-dry-run run): the actual releases/appcast.xml
+// write is deferred to the publish tail (section 12, inside `if (!DRY_RUN)`) — see F1 above.
 
 // ---------------------------------------------------------------------------
 // 11. Cask: render packaging/norma.rb.tmpl with this release's version/sha256(DMG)/url into
@@ -501,6 +544,7 @@ Artifacts:
   Zip: ${zipPath}
   DMG: ${dmgPath}
   Cask: ${caskOutPath}
+  Appcast preview: ${appcastPlan.action === "insert" ? appcastPreviewPath : `(skipped — ${version} already in ${appcastPath})`}
   Version: ${version}
   App notarization: ${submission.id} (${submission.status})
   DMG notarization: ${dmgSubmission.id} (${dmgSubmission.status})
@@ -542,8 +586,18 @@ if (guard.action === "publish") {
   }
 }
 
-// Appcast commit+push — resume-safe: only commit if releases/appcast.xml still has pending
-// (uncommitted) changes; a prior partial run may have already committed+pushed it.
+// Appcast write + commit+push. The actual releases/appcast.xml write lives HERE — inside
+// `!DRY_RUN`, past every abort/exit above (F1 fix, see section 10) — never earlier. Resume-safe
+// both ways: `appcastPlan.action === "skip"` means a prior attempt already wrote this version's
+// <item> (F2 fix — re-running never appends a duplicate), so nothing to write here either; the
+// git dirty-check below still catches an already-written-but-not-yet-committed file from a run
+// that crashed between the write and the commit.
+if (appcastPlan.action === "insert") {
+  writeFileSync(appcastPath, appcastPlan.updatedXml!);
+  console.log(`Appcast entry inserted into ${appcastPath}.`);
+} else {
+  console.log(`Appcast already carries ${version} — skipping insert (resume-safe).`);
+}
 const appcastDirty = probe(`git status --porcelain -- releases/appcast.xml`).stdout.trim() !== "";
 if (appcastDirty) {
   sh(`git add releases/appcast.xml`);

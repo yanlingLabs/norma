@@ -86,6 +86,51 @@ export function dmgStagePlan(appPath: string): DmgStageOp[] {
   ];
 }
 
+export interface AppcastInsertPlanInputs {
+  dryRun: boolean;
+  version: string;
+  /** Current contents of the appcast this run would insert into (read by release.ts from
+   * whichever file `target` below resolves to — always `releases/appcast.xml` on disk, since
+   * that's the only copy that exists; the preview file is only ever an OUTPUT). */
+  appcastXml: string;
+  /** The rendered `<item>` block (release-lib's `appcastItem()`) to insert for this version. */
+  item: string;
+}
+
+export interface AppcastInsertPlanResult {
+  /** Where release.ts should write `updatedXml` when `action` is "insert": "preview" ->
+   * out/release/<v>/appcast-preview.xml ONLY (dry-run — F1 fix: never the tracked file);
+   * "repo" -> releases/appcast.xml (real run — release.ts must do this write from inside its
+   * `!DRY_RUN` publish tail, not before). */
+  target: "preview" | "repo";
+  /** "insert": updatedXml is ready to write. "skip": an <item> for this exact
+   * <sparkle:version> is already present — F2 fix, makes re-running (e.g. --resume-publish
+   * after a partial failure) idempotent instead of appending a duplicate. */
+  action: "insert" | "skip";
+  updatedXml?: string;
+}
+
+/**
+ * Decides where a release's appcast `<item>` should land and whether it needs inserting at
+ * all — the pure half of release.ts §10's appcast step (the impure half — reading the real
+ * file, writing it, git add/commit/push — stays in release.ts). `--dry-run` always targets
+ * "preview" (mirrors `publishGuard`'s dry-run-wins-first shape); a real run targets "repo". A
+ * version already present in `appcastXml` (matched by an exact `<sparkle:version>` element) is
+ * always "skip", in both modes, so a re-run never appends a duplicate `<item>`. Throws if an
+ * insert is needed but `appcastXml` has no `</channel>` to insert before — same "can't find the
+ * anchor" failure release.ts used to check for inline.
+ */
+export function appcastInsertPlan(i: AppcastInsertPlanInputs): AppcastInsertPlanResult {
+  const target = i.dryRun ? "preview" : "repo";
+  const alreadyPresent = i.appcastXml.includes(`<sparkle:version>${i.version}</sparkle:version>`);
+  if (alreadyPresent) return { target, action: "skip" };
+  if (!i.appcastXml.includes("</channel>")) {
+    throw new Error("appcastXml is missing </channel> — cannot insert the item");
+  }
+  const updatedXml = i.appcastXml.replace("</channel>", `${i.item}\n  </channel>`);
+  return { target, action: "insert", updatedXml };
+}
+
 export interface PublishGuardInputs {
   dryRun: boolean;
   resumePublish: boolean;

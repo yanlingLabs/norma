@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { appcastItem, caskFrom, dmgStagePlan, preflight, publishGuard } from "./release-lib";
+import { appcastInsertPlan, appcastItem, caskFrom, dmgStagePlan, preflight, publishGuard } from "./release-lib";
 
 describe("preflight", () => {
   test("every check passing -> ok with no failures", () => {
@@ -118,6 +118,77 @@ describe("dmgStagePlan", () => {
   test("tolerates a trailing slash on the app path", () => {
     const ops = dmgStagePlan("/tmp/Norma.app/");
     expect(ops[0]).toEqual({ kind: "copy", source: "/tmp/Norma.app/", destName: "Norma.app" });
+  });
+});
+
+describe("appcastInsertPlan", () => {
+  const emptyChannel = `<?xml version="1.0"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>Norma Changelog</title>
+  </channel>
+</rss>
+`;
+  const item = `    <item>
+      <sparkle:version>0.2.002</sparkle:version>
+    </item>`;
+
+  test("dry-run + absent version -> preview target, insert action", () => {
+    const plan = appcastInsertPlan({ dryRun: true, version: "0.2.002", appcastXml: emptyChannel, item });
+    expect(plan.target).toBe("preview");
+    expect(plan.action).toBe("insert");
+    expect(plan.updatedXml).toBeDefined();
+  });
+
+  test("non-dry-run + absent version -> repo target, insert action", () => {
+    const plan = appcastInsertPlan({ dryRun: false, version: "0.2.002", appcastXml: emptyChannel, item });
+    expect(plan.target).toBe("repo");
+    expect(plan.action).toBe("insert");
+    expect(plan.updatedXml).toBeDefined();
+  });
+
+  test("updatedXml inserts the item immediately before </channel>, exactly once", () => {
+    const plan = appcastInsertPlan({ dryRun: false, version: "0.2.002", appcastXml: emptyChannel, item });
+    const xml = plan.updatedXml!;
+    const itemMatches = xml.match(/<item>/g);
+    expect(itemMatches?.length).toBe(1);
+    const channelCloseIndex = xml.indexOf("</channel>");
+    const itemIndex = xml.indexOf("<item>");
+    expect(itemIndex).toBeGreaterThan(-1);
+    expect(itemIndex).toBeLessThan(channelCloseIndex);
+    // Nothing but the item + a newline/indent sits between the item's close and </channel>.
+    expect(xml.slice(xml.indexOf("</item>") + "</item>".length, channelCloseIndex).trim()).toBe("");
+  });
+
+  test("version already present -> skip, dry-run", () => {
+    const withItem = emptyChannel.replace("</channel>", `${item}\n  </channel>`);
+    const plan = appcastInsertPlan({ dryRun: true, version: "0.2.002", appcastXml: withItem, item });
+    expect(plan.target).toBe("preview");
+    expect(plan.action).toBe("skip");
+    expect(plan.updatedXml).toBeUndefined();
+  });
+
+  test("version already present -> skip, non-dry-run (resume-safe: no duplicate item)", () => {
+    const withItem = emptyChannel.replace("</channel>", `${item}\n  </channel>`);
+    const plan = appcastInsertPlan({ dryRun: false, version: "0.2.002", appcastXml: withItem, item });
+    expect(plan.target).toBe("repo");
+    expect(plan.action).toBe("skip");
+    expect(plan.updatedXml).toBeUndefined();
+  });
+
+  test("a DIFFERENT version already present does not block inserting this one", () => {
+    const otherItem = `    <item>\n      <sparkle:version>0.1.999</sparkle:version>\n    </item>`;
+    const withOther = emptyChannel.replace("</channel>", `${otherItem}\n  </channel>`);
+    const plan = appcastInsertPlan({ dryRun: false, version: "0.2.002", appcastXml: withOther, item });
+    expect(plan.action).toBe("insert");
+    expect(plan.updatedXml).toContain("0.1.999");
+    expect(plan.updatedXml).toContain("0.2.002");
+  });
+
+  test("missing </channel> anchor throws", () => {
+    expect(() =>
+      appcastInsertPlan({ dryRun: false, version: "0.2.002", appcastXml: "<rss></rss>", item }),
+    ).toThrow();
   });
 });
 
