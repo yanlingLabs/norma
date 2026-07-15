@@ -1,5 +1,32 @@
-import { realpathSync } from "node:fs";
+import { realpathSync, lstatSync, readlinkSync } from "node:fs";
 import { isAbsolute, resolve, sep, dirname, basename, join } from "node:path";
+
+// Symlink chains longer than this are rejected outright (mirrors the kernel's own ELOOP guard,
+// just tighter). Also breaks link CYCLES (a→b→a never terminates otherwise): lstat on a cycle
+// member succeeds every hop (lstat never follows the final link), so only this cap stops it.
+const MAX_LINK_DEPTH = 8;
+
+/** Resolve the LEAF of `target` through any symlink chain (lstat/readlink, relative link text
+ *  resolved against the link's own directory), returning the final non-link path — which may not
+ *  exist (a DANGLING link's target). Non-links and entirely nonexistent paths return unchanged.
+ *
+ *  Exists to close a fence hole (task-24 review F4): `canonAncestor` below realpaths the deepest
+ *  EXISTING path — but a dangling symlink's leaf makes `realpathSync(target)` throw ENOENT, so the
+ *  walk retreated to the link's PARENT directory and never saw where the link actually points. An
+ *  in-root dangling symlink aimed at a nonexistent file in an existing OUTSIDE directory therefore
+ *  passed containment, and the subsequent write followed the link and landed outside every root —
+ *  a reviewer-less, card-less escape. Resolving the leaf's link text FIRST (this function), then
+ *  canonAncestor-ing the RESULT, makes containment judge the real destination. Chain-capped at
+ *  MAX_LINK_DEPTH (throws — fail-closed; callers treat it like any other fence rejection). */
+export function resolveLeafSymlinks(target: string, depth = 0): string {
+  if (depth >= MAX_LINK_DEPTH) throw new Error(`too many levels of symbolic links: ${target}`);
+  let st;
+  try { st = lstatSync(target); } catch { return target; } // nothing on disk at all — no link to follow
+  if (!st.isSymbolicLink()) return target;
+  const linkText = readlinkSync(target);
+  const next = isAbsolute(linkText) ? resolve(linkText) : resolve(dirname(target), linkText);
+  return resolveLeafSymlinks(next, depth + 1);
+}
 
 /** Symlink-hardened: realpath of `target` itself if it exists, else of its deepest existing
  *  ancestor (walking up dirname). Exported for fs-read.ts's denylist check, which needs the exact
@@ -24,6 +51,15 @@ export function canonAncestor(target: string): string {
  * in SessionDirectories' `added` set) is SKIPPED rather than fatal, so one
  * stale root can never brick resolution against the other, still-valid
  * roots. Mirrors the try/catch tolerance in dirs.ts's `canon`/`roots`.
+ *
+ * Leaf-link hardened (task-24 review F4): the target's LEAF is resolved through any symlink chain
+ * (resolveLeafSymlinks above) BEFORE the canonAncestor containment probe, so a dangling in-root
+ * symlink pointing outside every root is REJECTED — previously the ENOENT fallback walked to the
+ * link's parent (in-root) and the write escaped through the link. A dangling in-root link to an
+ * in-root target still resolves fine (the resolved leaf is in-root), and non-dangling links were
+ * already covered by realpath. The RETURN value stays the caller's literal `target` (not the link
+ * destination) — unchanged contract; the write then flows through the link to the destination
+ * containment just vetted.
  */
 export function resolveWithinAny(roots: string[], p: string): string {
   if (roots.length === 0) throw new Error("no allowed directories configured");
@@ -34,7 +70,7 @@ export function resolveWithinAny(roots: string[], p: string): string {
   }
   if (reals.length === 0) throw new Error(`path is outside the allowed directories: ${p}`);
   const target = isAbsolute(p) ? resolve(p) : resolve(reals[0]!, p);
-  const probe = canonAncestor(target);
+  const probe = canonAncestor(resolveLeafSymlinks(target));
   for (const root of reals) {
     if (probe === root || probe.startsWith(root + sep)) return target;
   }

@@ -14,11 +14,8 @@ import { registerNotebookTool } from "../../src/agent/tools/notebook";
 import { registerWorktreeTools } from "../../src/agent/tools/worktree";
 import { registerSpawnAgentTool } from "../../src/agent/tools/spawn";
 import { registerWebTools } from "../../src/agent/tools/web";
-import { registerRequestDirTool } from "../../src/agent/tools/request-dir";
 import { BackgroundTaskRegistry } from "../../src/agent/bg-registry";
 import { SkillStore } from "../../src/agent/skills";
-import { SessionDirectories } from "../../src/agent/dirs";
-import { ApprovalBroker } from "../../src/agent/approvals";
 import { QuestionBroker } from "../../src/agent/questions";
 import { TaskStore } from "../../src/agent/task-store";
 import { PlanBroker } from "../../src/agent/plans";
@@ -50,12 +47,6 @@ describe("lease-subagent isolation (4h-ii-a prerequisite)", () => {
     registerWorktreeTools(registry, { deferred: true });
     registerSpawnAgentTool(registry, { models: ["gpt-4"] });
     registerWebTools(registry, { audit: () => {}, secret: async () => null });
-    registerRequestDirTool(registry, {
-      broker: new ApprovalBroker(),
-      dirs: new SessionDirectories(() => []),
-      emit: () => {},
-      projectDir: () => "/",
-    });
 
     // Get all registered tool names and assert NONE match /lease|peripheral/i
     const allToolNames = registry.specs("/").map((spec) => spec.name);
@@ -69,6 +60,11 @@ describe("lease-subagent isolation (4h-ii-a prerequisite)", () => {
     expect(allToolNames).toContain("write");
     expect(allToolNames).toContain("bash");
     expect(allToolNames).toContain("spawn_agent");
+
+    // write-permission-flow (task 24, CC parity): request_directory is DELETED — an out-of-root
+    // write/edit now carries its own grant flow through the engine's dispatch loop instead of a
+    // dedicated model-invocable tool (see engine.test.ts's "out-of-root write/edit grant flow").
+    expect(allToolNames).not.toContain("request_directory");
   });
 
   test("specs() for a subagent (no exclusions) contains no lease-related tools", () => {

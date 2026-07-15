@@ -462,6 +462,59 @@ describe("engine + safety reviewer (auto-policy fs coverage, phase 5e T3)", () =
     expect(result.output).toContain("outside the allowed directories");
   });
 
+  // task-24 review F1: the write-permission-flow's auto-policy pre-grant must NOT bypass this fs
+  // reviewer. The first cut dispatched an out-of-root write straight to executeCall from the grant
+  // branch — reviewer never consulted, "unsafe" never seen. Now the grant is applied BEFORE the
+  // dispatch chain (dir joins the session roots, dirGrant nulled) and the call falls through the
+  // SAME chain an in-root write takes — where an out-of-root target is by definition outside the
+  // primary cwd subtree, i.e. exactly the fsWriteIsUnusual case the added-root test above pins.
+  test("out-of-root write under auto: the dir grant is silent but the WRITE still rides the fs reviewer — unsafe verdict blocks it exactly like an in-root unusual write (task-24 review F1)", async () => {
+    const prev = process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS;
+    process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS = "30"; // short: no watcher answers → broker times out fast
+    try {
+      const outsideDir = realpathSync(mkdtempSync(join(tmpdir(), "norma-fs-oor-unsafe-")));
+      const target = join(outsideDir, "f.txt");
+      const reviewer = stubReviewer({ verdict: "unsafe", reason: "REASON_OOR" });
+      const provider = new FakeProvider(writeTurn(target, "must not land"));
+      const { engine, store, sessionId, dirs } = setupEngine(provider, { reviewer: reviewer as any });
+
+      await engine.runTurn(sessionId);
+      const events = store.read(sessionId);
+
+      // The GRANT landed (auto grants silently; directory_added is observability, not approval)...
+      expect(events.some((e) => e.type === "directory_added" && (e as any).path === outsideDir)).toBe(true);
+      expect(dirs.has(sessionId, outsideDir)).toBe(true);
+      // ...but the WRITE was still reviewed, found unsafe, escalated, timed out, and blocked:
+      const review = events.find((e) => e.type === "tool_review") as any;
+      expect(review).toMatchObject({ toolName: "write", verdict: "unsafe", reason: "REASON_OOR" });
+      const result = events.find((e) => e.type === "tool_result") as any;
+      expect(result.isError).toBe(true);
+      expect(result.output).toContain("blocked by the safety reviewer");
+      expect(existsSync(target)).toBe(false); // blocked — never written
+    } finally {
+      if (prev === undefined) delete process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS;
+      else process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS = prev;
+    }
+  });
+
+  test("out-of-root write under auto: reviewer-approved (safe) → grant + review + the write lands (task-24 review F1, happy path)", async () => {
+    const outsideDir = realpathSync(mkdtempSync(join(tmpdir(), "norma-fs-oor-safe-")));
+    const target = join(outsideDir, "ok.txt");
+    const reviewer = stubReviewer({ verdict: "safe", reason: "granted dir, fine" });
+    const provider = new FakeProvider(writeTurn(target, "reviewed and landed"));
+    const { engine, store, sessionId } = setupEngine(provider, { reviewer: reviewer as any });
+
+    await engine.runTurn(sessionId);
+    const events = store.read(sessionId);
+
+    expect(events.some((e) => e.type === "directory_added" && (e as any).path === outsideDir)).toBe(true);
+    const review = events.find((e) => e.type === "tool_review") as any;
+    expect(review).toMatchObject({ toolName: "write", verdict: "safe" });
+    expect(review.summary).toContain(target); // précis saw the REAL (granted) destination
+    expect(events.some((e) => e.type === "approval_requested")).toBe(false); // safe → no escalation card
+    expect(readFileSync(target, "utf8")).toBe("reviewed and landed");
+  });
+
   test("plain in-cwd path with a dotted PREFIX but no dot-segment (e.g. \"src/a.ts\") → NOT reviewed", async () => {
     const reviewer = stubReviewer({ verdict: "unsafe", reason: "should never be asked" });
     const provider = new FakeProvider(writeTurn("src/a.ts", "export {}"));

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, readFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SessionEvent } from "@norma/protocol";
@@ -8,7 +8,6 @@ import { SessionHub, type HubClient } from "../../src/sessions/hub";
 import { ToolRegistry } from "../../src/agent/tools/registry";
 import { registerReadTools } from "../../src/agent/tools/fs-read";
 import { registerWriteTools } from "../../src/agent/tools/fs-write";
-import { registerRequestDirTool } from "../../src/agent/tools/request-dir";
 import { PermissionGate } from "../../src/agent/gate";
 import { ApprovalBroker } from "../../src/agent/approvals";
 import { AgentEngine } from "../../src/agent/engine";
@@ -20,7 +19,7 @@ import { SkillStore } from "../../src/agent/skills";
 import { Compactor } from "../../src/agent/compactor";
 import type { ProviderEvent } from "../../src/providers/types";
 
-function setup(script: ProviderEvent[][], policy: "ask" | "auto" = "auto", extraRoots: string[] = []) {
+function setup(script: ProviderEvent[][], policy: "ask" | "auto" = "auto", extraRoots: string[] = [], opts: { grantDeniedPrefixes?: string[] } = {}) {
   const home = mkdtempSync(join(tmpdir(), "norma-engine-"));
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-cwd-")));
   const store = new SessionStore(home);
@@ -31,13 +30,6 @@ function setup(script: ProviderEvent[][], policy: "ask" | "auto" = "auto", extra
   const broker = new ApprovalBroker();
   const provider = new FakeProvider(script);
   const dirs = new SessionDirectories(() => [cwd, ...extraRoots]);
-  registerRequestDirTool(registry, {
-    broker,
-    dirs,
-    emit: (sid, e) => hub.append(sid, e), // matches production wiring (daemon.ts)
-    projectDir: () => null,
-    approvalTimeoutMs: 500,
-  });
   // Default assembler — these tests don't exercise context assembly (see engine-context.test.ts).
   const assemblerHome = mkdtempSync(join(tmpdir(), "norma-engine-actx-"));
   const assemblerTrust = new TrustStore(join(assemblerHome, "trust.json"));
@@ -52,6 +44,7 @@ function setup(script: ProviderEvent[][], policy: "ask" | "auto" = "auto", extra
     approvalTimeoutMs: 500,
     assembler,
     compactor,
+    grantDeniedPrefixes: opts.grantDeniedPrefixes,
   });
   const sessionId = store.createSession("global", { cwd, approvalPolicy: policy });
   return { engine, store, hub, broker, sessionId, cwd, provider, dirs };
@@ -182,23 +175,244 @@ describe("AgentEngine", () => {
     expect(events.some((e) => e.type === "tool_call")).toBe(false);
   });
 
-  test("request_directory self-gates: exactly one approval_requested (not a gate prompt plus the tool's own), and approving it grants the dir", async () => {
-    const outsideDir = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-outside-")));
-    const { engine, store, hub, broker, sessionId, dirs } = setup([
-      [{ type: "tool_call", callId: "c1", name: "request_directory", argsJson: JSON.stringify({ path: outsideDir }) }, done("tool_calls")],
-      text("granted"),
-    ], "ask"); // "ask" policy: if the gate still double-prompted request_directory, this is where it would show up
-    const watcher: HubClient = {
-      clientName: "auto-approver",
-      deliver(e) { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, true, "auto-approver"); return true; },
-    };
-    hub.attach(watcher, sessionId, 0);
-    await engine.runTurn(sessionId);
-    const events = store.read(sessionId);
-    const approvalRequests = events.filter((e) => e.type === "approval_requested");
-    expect(approvalRequests.length).toBe(1); // one prompt, not two (no engine-level gate prompt + the tool's own)
-    expect(approvalRequests[0]).toMatchObject({ toolName: "request_directory" });
-    expect(dirs.has(sessionId, outsideDir)).toBe(true);
-    expect(events.find((e) => e.type === "tool_result")).toMatchObject({ isError: false });
+  // write-permission-flow (task 24, CC parity): request_directory is DELETED — an out-of-root
+  // write/edit now carries its own grant flow through the engine's dispatch loop (engine.ts's
+  // `dirGrant` branch), riding the SAME ApprovalBroker/requestApproval seam bash/worktree already
+  // use. cc-expert findings (real CC): an out-of-scope edit gets exactly ONE prompt, the ordinary
+  // tool-permission one — not a first generic card plus a second "grant this directory" card — so
+  // these tests assert exactly one approval_requested for the whole call, shaped like a write/edit
+  // card (toolName "write"/"edit"), not a bespoke "request_directory" name.
+  describe("out-of-root write/edit grant flow", () => {
+    test("ask policy: approve grants the directory and the write lands; a follow-up write to the SAME directory rides the existing grant (no SECOND directory_added, no grant-flavored card) — it still gets Norma's ORDINARY per-write ask-policy card, same as any in-root write would", async () => {
+      const outsideDir = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-outside-")));
+      const target1 = join(outsideDir, "file1.txt");
+      const target2 = join(outsideDir, "file2.txt");
+      const { engine, store, hub, broker, sessionId, dirs } = setup([
+        [{ type: "tool_call", callId: "c1", name: "write", argsJson: JSON.stringify({ path: target1, content: "one" }) }, done("tool_calls")],
+        [{ type: "tool_call", callId: "c2", name: "write", argsJson: JSON.stringify({ path: target2, content: "two" }) }, done("tool_calls")],
+        text("wrote both"),
+      ], "ask");
+      const watcher: HubClient = {
+        clientName: "auto-approver",
+        deliver(e) { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, true, "auto-approver"); return true; },
+      };
+      hub.attach(watcher, sessionId, 0);
+      await engine.runTurn(sessionId);
+      const events = store.read(sessionId);
+      const approvalRequests = events.filter((e) => e.type === "approval_requested") as any[];
+      // Norma's `ask` policy asks for EVERY write, in-root or not (gate.ts's MUTATING class,
+      // unrelated to this feature and unchanged by it — see the "in-root writes never trigger the
+      // grant flow" test below) — so there are still TWO cards here, one per call. The thing THIS
+      // test proves is which SHAPE each card is: c1 (genuinely out-of-root) gets the grant-flavored
+      // card; c2 (now in-root, riding the grant) gets the ORDINARY generic write card, not a
+      // second grant request.
+      expect(approvalRequests.length).toBe(2);
+      expect(approvalRequests[0]).toMatchObject({ toolName: "write" });
+      expect(approvalRequests[0].summary).toContain(outsideDir);
+      expect(approvalRequests[0].summary).toContain("outside the allowed directories");
+      expect(approvalRequests[1]).toMatchObject({ toolName: "write" });
+      expect(approvalRequests[1].summary).not.toContain("outside the allowed directories"); // ordinary card — no re-grant needed
+      expect(dirs.has(sessionId, outsideDir)).toBe(true);
+      const grants = events.filter((e) => e.type === "directory_added");
+      expect(grants.length).toBe(1); // granted exactly ONCE, not once per write
+      expect(grants[0]).toMatchObject({ path: outsideDir, persisted: false });
+      expect(readFileSync(target1, "utf8")).toBe("one");
+      expect(readFileSync(target2, "utf8")).toBe("two");
+      const results = events.filter((e) => e.type === "tool_result");
+      expect(results.every((r: any) => r.isError === false)).toBe(true);
+    });
+
+    test("ask policy: denial produces a clean error tool_result (not a crash) — nothing is written, nothing is granted", async () => {
+      const outsideDir = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-outside-deny-")));
+      const target = join(outsideDir, "nope.txt");
+      const { engine, store, hub, broker, sessionId, dirs } = setup([
+        [{ type: "tool_call", callId: "c1", name: "write", argsJson: JSON.stringify({ path: target, content: "x" }) }, done("tool_calls")],
+        text("ok, not writing"),
+      ], "ask");
+      const watcher: HubClient = {
+        clientName: "auto-denier",
+        deliver(e) { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, false, "auto-denier"); return true; },
+      };
+      hub.attach(watcher, sessionId, 0);
+      await engine.runTurn(sessionId);
+      const events = store.read(sessionId);
+      expect(events.find((e) => e.type === "approval_resolved")).toMatchObject({ approved: false, by: "auto-denier" });
+      expect(events.find((e) => e.type === "tool_result")).toMatchObject({ isError: true });
+      expect(existsSync(target)).toBe(false);
+      expect(dirs.has(sessionId, outsideDir)).toBe(false);
+      expect(events.some((e) => e.type === "directory_added")).toBe(false);
+    });
+
+    test("auto policy: no approval prompt at all (mirrors bash's own auto semantics) — silently granted ONCE, directory_added emitted for observability but not re-emitted for a same-directory follow-up, write lands", async () => {
+      const outsideDir = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-outside-auto-")));
+      const target1 = join(outsideDir, "auto1.txt");
+      const target2 = join(outsideDir, "auto2.txt");
+      const { engine, store, sessionId, dirs } = setup([
+        [{ type: "tool_call", callId: "c1", name: "write", argsJson: JSON.stringify({ path: target1, content: "auto-granted" }) }, done("tool_calls")],
+        [{ type: "tool_call", callId: "c2", name: "write", argsJson: JSON.stringify({ path: target2, content: "auto-granted-2" }) }, done("tool_calls")],
+        text("wrote both"),
+      ], "auto");
+      await engine.runTurn(sessionId);
+      const events = store.read(sessionId);
+      expect(events.some((e) => e.type === "approval_requested")).toBe(false); // never, under auto — matches bash
+      const grants = events.filter((e) => e.type === "directory_added");
+      expect(grants.length).toBe(1); // granted once for c1; c2 rides the SAME grant, no re-grant
+      expect(grants[0]).toMatchObject({ path: outsideDir, persisted: false });
+      expect(dirs.has(sessionId, outsideDir)).toBe(true);
+      expect(readFileSync(target1, "utf8")).toBe("auto-granted");
+      expect(readFileSync(target2, "utf8")).toBe("auto-granted-2");
+    });
+
+    test("in-root writes never trigger the grant flow (byte-identical fast path): the pre-existing generic ask-policy card is unaffected, no directory_added is ever emitted", async () => {
+      const { engine, store, hub, broker, sessionId, cwd } = setup([
+        [{ type: "tool_call", callId: "c1", name: "write", argsJson: JSON.stringify({ path: "in-root.txt", content: "y" }) }, done("tool_calls")],
+        text("wrote it"),
+      ], "ask");
+      const watcher: HubClient = {
+        clientName: "auto-approver",
+        deliver(e) { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, true, "auto-approver"); return true; },
+      };
+      hub.attach(watcher, sessionId, 0);
+      await engine.runTurn(sessionId);
+      const events = store.read(sessionId);
+      const approvalRequests = events.filter((e) => e.type === "approval_requested");
+      expect(approvalRequests.length).toBe(1);
+      expect(approvalRequests[0]).toMatchObject({ toolName: "write" }); // the ordinary write-call card, not a directory grant
+      expect(events.some((e) => e.type === "directory_added")).toBe(false);
+      expect(readFileSync(join(cwd, "in-root.txt"), "utf8")).toBe("y");
+    });
+
+    test("grants are session-scoped: a brand-new session sharing the SAME SessionDirectories store does not inherit a prior session's grant", async () => {
+      const outsideDir = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-outside-iso-")));
+      const target1 = join(outsideDir, "s1.txt");
+      const target2 = join(outsideDir, "s2.txt");
+      const { engine, store, hub, broker, sessionId, dirs, cwd } = setup([
+        [{ type: "tool_call", callId: "c1", name: "write", argsJson: JSON.stringify({ path: target1, content: "one" }) }, done("tool_calls")],
+        text("wrote it"),
+        [{ type: "tool_call", callId: "c2", name: "write", argsJson: JSON.stringify({ path: target2, content: "two" }) }, done("tool_calls")],
+        text("wrote it too"),
+      ], "ask");
+      const watcher: HubClient = {
+        clientName: "auto-approver",
+        deliver(e) { if (e.type === "approval_requested") broker.resolve((e as any).sessionId, e.callId, true, "auto-approver"); return true; },
+      };
+      hub.attach(watcher, sessionId, 0);
+      await engine.runTurn(sessionId);
+      expect(dirs.has(sessionId, outsideDir)).toBe(true);
+
+      // A NEW session, same store/dirs/engine instance — must NOT inherit session 1's grant.
+      const sessionId2 = store.createSession("global", { cwd, approvalPolicy: "ask" });
+      hub.attach(watcher, sessionId2, 0);
+      expect(dirs.has(sessionId2, outsideDir)).toBe(false); // not inherited
+      await engine.runTurn(sessionId2);
+      const events2 = store.read(sessionId2);
+      expect(events2.some((e) => e.type === "approval_requested")).toBe(true); // re-prompted — no free ride off session 1
+      expect(dirs.has(sessionId2, outsideDir)).toBe(true); // approved again, granted for THIS session too
+      expect(readFileSync(target2, "utf8")).toBe("two");
+    });
+
+    // task-24 review F2: the control plane (daemon.ts passes ~/.norma/run — the run dir holding
+    // the IPC socket/lock/plugin PID files, the SAME denylist the read tools get) must NEVER be
+    // grantable: hard tool error, no card, no directory_added — under BOTH policies. bash's
+    // seatbelt shares the session roots, so a grant would open the dir to bash too.
+    for (const policy of ["ask", "auto"] as const) {
+      test(`denied-prefix (control-plane) target under ${policy}: hard error, no approval card, no grant`, async () => {
+        const runDir = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-rundir-")));
+        const target = join(runDir, "core.sock.d", "evil.txt");
+        const { engine, store, sessionId, dirs } = setup([
+          [{ type: "tool_call", callId: "c1", name: "write", argsJson: JSON.stringify({ path: target, content: "x" }) }, done("tool_calls")],
+          text("blocked"),
+        ], policy, [], { grantDeniedPrefixes: [runDir] });
+        await engine.runTurn(sessionId);
+        const events = store.read(sessionId);
+        expect(events.some((e) => e.type === "approval_requested")).toBe(false); // no card, even under ask
+        expect(events.some((e) => e.type === "directory_added")).toBe(false);
+        const result = events.find((e) => e.type === "tool_result") as any;
+        expect(result.isError).toBe(true);
+        expect(result.output).toMatch(/control plane/);
+        expect(result.output).toMatch(/never be granted/);
+        expect(existsSync(target)).toBe(false);
+        expect(dirs.has(sessionId, runDir)).toBe(false);
+      });
+    }
+
+    test("denied-prefix hardening also blocks granting an ANCESTOR of the control plane (subtree containment would open it through the fence)", async () => {
+      const outer = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-outer-")));
+      const runDir = join(outer, "run"); // the denied prefix lives INSIDE the would-be grant dir
+      const target = join(outer, "adjacent.txt"); // grant dir would be `outer` itself
+      const { engine, store, sessionId, dirs } = setup([
+        [{ type: "tool_call", callId: "c1", name: "write", argsJson: JSON.stringify({ path: target, content: "x" }) }, done("tool_calls")],
+        text("blocked"),
+      ], "auto", [], { grantDeniedPrefixes: [runDir] });
+      await engine.runTurn(sessionId);
+      const events = store.read(sessionId);
+      expect(events.some((e) => e.type === "directory_added")).toBe(false);
+      expect((events.find((e) => e.type === "tool_result") as any).isError).toBe(true);
+      expect(existsSync(target)).toBe(false);
+      expect(dirs.has(sessionId, outer)).toBe(false);
+    });
+
+    // task-24 review F3: a grant whose directory does NOT yet exist (deep new subtree). The fence
+    // realpaths roots (SessionDirectories.canon + resolveWithinAny both tolerate-and-SKIP a root
+    // that doesn't resolve), so a granted-but-nonexistent dir silently dropped out and the
+    // just-approved write still failed. The grant now mkdirs the approved directory first.
+    test("deep not-yet-existing target dirs under auto: grant mkdirs the directory, directory_added emitted, the write lands (task-24 review F3)", async () => {
+      const outside = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-deep-auto-")));
+      const target = join(outside, "newsub", "deeper", "file.txt"); // nothing below `outside` exists
+      const grantDir = join(outside, "newsub", "deeper");
+      const { engine, store, sessionId, dirs } = setup([
+        [{ type: "tool_call", callId: "c1", name: "write", argsJson: JSON.stringify({ path: target, content: "deep" }) }, done("tool_calls")],
+        text("wrote it"),
+      ], "auto");
+      await engine.runTurn(sessionId);
+      const events = store.read(sessionId);
+      expect(events.some((e) => e.type === "directory_added" && (e as any).path === grantDir)).toBe(true);
+      expect((events.find((e) => e.type === "tool_result") as any).isError).toBe(false);
+      expect(readFileSync(target, "utf8")).toBe("deep"); // the approved write actually LANDED
+      expect(dirs.has(sessionId, grantDir)).toBe(true);
+    });
+
+    test("deep not-yet-existing target dirs under ask+approve: same — grant mkdirs, write lands (task-24 review F3)", async () => {
+      const outside = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-deep-ask-")));
+      const target = join(outside, "newsub", "deeper", "file.txt");
+      const grantDir = join(outside, "newsub", "deeper");
+      const { engine, store, hub, broker, sessionId, dirs } = setup([
+        [{ type: "tool_call", callId: "c1", name: "write", argsJson: JSON.stringify({ path: target, content: "deep-ask" }) }, done("tool_calls")],
+        text("wrote it"),
+      ], "ask");
+      const watcher: HubClient = {
+        clientName: "auto-approver",
+        deliver(e) { if (e.type === "approval_requested") broker.resolve(sessionId, e.callId, true, "auto-approver"); return true; },
+      };
+      hub.attach(watcher, sessionId, 0);
+      await engine.runTurn(sessionId);
+      const events = store.read(sessionId);
+      expect(events.some((e) => e.type === "directory_added" && (e as any).path === grantDir)).toBe(true);
+      expect((events.find((e) => e.type === "tool_result") as any).isError).toBe(false);
+      expect(readFileSync(target, "utf8")).toBe("deep-ask");
+      expect(dirs.has(sessionId, grantDir)).toBe(true);
+    });
+
+    // task-24 review F4 (engine half — the fence half is pinned in paths.test.ts): an in-root
+    // DANGLING symlink aimed at a nonexistent file in an existing OUTSIDE dir used to write
+    // through silently (reviewer-less, card-less escape). The fence now resolves the leaf's link
+    // chain, so the call classifies as out-of-root and takes the GRANT flow for the REAL target
+    // directory — never a silent escape.
+    test("in-root dangling symlink → outside dir: no longer a silent escape — grant-flows for the REAL (outside) directory under auto", async () => {
+      const outside = realpathSync(mkdtempSync(join(tmpdir(), "norma-engine-symlink-out-")));
+      const { engine, store, sessionId, cwd, dirs } = setup([
+        [{ type: "tool_call", callId: "c1", name: "write", argsJson: JSON.stringify({ path: "innocent.txt", content: "PWNED" }) }, done("tool_calls")],
+        text("done"),
+      ], "auto");
+      const { symlinkSync } = await import("node:fs");
+      symlinkSync(join(outside, "pwned.txt"), join(cwd, "innocent.txt")); // dangling — target doesn't exist
+      await engine.runTurn(sessionId);
+      const events = store.read(sessionId);
+      // The grant names the REAL destination directory (the outside dir), not the in-root spelling:
+      expect(events.some((e) => e.type === "directory_added" && (e as any).path === outside)).toBe(true);
+      expect(dirs.has(sessionId, outside)).toBe(true);
+      // The write went through the link INTO the granted dir — visible, granted, never silent:
+      expect(readFileSync(join(outside, "pwned.txt"), "utf8")).toBe("PWNED");
+    });
   });
 });

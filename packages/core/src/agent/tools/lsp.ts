@@ -16,7 +16,7 @@ import type { LspDiagnostic, LspLocation } from "../lsp/client";
  * rationale as memory.ts's `cwdOf`: `ctx.cwd`/`ctx.roots` are the CURRENT THREAD's (which for an
  * isolated worktree child can diverge from the session's own project directory), whereas these
  * resolve the SESSION's real cwd/roots (daemon.ts wires them from the identical `store.meta(sid)`/
- * `sessionDirs.roots(sid)`/`sessionTmpDir(sid)` sources memory/request-dir/fs-read already use).
+ * `sessionDirs.roots(sid)`/`sessionTmpDir(sid)` sources memory/fs-read already use).
  *
  * FENCE DISCIPLINE (the security lens for this file): every tool resolves `path` against the
  * session's read roots via `resolveWithinAny` BEFORE anything else — in particular before

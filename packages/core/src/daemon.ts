@@ -18,7 +18,6 @@ import { ToolRegistry } from "./agent/tools/registry";
 import { registerReadTools } from "./agent/tools/fs-read";
 import { registerWriteTools } from "./agent/tools/fs-write";
 import { registerBashTool } from "./agent/tools/bash";
-import { registerRequestDirTool } from "./agent/tools/request-dir";
 import { registerBackgroundTools } from "./agent/tools/background";
 import { registerSkillTools } from "./agent/tools/skill";
 import { registerToolSearchTool } from "./agent/tools/toolsearch";
@@ -248,7 +247,7 @@ export async function startDaemon(opts: {
     // memory is enabled, the session's MEMDIR joins the SAME write-fence `roots` the `write`/`edit`
     // tools (fs-write.ts) and bash's OS-sandbox writable set (bash.ts) already resolve against —
     // no new fencing mechanism, just one more entry in the list every other grant here (permission
-    // dirs, `request_directory`, `enter_worktree`) already goes through. `roots(sid)` is
+    // dirs, an out-of-root write/edit grant, `enter_worktree`) already goes through. `roots(sid)` is
     // SESSION-scoped (not per-thread): an isolated worktree child gets `rootsOverride` instead,
     // which REPLACES this list wholesale (engine.ts), so it never sees MEMDIR — but a plain
     // (non-isolated) child thread shares the session's roots exactly as it already shares every
@@ -601,12 +600,6 @@ export async function startDaemon(opts: {
     // `onCircuitOpen` was wired before `registry` existed).
     pluginSupervisor.startAll(spawnablePlugins);
 
-    registerRequestDirTool(registry, {
-      broker: approvalBroker,
-      dirs: sessionDirs,
-      emit: (sid, e) => hub.append(sid, e),
-      projectDir: (sid) => store.meta(sid).cwd,
-    });
     const compactor = new Compactor({ provider: agentProvider, store, hub });
     // hot-settings T2 review: ALWAYS constructed, never gated on the boot-time reviewer.enabled.
     // The BashReviewer constructor is inert (stores provider/model/timeoutMs refs only — no I/O,
@@ -639,6 +632,22 @@ export async function startDaemon(opts: {
       store, hub, registry, broker: approvalBroker,
       gate: new PermissionGate(),
       dirs: sessionDirs,
+      // write-permission-flow F2: the out-of-root write/edit grant flow must never silently grant
+      // any part of Norma's OWN home directory. This is BROADER than the READ denylist above
+      // (which locks only `dirs.runDir` — the rest of normaHome stays readable by design) on
+      // purpose: a GRANT is strictly higher-risk than a read — it opens the directory to WRITE,
+      // and because bash's seatbelt shares the session's write roots, to bash too. normaHome holds
+      // the control plane (run/: IPC socket, lock, plugin PID files) AND Norma's managed internal
+      // state (sessions/, logs/, plugins/, and crucially projects/<key>/memory — the per-project
+      // MEMDIR). The MEMDIR is the load-bearing case: when memory is ENABLED it's already a session
+      // BASE root (sessionDirs above), so a write there is in-root and never reaches the grant flow
+      // — but when memory is DISABLED it is deliberately NOT a root, and without this an auto-policy
+      // write could silently re-grant it, quietly defeating the memory-disable gate (and writing
+      // into ~/.norma). The agent never has a legitimate need to be *granted* write access to
+      // Norma's own home — its legitimate MEMDIR access comes from memory being enabled (a base
+      // root), not from a grant. Realpath-hardened in engine.ts's grantDenied, bidirectional
+      // (an ancestor of normaHome is refused too — see grantDenied's doc comment).
+      grantDeniedPrefixes: [normaHome],
       provider: agentProvider,
       assembler,
       compactor,

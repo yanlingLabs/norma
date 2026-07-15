@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
-import { relative, sep } from "node:path";
+import { existsSync, realpathSync, mkdirSync } from "node:fs";
+import { relative, sep, isAbsolute, resolve, dirname } from "node:path";
 import type { NewSessionEvent, Question, SessionEvent, Task } from "@norma/protocol";
 import type { SessionStore } from "../sessions/store";
 import type { SessionHub } from "../sessions/hub";
@@ -18,7 +18,7 @@ import type { ContextAssembler } from "./context";
 import type { Compactor } from "./compactor";
 import type { McpManager } from "./mcp/manager";
 import { bashLooksSafe, type BashReviewer, type ReviewInput } from "./reviewer";
-import { resolveWithinAny, isWithin, canonicalizeForWrite } from "./paths";
+import { resolveWithinAny, isWithin, canonicalizeForWrite, resolveLeafSymlinks } from "./paths";
 import type { WorktreeManager } from "./worktree";
 import type { SubagentManager } from "./subagents";
 import type { AgentStore } from "./agents";
@@ -205,6 +205,53 @@ function fsWritePrecis(call: { name: string; argsJson: string }, resolved: strin
   return `${call.name} ${resolved} (${chars} chars)`;
 }
 
+/** write-permission-flow (task 24, CC parity): the directory to grant if a write/edit call's
+ *  target resolves OUTSIDE every root — fs-write.ts's OWN fence (`roots` alone, never the
+ *  reviewer's broader roots+tmpDir above) — so this can never disagree with what the tool's own
+ *  resolveWithinAny will itself decide once dispatched. Returns null for an in-root path (nothing
+ *  to grant — the dispatch loop's existing branches run byte-identical to before this feature), a
+ *  non-write/edit call, or malformed/pathless argsJson (best-effort pre-check only; zod re-
+ *  validates the real args at execute time).
+ *
+ *  ALSO returns null for a path inside the session tmp dir specifically (`tmpDir` — bash's own
+ *  OS-sandbox-writable set includes it, resolveFsReviewTarget's BROADER roots+tmpDir fence
+ *  reviews it, but fs-write.ts's fence deliberately EXCLUDES it — see that fence's own doc
+ *  comment). That is an intentional narrower boundary the write/edit tools draw on purpose, not
+ *  an ungranted directory — a tmp-dir write must keep falling through to the EXISTING reviewer
+ *  branch (which reviews it, then still rejects it on execution) instead of being "fixed" by a
+ *  grant that would quietly widen what write/edit are allowed to touch.
+ *
+ *  The returned `dir` is the CANONICALIZED (symlink-resolved) immediate parent of the REAL
+ *  destination — leaf-link chain resolved first (resolveLeafSymlinks — task-24 review F4: an
+ *  in-root DANGLING symlink aimed outside now surfaces here as its true outside target, so the
+ *  grant names the actual escape directory), then canonicalizeForWrite (5e T3's own fix for
+ *  symlinked DIRECTORY segments) — so the human is always shown where the bytes would really
+ *  land, never a pre-symlink in-root-looking spelling. A resolution failure (e.g. the leaf-chain
+ *  depth cap) returns null — no grant offered; the call falls through to the normal dispatch and
+ *  the tool's own fence rejects it with the same error. */
+function fsWriteOutOfRootDir(call: { name: string; argsJson: string }, roots: string[], tmpDir: string): { path: string; dir: string } | null {
+  if (call.name !== "write" && call.name !== "edit") return null;
+  let path = "";
+  try {
+    const a = JSON.parse(call.argsJson || "{}") as { path?: unknown };
+    path = typeof a.path === "string" ? a.path : "";
+  } catch { return null; }
+  if (!path) return null;
+  try {
+    resolveWithinAny(roots, path);
+    return null; // in-root — nothing to grant
+  } catch {
+    try {
+      resolveWithinAny([...roots, tmpDir], path);
+      return null; // tmp-dir target — an intentional fence exclusion, not an ungranted directory
+    } catch { /* genuinely outside everything — fall through to the grant below */ }
+    try {
+      const raw = isAbsolute(path) ? resolve(path) : resolve(roots[0] ?? "/", path);
+      return { path, dir: dirname(canonicalizeForWrite(resolveLeafSymlinks(raw))) };
+    } catch { return null; } // unresolvable (link-chain cap etc.) — fail closed to the plain fence reject
+  }
+}
+
 /** phase 5e T3 (external coverage): the précis for an mcp__/plugin__ call — tool name + a
  *  single-line argsJson slice(160). Same "raw JSON, never a hand-crafted rendering" honesty as
  *  approvalCardSummary's generic fallback, just capped shorter — this is what the REVIEWER sees,
@@ -243,6 +290,17 @@ export interface EngineConfig {
   questions?: QuestionBroker;
   tasks?: TaskStore;
   approvalTimeoutMs?: number; // default 5 min
+  // write-permission-flow hardening (task-24 review F2): directories the out-of-root write/edit
+  // GRANT flow must never grant, in EITHER direction — a computed grant dir under one of these
+  // prefixes, or one that CONTAINS a prefix (granting an ancestor would make the denied dir
+  // reachable through the fence, since fence containment is subtree-based). Hard tool-error, no
+  // card, under BOTH ask and auto. daemon.ts supplies [normaHome] — deliberately BROADER than
+  // registerReadTools' runDir-only read denylist: a grant opens WRITE (and bash's seatbelt via
+  // shared session roots), and a runDir-only list would let an auto write silently re-grant the
+  // MEMDIR while memory.enabled:false, defeating that gate (review F2 ruling — do NOT narrow
+  // this back to runDir). Raw paths; realpath-canonicalized at check time (mirrors fs-read.ts's
+  // canonicalizeDenylist). Boot-constant like registerReadTools' own list, not a hot getter.
+  grantDeniedPrefixes?: string[];
   reviewer?: BashReviewer; // safety review for auto-policy bash/fs/external calls (undefined → no review, unchanged behavior)
   // hot-settings T2: these were plain boot-captured values; now getters read LIVE off daemon.ts's
   // `settings` holder (reassigned whole-object by a later task's watcher) so a settings reload
@@ -2201,6 +2259,28 @@ export class AgentEngine {
         // and the bridge (setCwd + git + same-turn cwd + worktree_* events) would NEVER run outside
         // `auto` policy — see task-4-report.md for the bug writeup.
         const isWorktree = (call.name === "enter_worktree" || call.name === "exit_worktree") && !!this.cfg.worktrees;
+        // CC parity (write-permission-flow): out-of-root write/edit. Norma has no model-invocable
+        // "request a directory" tool anymore — an out-of-root Write/Edit itself carries the SAME
+        // approval seam bash uses (cc-expert findings, task-24 recon: real CC shows exactly ONE
+        // prompt for an out-of-scope edit, not a generic "run this tool" card followed by a second
+        // "grant this directory" card — so the grant is handled here in the dispatch loop, BEFORE
+        // the generic `decision === "ask"` branch below gets first crack, rather than layering a
+        // second approval on top of it). `dirGrant` is null (byte-identical fast path — the
+        // UNCHANGED branches below run) for every in-root call; `!rootsOverride` skips this for a
+        // worktree-isolated child, whose roots are a FIXED confinement ([worktreeDir]) that
+        // SessionDirectories.add can never extend — granting there would be a no-op that only costs
+        // the human a pointless prompt before the SAME hard fail, so it falls through to today's
+        // plain reject instead (fs-write.ts's own fence, unchanged). `let`, not `const`: the auto
+        // pre-grant below NULLS it once the grant lands, so the call then flows through the normal
+        // dispatch chain as an ordinary in-root write (task-24 review F1 — see the pre-grant).
+        let dirGrant =
+          (call.name === "write" || call.name === "edit") && decision !== "deny" && !rootsOverride
+            ? fsWriteOutOfRootDir(call, this.cfg.dirs.roots(sessionId), sessionTmpDir(sessionId))
+            : null;
+        // task-24 review F2: the control plane (daemon.ts passes ~/.norma/run — the SAME denylist
+        // the read tools get) is NEVER grantable, either policy, no card — checked once here, and
+        // consulted by both the auto pre-grant below and the deny branch in the dispatch chain.
+        const dirGrantDenied = dirGrant !== null && this.grantDenied(dirGrant.dir);
         // [4f pre-tool — Site 2 (normal calls)] Post-gate (decision computed just above), before ANY
         // dispatch branch runs/approves. Bridged calls (spawn_agent/send_message) NEVER reach here —
         // they were siphoned into spawn/sendMessageOutcomes and hit the `preOutcome` branch ABOVE,
@@ -2224,6 +2304,23 @@ export class AgentEngine {
             continue;
           }
         }
+        // task-24 review F1 — auto-policy pre-grant. Under `auto` the grant itself is silent
+        // (mirrors bash's own silent auto-allow; explicit product choice diverging from real CC's
+        // acceptEdits, which still prompts out-of-scope — see task-24-report). But the WRITE must
+        // then flow through the SAME dispatch chain an in-root write gets — in particular the fs
+        // safety-reviewer branch below (an out-of-root target is by definition outside the primary
+        // cwd subtree, so fsWriteIsUnusual reviews it) — which the first cut bypassed by
+        // dispatching executeCall directly from the grant branch. So: apply the grant HERE (mkdir
+        // — review F3: the fence realpaths roots, so a not-yet-existing grant dir would silently
+        // drop out of resolveWithinAny; creating it is exactly what was approved — then
+        // SessionDirectories.add + directory_added), NULL dirGrant, and fall through — the call is
+        // now an ordinary in-root write and every later branch (reviewer included) sees it
+        // unchanged. Placed AFTER the pre-tool hook block so a hook-blocked call never grants.
+        let grantFailure: string | null = null;
+        if (dirGrant && !dirGrantDenied && meta.approvalPolicy === "auto") {
+          grantFailure = this.applyDirGrant(sessionId, threadId, dirGrant.dir);
+          if (!grantFailure) dirGrant = null;
+        }
         if (decision === "deny") {
           // Plan mode's blanket deny (gate.ts): tool NOT run. No approval flow here — the point
           // of plan mode is that nothing mutates until exit_plan_mode is approved.
@@ -2231,6 +2328,20 @@ export class AgentEngine {
             output: "Blocked in plan mode — you are researching and planning, so file changes and commands are disabled. Make no changes; when your plan is ready, call exit_plan_mode to present it for approval.",
             isError: true,
           };
+        } else if (dirGrant && dirGrantDenied) {
+          // task-24 review F2: hard error, no card, no grant — under BOTH ask and auto (this
+          // branch precedes the ask-policy grant card below AND the generic ask branch; the auto
+          // pre-grant above already skipped a denied dir). bash's seatbelt shares the session
+          // roots, so a grant here would open the control plane to bash too — never offered.
+          outcome = {
+            output: `cannot ${call.name} ${dirGrant.path}: ${dirGrant.dir} is Norma's control plane and can never be granted`,
+            isError: true,
+          };
+        } else if (grantFailure) {
+          // auto pre-grant's mkdir failed (EACCES/EROFS/...): the grant did NOT land (no
+          // directory_added, dir not added to the session roots) — surface why instead of letting
+          // the fence throw its generic "outside the allowed directories" a moment later.
+          outcome = { output: grantFailure, isError: true };
         } else if (isWorktree) {
           // "allow" (auto policy) runs the bridge directly, synchronously. "ask" (default policy)
           // still waits on the ApprovalBroker via requestApproval, but passes the bridge itself as
@@ -2253,6 +2364,23 @@ export class AgentEngine {
             outcome = this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd);
           }
           if (newCwd !== undefined) cwd = newCwd;
+        } else if (dirGrant) {
+          // Out-of-root write/edit under `ask` policy (the auto case was pre-granted + nulled
+          // above, so it never reaches this branch): ONE grant-flavored card through the SAME
+          // requestApproval seam bash/worktree use — approval applies the grant (mkdir + roots +
+          // directory_added, review F3) then runs the call; the human card IS the review under
+          // `ask` (the AI-reviewer branches below are auto-policy-only, same as for an in-root
+          // write). Denial rides requestApproval's deniedByHuman path unchanged.
+          const grant = dirGrant; // narrow for the closure
+          outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
+            timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
+            summary: `${call.name} ${grant.path} — outside the allowed directories; grant write access to ${grant.dir}?`,
+            // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
+          }, loaded, async () => {
+            const failure = this.applyDirGrant(sessionId, threadId, grant.dir);
+            if (failure) return { output: failure, isError: true };
+            return this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
+          }, pins, rootsOverride, visionCapable);
         } else if (decision === "ask") {
           outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
             timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
@@ -2709,6 +2837,42 @@ export class AgentEngine {
       reviewerReason: sanitizeReviewText(v.reason, 300),
       denialMessage,
     }, loaded, undefined, pins, rootsOverride, visionCapable);
+  }
+
+  /** write-permission-flow (task 24): apply an out-of-root write/edit grant — mkdir the directory
+   *  (review F3: SessionDirectories.canon and resolveWithinAny both realpath roots, so a
+   *  NOT-YET-EXISTING grant dir would silently drop out of the fence right after being "granted"
+   *  and the approved write would still fail; creating the directory is exactly what the user
+   *  approved), then add it to the session's live roots and emit `directory_added` (existing
+   *  protocol event, already rendered by CLI/dashboard — observability, not an approval). Returns
+   *  an error message instead of throwing (mkdir can fail: EACCES/EROFS/a FILE already at that
+   *  path) — on failure NOTHING is granted and no event is emitted. Both grant sites (the auto
+   *  pre-grant and the ask card's onApprove) share this ONE definition. */
+  private applyDirGrant(sessionId: string, threadId: string, dir: string): string | null {
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch (err) {
+      return `could not create ${dir}: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    this.cfg.dirs.add(sessionId, dir);
+    this.emit(sessionId, { type: "directory_added", sessionId, threadId, path: dir, persisted: false });
+    return null;
+  }
+
+  /** write-permission-flow hardening (task-24 review F2): true when `dir` (a computed grant dir —
+   *  already canonicalized by fsWriteOutOfRootDir: existing part realpathed, missing tail literal)
+   *  must never be granted. BIDIRECTIONAL containment against each denied prefix (realpathed here,
+   *  mirroring fs-read.ts's canonicalizeDenylist): `dir` at/under a prefix is the direct case;
+   *  `dir` CONTAINING a prefix is the indirect one — fence containment is subtree-based, so
+   *  granting an ANCESTOR of ~/.norma/run would make the control plane writable through that root
+   *  just as surely as granting it directly (and bash's seatbelt shares the session roots). */
+  private grantDenied(dir: string): boolean {
+    for (const p of this.cfg.grantDeniedPrefixes ?? []) {
+      let cp: string;
+      try { cp = realpathSync(p); } catch { cp = resolve(p); }
+      if (dir === cp || dir.startsWith(cp + sep) || cp.startsWith(dir + sep)) return true;
+    }
+    return false;
   }
 
   /** Shared approval-request flow for the `ask`-policy path, the reviewer's escalation path, and
