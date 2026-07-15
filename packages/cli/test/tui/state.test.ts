@@ -15,6 +15,8 @@ describe("state.ts — initialState", () => {
       inTokens: 0,
       outTokens: 0,
       pending: null,
+      childBlocks: {},
+      childPendingTool: {},
     });
   });
 });
@@ -530,6 +532,112 @@ describe("state.ts — note one-liners match main.ts's wording (bg-task/worktree
       reason: "recursive delete outside cwd", summary: "bash rm -rf /tmp/x",
     }, T0);
     expect(next).toEqual(s);
+  });
+});
+
+describe("state.ts — child transcript accumulation (child-transcript-view T2)", () => {
+  test("user/assistant/tool events for a child thread accumulate into childBlocks[threadId], isolated across threads", () => {
+    let s = initialState();
+    s = reduce(s, { type: "thread_started", threadId: "th_a", parentThreadId: "main", agentType: "general-purpose", prompt: "go" }, T0);
+    s = reduce(s, { type: "thread_started", threadId: "th_b", parentThreadId: "main", agentType: "general-purpose", prompt: "go" }, T0);
+
+    s = reduce(s, { type: "user_message", threadId: "th_a", text: "steer th_a", clientName: "send_message" }, T0 + 1);
+    s = reduce(s, { type: "assistant_message", threadId: "th_a", text: "on it" }, T0 + 2);
+    s = reduce(s, { type: "tool_call", threadId: "th_a", callId: "c1", name: "bash", argsJson: '{"command":"ls"}' }, T0 + 3);
+    s = reduce(s, { type: "tool_result", threadId: "th_a", callId: "c1", output: "file.txt", isError: false }, T0 + 4);
+
+    s = reduce(s, { type: "assistant_message", threadId: "th_b", text: "different agent" }, T0 + 5);
+
+    expect(s.childBlocks["th_a"]).toEqual([
+      { kind: "user", text: "steer th_a" },
+      { kind: "assistant", text: "on it" },
+      { kind: "tool", name: "bash", argsJson: '{"command":"ls"}', output: "file.txt", isError: false },
+    ]);
+    expect(s.childBlocks["th_b"]).toEqual([{ kind: "assistant", text: "different agent" }]);
+
+    // MAIN's own committed transcript is untouched by any of this (isolation from the main path).
+    expect(s.committed).toEqual([]);
+    // The child's tool_call/tool_result pairing is consumed — no dangling pending entry.
+    expect(s.childPendingTool["th_a"]).toBeUndefined();
+  });
+
+  test("user_message from a steer drain (clientName 'send_message', non-MAIN threadId) renders as a user block in the child's list, not the main transcript", () => {
+    let s = initialState();
+    s = reduce(s, { type: "thread_started", threadId: "th_c", parentThreadId: "main", agentType: "general-purpose", prompt: "go" }, T0);
+    s = reduce(s, { type: "user_message", threadId: "th_c", text: "please also check the tests", clientName: "send_message" }, T0 + 1);
+    expect(s.childBlocks["th_c"]).toEqual([{ kind: "user", text: "please also check the tests" }]);
+    expect(s.committed).toEqual([]);
+  });
+
+  test("MAIN blocks are byte-identical to before the refactor (regression pin for the shared helpers)", () => {
+    let s = initialState();
+    s = reduce(s, { type: "user_message", threadId: "main", text: "hi", clientName: "cli-chat" }, T0);
+    s = reduce(s, { type: "assistant_message", threadId: "main", text: "hello back" }, T0 + 1);
+    s = reduce(s, { type: "tool_call", threadId: "main", callId: "c1", name: "bash", argsJson: '{"command":"ls"}' }, T0 + 2);
+    s = reduce(s, { type: "tool_result", threadId: "main", callId: "c1", output: "file.txt", isError: false }, T0 + 3);
+    expect(s.committed).toEqual([
+      { kind: "user", text: "hi" },
+      { kind: "assistant", text: "hello back" },
+      { kind: "tool", name: "bash", argsJson: '{"command":"ls"}', output: "file.txt", isError: false },
+    ]);
+    // Nothing leaked into childBlocks for the main thread.
+    expect(s.childBlocks).toEqual({});
+  });
+
+  test("cap: appending past CHILD_BLOCK_CAP (200) drops the oldest, keeping exactly 200 with the newest content", () => {
+    let s = initialState();
+    s = reduce(s, { type: "thread_started", threadId: "th_cap", parentThreadId: "main", agentType: "general-purpose", prompt: "go" }, T0);
+    for (let i = 0; i < 205; i++) {
+      s = reduce(s, { type: "user_message", threadId: "th_cap", text: `msg-${i}` }, T0 + i);
+    }
+    const blocks = s.childBlocks["th_cap"]!;
+    expect(blocks).toHaveLength(200);
+    expect(blocks[0]).toEqual({ kind: "user", text: "msg-5" }); // oldest 5 (msg-0..msg-4) dropped
+    expect(blocks.at(-1)).toEqual({ kind: "user", text: "msg-204" });
+  });
+
+  test("child thread_completed appends the finish-verb note to childBlocks[threadId] (reusing subagent-state's finish mapping), same block as the roster-wide note", () => {
+    let s = initialState();
+    s = reduce(s, {
+      type: "thread_started", threadId: "th_st", parentThreadId: "main", agentType: "general-purpose",
+      prompt: "scan the machine", description: "laptop scan",
+    }, T0);
+    s = reduce(s, { type: "turn_started", threadId: "th_st", ts: T0 + 100 }, T0 + 100);
+    s = reduce(s, { type: "thread_completed", threadId: "th_st", stopReason: "stalled", ts: T0 + 4_100 }, T0 + 4_100);
+
+    const expectedNote = { kind: "note" as const, text: 'Agent "laptop scan": Stalled (0 tool uses · 4s)' };
+    expect(s.childBlocks["th_st"]).toContainEqual(expectedNote);
+    expect(s.committed).toContainEqual(expectedNote); // same block, both destinations
+  });
+
+  test("child turn_completed appends a turn-summary block (or interrupted, on stopReason 'aborted') to childBlocks, with this turn's own duration", () => {
+    let s = initialState();
+    s = reduce(s, { type: "thread_started", threadId: "th_multi", parentThreadId: "main", agentType: "general-purpose", prompt: "go" }, T0);
+    s = reduce(s, { type: "turn_started", threadId: "th_multi", ts: T0 + 100 }, T0 + 100);
+    s = reduce(s, { type: "turn_completed", threadId: "th_multi", stopReason: "end_turn", inputTokens: 10, outputTokens: 5, ts: T0 + 3_100 }, T0 + 3_100);
+    expect(s.childBlocks["th_multi"]).toContainEqual({ kind: "turn-summary", durationMs: 3_000, inTokens: 10, outTokens: 5 });
+
+    s = reduce(s, { type: "turn_started", threadId: "th_multi", ts: T0 + 3_200 }, T0 + 3_200);
+    s = reduce(s, { type: "turn_completed", threadId: "th_multi", stopReason: "aborted", inputTokens: 1, outputTokens: 1, ts: T0 + 3_700 }, T0 + 3_700);
+    expect(s.childBlocks["th_multi"]).toContainEqual({ kind: "interrupted" });
+  });
+
+  test("pruning a done agent's roster row on the next main turn_started also drops its childBlocks (and childPendingTool) entry", () => {
+    let s = initialState();
+    s = reduce(s, {
+      type: "thread_started", threadId: "th_p", parentThreadId: "main", agentType: "general-purpose",
+      prompt: "refactor widget", description: "refactor widget",
+    }, T0);
+    s = reduce(s, { type: "turn_started", threadId: "th_p", ts: T0 + 100 }, T0 + 100);
+    s = reduce(s, { type: "user_message", threadId: "th_p", text: "go" }, T0 + 150);
+    s = reduce(s, { type: "thread_completed", threadId: "th_p", stopReason: "end_turn", ts: T0 + 5_100 }, T0 + 5_100);
+    expect(s.childBlocks["th_p"]).toBeDefined();
+    expect(s.childBlocks["th_p"]!.length).toBeGreaterThan(0);
+
+    s = reduce(s, { type: "turn_started", threadId: "main" }, T0 + 6_000);
+    expect(s.agents.find((a) => a.threadId === "th_p")).toBeUndefined(); // roster row gone (pre-existing prune)
+    expect(s.childBlocks["th_p"]).toBeUndefined(); // its transcript entry is gone too
+    expect(s.childPendingTool["th_p"]).toBeUndefined();
   });
 });
 
