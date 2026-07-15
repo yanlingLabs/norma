@@ -88,6 +88,10 @@ const fixtures: Record<string, unknown> = {
   // reasoning_item/task_notification above — NOT sensitive (no encrypted_content), so a normal
   // fixture is correct here (see this variant's own doc comment in events.ts).
   tool_review: { type: "tool_review", sessionId: "s_1", threadId: "t_1", seq: 31, ts: 1700000000021, toolName: "bash", verdict: "unsafe", reason: "recursive delete outside the session cwd", summary: "bash rm -rf /tmp/scratch" },
+  // task-30 (push-notification track — the final CC-parity tool item): a NEW SessionEvent
+  // variant, same full switch-trap discipline as tool_review above. NOT sensitive — a normal
+  // fixture.
+  notification_requested: { type: "notification_requested", sessionId: "s_1", threadId: "t_1", seq: 33, ts: 1700000000023, title: "Norma", message: "Long-running migration finished — 12,004 rows updated." },
 };
 for (const [name, value] of Object.entries(fixtures)) {
   SessionEvent.parse(value); // fixtures must be valid by construction

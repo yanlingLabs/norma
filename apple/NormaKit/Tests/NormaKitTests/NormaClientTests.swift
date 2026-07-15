@@ -176,6 +176,29 @@ final class NormaClientTests: XCTestCase {
         XCTAssertEqual(SessionEvent.toolReview(v).sessionId, "s_1")
     }
 
+    /// task-30 (push-notification track — another NormaKit-trap task, same shape as
+    /// testToolReviewEventDecodesAndAccessorsWork above): the NEW `notification_requested` variant
+    /// must decode as a REAL case and both exhaustive accessor switches (`var seq`/`var
+    /// sessionId`) must return its values — this is what would have failed to compile before this
+    /// task's switch sync. Also pins that it is NOT treated as transient (unlike assistantDelta/
+    /// the lease events) — nothing here bypasses the normal seq-dedupe path.
+    func testNotificationRequestedEventDecodesAndAccessorsWork() async throws {
+        let t = ScriptedTransport()
+        let client = makeClient(t)
+        async let connected: Void = client.connect()
+        let hello = try await waitForSent(t, count: 1)[0]
+        t.feed(#"{"jsonrpc":"2.0","id":\#(decodeLine(hello)["id"] as! Int),"result":{"ok":true}}"#)
+        try await connected
+
+        var iter = client.events.makeAsyncIterator()
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"notification_requested","seq":9,"sessionId":"s_1","ts":5,"threadId":"main","title":"Norma","message":"migration finished"}}"#)
+        guard case .session(.notificationRequested(let v)) = await iter.next() else { return XCTFail() }
+        XCTAssertEqual(v.title, "Norma")
+        XCTAssertEqual(v.message, "migration finished")
+        XCTAssertEqual(SessionEvent.notificationRequested(v).seq, 9)
+        XCTAssertEqual(SessionEvent.notificationRequested(v).sessionId, "s_1")
+    }
+
     func testConnectionDropFailsPendingAndYieldsDisconnected() async throws {
         let t = ScriptedTransport()
         let client = makeClient(t)

@@ -493,6 +493,15 @@ export function reduce(s: TuiState, e: WireEvent, nowMs: number): TuiState {
       return { ...s, committed: [...s.committed, { kind: "note", text }] };
     }
 
+    // task-30 (push-notification track): a minimal one-liner — the app's own delivery (native
+    // UNUserNotificationCenter alert, SessionModel.apply in the Norma target) is where the real
+    // "notification" happens; the CLI just needs a visible trace in the transcript, same class as
+    // the CU lease notes above.
+    case "notification_requested": {
+      const text = `🔔 ${str(e.title)}: ${str(e.message)}`;
+      return { ...s, committed: [...s.committed, { kind: "note", text }] };
+    }
+
     case "agent_error": {
       // main.ts:659 sends this to console.error (stderr), not the pinned block — but the Ink app
       // has no separate stderr surface, so its content becomes a committed note here (same wording).
