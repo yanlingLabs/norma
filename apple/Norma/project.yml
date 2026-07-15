@@ -51,7 +51,14 @@ targets:
           # Stable code identity: bun's ad-hoc signature changes every rebuild, which would re-prompt
           # Keychain access for com.norma.core secrets on each update; the app's team identity is
           # stable, and the outer app signature runs last, leaving this nested signature intact.
-          codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" "${DEST_RES}/norma-core"
+          # --options runtime --timestamp (release-pipeline T1): a plain re-sign here does NOT
+          # inherit hardened runtime/secure-timestamp from the outer xcodebuild invocation —
+          # verified empirically: without these flags codesign -dvv on the embedded norma-core
+          # showed flags=0x0(none) even when the outer app build had ENABLE_HARDENED_RUNTIME=YES
+          # and OTHER_CODE_SIGN_FLAGS=--timestamp. Notarization requires every nested Mach-O to
+          # carry the hardened-runtime flag, so this nested resign must request it explicitly.
+          # Release-only (see CONFIGURATION check above) — dev/Debug builds never reach this line.
+          codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" --options runtime --timestamp "${DEST_RES}/norma-core"
     info:
       path: Support/Info.plist
       properties:
@@ -71,10 +78,28 @@ targets:
         SUPublicEDKey: "z8++xdFBdjTq+kTj5v/5OGP0WRaIJrg3VarFSWVt/jE="
         SUEnableAutomaticChecks: true
         SUAutomaticallyUpdate: true
+    # Empty entitlements (release-pipeline T1 audit, both variants launch-tested on a
+    # throwaway NORMA_HOME with Developer ID + hardened runtime + CODE_SIGN_INJECT_
+    # BASE_ENTITLEMENTS=NO): `com.apple.security.cs.disable-library-validation` was
+    # dropped after confirming it isn't needed — (1) `norma-core` runs as a spawned
+    # CHILD PROCESS (Process(), not dlopen'd), so the app's own library-validation
+    # entitlement never governs it; (2) the only in-process dynamic loading the app
+    # does is Sparkle.framework (embedded, signed by the SAME Developer ID team — always
+    # allowed under hardened runtime's library validation) and the Swift standard
+    # libraries (re-signed with the same identity by CopySwiftLibs); (3) the trackpad
+    # gesture code's two `dlopen` calls (Gesture/TrackpadHaptics.swift, Gesture/
+    # MultitouchTrigger.swift) target `/System/Library/PrivateFrameworks/
+    # MultitouchSupport.framework` — an Apple-signed system framework, which library
+    # validation always permits regardless of team match; (4) the Dashboard plugin
+    # manager (`Dashboard/panes/PluginManagerView.swift`) also runs plugins via
+    # `Process()`, never in-process. Empirically: an empty-entitlements Release build
+    # launched fully on a throwaway `NORMA_HOME` — bundled daemon spawned, listened on
+    # `run/core.sock`, no crash — identical outcome to the entitled variant. If a future
+    # plugin architecture ever needs to dlopen a differently-signed dylib IN-PROCESS,
+    # this decision must be revisited.
     entitlements:
       path: Support/Norma.entitlements
-      properties:
-        com.apple.security.cs.disable-library-validation: true
+      properties: {}
     settings:
       base:
         CODE_SIGN_IDENTITY: "Apple Development"
