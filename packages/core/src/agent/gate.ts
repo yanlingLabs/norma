@@ -49,16 +49,16 @@ export type SessionApprovalPolicy = "ask" | "auto" | "plan";
 // read BackgroundAgentRegistry/SessionStore state (agent_output never flips `notified`) — same
 // class as task_get/task_list, and must stay allowed under `plan` so a planning session can still
 // check on its background agents.
-// memory_read (phase 5b Task 2, design doc §4.8) is read-only too: it only reads a fact file off
-// MemoryStore, same class as task_get — must stay allowed under `plan` so a planning session can
-// still recall saved facts. Contrast with memory_write/memory_delete below (MUTATING) — reading a
-// fact never needs the human's attention, writing/deleting one does.
 // lsp_diagnostics/lsp_definition/lsp_references (phase 5f Task 3) are read-only too: each only
 // queries a language server (spawned/reused via LspManager) or reads a one-line disk preview
 // through the SAME read fence the tool's own `path` arg is held to — no fs/process mutation, same
 // class as read/glob/grep. Must stay allowed under `plan` so a planning session can still look up
 // diagnostics/definitions/references while researching.
-const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output", "memory_read", "lsp_diagnostics", "lsp_definition", "lsp_references"]);
+// T1 (file-based memory, design doc `2026-07-15-file-based-memory-design.md`) DELETED the
+// memory_read/memory_write/memory_delete tools that used to have their own entries here (phase 5b
+// Task 2) — memory reads/writes now go through the plain read/write/edit tools (already
+// classified below), riding their EXISTING gate posture with no new class of its own.
+const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output", "lsp_diagnostics", "lsp_definition", "lsp_references"]);
 // `computer` (Phase 5 CU) is MUTATING: a computer-use action drives real mouse/keyboard/screen, so
 // it must pass the gate on EVERY call (spec §4.6: "every CU action passes the permission gate") —
 // ask → per-action approval card, auto → allow, plan → deny (CU makes changes). Note this is the
@@ -71,17 +71,12 @@ const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill",
 // plan-mode session must not be able to SCHEDULE a future mutation any more than it can perform one
 // now). `list`/`enable`/`disable`/`delete` ride the same class as a deliberate simplification — one
 // tool, one gate decision, no op-dependent carve-out.
-// memory_write/memory_delete (phase 5b Task 2) sit in MUTATING too — but PLAIN MUTATING, ridden
-// the exact same way write/edit/bash/computer/schedule already are: ask under `ask` (a card),
-// allow under `auto`, deny under `plan`. THE USER PIN (design doc §"Status", 2026-07-08 sketch
-// §5b): "the model writes user-scope facts on its own judgment; no card under auto policy; every
-// write audit-logged + reviewable in the dashboard memory editor." That pin is exactly what riding
-// the standard MUTATING branch already gives us — under `auto` a memory write proceeds silently
-// (MemoryStore.write's own audit.jsonl line is the record, not a card) — so this does NOT get a
-// new, stricter "always ask regardless of policy" class of its own; it must be classified
-// identically to computer/schedule above, not more cautiously. Project-scope trust is still a hard
-// gate (untrusted cwd → typed store error), independent of and prior to this policy gate.
-const MUTATING = new Set(["write", "edit", "bash", "notebook_edit", "enter_worktree", "exit_worktree", "computer", "schedule", "memory_write", "memory_delete"]);
+// T1 (file-based memory) note: a memory-fact write now lands through the plain `write`/`edit`
+// tools below — same MUTATING class, same "ask under `ask`, allow under `auto` with no card" shape
+// the OLD memory_write already had (THE USER PIN, design doc §"Status", 2026-07-08 sketch §5b:
+// "the model writes... on its own judgment; no card under auto policy"), just with no
+// memory-specific gate entry needed anymore since write/edit already ride it.
+const MUTATING = new Set(["write", "edit", "bash", "notebook_edit", "enter_worktree", "exit_worktree", "computer", "schedule"]);
 const SELF_GATING = new Set(["request_directory"]);
 // web_fetch (4g Task 5, T6 adds web_search here) is Norma's ONLY network-capable tool — it does NOT
 // belong in READ_ONLY (it makes a live outbound request; the response bytes are DATA that could
@@ -99,11 +94,13 @@ const NETWORK = new Set(["web_fetch", "web_search"]);
 // `plan`. THE SKETCH PIN (phase-5-intelligence-design-sketch.md §5c): "a skill is standing
 // instructions, i.e. durable prompt injection into future sessions" — higher blast radius than a
 // file write, because a landed skill keeps steering sessions long after the one that wrote it.
-// This completes the memory story told above MUTATING: memory_write's USER pin deliberately chose
-// audit-instead-of-card (under `auto` a fact lands silently; the audit.jsonl line + dashboard
-// memory editor are the review surface) because a recalled FACT is data the model weighs — a
-// skill is INSTRUCTIONS the model follows, so the same silent-under-auto posture would let an
-// unattended session install standing directives into every future session. Checked BEFORE the
+// This completes the memory story told above MUTATING: a memory-fact write's USER pin deliberately
+// chose silent-under-`auto` (a fact lands with no card — same as any other plain `write` under
+// `auto`) because a recalled FACT is data the model weighs — a skill is INSTRUCTIONS the model
+// follows, so the same silent-under-auto posture would let an unattended session install standing
+// directives into every future session. (T1 note: the OLD tool-based memory_write additionally
+// wrote an audit.jsonl line on every save, reviewable in the dashboard; a plain `write` into MEMDIR
+// carries no such per-fact audit trail — see task-21-report.md's concerns.) Checked BEFORE the
 // policy branches in evaluate(): membership overrides policy entirely, so a later accidental
 // reclassification (e.g. skill_write ALSO added to MUTATING) cannot widen it to allow-under-auto.
 const ALWAYS_ASK = new Set(["skill_write"]);

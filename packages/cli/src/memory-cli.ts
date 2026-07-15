@@ -11,10 +11,12 @@
 // catches: a store failure surfaces as a thrown RpcFailure, same as routines.create/enable/
 // disable — the caller's try/catch prints `.message` and exits 1.
 //
-// The formatters mirror core/src/agent/tools/memory.ts's own memory_read/memory_delete wording
-// verbatim so the CLI/tool/slash surfaces read identically, the same way routines-cli.ts's
-// formatRoutineDetail/formatRoutineLine are shared by main.ts's colored list and /routines' plain
-// note.
+// This CLI surface talks to the OLD phase-5b MemoryStore over the memory.* RPCs — UNTOUCHED by
+// T1's file-based memory (design doc `2026-07-15-file-based-memory-design.md`), which deleted the
+// AGENT-facing memory_read/memory_write/memory_delete tools this module's formatters used to
+// mirror (core/src/agent/tools/memory.ts, now removed) in favor of a plain per-project MEMDIR;
+// T2 rewires this CLI/dashboard surface onto MEMDIR files. The wording below is kept as-is for
+// continuity in the meantime.
 import type { NormaClient } from "./client";
 
 export type MemoryScope = "user" | "project";

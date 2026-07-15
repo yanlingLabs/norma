@@ -4,7 +4,7 @@ export { FileSecretStore, KeychainSecretStore } from "./auth/secret-store";
 export { TOKEN_NAMES } from "./auth/tokens";
 export {
   loadSettings, saveSettings, loadPermissionDirs, addLocalDir,
-  REASONING_EFFORTS, setProviderModel, setReasoningEffort,
+  REASONING_EFFORTS, setProviderModel, setReasoningEffort, memoryEnabledFrom,
   type Settings,
 } from "./settings";
 export {
@@ -60,6 +60,12 @@ export {
   type MemoryAuditLine,
   type MemoryResult,
 } from "./agent/memory";
+export {
+  repoRootFor,
+  sanitizeProjectKey,
+  memoryDirFor,
+  type MemoryDirOptions,
+} from "./agent/memory-dir";
 export { AgentStore, GENERAL_OVERLAY, type ResolvedAgent, type AgentMeta } from "./agent/agents";
 export { PluginStore, PluginManifest, type PluginInfo } from "./agent/plugins";
 export { BackgroundTaskRegistry, type BgDeps } from "./agent/bg-registry";

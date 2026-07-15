@@ -165,6 +165,19 @@ export const Settings = z.object({
       channel: z.enum(["stable", "beta"]).optional(),
     })
     .optional(),
+  /** File-based memory (MEMDIR, T1 — design doc `2026-07-15-file-based-memory-design.md`).
+   *  `enabled` default-ON, the SAME `!== false` boot-snapshot-shaped default as `lsp.enabled`/
+   *  `hooks.enabled` above, but read LIVE (hot, per [[no-daemon-restart-for-settings]]) by both
+   *  daemon.ts's write-root join and context.ts's injection — a toggle takes effect on the
+   *  session's NEXT tool call / turn, no restart. `directory` (absolute or `~/`-relative) replaces
+   *  the computed `~/.norma/projects/<key>/memory` path entirely (CC's own relocatable-directory
+   *  setting) — see memory-dir.ts's `memoryDirFor`. */
+  memory: z
+    .object({
+      enabled: z.boolean().optional(),
+      directory: z.string().optional(),
+    })
+    .optional(),
 });
 export type Settings = z.infer<typeof Settings>;
 
@@ -174,6 +187,12 @@ export type Settings = z.infer<typeof Settings>;
  *  settings-reader (daemon.ts, re-reads settings.json per call, mtime-cached — same pattern as
  *  providers/manager.ts's `liveModel`) and this file's own tests exercise the SAME decision. */
 export const hooksEnabledFrom = (s: Settings): boolean => s.hooks?.enabled !== false;
+
+/** Same default-ON shape as `hooksEnabledFrom` above: absent block, absent field, or `true` all
+ *  mean file-based memory is on; only an explicit `false` turns it off. The single place this
+ *  decision is made — daemon.ts's write-root join and context.ts's injection gate both call this
+ *  (via a live getter over the `settings` holder) rather than re-deriving it inline. */
+export const memoryEnabledFrom = (s: Settings): boolean => s.memory?.enabled !== false;
 
 // gpt-5.4 was the pre-deprecation default; fully deprecated per the 2026-07-10 user decision
 // (packages/core/src/providers/codex-config.ts) — a fresh v1→v2 migration must not persist a
