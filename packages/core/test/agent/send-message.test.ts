@@ -197,6 +197,132 @@ describe("AgentEngine: send_message (4h-ii-b Task 4 — CC SendMessage parity)",
     ]);
   });
 
+  // task-15 (CC parity — THE headline user-visible fix): send_message to a STALL-FAILED agent (not
+  // just a cleanly-finished one like (b) above) now auto-resumes it — status flips back to
+  // "running" — instead of returning "didn't finish cleanly and can't be resumed". send_message's
+  // terminal-target branch funnels through the SAME resumeThread guard as spawn_agent{resume}, so
+  // the failed child's orphaned function_call (its tool stalled mid-flight, tool_call persisted but
+  // no tool_result ever came) is repaired with a synthetic cancellation tool_result exactly the
+  // same way — this test just proves send_message hits the identical fixed path.
+  test("(task-15) send_message to a stall-FAILED agent auto-resumes it (status returns to 'running')", async () => {
+    const registry = new ToolRegistry();
+    registerSendMessageTool(registry);
+    registry.register({
+      name: "hang",
+      description: "test-only: a tool call whose run() never resolves — simulates a tool still in flight when the stall watchdog gives up",
+      args: z.object({}),
+      run: () => new Promise<string>(() => { /* never resolves */ }),
+    });
+    const { engine, store, sessionId, provider, bgAgents } = setup(
+      [
+        [spawnNamed("s1", "do the task", "worker"), done("tool_calls")], // turn 1: sync spawn
+        [{ type: "tool_call", callId: "hang1", name: "hang", argsJson: "{}" }, done("tool_calls")], // child's only round: stalls mid-tool
+        text("parent turn1"),
+        [sendMessage("m1", "worker", "keep going"), done("tool_calls")], // turn 2: message the FAILED child
+        text("child-out-2"),                                            // the resumed (detached) child's own run
+        text("parent turn2"),
+      ],
+      { registry, subagentsOpts: { stallTimeoutMs: 40 } },
+    );
+    await engine.runTurn(sessionId); // turn 1: spawn "worker" — stalls mid-tool → status "failed"
+    expect(bgAgents.get("worker", sessionId)?.status).toBe("failed");
+
+    await engine.runTurn(sessionId); // turn 2: send_message to the FAILED agent → auto-resumes
+
+    const result = toolResult(store.read(sessionId), "m1");
+    expect(result).toMatchObject({ isError: false }); // no longer "didn't finish cleanly"
+    const worker = bgAgents.get("worker", sessionId)!;
+    expect(result!.output).toBe(JSON.stringify({ agentId: worker.threadId, status: "running" }));
+
+    // the repaired resumed run's own request pairs the orphan with a synthetic cancellation —
+    // never a bare, unresolved function_call (which orphanFunctionCall would catch as a hard
+    // provider reject waiting to happen).
+    const fp = provider as FakeProvider;
+    const resumed = fp.requests.find((r) => isChildRun(r.input, "do the task") && lastUserOf(r.input) === "keep going");
+    expect(resumed).toBeDefined();
+    expect(orphanFunctionCall(resumed!.input)).toBe(false);
+    expect(resumed!.input).toContainEqual({
+      type: "tool_result", callId: "hang1",
+      output: "[cancelled: the agent ended before this tool call completed]",
+      isError: true,
+    });
+
+    // let the detached resumed run settle before the test ends (no dangling chain)
+    for (let i = 0; i < 200 && bgAgents.get("worker", sessionId)?.status === "running"; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(bgAgents.get("worker", sessionId)?.status).toBe("completed");
+  });
+
+  // task-15 REVIEW (buried orphan through the send_message funnel): the repair is in-memory-only,
+  // so after the first repaired resume the store STILL contains the unpaired tool_call — a SECOND
+  // send_message (after the first resume completed CLEANLY, so the child's tail is now a clean
+  // assistant message) reconstructs the full history with that orphan BURIED mid-history. The
+  // always-run full-array repair must pair it again on every later resume — this file's own
+  // orphanFunctionCall helper (the documented hard-reject detector) is the invariant check.
+  test("(task-15 review) SECOND send_message after a repaired resume completed cleanly — the buried orphan is still paired, resume succeeds", async () => {
+    const registry = new ToolRegistry();
+    registerSendMessageTool(registry);
+    registry.register({
+      name: "hang",
+      description: "test-only: a tool call whose run() never resolves — simulates a tool still in flight when the stall watchdog gives up",
+      args: z.object({}),
+      run: () => new Promise<string>(() => { /* never resolves */ }),
+    });
+    const { engine, store, sessionId, provider, bgAgents } = setup(
+      [
+        [spawnNamed("s1", "do the task", "worker"), done("tool_calls")], // turn 1: sync spawn
+        [{ type: "tool_call", callId: "hang1", name: "hang", argsJson: "{}" }, done("tool_calls")], // child run 1: stalls mid-tool
+        text("parent turn1"),
+        [sendMessage("m1", "worker", "keep going"), done("tool_calls")], // turn 2: message the FAILED child → resume #1 (repaired)
+        text("child-out-2"),                                            // resumed run completes CLEANLY (detached)
+        text("parent turn2"),
+        [sendMessage("m2", "worker", "go again"), done("tool_calls")],   // turn 3: message the now-COMPLETED child → resume #2
+        text("child-out-3"),                                            // second resumed run (detached)
+        text("parent turn3"),
+      ],
+      { registry, subagentsOpts: { stallTimeoutMs: 40 } },
+    );
+    await engine.runTurn(sessionId); // turn 1: spawn — stalls mid-tool
+    expect(bgAgents.get("worker", sessionId)?.status).toBe("failed");
+
+    await engine.runTurn(sessionId); // turn 2: send_message → repaired resume #1
+    for (let i = 0; i < 200 && bgAgents.get("worker", sessionId)?.status === "running"; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(bgAgents.get("worker", sessionId)?.status).toBe("completed"); // clean tail now masks the buried orphan
+
+    await engine.runTurn(sessionId); // turn 3: send_message again → resume #2 must re-pair the buried orphan
+
+    const result2 = toolResult(store.read(sessionId), "m2");
+    expect(result2).toMatchObject({ isError: false });
+    const worker = bgAgents.get("worker", sessionId)!;
+    expect(result2!.output).toBe(JSON.stringify({ agentId: worker.threadId, status: "running" }));
+
+    const fp = provider as FakeProvider;
+    const secondResume = fp.requests.find((r) => isChildRun(r.input, "do the task") && lastUserOf(r.input) === "go again");
+    expect(secondResume).toBeDefined();
+    // the documented hard-reject invariant holds: NO function_call anywhere in the input lacks an
+    // immediately-following tool_result — the buried orphan included.
+    expect(orphanFunctionCall(secondResume!.input)).toBe(false);
+    // and the pairing is the synthetic cancellation, sitting MID-HISTORY (right after the orphan,
+    // which is input[1] just behind the opening prompt), NOT at the tail.
+    const inputItems = secondResume!.input as Array<{ type?: string; callId?: string }>;
+    expect(inputItems[1]).toMatchObject({ type: "function_call", callId: "hang1" });
+    expect(secondResume!.input[2]).toEqual({
+      type: "tool_result", callId: "hang1",
+      output: "[cancelled: the agent ended before this tool call completed]",
+      isError: true,
+    });
+    expect(secondResume!.input.length).toBeGreaterThan(4); // history continues past the pair (resume #1's prompt, its reply, the new message)
+
+    // let the detached second resume settle before the test ends (no dangling chain)
+    for (let i = 0; i < 200 && bgAgents.get("worker", sessionId)?.status === "running"; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(bgAgents.get("worker", sessionId)?.status).toBe("completed");
+  });
+
   // (c) SM4: an unknown `to` → typed isError, no side effect (no thread started, child never ran).
   test("(c) send_message to an unknown agent → typed isError, no side effect", async () => {
     const { engine, store, sessionId, provider } = setupSend([
