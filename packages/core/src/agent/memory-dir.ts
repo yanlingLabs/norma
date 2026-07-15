@@ -96,6 +96,16 @@ export interface MemoryDirOptions {
   directory?: string;
 }
 
+/** Shared override-resolution: `memoryDirFor` and `globalMemoryDirFor` both replace their
+ *  computed path ENTIRELY with `opts.directory` when set (CC's one relocatable-directory setting
+ *  applies to whichever bucket a caller asked for — there's no separate "global override"). Null
+ *  means "no override configured", not "empty string" (see `MemoryDirOptions.directory`'s own
+ *  doc comment on whitespace-only treated as absent). */
+function resolveOverride(opts: MemoryDirOptions): string | null {
+  if (opts.directory && opts.directory.trim()) return canon(expandTilde(opts.directory.trim()));
+  return null;
+}
+
 /**
  * The per-project memory directory for a session's `cwd` — pure path computation, no I/O beyond
  * `repoRootFor`'s memoized git spawn (specifically: does NOT create the directory; callers that
@@ -103,9 +113,25 @@ export interface MemoryDirOptions {
  * boot" precedent as `session-tmp.ts`'s `sessionTmpDir`).
  */
 export function memoryDirFor(cwd: string, opts: MemoryDirOptions): string {
-  if (opts.directory && opts.directory.trim()) {
-    return canon(expandTilde(opts.directory.trim()));
-  }
+  const override = resolveOverride(opts);
+  if (override) return override;
   const key = sanitizeProjectKey(repoRootFor(cwd));
   return join(opts.normaHome, "projects", key, "memory");
+}
+
+/**
+ * The "no project" bucket (T2, design doc's "facts that don't map to a project → a sensible
+ * default location"): `~/.norma/projects/_global/memory`, the SAME `projects/<key>/memory` shape
+ * `memoryDirFor` uses, with a reserved key (`_global`) `sanitizeProjectKey` can never itself
+ * produce (its output always starts with a sanitized absolute-path segment, never `_`) — so this
+ * can't collide with any real project's directory. Two consumers share it: T2's migration
+ * importer (legacy USER-scope facts, which were never tied to a repo, land here) and the
+ * memory.* RPC rewire (ipc/server.ts) when a caller passes no `cwd` (the CLI's `scope:"user"`,
+ * no `--project`, never did) — so a fact migrated here is immediately visible to `norma memory
+ * list` with no flags, no coincidence.
+ */
+export function globalMemoryDirFor(opts: MemoryDirOptions): string {
+  const override = resolveOverride(opts);
+  if (override) return override;
+  return join(opts.normaHome, "projects", "_global", "memory");
 }

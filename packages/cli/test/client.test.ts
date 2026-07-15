@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync } from "node:fs";
+import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startDaemon, FileSecretStore, FakeProvider, MemoryStore, type RunningDaemon } from "@norma/core";
@@ -15,8 +15,9 @@ describe("NormaClient", () => {
   // tmpdir `home` almost everywhere EXCEPT this may pick up real host-machine credentials in some
   // dev environments. Pass explicit `null` (Task 6 tests) to force a deterministic no-provider
   // daemon regardless of host state.
-  async function boot(provider?: FakeProvider | null): Promise<string> {
+  async function boot(provider?: FakeProvider | null, settingsOverrides?: Record<string, unknown>): Promise<string> {
     const home = mkdtempSync(join(tmpdir(), "norma-cli-"));
+    if (settingsOverrides) writeFileSync(join(home, "settings.json"), JSON.stringify(settingsOverrides));
     daemon = await startDaemon({
       home,
       secrets: new FileSecretStore(join(home, "test-secrets")),
@@ -318,8 +319,13 @@ describe("NormaClient", () => {
   // pointed at the SAME normaHome: both are stateless fact-file readers/writers over the same
   // directory, no in-process cache to desync (memory.ts's own `list`/`read` re-read from disk on
   // every call) — the daemon's own instance sees whatever this one writes.
+  //
+  // T2 (design doc "dashboard rewire") makes memory.enabled default ON route these RPCs onto
+  // MEMDIR files instead (ipc/server.ts's `memoryFileDir`) — since this test seeds the LEGACY
+  // store directly, it explicitly disables the new backend so the RPCs still read from where it
+  // wrote. Files-backed RPC coverage lives in core's own daemon-memory-rpc.test.ts.
   test("memoryList/memoryRead/memoryDelete round-trip against a real daemon", async () => {
-    const home = await boot(null);
+    const home = await boot(null, { memory: { enabled: false } });
     const seed = new MemoryStore({ normaHome: home, trust: { isTrusted: () => true } });
     const wrote = await seed.write("user", { name: "captain", description: "prefers concise replies", type: "user", body: "Sam prefers short answers." }, { source: "rpc" });
     expect(wrote.ok).toBe(true);

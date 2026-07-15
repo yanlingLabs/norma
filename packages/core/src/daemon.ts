@@ -9,7 +9,8 @@ import { SessionStore } from "./sessions/store";
 import { SessionHub } from "./sessions/hub";
 import { startIpcServer, type IpcServer, type IpcServerOptions } from "./ipc/server";
 import { loadSettings, loadPermissionDirs, hooksEnabledFrom, memoryEnabledFrom } from "./settings";
-import { memoryDirFor } from "./agent/memory-dir";
+import { memoryDirFor, globalMemoryDirFor } from "./agent/memory-dir";
+import { migrateMemoryStore } from "./agent/memory-migrate";
 import { createProvider } from "./providers/manager";
 import type { Provider } from "./providers/types";
 import { QuotaManager } from "./providers/quota";
@@ -199,10 +200,25 @@ export async function startDaemon(opts: {
   // NEXT tool call / turn, no daemon restart, same shape as `hooksEnabledHot` further down.
   const memoryEnabledHot = (): boolean => (settings ? memoryEnabledFrom(settings) : true);
   const memoryDirOf = (cwd: string): string => memoryDirFor(cwd, { normaHome, directory: settings?.memory?.directory });
+  const memoryGlobalDirOf = (): string => globalMemoryDirFor({ normaHome, directory: settings?.memory?.directory });
   const assembler = new ContextAssembler({
     normaHome, trust: trustStore, skills: skillStore,
     memory: { enabled: memoryEnabledHot, dirFor: memoryDirOf },
   });
+  // T2 (design doc "migration importer"): one-time-per-fact, idempotent best-effort import of
+  // Phase 5b's MemoryStore facts into MEMDIR files, run at boot whenever memory.enabled's
+  // BOOT-TIME value (not hot — this runs once, here, not re-checked per turn like
+  // `memoryEnabledHot` above) is on. Never touches/deletes the old store (see
+  // memory-migrate.ts's own doc comment) — a later `memory.enabled: false` still finds the
+  // original data untouched. Failure is logged, never fatal to daemon boot (same "degrade, don't
+  // crash" precedent as the settings-load try/catch above).
+  if (memoryEnabledHot()) {
+    try {
+      migrateMemoryStore({ normaHome, trust: trustStore, directory: settings?.memory?.directory });
+    } catch (err) {
+      console.error(`memory migration skipped: ${(err as Error).message}`);
+    }
+  }
   // Phase 5b Task 2: ONE MemoryStore for the whole daemon (fact-file CRUD is the single-writer
   // contract §4.8 requires — daemon RPCs (ipc/server.ts's memory.*) must share this exact
   // instance, never open a second one). Built unconditionally, same "needs only normaHome/trust,
@@ -213,9 +229,10 @@ export async function startDaemon(opts: {
   // deleted — see agent/tools/memory.ts's removal) and, whenever `memory.enabled` (above) is on,
   // the assembler's OWN injection of this store's data (context.ts's legacy branch, which reads
   // these exact `<normaHome>/memory/MEMORY.md` / `<cwd>/.norma/memory/MEMORY.md` paths, is skipped
-  // in favor of the new per-project MEMDIR). The store instance itself, its on-disk data, and the
-  // RPCs below are UNTOUCHED — T2 migrates existing facts into MEMDIR files and rewires the
-  // dashboard onto them; until then this is the interim state (see task-21-report.md).
+  // in favor of the new per-project MEMDIR). T2 rewires the memory.* RPCs (below, `memoryFiles`)
+  // to read/write MEMDIR files whenever `memory.enabled` is on, falling back to THIS store
+  // unchanged when it's off — the store instance itself and its on-disk data stay untouched
+  // either way (the escape hatch, and the migration importer's source, both need it intact).
   const memoryStore = new MemoryStore({ normaHome, trust: trustStore });
   // Built unconditionally (needs only store, no provider) so the server's session.addDir /
   // setCwd handlers always have live roots to work with, even when the agent is disabled.
@@ -799,11 +816,18 @@ export async function startDaemon(opts: {
     // `if (agentProvider)` gate above) and the scheduler (constructed just above this call) both
     // share — one sqlite handle for the whole daemon.
     routines: routineStore,
-    // Phase 5b Task 3: the memory.* RPCs' backing store — one single-writer promise chain for the
-    // whole daemon (memory.ts's own §4.8 contract). T1 (file-based memory) deleted the tool
-    // surface over this SAME store (memory_read/write/delete); the RPCs here are untouched
-    // (dashboard/CLI still consume them — see the store's own construction comment above).
+    // Phase 5b Task 3: the memory.* RPCs' LEGACY backing store — one single-writer promise chain
+    // for the whole daemon (memory.ts's own §4.8 contract). Read/written whenever `memoryFiles`
+    // below reports disabled (the escape hatch) — the RPCs never open a second store instance.
     memory: memoryStore,
+    // T2 (design doc "dashboard rewire"): the SAME live enabled()/dirFor() getters the write-root
+    // join and the assembler's injection already use (`memoryEnabledHot`/`memoryDirOf` above) —
+    // one settings-derived decision, read hot by every consumer, not re-derived per call site.
+    // `globalDir()` is the "no project" bucket (`globalMemoryDirFor`) the RPCs fall back to for a
+    // cwd-less request (the CLI's `scope:"user"`, no `--project`, never passes one) — see
+    // ipc/server.ts's memory.* handlers and memory-migrate.ts's own doc comment for why this is
+    // the SAME bucket the importer uses for facts that don't map to a project.
+    memoryFiles: { enabled: memoryEnabledHot, dirFor: memoryDirOf, globalDir: memoryGlobalDirOf },
     ...opts.server,
   });
 

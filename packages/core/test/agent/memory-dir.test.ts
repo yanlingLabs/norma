@@ -6,6 +6,7 @@ import {
   repoRootFor,
   sanitizeProjectKey,
   memoryDirFor,
+  globalMemoryDirFor,
   _clearRepoRootCacheForTests,
 } from "../../src/agent/memory-dir";
 
@@ -121,5 +122,32 @@ describe("memory-dir: memoryDirFor", () => {
     const dir = memoryDirFor(root, { normaHome });
     const exists = Bun.spawnSync(["test", "-d", dir]).exitCode === 0;
     expect(exists).toBe(false);
+  });
+});
+
+// T2 (design doc "migration importer" / "dashboard rewire"): the "no project" bucket both the
+// importer (legacy USER-scope facts) and the memory.* RPC rewire (a cwd-less request) fall back
+// to — see memory-migrate.ts / ipc/server.ts's own doc comments.
+describe("memory-dir: globalMemoryDirFor", () => {
+  test("computes ~/.norma/projects/_global/memory", () => {
+    const normaHome = realDir();
+    expect(globalMemoryDirFor({ normaHome })).toBe(join(normaHome, "projects", "_global", "memory"));
+  });
+
+  test("never collides with a real project's sanitized key", () => {
+    const normaHome = realDir();
+    const root = initRepo();
+    expect(globalMemoryDirFor({ normaHome })).not.toBe(memoryDirFor(root, { normaHome }));
+  });
+
+  test("settings.memory.directory overrides the computed path entirely, same as memoryDirFor", () => {
+    const normaHome = realDir();
+    const override = realDir();
+    expect(globalMemoryDirFor({ normaHome, directory: override })).toBe(override);
+  });
+
+  test("an empty/whitespace-only override is treated as absent", () => {
+    const normaHome = realDir();
+    expect(globalMemoryDirFor({ normaHome, directory: "  " })).toBe(join(normaHome, "projects", "_global", "memory"));
   });
 });

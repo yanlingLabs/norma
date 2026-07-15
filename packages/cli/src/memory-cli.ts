@@ -11,12 +11,16 @@
 // catches: a store failure surfaces as a thrown RpcFailure, same as routines.create/enable/
 // disable — the caller's try/catch prints `.message` and exits 1.
 //
-// This CLI surface talks to the OLD phase-5b MemoryStore over the memory.* RPCs — UNTOUCHED by
-// T1's file-based memory (design doc `2026-07-15-file-based-memory-design.md`), which deleted the
-// AGENT-facing memory_read/memory_write/memory_delete tools this module's formatters used to
-// mirror (core/src/agent/tools/memory.ts, now removed) in favor of a plain per-project MEMDIR;
-// T2 rewires this CLI/dashboard surface onto MEMDIR files. The wording below is kept as-is for
-// continuity in the meantime.
+// This CLI surface is a pure RPC client — it has NO opinion on which backend answers memory.*
+// (T2, design doc "dashboard rewire"): the DAEMON decides, per call, whether `memory.enabled` (T1)
+// routes list/read/delete onto MEMDIR files or the legacy phase-5b MemoryStore (core/src/ipc/
+// server.ts's memory.* handlers, `memoryFileDir`) — this module and its `--project`/scope
+// plumbing are unchanged either way. `--project` still resolves to `cwd: process.cwd()`: on the
+// files backend that's exactly the `cwd` the server needs to resolve the CALLER's own project
+// MEMDIR (`memoryDirFor`); no `--project` (scope:"user", no cwd) falls back server-side to the
+// "no project" global bucket (`globalMemoryDirFor`) — the SAME bucket the migration importer
+// (core/src/agent/memory-migrate.ts) uses for facts that don't map to a project, so a fact
+// migrated there is immediately visible to a plain `norma memory list`.
 import type { NormaClient } from "./client";
 
 export type MemoryScope = "user" | "project";
