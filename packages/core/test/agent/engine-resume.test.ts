@@ -754,4 +754,152 @@ describe("AgentEngine: spawn_agent resume (4h-ii-b Task 3)", () => {
     const childEventsAfter = store.read(sessionId).filter((e) => "threadId" in e && e.threadId === worker.threadId);
     expect(childEventsAfter.some((e) => e.type === "tool_result" && e.callId === "hang1")).toBe(false);
   });
+
+  // task-15 REVIEW (buried-orphan headline): because the repair is in-memory-only, the store
+  // PERMANENTLY contains the unpaired tool_call after the first stall — and a LATER resume of the
+  // same child (even one whose tail now ends cleanly on an assistant message, i.e. the guard's
+  // case-1 shape) reconstructs the FULL history and replays that orphan BURIED mid-history. A
+  // tail-only repair hands the provider that buried orphan verbatim (mapInput is a blind 1:1 map —
+  // a hard reject). The repair must therefore run on EVERY resume and scan the WHOLE array:
+  // stall → resume (repaired, completes cleanly) → resume AGAIN → the buried orphan is paired
+  // with a synthetic result mid-history, not at the tail.
+  test("(task-15 review) buried orphan: stall → repaired resume completes cleanly → SECOND resume still pairs the mid-history orphan", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "hang",
+      description: "test-only: a tool whose run() never resolves — simulates a tool still in flight when the stall watchdog gives up on it",
+      args: z.object({}),
+      run: () => new Promise<string>(() => { /* never resolves */ }),
+    });
+    const { engine, sessionId, provider, bgAgents } = setup(
+      [
+        [spawnNamed("s1", "do the task", "worker"), done("tool_calls")], // turn 1 round 0: spawn
+        [{ type: "tool_call", callId: "hang1", name: "hang", argsJson: "{}" }, done("tool_calls")], // child run 1: stalls mid-tool
+        text("parent turn1"),
+        [resumeCall("r1", "worker", "P1"), done("tool_calls")],           // turn 2: resume #1 (repairs the tail orphan)
+        text("child-out-2"),                                             // resumed run COMPLETES CLEANLY (ends on assistant)
+        text("parent turn2"),
+        [resumeCall("r2", "worker", "P2"), done("tool_calls")],           // turn 3: resume #2 — tail is now CLEAN (assistant), orphan is BURIED
+        text("child-out-3"),                                             // second resumed run
+        text("parent turn3"),
+      ],
+      { registry, subagentsOpts: { stallTimeoutMs: 40 } },
+    );
+    await engine.runTurn(sessionId); // turn 1: spawn — stalls mid-tool
+    expect(bgAgents.get("worker", sessionId)?.status).toBe("failed");
+    await engine.runTurn(sessionId); // turn 2: resume #1 — repaired, completes cleanly
+    expect(bgAgents.get("worker", sessionId)?.status).toBe("completed");
+    await engine.runTurn(sessionId); // turn 3: resume #2 — the orphan is now buried mid-history
+
+    const fp = provider as FakeProvider;
+    const secondResume = fp.requests.find((r) => isChildRun(r.input, "do the task") && lastUserOf(r.input) === "P2");
+    expect(secondResume).toBeDefined();
+    expect(secondResume!.input).toEqual([
+      M("user", "do the task"),                                                // opening prompt
+      { type: "function_call", callId: "hang1", name: "hang", argsJson: "{}" }, // the buried orphan, replayed from the store
+      {                                                                         // the synthetic pair — MID-HISTORY, not at the tail
+        type: "tool_result", callId: "hang1",
+        output: "[cancelled: the agent ended before this tool call completed]",
+        isError: true,
+      },
+      M("user", "P1"),               // resume #1's prompt
+      M("assistant", "child-out-2"), // the clean completion that made the TAIL look clean
+      M("user", "P2"),               // resume #2's prompt, last
+    ]);
+  });
+
+  // task-15 REVIEW (double-stall): a child that stalls mid-tool TWICE across two resumes leaves
+  // TWO unpaired tool_calls in the store — one buried, one at the tail. The full-array scan must
+  // pair BOTH with synthetics in the final reconstruction.
+  test("(task-15 review) double-stall: stall → resume → stall again → resume — BOTH orphans are paired in the final input", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "hang",
+      description: "test-only: a tool whose run() never resolves — simulates a tool still in flight when the stall watchdog gives up on it",
+      args: z.object({}),
+      run: () => new Promise<string>(() => { /* never resolves */ }),
+    });
+    const { engine, sessionId, provider, bgAgents } = setup(
+      [
+        [spawnNamed("s1", "do the task", "worker"), done("tool_calls")], // turn 1 round 0: spawn
+        [{ type: "tool_call", callId: "hang1", name: "hang", argsJson: "{}" }, done("tool_calls")], // child run 1: stalls mid-tool
+        text("parent turn1"),
+        [resumeCall("r1", "worker", "P1"), done("tool_calls")],           // turn 2: resume #1 (repairs hang1)
+        [{ type: "tool_call", callId: "hang2", name: "hang", argsJson: "{}" }, done("tool_calls")], // resumed run: stalls mid-tool AGAIN
+        text("parent turn2"),
+        [resumeCall("r2", "worker", "P2"), done("tool_calls")],           // turn 3: resume #2 — hang1 buried + hang2 at the tail
+        text("child-out-3"),                                             // second resumed run
+        text("parent turn3"),
+      ],
+      { registry, subagentsOpts: { stallTimeoutMs: 40 } },
+    );
+    await engine.runTurn(sessionId); // turn 1: spawn — stalls mid-tool (hang1 orphaned)
+    expect(bgAgents.get("worker", sessionId)?.status).toBe("failed");
+    await engine.runTurn(sessionId); // turn 2: resume #1 — stalls mid-tool again (hang2 orphaned)
+    expect(bgAgents.get("worker", sessionId)?.status).toBe("failed");
+    await engine.runTurn(sessionId); // turn 3: resume #2 — both orphans must be paired
+
+    const synth = (callId: string) => ({
+      type: "tool_result" as const, callId,
+      output: "[cancelled: the agent ended before this tool call completed]",
+      isError: true,
+    });
+    const fp = provider as FakeProvider;
+    const secondResume = fp.requests.find((r) => isChildRun(r.input, "do the task") && lastUserOf(r.input) === "P2");
+    expect(secondResume).toBeDefined();
+    expect(secondResume!.input).toEqual([
+      M("user", "do the task"),                                                // opening prompt
+      { type: "function_call", callId: "hang1", name: "hang", argsJson: "{}" }, // orphan #1 (buried)
+      synth("hang1"),                                                          // paired mid-history
+      M("user", "P1"),                                                         // resume #1's prompt
+      { type: "function_call", callId: "hang2", name: "hang", argsJson: "{}" }, // orphan #2 (tail-side)
+      synth("hang2"),                                                          // paired too
+      M("user", "P2"),                                                         // resume #2's prompt, last
+    ]);
+  });
+
+  // task-15 REVIEW (test gap): a [function_call, reasoning] TAIL — an orphaned call followed by a
+  // stray trailing reasoning item. The guard's trailing-reasoning skip lands on the function_call
+  // (→ resumable, repaired); normalizeReplayOrder replays [.., fc, reasoning, user] verbatim
+  // (reasoning passes through in place, only interior MESSAGES defer); and the repair splices the
+  // synthetic result immediately after the CALL itself — before the trailing reasoning — since
+  // reasoning is order-transparent state that precedes what it reasons for, so the pair closes
+  // first: [.., fc, synthetic, reasoning, user].
+  test("(task-15 review) resume a child whose history ends [orphan function_call, reasoning] → repaired; synthetic lands between the call and the reasoning", async () => {
+    const recJson = (ec: string) => JSON.stringify({ type: "reasoning", summary: [], encrypted_content: ec });
+    const REAS = (ec: string) => ({ type: "reasoning" as const, itemJson: recJson(ec) });
+    const { engine, store, sessionId, provider, bgAgents } = setup([
+      [spawnNamed("s1", "do the task", "worker"), done("tool_calls")], // turn 1: spawn (completes clean)
+      text("child-out-1"),
+      text("parent turn1"),
+      [resumeCall("r1", "worker", "continue"), done("tool_calls")],    // turn 2: resume — repaired
+      text("child-out-2"),                                             // the resumed child's own run
+      text("parent turn2"),
+    ]);
+    await engine.runTurn(sessionId);
+    const worker = bgAgents.get("worker", sessionId)!;
+
+    // seed the [orphan function_call, reasoning] tail: a dispatched call whose result never came,
+    // then a stray reasoning item.
+    store.append(sessionId, { type: "tool_call", sessionId, threadId: worker.threadId, callId: "o1", name: "read", argsJson: "{}" });
+    store.append(sessionId, { type: "reasoning_item", sessionId, threadId: worker.threadId, itemJson: recJson("EC1") });
+
+    await engine.runTurn(sessionId); // turn 2: resume — guard lands on the fc past the reasoning → repair
+
+    const fp = provider as FakeProvider;
+    const resumed = fp.requests.find((r) => isChildRun(r.input, "do the task") && lastUserOf(r.input) === "continue");
+    expect(resumed).toBeDefined();
+    expect(resumed!.input).toEqual([
+      M("user", "do the task"),
+      M("assistant", "child-out-1"),
+      { type: "function_call", callId: "o1", name: "read", argsJson: "{}" },
+      {                                                                 // synthetic BETWEEN the call and the trailing reasoning
+        type: "tool_result", callId: "o1",
+        output: "[cancelled: the agent ended before this tool call completed]",
+        isError: true,
+      },
+      REAS("EC1"),
+      M("user", "continue"),
+    ]);
+  });
 });

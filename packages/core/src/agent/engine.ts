@@ -795,37 +795,51 @@ export class AgentEngine {
     return this.normalizeReplayOrder(input);
   }
 
-  /** task-15 (CC parity: resume an abnormally-ended agent) — repairs a trailing ORPHANED
-   *  function_call (a tool_call the engine dispatched — see the per-call dispatch loop's own
-   *  `this.emit(...{type:"tool_call"}...)`, which always fires BEFORE the awaited execution — whose
-   *  matching tool_result never got persisted because the child stalled, was ESC-aborted, or
-   *  errored while that tool was still in flight) by splicing a SYNTHETIC `tool_result` in
-   *  immediately after it, so the provider never sees a function_call with no matching output —
-   *  CC's own stated invariant ("the transcript must not contain a tool result without its tool
-   *  use, or vice versa; append a synthetic error/cancel result when required").
+  /** task-15 (CC parity: resume an abnormally-ended agent; review-generalized) — repairs EVERY
+   *  orphaned function_call anywhere in the reconstructed history (a tool_call the engine
+   *  dispatched — the per-call dispatch loop's `this.emit(...{type:"tool_call"}...)` always fires
+   *  BEFORE the awaited execution — whose matching tool_result never got persisted because the
+   *  child stalled, was ESC-aborted, or errored while that tool was still in flight) by splicing a
+   *  SYNTHETIC `tool_result` in immediately after it, so the provider never sees a function_call
+   *  with no matching output — CC's own stated invariant ("the transcript must not contain a tool
+   *  result without its tool use, or vice versa; append a synthetic error/cancel result when
+   *  required").
    *
-   *  ONLY ever called (by resumeThread, above) once the clean-termination guard has already
-   *  confirmed the reconstructed history's last REAL item (past any trailing reasoning) IS a
-   *  function_call — so `history` here is guaranteed to end that way. Walks back from the tail
-   *  collecting the CONTIGUOUS run of trailing function_call items (defensive: the per-call
-   *  dispatch loop is sequential — `for (const call of calls) { emit tool_call; await execute; emit
-   *  tool_result; }` — so a call only starts once the PRIOR call's own result was already emitted;
-   *  in practice at most one trailing orphan is ever reachable, but repairing a run costs nothing
-   *  extra) and inserts one synthetic cancellation tool_result right after EACH, preserving order.
-   *  A NEW array — `history` itself (and the store) is never mutated; this repair is purely an
-   *  in-memory transform of the reconstructed input for THIS resume's request. */
-  private repairOrphanedTail(history: TurnInputItem[]): TurnInputItem[] {
-    let idx = history.length - 1;
-    while (idx >= 0 && history[idx]!.type === "reasoning") idx--;
-    let firstOrphanIdx = idx;
-    while (firstOrphanIdx >= 0 && history[firstOrphanIdx]!.type === "function_call") firstOrphanIdx--;
-    firstOrphanIdx++;
-    const repaired = history.slice();
-    for (let i = idx; i >= firstOrphanIdx; i--) {
-      const orphan = repaired[i] as Extract<TurnInputItem, { type: "function_call" }>;
-      repaired.splice(i + 1, 0, {
+   *  FULL-ARRAY SCAN, not a tail check (review finding): the repair is deliberately in-memory-only
+   *  (never persisted as a fake store event), so once a child has EVER stall-aborted mid-tool, the
+   *  store permanently contains that unpaired tool_call — and every LATER resume's reconstruction
+   *  replays it from the store again, now BURIED mid-history behind the repaired resume's own new
+   *  prompt/turns (including a resume whose tail ends cleanly on an assistant message). A
+   *  tail-only repair would hand the provider that buried orphan verbatim — mapInput is a blind
+   *  1:1 map (send-message.test.ts's own `orphanFunctionCall` helper documents this exact shape as
+   *  a hard provider reject) — silently defeating the fix for the repeated-failure case. So
+   *  resumeThread runs this on EVERY resume, unconditionally; a fully-paired history passes
+   *  through with identical contents (pure no-op, pinned by the clean-resume regression test).
+   *
+   *  Pairing check: `normalizeReplayOrder` guarantees a matched pair lands ADJACENT in replay
+   *  order (interior messages are deferred past the result), so "is the next item this call's own
+   *  tool_result" suffices. The one non-message item it never moves is opaque `reasoning`, which
+   *  passes through in place — unreachable between a pair in practice (reasoning persists during
+   *  streaming; call/result persist later, during that round's dispatch), but skipped here
+   *  defensively so a hypothetical [call, reasoning, result] is still seen as paired rather than
+   *  given a duplicate-callId synthetic. The synthetic still splices IMMEDIATELY after the orphan
+   *  call itself (before any trailing reasoning — reasoning is order-transparent state that always
+   *  PRECEDES the item it reasons for, so the pair must close before it).
+   *  Returns a NEW array — `history` itself (and the store) is never mutated; this repair is
+   *  purely an in-memory transform of the reconstructed input for THIS resume's request. */
+  private repairOrphanedCalls(history: TurnInputItem[]): TurnInputItem[] {
+    const repaired: TurnInputItem[] = [];
+    for (let i = 0; i < history.length; i++) {
+      const item = history[i]!;
+      repaired.push(item);
+      if (item.type !== "function_call") continue;
+      let j = i + 1;
+      while (j < history.length && history[j]!.type === "reasoning") j++;
+      const candidate = history[j];
+      if (candidate && candidate.type === "tool_result" && candidate.callId === item.callId) continue;
+      repaired.push({
         type: "tool_result",
-        callId: orphan.callId,
+        callId: item.callId,
         output: "[cancelled: the agent ended before this tool call completed]",
         isError: true,
       });
@@ -2322,9 +2336,13 @@ export class AgentEngine {
     //   - ends on an ORPHAN function_call (the call was dispatched — its tool_call event persisted
     //     at engine.ts's per-call dispatch loop — but its tool_result never was: the child
     //     stalled/aborted/errored while the tool was still in flight) → REPAIRED below
-    //     (repairOrphanedTail), never refused. The repair is an IN-MEMORY transform of the
+    //     (repairOrphanedCalls), never refused. The repair is an IN-MEMORY transform of the
     //     reconstructed input only — never persisted as a fake store event (the store must stay a
-    //     truthful record of what actually happened).
+    //     truthful record of what actually happened). Review generalization: BECAUSE it is never
+    //     persisted, the stored orphan survives forever and reappears buried mid-history in every
+    //     LATER reconstruction of this child — so the repair runs UNCONDITIONALLY on every resume
+    //     (all three resumable shapes above, not just this one) and scans the WHOLE array, not
+    //     just the tail. See repairOrphanedCalls's own doc comment.
     //   - no history at all (child aborted before its very first event ever persisted — a fresh
     //     spawn's opening prompt is never itself stored, see childHistoryInput's KNOWN GAP note) →
     //     still refused, just with a clearer message.
@@ -2358,8 +2376,7 @@ export class AgentEngine {
         isError: true,
       };
     }
-    const needsOrphanRepair = lastPrior.type === "function_call";
-    if (!needsOrphanRepair && lastPrior.type !== "tool_result" && !(lastPrior.type === "message" && lastPrior.role === "assistant")) {
+    if (lastPrior.type !== "function_call" && lastPrior.type !== "tool_result" && !(lastPrior.type === "message" && lastPrior.role === "assistant")) {
       return { output: `agent '${resumeArg}' didn't finish cleanly and can't be resumed`, isError: true };
     }
 
@@ -2423,20 +2440,17 @@ export class AgentEngine {
     // NOT re-persist its input, so this event is written exactly once (pinned by an engine test).
     this.emit(sessionId, { type: "user_message", sessionId, threadId: entry.threadId, text: prompt, clientName: "resume" });
     // Reconstruct: opening prompt (the fresh spawn never persisted it) + the child's OWN stored
-    // history (now ending with the prompt just persisted). task-15: when the guard above found an
-    // orphaned function_call at the tail, repair it HERE — on this fresh reconstruction, not the
-    // earlier `priorHistory` — by splicing a synthetic cancellation tool_result in ahead of the
-    // just-persisted new-prompt user_message (always the last item post-persist), never touching
-    // the store. `needsOrphanRepair` was decided once, above, off the SAME shape this reconstructs
-    // (nothing else can append to this child's thread between the two reads — this function never
-    // awaits anything in between), so it still applies unchanged here.
-    const reconstructedChild = this.childHistoryInput(sessionId, entry.threadId);
-    const childHistory = needsOrphanRepair
-      ? [...this.repairOrphanedTail(reconstructedChild.slice(0, -1)), reconstructedChild[reconstructedChild.length - 1]!]
-      : reconstructedChild;
+    // history (now ending with the prompt just persisted). task-15 (review-generalized): repair
+    // ALWAYS runs, on this fresh full reconstruction — every orphaned function_call anywhere in
+    // the history (a fresh one at the tail, or one BURIED mid-history by a prior repaired resume —
+    // the repair is in-memory-only, so the stored orphan persists forever and resurfaces in every
+    // later reconstruction) gets its synthetic cancellation tool_result spliced in right after it,
+    // never touching the store. A fully-paired history passes through content-identical (pure
+    // no-op). Each synthetic lands adjacent to its own call, so the just-persisted new-prompt
+    // user_message stays LAST: [ ...history (with synthetics paired in), new user message ].
     const input: TurnInputItem[] = [
       { type: "message", role: "user", content: rc.openingPrompt },
-      ...childHistory,
+      ...this.repairOrphanedCalls(this.childHistoryInput(sessionId, entry.threadId)),
     ];
 
     // D5 — replay the EXACT runThread args captured at spawn (fresh Sets from the arrayified
