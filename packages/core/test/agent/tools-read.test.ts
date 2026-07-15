@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { resolveWithin } from "../../src/agent/paths";
 import { ToolRegistry } from "../../src/agent/tools/registry";
 import { registerReadTools } from "../../src/agent/tools/fs-read";
+import { makePng } from "./read-fixtures";
 
 function proj(): string {
   const d = realpathSync(mkdtempSync(join(tmpdir(), "norma-tools-")));
@@ -430,5 +431,252 @@ describe("read-only denylist — Norma's own credential/runtime dir (task-10)", 
     registerReadTools(r); // no opts — same as every pre-task-10 caller
     const res = await r.execute("read", { path: join(d, "a.txt") }, { cwd: d, roots: [d], sessionId: "s1" });
     expect(res.isError).toBe(false);
+  });
+});
+
+// multimodal-read T1: images ---------------------------------------------------------------------
+describe("read: images (multimodal-read T1)", () => {
+  function makeRegistry(): ToolRegistry {
+    const r = new ToolRegistry();
+    registerReadTools(r);
+    return r;
+  }
+
+  test("small image: read as-is, attached via ctx.attachImage, note has dims/size, no downscale", async () => {
+    const d = proj();
+    const png = makePng(4, 4);
+    writeFileSync(join(d, "tiny.png"), png);
+    const attached: string[] = [];
+    const res = await makeRegistry().execute(
+      "read",
+      { path: "tiny.png" },
+      { cwd: d, roots: [d], sessionId: "s1", tmpDir: d, attachImage: (u) => attached.push(u), visionCapable: true },
+    );
+    expect(res.isError).toBe(false);
+    expect(res.output).toContain("4×4");
+    expect(res.output).toContain("The image follows this result as the next message.");
+    expect(res.output).not.toContain("downscaled");
+    expect(attached.length).toBe(1);
+    expect(attached[0]).toMatch(/^data:image\/png;base64,/);
+    // Untouched bytes (no re-encode) for a small image well under both thresholds.
+    const b64 = attached[0]!.split(",")[1]!;
+    expect(Buffer.from(b64, "base64").equals(png)).toBe(true);
+  });
+
+  test("image extension matching is case-insensitive", async () => {
+    const d = proj();
+    writeFileSync(join(d, "PHOTO.PNG"), makePng(4, 4));
+    const attached: string[] = [];
+    const res = await makeRegistry().execute(
+      "read",
+      { path: "PHOTO.PNG" },
+      { cwd: d, roots: [d], sessionId: "s1", tmpDir: d, attachImage: (u) => attached.push(u), visionCapable: true },
+    );
+    expect(res.isError).toBe(false);
+    expect(attached.length).toBe(1);
+  });
+
+  test("non-vision model: clean refusal naming the model limitation, nothing attached", async () => {
+    const d = proj();
+    writeFileSync(join(d, "tiny.png"), makePng(4, 4));
+    const attached: string[] = [];
+    const res = await makeRegistry().execute(
+      "read",
+      { path: "tiny.png" },
+      { cwd: d, roots: [d], sessionId: "s1", tmpDir: d, attachImage: (u) => attached.push(u), visionCapable: false },
+    );
+    expect(res.isError).toBe(true);
+    expect(res.output).toContain("this model cannot view images");
+    expect(attached.length).toBe(0);
+  });
+
+  test("oversize source (>20MB) is refused, naming the actual size — no dimension probe, no attach", async () => {
+    const d = proj();
+    // The size cap is checked BEFORE dimensions are ever probed, so this doesn't need to be a real
+    // decodable PNG — a big buffer with a .png name is enough to exercise the refusal path.
+    writeFileSync(join(d, "big.png"), Buffer.alloc(21 * 1024 * 1024, 1));
+    const attached: string[] = [];
+    const res = await makeRegistry().execute(
+      "read",
+      { path: "big.png" },
+      { cwd: d, roots: [d], sessionId: "s1", tmpDir: d, attachImage: (u) => attached.push(u), visionCapable: true },
+    );
+    expect(res.isError).toBe(true);
+    expect(res.output).toContain("21.0MB");
+    expect(res.output).toContain("exceeds the 20.0MB read limit");
+    expect(attached.length).toBe(0);
+  });
+
+  test("dimensions over 1600px trigger a sips downscale + JPEG re-encode into the session tmp dir", async () => {
+    const d = proj();
+    const t = realpathSync(mkdtempSync(join(tmpdir(), "norma-img-tmp-")));
+    writeFileSync(join(d, "big-dims.png"), makePng(2000, 1200));
+    const attached: string[] = [];
+    const res = await makeRegistry().execute(
+      "read",
+      { path: "big-dims.png" },
+      { cwd: d, roots: [d], sessionId: "s1", tmpDir: t, attachImage: (u) => attached.push(u), visionCapable: true },
+    );
+    expect(res.isError).toBe(false);
+    expect(res.output).toContain("2000×1200"); // original dims noted
+    expect(res.output).toContain("downscaled to 1600×960 JPEG"); // longest side capped at 1600, aspect preserved
+    expect(attached.length).toBe(1);
+    expect(attached[0]).toMatch(/^data:image\/jpeg;base64,/);
+    const bytes = Buffer.from(attached[0]!.split(",")[1]!, "base64");
+    expect(bytes.subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8])); // JPEG SOI marker — really re-encoded
+    // The scratch file sips wrote into tmpDir must be cleaned up, not left behind.
+    const leftover = readdirSync(t).filter((f) => f.startsWith("read-image-"));
+    expect(leftover.length).toBe(0);
+  });
+
+  test("small dimensions but a file over 500KB is recompressed WITHOUT resizing (sips -Z upscale trap avoided)", async () => {
+    const d = proj();
+    const t = realpathSync(mkdtempSync(join(tmpdir(), "norma-img-tmp2-")));
+    const noisy = makePng(500, 500, { noisy: true });
+    expect(noisy.length).toBeGreaterThan(500 * 1024); // sanity: the fixture really is over the threshold
+    writeFileSync(join(d, "noisy.png"), noisy);
+    const attached: string[] = [];
+    const res = await makeRegistry().execute(
+      "read",
+      { path: "noisy.png" },
+      { cwd: d, roots: [d], sessionId: "s1", tmpDir: t, attachImage: (u) => attached.push(u), visionCapable: true },
+    );
+    expect(res.isError).toBe(false);
+    expect(res.output).toContain("500×500");
+    // Dimensions UNCHANGED (500×500, not upscaled to 1600×1600 — the sips -Z quirk this guards against).
+    expect(res.output).toContain("downscaled to 500×500 JPEG");
+    expect(attached[0]).toMatch(/^data:image\/jpeg;base64,/);
+    const bytes = Buffer.from(attached[0]!.split(",")[1]!, "base64");
+    expect(bytes.length).toBeLessThan(noisy.length); // materially smaller than the source
+  });
+
+  test("attachImage absent in ctx: image is still processed and noted, nothing throws", async () => {
+    const d = proj();
+    writeFileSync(join(d, "tiny.png"), makePng(4, 4));
+    const res = await makeRegistry().execute(
+      "read",
+      { path: "tiny.png" },
+      { cwd: d, roots: [d], sessionId: "s1", tmpDir: d, visionCapable: true },
+    );
+    expect(res.isError).toBe(false);
+    expect(res.output).toContain("4×4");
+  });
+
+  test("a missing image file is a tool error, not a throw", async () => {
+    const d = proj();
+    const res = await makeRegistry().execute(
+      "read",
+      { path: "nope.png" },
+      { cwd: d, roots: [d], sessionId: "s1", tmpDir: d, visionCapable: true },
+    );
+    expect(res.isError).toBe(true);
+  });
+});
+
+// multimodal-read T1: notebooks (.ipynb) ---------------------------------------------------------
+describe("read: notebooks (.ipynb) (multimodal-read T1)", () => {
+  function makeRegistry(): ToolRegistry {
+    const r = new ToolRegistry();
+    registerReadTools(r);
+    return r;
+  }
+  function nb(cells: unknown[]): string {
+    return JSON.stringify({ cells, metadata: {}, nbformat: 4, nbformat_minor: 5 });
+  }
+
+  test("renders every cell with [cell N — type] headers, source, and stream/text outputs", async () => {
+    const d = proj();
+    const cells = [
+      { cell_type: "markdown", source: ["# Title\n", "some notes"] },
+      { cell_type: "code", source: ["print('hi')"], outputs: [{ output_type: "stream", name: "stdout", text: ["hi\n"] }] },
+      { cell_type: "code", source: ["6 * 7"], outputs: [{ output_type: "execute_result", data: { "text/plain": ["42"] } }] },
+    ];
+    writeFileSync(join(d, "nb.ipynb"), nb(cells));
+    const res = await makeRegistry().execute("read", { path: "nb.ipynb" }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(false);
+    expect(res.output).toContain("[cell 1 — markdown]");
+    expect(res.output).toContain("# Title\nsome notes");
+    expect(res.output).toContain("[cell 2 — code]");
+    expect(res.output).toContain("print('hi')");
+    expect(res.output).toContain("hi\n");
+    expect(res.output).toContain("[cell 3 — code]");
+    expect(res.output).toContain("42");
+  });
+
+  test("image/png output attaches via ctx.attachImage when vision-capable", async () => {
+    const d = proj();
+    const b64 = makePng(2, 2).toString("base64");
+    const cells = [{ cell_type: "code", source: ["show()"], outputs: [{ output_type: "display_data", data: { "image/png": b64 } }] }];
+    writeFileSync(join(d, "nb.ipynb"), nb(cells));
+    const attached: string[] = [];
+    const res = await makeRegistry().execute(
+      "read",
+      { path: "nb.ipynb" },
+      { cwd: d, roots: [d], sessionId: "s1", attachImage: (u) => attached.push(u), visionCapable: true },
+    );
+    expect(res.isError).toBe(false);
+    expect(attached).toEqual([`data:image/png;base64,${b64}`]);
+    expect(res.output).toContain("attached as the next message");
+  });
+
+  test("image/png output is honestly omitted when attachImage isn't wired (non-vision)", async () => {
+    const d = proj();
+    const b64 = makePng(2, 2).toString("base64");
+    const cells = [{ cell_type: "code", source: ["show()"], outputs: [{ output_type: "display_data", data: { "image/png": b64 } }] }];
+    writeFileSync(join(d, "nb.ipynb"), nb(cells));
+    const res = await makeRegistry().execute("read", { path: "nb.ipynb" }, { cwd: d, roots: [d], sessionId: "s1", visionCapable: false });
+    expect(res.isError).toBe(false);
+    expect(res.output).toContain("[image output omitted");
+  });
+
+  test("error outputs render ename/evalue/traceback", async () => {
+    const d = proj();
+    const cells = [
+      {
+        cell_type: "code",
+        source: ["1/0"],
+        outputs: [{ output_type: "error", ename: "ZeroDivisionError", evalue: "division by zero", traceback: ["Traceback...", "ZeroDivisionError: division by zero"] }],
+      },
+    ];
+    writeFileSync(join(d, "nb.ipynb"), nb(cells));
+    const res = await makeRegistry().execute("read", { path: "nb.ipynb" }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(false);
+    expect(res.output).toContain("ZeroDivisionError: division by zero");
+  });
+
+  test("a per-output cap truncates a huge stream output", async () => {
+    const d = proj();
+    const big = "x".repeat(5000);
+    const cells = [{ cell_type: "code", source: ["print(x)"], outputs: [{ output_type: "stream", text: [big] }] }];
+    writeFileSync(join(d, "nb.ipynb"), nb(cells));
+    const res = await makeRegistry().execute("read", { path: "nb.ipynb" }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res.isError).toBe(false);
+    expect(res.output).toContain("[output truncated at 4000 chars]");
+  });
+
+  test("malformed JSON falls back to the plain-text read, byte-identical", async () => {
+    const d = proj();
+    writeFileSync(join(d, "broken.ipynb"), "{ not valid json ][");
+    const res = await makeRegistry().execute("read", { path: "broken.ipynb" }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res).toEqual({ output: "{ not valid json ][", isError: false });
+  });
+
+  test("malformed-notebook fallback still honors offset/limit exactly like a normal text read", async () => {
+    const d = proj();
+    writeFileSync(join(d, "broken.ipynb"), "l1\nl2\nl3\nl4\nl5"); // not valid JSON, but readable multi-line text
+    const res = await makeRegistry().execute(
+      "read",
+      { path: "broken.ipynb", offset: 2, limit: 2 },
+      { cwd: d, roots: [d], sessionId: "s1" },
+    );
+    expect(res).toEqual({ output: "l2\nl3", isError: false });
+  });
+
+  test("valid JSON without a cells array also falls back to plain text", async () => {
+    const d = proj();
+    const content = JSON.stringify({ foo: "bar" });
+    writeFileSync(join(d, "notreal.ipynb"), content);
+    const res = await makeRegistry().execute("read", { path: "notreal.ipynb" }, { cwd: d, roots: [d], sessionId: "s1" });
+    expect(res).toEqual({ output: content, isError: false });
   });
 });

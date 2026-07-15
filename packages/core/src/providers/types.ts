@@ -27,12 +27,15 @@ export type TurnInputItem =
   | { type: "function_call"; callId: string; name: string; argsJson: string }
   | { type: "tool_result"; callId: string; output: string; isError?: boolean }
   | { type: "reasoning"; itemJson: string }
-  // Computer-use (Phase 5 CU): a vision image fed to the model as a user message. `imageUrl` is a
-  // `data:image/png;base64,…` URL — the EXACT `input_image` shape the CU spike verified against the
-  // Codex backend (research/2026-07-03-cu-vision-spike.md). `alt` is optional caption text emitted
-  // as an `input_text` part alongside the image. Produced transiently in-turn by the engine's CU
-  // image drain (never a persisted session event — see engine.ts's pendingCuImages), so
-  // `eventToInput` has no case for it and cross-turn history never reconstructs a past screenshot.
+  // A vision image fed to the model as a user message. `imageUrl` is a `data:image/png;base64,…`
+  // URL — the EXACT `input_image` shape the CU spike verified against the Codex backend
+  // (research/2026-07-03-cu-vision-spike.md). `alt` is optional caption text emitted as an
+  // `input_text` part alongside the image. Originally Phase 5 CU-only (the `computer` tool's
+  // screenshots); generalized (multimodal-read T1) to any vision-capable-model tool call — the
+  // `read` tool's images and notebook image outputs ride the identical shape. Produced transiently
+  // in-turn by the engine's image drain (never a persisted session event — see engine.ts's
+  // pendingImages), so `eventToInput` has no case for it and cross-turn history never reconstructs
+  // a past image.
   | { type: "image"; imageUrl: string; alt?: string };
 
 export interface ToolSpec {

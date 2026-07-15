@@ -25,12 +25,14 @@ export interface ToolContext {
   // neither is).
   computerUse?: ComputerUseService;
   // Stages a vision image (a `data:` URL) for the model — the engine appends it to the turn's input
-  // as an `{type:"image"}` item at round end (see engine.ts's pendingCuImages). The `computer`
-  // tool's screenshot action calls this; every other tool ignores it.
+  // as an `{type:"image"}` item at round end (see engine.ts's pendingImages). Wired by the engine
+  // whenever the thread's model is vision-capable, independent of computer-use (multimodal-read
+  // T1 — originally CU-only). The `computer` tool's screenshot/zoom actions call this, as does the
+  // `read` tool (image files, and .ipynb image/png cell outputs); any other tool may ignore it.
   attachImage?: (dataUrl: string) => void;
   // Whether the turn's resolved model accepts image input (ModelInfo.supportsVision). The computer
-  // tool's screenshot action refuses when this is explicitly false (ax_snapshot still works). Unset
-  // = unknown → not blocked.
+  // tool's screenshot action refuses when this is explicitly false (ax_snapshot still works); the
+  // `read` tool refuses reading an image file the same way. Unset = unknown → not blocked.
   visionCapable?: boolean;
 }
 export interface ToolOutcome { output: string; isError: boolean }

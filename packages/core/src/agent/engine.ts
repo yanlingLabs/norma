@@ -464,17 +464,19 @@ export class AgentEngine {
   // it already started; CC has the same re-fire-on-restart shape). Only consulted when cfg.hooks
   // is wired, so it's inert (allocated-but-untouched) for every hook-less config — byte-identical.
   private hookSessionStarted = new Set<string>();
-  // Computer use (Phase 5 CU): screenshots staged by the `computer` tool this turn, keyed by
-  // cuImageKey(sessionId, threadId, callId) — NOT bare callId: callIds are provider-minted with no
-  // cross-session/cross-thread uniqueness guarantee, and a bare-callId collision between two
-  // concurrent sessions would drain one session's screen content into the OTHER's model input (a
-  // cross-session leak). `ctx.attachImage` (wired in executeCall) pushes here; the round-end drain
-  // in runThread (drainRoundImages) pops each processed call's images into `input` as `{type:
-  // "image"}` items and deletes the entry; runTurn's finally sweeps this session's leftovers.
-  // Never persisted (see the TurnInputItem image variant's doc comment) — a purely in-turn,
-  // in-memory hand-off from tool to provider input.
-  private pendingCuImages = new Map<string, string[]>();
-  private static cuImageKey(sessionId: string, threadId: string, callId: string): string {
+  // Vision image bridge (originally Phase 5 CU-only; generalized so ANY tool can stage an image —
+  // the `computer` tool's screenshots AND the `read` tool's image/notebook-image-output attaches
+  // both go through this ONE map): images staged this turn, keyed by imageKey(sessionId, threadId,
+  // callId) — NOT bare callId: callIds are provider-minted with no cross-session/cross-thread
+  // uniqueness guarantee, and a bare-callId collision between two concurrent sessions would drain
+  // one session's image into the OTHER's model input (a cross-session leak). `ctx.attachImage`
+  // (wired in executeCall whenever the thread's model is vision-capable — independent of whether
+  // computer-use is configured) pushes here; the round-end drain in runThread (drainRoundImages)
+  // pops each processed call's images into `input` as `{type:"image"}` items and deletes the entry;
+  // runTurn's finally sweeps this session's leftovers. Never persisted (see the TurnInputItem image
+  // variant's doc comment) — a purely in-turn, in-memory hand-off from tool to provider input.
+  private pendingImages = new Map<string, string[]>();
+  private static imageKey(sessionId: string, threadId: string, callId: string): string {
     return `${sessionId}|${threadId}|${callId}`;
   }
   // CC-parity subagent transcript writer (subagent-transcript.ts) — constructed in the constructor
@@ -565,20 +567,25 @@ export class AgentEngine {
       // a mid-turn DISABLE is a harmless no-op here (teardownComputer's releaseAll already released
       // everyone AND cleared the holder, so this read resolves to `undefined` — nothing to release).
       const cu = this.cfg.computerUse?.();
-      if (cu) {
-        const bgRunning = this.cfg.bgAgents?.list(sessionId).some((e) => e.status === "running") ?? false;
-        if (!bgRunning) {
-          cu.releaseSession(sessionId);
-          // Teardown sweep for staged-but-undrained screenshots (an abnormal unwind between
-          // staging and the round-end drain — e.g. an emit throw mid-dispatch — would otherwise
-          // leak the base64 in the map for the daemon's lifetime). Keys are namespaced
-          // `${sessionId}|...` (cuImageKey) so this touches only THIS session's leftovers, and it
-          // runs only when NO detached child is live (same bgRunning guard as the release above) —
-          // a mid-round child's staged-but-not-yet-drained image must never be swept out from
-          // under its own round-end drain.
-          for (const key of this.pendingCuImages.keys()) {
-            if (key.startsWith(`${sessionId}|`)) this.pendingCuImages.delete(key);
-          }
+      // bgRunning gates BOTH the CU lease release below AND the pendingImages sweep further down —
+      // computed once, unconditionally (not nested inside `if (cu)` anymore): a detached background
+      // agent shares this sessionId and may be mid-CU-loop OR mid-`read`-of-an-image, so neither
+      // teardown may run while one is live.
+      const bgRunning = this.cfg.bgAgents?.list(sessionId).some((e) => e.status === "running") ?? false;
+      if (cu && !bgRunning) {
+        cu.releaseSession(sessionId);
+      }
+      if (!bgRunning) {
+        // Teardown sweep for staged-but-undrained images (an abnormal unwind between staging and
+        // the round-end drain — e.g. an emit throw mid-dispatch — would otherwise leak the base64
+        // in the map for the daemon's lifetime). Generalized past CU: the `read` tool can stage an
+        // image via ctx.attachImage whenever the model is vision-capable, with no computer-use
+        // service involved at all — so this sweep must run whenever no bg agent is live, NOT only
+        // when `cu` is configured. Keys are namespaced `${sessionId}|...` (imageKey) so this
+        // touches only THIS session's leftovers; a mid-round child's staged-but-not-yet-drained
+        // image must never be swept out from under its own round-end drain (same bgRunning guard).
+        for (const key of this.pendingImages.keys()) {
+          if (key.startsWith(`${sessionId}|`)) this.pendingImages.delete(key);
         }
       }
       if (this.retriggerPending.delete(sessionId) && !ac.signal.aborted) {
@@ -3108,21 +3115,22 @@ export class AgentEngine {
     }
   }
 
-  /** Computer use (Phase 5 CU): drain the screenshots the `computer` tool staged for this round's
-   *  calls (via ctx.attachImage → pendingCuImages, keyed by cuImageKey — session|thread|callId, see
-   *  the map's doc comment) into `input` as `{type:"image"}` items. Called at the END of a round's
-   *  dispatch loop — AFTER every tool_result — so an image never splits a function_call/tool_result
-   *  pair (the whole assistant batch stays intact, then the images follow as a user turn the model
-   *  sees next round). Also called before the deniedByHuman early return so the map never leaks
-   *  staged entries. A no-op (byte-identical) when nothing was staged — i.e. always, unless the
-   *  `computer` tool ran a screenshot this round. */
+  /** Drain the images ANY tool staged for this round's calls (via ctx.attachImage → pendingImages,
+   *  keyed by imageKey — session|thread|callId, see the map's doc comment) into `input` as
+   *  `{type:"image"}` items. Originally Phase 5 CU-only (the `computer` tool's screenshots);
+   *  generalized so the `read` tool's image/notebook-image-output attaches ride the identical path
+   *  — this function has no idea which tool staged what. Called at the END of a round's dispatch
+   *  loop — AFTER every tool_result — so an image never splits a function_call/tool_result pair
+   *  (the whole assistant batch stays intact, then the images follow as a user turn the model sees
+   *  next round). Also called before the deniedByHuman early return so the map never leaks staged
+   *  entries. A no-op (byte-identical) when nothing was staged this round. */
   private drainRoundImages(sessionId: string, threadId: string, calls: Array<{ callId: string }>, input: TurnInputItem[]): void {
-    if (this.pendingCuImages.size === 0) return;
+    if (this.pendingImages.size === 0) return;
     for (const c of calls) {
-      const key = AgentEngine.cuImageKey(sessionId, threadId, c.callId);
-      const imgs = this.pendingCuImages.get(key);
+      const key = AgentEngine.imageKey(sessionId, threadId, c.callId);
+      const imgs = this.pendingImages.get(key);
       if (!imgs) continue;
-      this.pendingCuImages.delete(key);
+      this.pendingImages.delete(key);
       for (const url of imgs) input.push({ type: "image", imageUrl: url });
     }
   }
@@ -3210,26 +3218,32 @@ export class AgentEngine {
     // The calling thread's own `loaded` set (see its doc comment above), unioned with this
     // round's pins into a NEW Set — `loaded` itself is NEVER copied/mutated by this union.
     const effectiveLoaded = pins.size ? new Set([...loaded, ...pins]) : loaded;
-    // Computer use (Phase 5 CU): wire the `computer` tool's bridges ONLY when the service is
-    // configured — otherwise both stay undefined and the tool ctx is byte-identical to pre-CU.
-    // `attachImage` closes over this call's namespaced key (session|thread|callId — see the
-    // pendingCuImages doc comment for why bare callId is unsafe): a staged screenshot lands in
-    // pendingCuImages under that key, drained into `input` at this round's end (drainRoundImages).
-    // hot-settings T5a: read the getter LIVE here (per tool call), not the runTurn-start snapshot
-    // — a mid-turn hot-disable must make a LATER call in the same turn see `undefined` too. Safe
-    // unguarded: during T5b's disable DRAIN window the `computer` tool is still registered and the
-    // getter still resolves live, so a NEW `computer` call CAN still dispatch then — it merely
-    // prolongs the bounded drain (T4's computerInFlight gate waits it out) rather than being
-    // yanked; once teardownComputer runs (unregister + holder cleared) this getter resolves
-    // `undefined` and the tool is gone, so a later call errors cleanly. No "half disabled" state
-    // is ever observed: at every instant the tool's presence and this getter agree.
+    // Computer use (Phase 5 CU): wire the `computer` tool's OWN bridge (ctx.computerUse) ONLY when
+    // the service is configured — otherwise it stays undefined and the tool ctx is byte-identical
+    // to pre-CU. hot-settings T5a: read the getter LIVE here (per tool call), not the runTurn-start
+    // snapshot — a mid-turn hot-disable must make a LATER call in the same turn see `undefined`
+    // too. Safe unguarded: during T5b's disable DRAIN window the `computer` tool is still
+    // registered and the getter still resolves live, so a NEW `computer` call CAN still dispatch
+    // then — it merely prolongs the bounded drain (T4's computerInFlight gate waits it out) rather
+    // than being yanked; once teardownComputer runs (unregister + holder cleared) this getter
+    // resolves `undefined` and the tool is gone, so a later call errors cleanly. No "half disabled"
+    // state is ever observed: at every instant the tool's presence and this getter agree.
     const cuNow = this.cfg.computerUse?.();
-    const attachImage = cuNow
+    // ctx.attachImage — generalized (multimodal-read T1): wired whenever the THREAD's model is
+    // vision-capable, independent of computer-use. Previously gated on `cuNow` (CU-only); now ANY
+    // tool that stages an image (the `computer` tool's screenshots, the `read` tool's images and
+    // notebook image outputs) can do so as long as the model can actually see it. `visionCapable`
+    // is undefined only when the resolved model isn't in the provider's own model list (an unknown
+    // model) — treated as "not vision-capable" here (no wiring), the conservative default. Closes
+    // over this call's namespaced key (session|thread|callId — see the pendingImages doc comment
+    // for why bare callId is unsafe): a staged image lands in pendingImages under that key, drained
+    // into `input` at this round's end (drainRoundImages).
+    const attachImage = visionCapable
       ? (dataUrl: string) => {
-          const key = AgentEngine.cuImageKey(sessionId, threadId, call.callId);
-          const arr = this.pendingCuImages.get(key) ?? [];
+          const key = AgentEngine.imageKey(sessionId, threadId, call.callId);
+          const arr = this.pendingImages.get(key) ?? [];
           arr.push(dataUrl);
-          this.pendingCuImages.set(key, arr);
+          this.pendingImages.set(key, arr);
         }
       : undefined;
     const result = await this.cfg.registry.execute(call.name, args, {
