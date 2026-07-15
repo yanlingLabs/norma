@@ -38,6 +38,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
     case shortcutInvoke(ShortcutInvoke)
     case tileAction(TileAction)
     case toolReview(ToolReview)
+    case notificationRequested(NotificationRequested)
 
     public struct SessionCreated: Codable, Equatable, Sendable {
         public let seq: Int
@@ -501,6 +502,23 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         public let summary: String
     }
 
+    /// Push-notification track (task-30, the final CC-parity tool item) — emitted once per
+    /// `push_notification` tool call. NOT transient (unlike `AssistantDelta`/the lease events
+    /// above): persisted and replayed like `ToolReview`/`TaskUpdated`. Delivery is entirely
+    /// client-side: the Norma app target posts a native `UNUserNotificationCenter` alert
+    /// (`SessionModel.apply`, gated on `ts` being wall-clock-fresh so a reattach/refocus replay
+    /// never re-fires a historical notification as a new banner); the daemon additionally shells
+    /// `osascript` as a headless fallback when nobody's attached at all (see core's
+    /// `agent/notify-fallback.ts`).
+    public struct NotificationRequested: Codable, Equatable, Sendable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let title: String
+        public let message: String
+    }
+
     private enum Discriminator: String, Codable {
         case session_created
         case harness_attached
@@ -539,6 +557,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         case shortcut_invoke
         case tile_action
         case tool_review
+        case notification_requested
     }
 
     private enum TypeKey: String, CodingKey { case type }
@@ -583,6 +602,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         case .shortcut_invoke:      self = .shortcutInvoke(try ShortcutInvoke(from: decoder))
         case .tile_action:          self = .tileAction(try TileAction(from: decoder))
         case .tool_review:          self = .toolReview(try ToolReview(from: decoder))
+        case .notification_requested: self = .notificationRequested(try NotificationRequested(from: decoder))
         }
     }
 
@@ -736,6 +756,10 @@ public enum SessionEvent: Codable, Equatable, Sendable {
             try v.encode(to: encoder)
             var c = encoder.container(keyedBy: TypeKey.self)
             try c.encode(Discriminator.tool_review.rawValue, forKey: .type)
+        case .notificationRequested(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.notification_requested.rawValue, forKey: .type)
         }
     }
 }

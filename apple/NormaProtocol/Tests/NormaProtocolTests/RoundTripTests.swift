@@ -4,7 +4,7 @@ import XCTest
 final class RoundTripTests: XCTestCase {
     func fixtureURLs() throws -> [URL] {
         let urls = Bundle.module.urls(forResourcesWithExtension: "json", subdirectory: "Fixtures") ?? []
-        XCTAssertEqual(urls.count, 43, "expected 43 fixtures — regenerate via pnpm protocol:generate")
+        XCTAssertEqual(urls.count, 44, "expected 44 fixtures — regenerate via pnpm protocol:generate")
         return urls
     }
 
@@ -118,5 +118,18 @@ final class RoundTripTests: XCTestCase {
         let data = try Data(contentsOf: url)
         guard case .threadCompleted(let v) = try JSONDecoder().decode(SessionEvent.self, from: data) else { return XCTFail() }
         XCTAssertEqual(v.stopReason, "stalled")
+    }
+
+    /// task-30 (push-notification track — the final CC-parity tool item, and another
+    /// NormaKit-trap task like `tool_review` above): the NEW `notification_requested` variant
+    /// decodes with its title/message intact — proves the exhaustive switches + codec were synced.
+    func testNotificationRequestedDecodes() throws {
+        guard let url = Bundle.module.url(forResource: "notification_requested", withExtension: "json", subdirectory: "Fixtures") else {
+            return XCTFail("missing notification_requested.json fixture")
+        }
+        let data = try Data(contentsOf: url)
+        guard case .notificationRequested(let v) = try JSONDecoder().decode(SessionEvent.self, from: data) else { return XCTFail() }
+        XCTAssertEqual(v.title, "Norma")
+        XCTAssertFalse(v.message.isEmpty)
     }
 }

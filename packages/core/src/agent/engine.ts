@@ -414,6 +414,14 @@ export interface EngineConfig {
   // the automatic post-edit append.
   lsp?: () => LspManager | undefined;
   autoDiagnosticsEnabled?: () => boolean | undefined;
+  // task-30 (push-notification track): the headless osascript fallback (notify-fallback.ts's
+  // notifyHeadless) — called by the `notify` bridge (executeCall, below) ONLY when
+  // `hub.attachedCount(sessionId) === 0` at the moment push_notification fires. Optional/absent
+  // (every test that doesn't care) means the fallback simply never runs — the
+  // notification_requested event is still always emitted via `hub.append` regardless of this
+  // field. daemon.ts wires the real `notifyHeadless`; tests inject a spy to assert it fires (or
+  // doesn't) without ever shelling out to osascript for real.
+  notifyFallback?: (title: string, message: string) => void;
 }
 
 export class AgentEngine {
@@ -3215,6 +3223,19 @@ export class AgentEngine {
     const taskEvent = this.cfg.tasks
       ? (task: Task) => { this.emit(sessionId, { type: "task_updated", sessionId, threadId, task }); }
       : undefined;
+    // task-30 (push-notification track): unlike ask/taskEvent above, this bridge is NEVER gated on
+    // an optional subsystem — hub is a mandatory EngineConfig field, so push_notification always
+    // gets a working ctx.notify when dispatched through the real engine. Two things happen, always
+    // in this order: (1) emit + persist notification_requested (so ANY attached client, live or
+    // via later replay, can render it) — (2) if NOBODY is attached right now
+    // (hub.attachedCount === 0), also fire the headless osascript fallback. The count check reads
+    // attachedCount AFTER the emit so a client that raced in via harness_attached during the emit's
+    // own broadcast still counts as "attached" for this decision (appendAndBroadcast is fully
+    // synchronous, so there is no actual race — this ordering is just belt-and-suspenders).
+    const notify = (title: string, message: string) => {
+      this.emit(sessionId, { type: "notification_requested", sessionId, threadId, title, message });
+      if (this.cfg.hub.attachedCount(sessionId) === 0) this.cfg.notifyFallback?.(title, message);
+    };
     // The calling thread's own `loaded` set (see its doc comment above), unioned with this
     // round's pins into a NEW Set — `loaded` itself is NEVER copied/mutated by this union.
     const effectiveLoaded = pins.size ? new Set([...loaded, ...pins]) : loaded;
@@ -3255,6 +3276,7 @@ export class AgentEngine {
       builtinDeferral: this.toolSearchEnabled(),
       ask,
       taskEvent,
+      notify,
       computerUse: cuNow,
       attachImage,
       visionCapable,

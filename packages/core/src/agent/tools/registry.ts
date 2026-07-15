@@ -19,6 +19,12 @@ export interface ToolContext {
   builtinDeferral?: boolean; // true when built-in ToolSearch deferral is active for this session (mirrors the engine's toolSearchEnabled()) — any def registered `deferred: true` rides deferral whenever this is true, independent of the external count/threshold
   ask?: (questions: Question[]) => Promise<AskOutcome>; // engine bridge: emits question_asked/question_resolved events and blocks on the QuestionBroker; the ask_user tool calls it
   taskEvent?: (task: Task) => void; // engine bridge: emits task_updated; called by the task tools (task_create/task_update/task_list)
+  // task-30: engine bridge for push_notification — emits notification_requested (hub.append) and,
+  // when the session has zero attached clients (SessionHub.attachedCount), ALSO fires the headless
+  // osascript fallback (notify-fallback.ts). Unlike ask/taskEvent this is never gated on an
+  // optional subsystem (SessionHub is a mandatory EngineConfig field), so it's always set when a
+  // tool runs through the real engine — absent only for a direct registry.execute() call in tests.
+  notify?: (title: string, message: string) => void;
   // Computer use (Phase 5 CU): the lease-holding service the `computer` tool drives (screenshot/
   // ax-read/input-drive via the peripheral broker). Absent → the computer tool isn't wired for this
   // session (it's registered only when settings.computerUse.enabled, so normally both are set or

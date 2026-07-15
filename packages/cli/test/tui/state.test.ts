@@ -498,6 +498,14 @@ describe("state.ts — note one-liners match main.ts's wording (bg-task/worktree
     expect(s.committed.at(-1)).toEqual({ kind: "note", text: "agent error: provider timeout" });
   });
 
+  // task-30 (push-notification track): the CLI renders a minimal note line — real delivery is the
+  // app's native alert / the daemon's headless osascript fallback, neither of which the CLI does.
+  test("notification_requested", () => {
+    let s = initialState();
+    s = reduce(s, { type: "notification_requested", threadId: "main", title: "Norma", message: "migration finished" }, T0);
+    expect(s.committed.at(-1)).toEqual({ kind: "note", text: "notification: Norma: migration finished" });
+  });
+
   test("lease_granted / lease_lost (Phase 5 CU) — CU control notes with friendly class labels", () => {
     let s = initialState();
     const holder = { kind: "session", id: "s1" };

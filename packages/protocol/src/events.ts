@@ -311,6 +311,30 @@ export const ToolReviewEvent = ThreadBase.extend({
   summary: z.string(),
 });
 
+/** Push-notification track (task-30, the final CC-parity tool item): emitted by the
+ *  `push_notification` tool (core's `agent/tools/push-notification.ts`) once per call — a real
+ *  wire event, NOT transient (unlike `assistant_delta`/the lease events above): it's persisted
+ *  and replayed like `tool_review`/`task_updated`, so a client that attaches/reattaches later
+ *  still sees it in the session's history. `title`/`message` mirror the tool's own zod bounds
+ *  (min(1)/max(100) and min(1)/max(500)) — the tool always supplies a non-empty title (defaults
+ *  to "Norma" when the caller omits one), so this schema can require both rather than treating
+ *  either as optional.
+ *
+ *  DELIVERY is entirely client-side (NormaKit/CLI/app), not this schema's concern: the app posts
+ *  a native `UNUserNotificationCenter` alert (see `SessionModel.apply` in the Norma target, which
+ *  additionally gates delivery on the event's `ts` being wall-clock-fresh — a reattach/refocus
+ *  replays a session's ENTIRE history from seq 0, and without that freshness gate every
+ *  historical notification would re-fire as a new banner on every reconnect); the daemon itself
+ *  also shells out to `osascript` as a headless fallback ONLY when the session has zero attached
+ *  clients at emission time (`SessionHub.attachedCount`, checked by the engine's `notify` bridge
+ *  in `engine.ts`) — see `agent/notify-fallback.ts`'s own doc comment for why that fallback is
+ *  argv-safe against injection. */
+export const NotificationRequestedEvent = ThreadBase.extend({
+  type: z.literal("notification_requested"),
+  title: z.string().min(1).max(100),
+  message: z.string().min(1).max(500),
+});
+
 export const SessionEvent = z.discriminatedUnion("type", [
   SessionCreatedEvent,
   HarnessAttachedEvent,
@@ -351,6 +375,7 @@ export const SessionEvent = z.discriminatedUnion("type", [
   ShortcutInvokeEvent,
   TileActionEvent,
   ToolReviewEvent,
+  NotificationRequestedEvent,
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 

@@ -65,6 +65,16 @@ export class SessionHub {
     return this.appendAndBroadcast(sessionId, input);
   }
 
+  /** How many clients are currently attached to `sessionId` — read-only, no side effects. Used by
+   *  the `push_notification` tool's engine bridge (task-30): when this is `0` at the moment the
+   *  tool fires, nothing live is attached to render the `notification_requested` event that was
+   *  just emitted (no CLI harness, no app window), so the caller falls back to a headless
+   *  `osascript` notification (see `agent/notify-fallback.ts`). Zero is a real, common case — a
+   *  scheduled routine (Phase 5 routines) runs completely unattended. */
+  attachedCount(sessionId: string): number {
+    return this.attachments.get(sessionId)?.size ?? 0;
+  }
+
   private appendAndBroadcast(sessionId: string, input: EventInput): SessionEvent {
     const event = this.store.append(sessionId, input);
     this.fanOut(sessionId, event);

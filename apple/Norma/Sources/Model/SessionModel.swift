@@ -484,6 +484,17 @@ enum SessionReducer {
 @MainActor
 final class SessionModel: ObservableObject {
     @Published private(set) var state = OrbSessionState()
+    private let notifier: NotificationPosting
+
+    /// task-30 (push-notification track): how fresh `notificationRequested.ts` must be (wall-clock
+    /// ms) to actually post a native alert. See `apply`'s own doc comment for why this exists —
+    /// internal (not `private`) so `SessionModelTests` can pin the exact boundary rather than
+    /// guessing at it.
+    static let notificationFreshnessMs: Double = 10_000
+
+    init(notifier: NotificationPosting = SystemNotificationPoster()) {
+        self.notifier = notifier
+    }
 
     func apply(_ event: SessionEvent) {
         state = SessionReducer.reduce(state, event)
@@ -496,6 +507,25 @@ final class SessionModel: ObservableObject {
         // production code; `OrbSessionState.workingVerb`'s doc comment points back here.
         if case .turnStarted(let v) = event, v.threadId == "main" {
             state.workingVerb = WorkingVerbs.random()
+        }
+        // task-30 (push-notification track): a SECOND impurity seam, same shape as workingVerb
+        // above — posting a native OS notification is a real side effect, so it can never live in
+        // the pure `SessionReducer`. REPLAY SAFETY is the reason this isn't a plain unconditional
+        // post: `notification_requested` is persisted and replayed like any other event, and
+        // AppModel.refocus/SessionFeed.repin/a fresh app launch all replay a session's ENTIRE
+        // history from seq 0 — without a freshness gate, reattaching to (or relaunching into) a
+        // session with old notifications would re-fire every one of them as a brand-new banner.
+        // `ts` is the daemon's own wall-clock stamp at emission (`Date.now()`, sessions/store.ts) —
+        // a genuinely live event's `ts` is always within a few ms of "now"; a replayed one is
+        // whatever it was stamped at, virtually always older than the threshold in any realistic
+        // session. A slow/laggy daemon roundtrip could in principle delay a live notification past
+        // the threshold and silently drop it — acceptable for v1 (a missed OS toast, not data
+        // loss: the event itself is still in the transcript/session history either way).
+        if case .notificationRequested(let v) = event {
+            let ageMs = Date().timeIntervalSince1970 * 1000 - Double(v.ts)
+            if ageMs < Self.notificationFreshnessMs {
+                notifier.post(title: v.title, body: v.message)
+            }
         }
     }
 

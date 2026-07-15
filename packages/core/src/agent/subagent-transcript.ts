@@ -44,6 +44,11 @@ const TRANSCRIPT_INCLUDE = {
   question_resolved: true,
   task_updated: true, // task tools are not child-excluded — a child's task updates are its work
   tool_review: true, // reviewer verdicts on the child's own calls (précis only, never full args)
+  // task-30 (push-notification track): push_notification is NOT in childExcludeTools (engine.ts) —
+  // a background subagent finishing a long task is exactly the CC-parity case ("pushes when a
+  // long task finishes"), so its own notification_requested calls are part of its work, same
+  // reasoning as task_updated above. Content is just title/message text, nothing sensitive.
+  notification_requested: true,
   worktree_entered: true,
   worktree_exited: true,
   // ---- excluded: allowlist by design — an unknown/future event type must never leak into a

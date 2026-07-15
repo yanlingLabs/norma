@@ -45,6 +45,12 @@ final class SessionModelTests: XCTestCase {
     func harnessDetached(_ clientName: String, seq: Int = 2) -> SessionEvent {
         ev(#"{"type":"harness_detached","seq":\#(seq),"sessionId":"s","ts":0,"clientName":"\#(clientName)"}"#)
     }
+    // task-30: `ts` defaults to "now" (ms) so a bare `notificationRequested()` call reads as a
+    // genuinely LIVE event without every call site having to compute a fresh timestamp itself;
+    // tests that specifically want a STALE (replayed) event pass an old `ts` explicitly.
+    func notificationRequested(title: String = "Norma", message: String = "done", ts: Int = Int(Date().timeIntervalSince1970 * 1000), seq: Int = 1) -> SessionEvent {
+        ev(#"{"type":"notification_requested","seq":\#(seq),"sessionId":"s","ts":\#(ts),"threadId":"main","title":"\#(title)","message":"\#(message)"}"#)
+    }
 
     func testTurnLifecycleDrivesStatus() {
         var s = OrbSessionState()
@@ -683,5 +689,77 @@ final class SessionModelTests: XCTestCase {
         s = SessionReducer.reduce(s, harnessDetached("cli-status", seq: 6))
         XCTAssertTrue(s.attachedClients.isEmpty)
         XCTAssertFalse(s.cliAttached)
+    }
+
+    // MARK: - task-30 (push-notification track): `SessionModel.apply`'s notification-posting seam.
+    //
+    // `SessionReducer.reduce` itself does nothing special for `notificationRequested` (it falls to
+    // the reducer's `default: break`, same as assistant_delta/checkpoint/etc.) — the real behavior
+    // lives entirely in `SessionModel.apply`'s impurity seam, tested here via an injected fake so
+    // the real `UNUserNotificationCenter` is never touched.
+
+    final class FakeNotificationPoster: NotificationPosting {
+        private(set) var posts: [(title: String, body: String)] = []
+        func post(title: String, body: String) { posts.append((title, body)) }
+    }
+
+    @MainActor
+    func testFreshNotificationRequestedPostsANativeAlert() {
+        let poster = FakeNotificationPoster()
+        let session = SessionModel(notifier: poster)
+        session.apply(notificationRequested(title: "Build", message: "finished"))
+        XCTAssertEqual(poster.posts.count, 1)
+        XCTAssertEqual(poster.posts[0].title, "Build")
+        XCTAssertEqual(poster.posts[0].body, "finished")
+    }
+
+    /// Replay-safety: a session reattach/refocus/relaunch replays its ENTIRE history from seq 0
+    /// (AppModel.refocus/SessionFeed.repin) — an OLD `notification_requested` (from, say, an hour
+    /// ago) must NOT re-fire as a brand-new native banner just because it's being replayed now.
+    @MainActor
+    func testStaleReplayedNotificationRequestedDoesNotPost() {
+        let poster = FakeNotificationPoster()
+        let session = SessionModel(notifier: poster)
+        let anHourAgo = Int(Date().timeIntervalSince1970 * 1000) - 3_600_000
+        session.apply(notificationRequested(message: "old news", ts: anHourAgo))
+        XCTAssertTrue(poster.posts.isEmpty)
+    }
+
+    /// Pins the exact freshness boundary (`SessionModel.notificationFreshnessMs`) both directions —
+    /// just inside it posts, just outside it doesn't — rather than only testing comfortably-fresh/
+    /// comfortably-stale cases that would pass even if the boundary math were off by a lot.
+    @MainActor
+    func testNotificationFreshnessBoundary() {
+        let now = Date().timeIntervalSince1970 * 1000
+        let justFresh = Int(now - SessionModel.notificationFreshnessMs + 500)
+        let justStale = Int(now - SessionModel.notificationFreshnessMs - 500)
+
+        let freshPoster = FakeNotificationPoster()
+        SessionModel(notifier: freshPoster).apply(notificationRequested(ts: justFresh))
+        XCTAssertEqual(freshPoster.posts.count, 1)
+
+        let stalePoster = FakeNotificationPoster()
+        SessionModel(notifier: stalePoster).apply(notificationRequested(ts: justStale))
+        XCTAssertTrue(stalePoster.posts.isEmpty)
+    }
+
+    /// `SessionReducer.reduce` itself is a pure no-op for `notificationRequested` (falls to
+    /// `default: break`, same as `turnStarted` does for `workingVerb` above) — the posting
+    /// happens ONLY in `SessionModel.apply`'s impurity seam, never inside the reducer.
+    func testReducerAloneNeverActsOnNotificationRequested() {
+        var s = OrbSessionState()
+        let before = s
+        s = SessionReducer.reduce(s, notificationRequested())
+        XCTAssertEqual(s, before)
+    }
+
+    /// A non-notification event must never touch the poster at all.
+    @MainActor
+    func testUnrelatedEventNeverPosts() {
+        let poster = FakeNotificationPoster()
+        let session = SessionModel(notifier: poster)
+        session.apply(turnStarted())
+        session.apply(taskUpdated(id: "1", subject: "a", status: "pending"))
+        XCTAssertTrue(poster.posts.isEmpty)
     }
 }

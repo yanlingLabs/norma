@@ -192,6 +192,25 @@ describe("SessionHub", () => {
     expect(b.received.some((ev) => ev.type === "assistant_delta")).toBe(false);
   });
 
+  test("attachedCount reflects attach/detach — 0 for an unknown or never-attached session", () => {
+    const { store, hub } = setup();
+    const id = store.createSession("global");
+    expect(hub.attachedCount(id)).toBe(0);
+    expect(hub.attachedCount("s_nonexistent")).toBe(0);
+
+    const a = fakeClient("a");
+    const b = fakeClient("b");
+    hub.attach(a, id, 0);
+    expect(hub.attachedCount(id)).toBe(1);
+    hub.attach(b, id, 0);
+    expect(hub.attachedCount(id)).toBe(2);
+
+    hub.detach(a);
+    expect(hub.attachedCount(id)).toBe(1);
+    hub.detach(b);
+    expect(hub.attachedCount(id)).toBe(0);
+  });
+
   test("broadcastTransient evicts a dead client like a normal broadcast", () => {
     const { store, hub } = setup();
     const id = store.createSession("global");

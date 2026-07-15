@@ -38,6 +38,8 @@ export { registerWebTools, WEB_SEARCH_API_KEY_SECRET, type WebToolDeps } from ".
 export { registerToolSearchTool } from "./agent/tools/toolsearch";
 export { registerAskUserTool } from "./agent/tools/ask-user";
 export { registerPlanTool } from "./agent/tools/plan";
+export { registerPushNotificationTool } from "./agent/tools/push-notification";
+export { notifyHeadless, type OsascriptSpawnFn } from "./agent/notify-fallback";
 export { TaskStore } from "./agent/task-store";
 export { registerTaskTools } from "./agent/tools/tasks";
 export { buildSeatbeltProfile, sandboxAvailable } from "./agent/sandbox";
