@@ -76,12 +76,21 @@ describe("write tools", () => {
     expect(readFileSync(join(b, "made.txt"), "utf8")).toBe("hi");
   });
 
-  test("write outside all roots errors and names request_directory", async () => {
+  // write-permission-flow (task 24, CC parity): request_directory is gone — a bare ToolRegistry
+  // call (no engine wiring, as here) still hard-fails on an out-of-root target with the plain
+  // fence message. The GRANT flow (session-scoped, out-of-root write/edit rides the approval seam
+  // bash uses) lives in engine.ts's dispatch loop, which sees this fence throw and, under `ask`/
+  // `auto` policy, grants the containing directory to SessionDirectories BEFORE ever calling this
+  // tool — so by the time resolveWithinAny reads `roots` in production it already includes the
+  // grant. See engine.test.ts for the end-to-end grant flow; this file only covers the tool's own
+  // fence in isolation, unchanged.
+  test("write outside all roots errors with the plain fence message (no request_directory mention)", async () => {
     const { r, d } = setup();
     const outside = realpathSync(mkdtempSync(join(tmpdir(), "norma-w3-")));
     const res = await r.execute("write", { path: join(outside, "x.txt"), content: "y" }, { cwd: d, roots: [d], sessionId: "s1" });
     expect(res.isError).toBe(true);
-    expect(res.output).toMatch(/request_directory/);
+    expect(res.output).toMatch(/outside the allowed directories/);
+    expect(res.output).not.toMatch(/request_directory/);
     expect(existsSync(join(outside, "x.txt"))).toBe(false);
   });
 });

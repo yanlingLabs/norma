@@ -20,13 +20,7 @@ describe("PermissionGate v1", () => {
 
   test("unknown tools always ask (fail-closed toward the human)", () => {
     expect(gate.evaluate("mystery", "auto")).toBe("ask");
-  });
-
-  test("request_directory self-gates via its own ApprovalBroker prompt (the engine gate must not also ask — would double-prompt); fail-closed is preserved for genuinely unknown tools", () => {
-    expect(gate.evaluate("request_directory", "ask")).toBe("allow");
-    expect(gate.evaluate("request_directory", "auto")).toBe("allow");
     expect(gate.evaluate("mystery", "ask")).toBe("ask");
-    expect(gate.evaluate("mystery", "auto")).toBe("ask");
   });
 
   test("bash is a mutating tool: ask under ask-policy, allow under auto", () => {
@@ -121,7 +115,7 @@ describe("PermissionGate v1", () => {
 
   test("plan matrix: read-only + exit_plan_mode + ask_user + task_* allow; write/edit/bash/mcp/plugin deny; unclassified deny", () => {
     const g = new PermissionGate();
-    for (const t of ["read", "glob", "grep", "ls", "Skill", "ToolSearch", "ask_user", "task_create", "task_list", "exit_plan_mode", "request_directory"]) {
+    for (const t of ["read", "glob", "grep", "ls", "Skill", "ToolSearch", "ask_user", "task_create", "task_list", "exit_plan_mode"]) {
       expect(g.evaluate(t, "plan")).toBe("allow");
     }
     for (const t of ["write", "edit", "bash", "mcp__x__y", "plugin__x__y", "frobnicate"]) {
@@ -187,17 +181,28 @@ describe("PermissionGate v1", () => {
   // Guard: skill_write must be ALWAYS_ASK's ONLY member. "ask under auto" is the class's unique
   // signature — every tool previously classified in any other class must still resolve to
   // "allow" under `auto`, so a tool silently moved into (or added to) ALWAYS_ASK fails HERE,
-  // not in some downstream E2E. The list enumerates every member of READ_ONLY, MUTATING,
-  // SELF_GATING, and NETWORK as of 5c T2, plus the external (mcp__/plugin__) shape.
+  // not in some downstream E2E. The list enumerates every member of READ_ONLY, MUTATING, and
+  // NETWORK as of write-permission-flow (task 24 — SELF_GATING/request_directory removed, no
+  // replacement class), plus the external (mcp__/plugin__) shape.
   test("guard: no existing tool joined ALWAYS_ASK — every previously classified tool still allows under auto", () => {
     const classified = [
       // READ_ONLY
       "read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output", "lsp_diagnostics", "lsp_definition", "lsp_references",
       // MUTATING
       "write", "edit", "bash", "notebook_edit", "enter_worktree", "exit_worktree", "computer", "schedule",
-      // SELF_GATING + NETWORK + externals
-      "request_directory", "web_fetch", "web_search", "mcp__x__y", "plugin__x__y",
+      // NETWORK + externals
+      "web_fetch", "web_search", "mcp__x__y", "plugin__x__y",
     ];
     for (const t of classified) expect(gate.evaluate(t, "auto")).toBe("allow");
+  });
+
+  // write-permission-flow (task 24, CC parity): request_directory is GONE — write/edit's own
+  // out-of-root target now carries its own approval via the engine's dispatch loop (engine.ts's
+  // `dirGrant` branch), not a self-gating tool the gate had to special-case. Guard against a
+  // regression where the name comes back and the gate has to special-case it again.
+  test("request_directory is not a recognized tool name — falls to the unclassified fail-closed branch like any unknown tool", () => {
+    expect(gate.evaluate("request_directory", "ask")).toBe("ask");
+    expect(gate.evaluate("request_directory", "auto")).toBe("ask");
+    expect(gate.evaluate("request_directory", "plan")).toBe("deny");
   });
 });

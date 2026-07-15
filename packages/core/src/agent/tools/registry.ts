@@ -9,7 +9,7 @@ export interface ToolContext {
   cwd: string;
   roots: string[]; // allowed roots; roots[0] MUST be the primary cwd — relative tool paths resolve against it
   tmpDir?: string; // per-session scratch dir (sandbox writable root + child TMPDIR); bash uses it, other tools ignore
-  sessionId: string; // needed by request_directory (approvals/dirs are keyed per-session); other tools ignore it
+  sessionId: string; // scopes ask/task/computer-use bridges below to this session; write/edit's out-of-root grant flow lives in engine.ts's dispatch loop (keyed per-session there), not here
   signal?: AbortSignal; // aborts when the turn is interrupted; long-running tools (bash) should honor it
   markSkillLoaded?: (name: string) => void; // set by the engine; the Skill tool calls it to pin a loaded skill for the session
   markToolLoaded?: (name: string) => void; // set by the engine; the ToolSearch tool calls it to pin a deferred tool's schema as loaded for the session

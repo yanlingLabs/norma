@@ -173,7 +173,11 @@ describe("AgentEngine: honest skill_write approval card (5c whole-branch review)
   });
 
   test("regression pin: a non-skill_write card keeps the generic summary byte-identical", async () => {
-    const argsJson = JSON.stringify({ path: "/tmp/regression-pin.txt", content: "hello card" });
+    // In-cwd relative path (write-permission-flow, task 24): an out-of-root target now rides its
+    // OWN dedicated grant-flavored card (engine.ts's `dirGrant` branch) instead of this generic
+    // one — irrelevant to what THIS pin actually checks (approvalCardSummary's generic fallback
+    // format), so this stays in-cwd to keep testing that, not the out-of-root path.
+    const argsJson = JSON.stringify({ path: "regression-pin.txt", content: "hello card" });
     const { engine, sessionId, events, hub, broker } = setup(
       [
         [{ type: "tool_call", callId: "w1", name: "write", argsJson }, done("tool_calls")],

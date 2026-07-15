@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
-import { relative, sep } from "node:path";
+import { relative, sep, isAbsolute, resolve, dirname } from "node:path";
 import type { NewSessionEvent, Question, SessionEvent, Task } from "@norma/protocol";
 import type { SessionStore } from "../sessions/store";
 import type { SessionHub } from "../sessions/hub";
@@ -203,6 +203,48 @@ function fsWritePrecis(call: { name: string; argsJson: string }, resolved: strin
     if (typeof text === "string") chars = text.length;
   } catch { /* malformed argsJson → chars stays 0 (display-only degradation) */ }
   return `${call.name} ${resolved} (${chars} chars)`;
+}
+
+/** write-permission-flow (task 24, CC parity): the directory to grant if a write/edit call's
+ *  target resolves OUTSIDE every root — fs-write.ts's OWN fence (`roots` alone, never the
+ *  reviewer's broader roots+tmpDir above) — so this can never disagree with what the tool's own
+ *  resolveWithinAny will itself decide once dispatched. Returns null for an in-root path (nothing
+ *  to grant — the dispatch loop's existing branches run byte-identical to before this feature), a
+ *  non-write/edit call, or malformed/pathless argsJson (best-effort pre-check only; zod re-
+ *  validates the real args at execute time).
+ *
+ *  ALSO returns null for a path inside the session tmp dir specifically (`tmpDir` — bash's own
+ *  OS-sandbox-writable set includes it, resolveFsReviewTarget's BROADER roots+tmpDir fence
+ *  reviews it, but fs-write.ts's fence deliberately EXCLUDES it — see that fence's own doc
+ *  comment). That is an intentional narrower boundary the write/edit tools draw on purpose, not
+ *  an ungranted directory — a tmp-dir write must keep falling through to the EXISTING reviewer
+ *  branch (which reviews it, then still rejects it on execution) instead of being "fixed" by a
+ *  grant that would quietly widen what write/edit are allowed to touch.
+ *
+ *  The returned `dir` is the CANONICALIZED (symlink-resolved) immediate parent of the REAL
+ *  destination — computed the same way resolveFsReviewTarget/canonicalizeForWrite do above (5e
+ *  T3's own fix), so a write through an in-cwd symlink into an outside target grants (and shows
+ *  the human) the actual escape directory, never the pre-symlink in-cwd-looking spelling that a
+ *  naive string resolve would show. */
+function fsWriteOutOfRootDir(call: { name: string; argsJson: string }, roots: string[], tmpDir: string): { path: string; dir: string } | null {
+  if (call.name !== "write" && call.name !== "edit") return null;
+  let path = "";
+  try {
+    const a = JSON.parse(call.argsJson || "{}") as { path?: unknown };
+    path = typeof a.path === "string" ? a.path : "";
+  } catch { return null; }
+  if (!path) return null;
+  try {
+    resolveWithinAny(roots, path);
+    return null; // in-root — nothing to grant
+  } catch {
+    try {
+      resolveWithinAny([...roots, tmpDir], path);
+      return null; // tmp-dir target — an intentional fence exclusion, not an ungranted directory
+    } catch { /* genuinely outside everything — fall through to the grant below */ }
+    const raw = isAbsolute(path) ? resolve(path) : resolve(roots[0] ?? "/", path);
+    return { path, dir: dirname(canonicalizeForWrite(raw)) };
+  }
 }
 
 /** phase 5e T3 (external coverage): the précis for an mcp__/plugin__ call — tool name + a
@@ -2201,6 +2243,22 @@ export class AgentEngine {
         // and the bridge (setCwd + git + same-turn cwd + worktree_* events) would NEVER run outside
         // `auto` policy — see task-4-report.md for the bug writeup.
         const isWorktree = (call.name === "enter_worktree" || call.name === "exit_worktree") && !!this.cfg.worktrees;
+        // CC parity (write-permission-flow): out-of-root write/edit. Norma has no model-invocable
+        // "request a directory" tool anymore — an out-of-root Write/Edit itself carries the SAME
+        // approval seam bash uses (cc-expert findings, task-24 recon: real CC shows exactly ONE
+        // prompt for an out-of-scope edit, not a generic "run this tool" card followed by a second
+        // "grant this directory" card — so this branch INTERCEPTS write/edit here, BEFORE the
+        // generic `decision === "ask"` branch below, rather than layering a second approval on top
+        // of it). `dirGrant` is null (byte-identical fast path — falls through to the UNCHANGED
+        // branches below) for every in-root call; `!rootsOverride` skips this for a
+        // worktree-isolated child, whose roots are a FIXED confinement ([worktreeDir]) that
+        // SessionDirectories.add can never extend — granting there would be a no-op that only costs
+        // the human a pointless prompt before the SAME hard fail, so it falls through to today's
+        // plain reject instead (fs-write.ts's own fence, unchanged).
+        const dirGrant =
+          (call.name === "write" || call.name === "edit") && decision !== "deny" && !rootsOverride
+            ? fsWriteOutOfRootDir(call, this.cfg.dirs.roots(sessionId), sessionTmpDir(sessionId))
+            : null;
         // [4f pre-tool — Site 2 (normal calls)] Post-gate (decision computed just above), before ANY
         // dispatch branch runs/approves. Bridged calls (spawn_agent/send_message) NEVER reach here —
         // they were siphoned into spawn/sendMessageOutcomes and hit the `preOutcome` branch ABOVE,
@@ -2253,6 +2311,30 @@ export class AgentEngine {
             outcome = this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd);
           }
           if (newCwd !== undefined) cwd = newCwd;
+        } else if (dirGrant) {
+          // Out-of-root write/edit (see dirGrant's doc comment above). `auto` mirrors bash's own
+          // auto semantics — Norma's `auto` already lets bash (and every other MUTATING tool) run
+          // completely unattended, so a write reaching outside the sandbox gets the SAME silent
+          // pass, not a bespoke stricter carve-out (explicit product choice — diverges from real
+          // CC's acceptEdits, which still prompts for out-of-scope paths; see cc-expert findings).
+          // `directory_added` (existing protocol event, already rendered by the CLI/dashboard) is
+          // emitted either way for observability, mirroring the OLD request_directory tool's own
+          // emit — it is NOT an approval, just a record that the grant took effect.
+          if (meta.approvalPolicy === "auto") {
+            this.cfg.dirs.add(sessionId, dirGrant.dir);
+            this.emit(sessionId, { type: "directory_added", sessionId, threadId, path: dirGrant.dir, persisted: false });
+            outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
+          } else {
+            outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
+              timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
+              summary: `${call.name} ${dirGrant.path} — outside the allowed directories; grant write access to ${dirGrant.dir}?`,
+              // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
+            }, loaded, async () => {
+              this.cfg.dirs.add(sessionId, dirGrant.dir);
+              this.emit(sessionId, { type: "directory_added", sessionId, threadId, path: dirGrant.dir, persisted: false });
+              return this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
+            }, pins, rootsOverride, visionCapable);
+          }
         } else if (decision === "ask") {
           outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
             timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,

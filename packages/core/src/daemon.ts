@@ -18,7 +18,6 @@ import { ToolRegistry } from "./agent/tools/registry";
 import { registerReadTools } from "./agent/tools/fs-read";
 import { registerWriteTools } from "./agent/tools/fs-write";
 import { registerBashTool } from "./agent/tools/bash";
-import { registerRequestDirTool } from "./agent/tools/request-dir";
 import { registerBackgroundTools } from "./agent/tools/background";
 import { registerSkillTools } from "./agent/tools/skill";
 import { registerToolSearchTool } from "./agent/tools/toolsearch";
@@ -248,7 +247,7 @@ export async function startDaemon(opts: {
     // memory is enabled, the session's MEMDIR joins the SAME write-fence `roots` the `write`/`edit`
     // tools (fs-write.ts) and bash's OS-sandbox writable set (bash.ts) already resolve against —
     // no new fencing mechanism, just one more entry in the list every other grant here (permission
-    // dirs, `request_directory`, `enter_worktree`) already goes through. `roots(sid)` is
+    // dirs, an out-of-root write/edit grant, `enter_worktree`) already goes through. `roots(sid)` is
     // SESSION-scoped (not per-thread): an isolated worktree child gets `rootsOverride` instead,
     // which REPLACES this list wholesale (engine.ts), so it never sees MEMDIR — but a plain
     // (non-isolated) child thread shares the session's roots exactly as it already shares every
@@ -601,12 +600,6 @@ export async function startDaemon(opts: {
     // `onCircuitOpen` was wired before `registry` existed).
     pluginSupervisor.startAll(spawnablePlugins);
 
-    registerRequestDirTool(registry, {
-      broker: approvalBroker,
-      dirs: sessionDirs,
-      emit: (sid, e) => hub.append(sid, e),
-      projectDir: (sid) => store.meta(sid).cwd,
-    });
     const compactor = new Compactor({ provider: agentProvider, store, hub });
     // hot-settings T2 review: ALWAYS constructed, never gated on the boot-time reviewer.enabled.
     // The BashReviewer constructor is inert (stores provider/model/timeoutMs refs only — no I/O,
