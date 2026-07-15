@@ -21,6 +21,21 @@
  *  - NormaHelper's embedded codesign identifier becomes "NormaHelper" (not "com.norma.helper")
  *    under this override set — confirmed harmless (Label-based launchd matching, team-based
  *    peer trust) — not fixed here, out of scope.
+ *
+ * T2 finding (this task, empirical — only surfaces on a REAL notarization submission, which is
+ * why T1's audit couldn't have caught it): Sparkle.framework's own bundle gets correctly
+ * re-signed by Xcode's "Embed Frameworks" copy-and-sign step (TeamIdentifier=37N77U9RSZ, per
+ * T1), but that step does not recurse into the framework's OWN nested code. Sparkle's SPM
+ * binary distribution ships Autoupdate, Updater.app, and the two XPCServices helpers ad-hoc
+ * signed (flags=0x10002(adhoc,runtime), TeamIdentifier=not set, no secure timestamp) — the
+ * first real `notarytool submit` rejected the build on exactly these four paths ("not signed
+ * with a valid Developer ID certificate" + "signature does not include a secure timestamp").
+ * Fixed below by re-signing each nested helper ourselves (deepest-first — codesign requires
+ * inside-out signing since signing a container after its contents change invalidates the
+ * container's own seal), preserving each one's existing entitlements as-is (extracted then
+ * reapplied; Autoupdate is the only one with a real entitlement — see resignPreserving below),
+ * then re-signing Sparkle.framework and finally the outer Norma.app so their seals pick up the
+ * changed nested content.
  */
 import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
@@ -152,6 +167,41 @@ if (!existsSync(app)) fail(`build did not produce ${app}`);
 console.log(`Built: ${app}`);
 
 // ---------------------------------------------------------------------------
+// 3b. Re-sign Sparkle.framework's nested helper binaries (T2 finding, see header comment) —
+//     the SPM binary distribution ships them ad-hoc, which Apple's notary service rejects.
+//     Preserves each target's existing entitlements as-is (extract, then reapply).
+// ---------------------------------------------------------------------------
+const IDENTITY = "Developer ID Application";
+function resignPreservingEntitlements(path: string) {
+  const entPlist = join(OUT, `.ent-${path.replace(/[^a-zA-Z0-9]/g, "_")}.plist`);
+  rmSync(entPlist, { force: true });
+  probe(`codesign -d --entitlements ":${entPlist}" "${path}"`); // best-effort; not every target has one
+  const entFlag = existsSync(entPlist) ? `--entitlements "${entPlist}"` : "";
+  sh(`codesign --force --options runtime --timestamp ${entFlag} --sign "${IDENTITY}" "${path}"`);
+}
+const sparkleFramework = join(app, "Contents", "Frameworks", "Sparkle.framework");
+const sparkleVersionsB = join(sparkleFramework, "Versions", "B");
+const nestedSparkleHelpers = [
+  join(sparkleVersionsB, "Autoupdate"),
+  join(sparkleVersionsB, "Updater.app"),
+  join(sparkleVersionsB, "XPCServices", "Downloader.xpc"),
+  join(sparkleVersionsB, "XPCServices", "Installer.xpc"),
+];
+console.log("Re-signing Sparkle.framework's nested helper binaries (shipped ad-hoc by the SPM distribution)...");
+for (const target of nestedSparkleHelpers) {
+  if (!existsSync(target)) {
+    console.log(`  (skip — not present in this Sparkle version: ${target})`);
+    continue;
+  }
+  resignPreservingEntitlements(target);
+}
+// Re-sign the enclosing framework so its own seal picks up the freshly-signed nested content,
+// then the outer app so ITS seal picks up the changed nested framework.
+resignPreservingEntitlements(sparkleFramework);
+resignPreservingEntitlements(app);
+console.log("Sparkle.framework nested helpers + framework + outer app re-signed.");
+
+// ---------------------------------------------------------------------------
 // 4. Verify signatures BEFORE spending a notarization submission on a bad build.
 // ---------------------------------------------------------------------------
 console.log("Verifying signatures...");
@@ -160,18 +210,26 @@ try {
 } catch {
   fail(`codesign --verify --deep --strict failed on ${app}`);
 }
-function assertTeam(path: string, label: string) {
+function assertSigned(path: string, label: string) {
   if (!existsSync(path)) fail(`${label} not found at ${path} — build did not embed it as expected`);
   const out = probe(`codesign -dvv "${path}" 2>&1`).stdout;
   if (!out.includes(`TeamIdentifier=${TEAM_ID}`)) {
     fail(`${label}: TeamIdentifier mismatch (expected ${TEAM_ID}):\n${out}`);
   }
+  if (!/^Timestamp=/m.test(out)) {
+    fail(`${label}: missing secure timestamp (notarization will reject this):\n${out}`);
+  }
 }
-assertTeam(app, "Norma.app");
-assertTeam(join(app, "Contents", "Resources", "norma-core"), "norma-core");
-assertTeam(join(app, "Contents", "MacOS", "NormaHelper"), "NormaHelper");
-assertTeam(join(app, "Contents", "Frameworks", "Sparkle.framework"), "Sparkle.framework");
-console.log("Signatures verified: codesign --verify --deep --strict PASS; TeamIdentifier matches on app + norma-core + NormaHelper + Sparkle.framework.");
+assertSigned(app, "Norma.app");
+assertSigned(join(app, "Contents", "Resources", "norma-core"), "norma-core");
+assertSigned(join(app, "Contents", "MacOS", "NormaHelper"), "NormaHelper");
+assertSigned(sparkleFramework, "Sparkle.framework");
+for (const target of nestedSparkleHelpers) {
+  if (existsSync(target)) assertSigned(target, `Sparkle.framework nested helper (${target.split("/").pop()})`);
+}
+console.log(
+  "Signatures verified: codesign --verify --deep --strict PASS; TeamIdentifier + secure timestamp confirmed on app + norma-core + NormaHelper + Sparkle.framework + its nested helpers.",
+);
 
 // ---------------------------------------------------------------------------
 // 5. ditto zip for notarization submission.
