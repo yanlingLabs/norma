@@ -49,16 +49,17 @@ export type SessionApprovalPolicy = "ask" | "auto" | "plan";
 // read BackgroundAgentRegistry/SessionStore state (agent_output never flips `notified`) — same
 // class as task_get/task_list, and must stay allowed under `plan` so a planning session can still
 // check on its background agents.
-// lsp_diagnostics/lsp_definition/lsp_references (phase 5f Task 3) are read-only too: each only
-// queries a language server (spawned/reused via LspManager) or reads a one-line disk preview
-// through the SAME read fence the tool's own `path` arg is held to — no fs/process mutation, same
-// class as read/glob/grep. Must stay allowed under `plan` so a planning session can still look up
-// diagnostics/definitions/references while researching.
+// `lsp` (lsp consolidation T2 — replaces phase 5f's lsp_diagnostics/lsp_definition/lsp_references,
+// net -2) is read-only too: every action only queries a language server (spawned/reused via
+// LspManager) or reads a one-line disk preview through the SAME read fence the tool's own
+// `file_path` arg is held to — no fs/process mutation, same class as read/glob/grep. Must stay
+// allowed under `plan` so a planning session can still look up diagnostics/definitions/references/
+// hover/symbols while researching.
 // T1 (file-based memory, design doc `2026-07-15-file-based-memory-design.md`) DELETED the
 // memory_read/memory_write/memory_delete tools that used to have their own entries here (phase 5b
 // Task 2) — memory reads/writes now go through the plain read/write/edit tools (already
 // classified below), riding their EXISTING gate posture with no new class of its own.
-const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output", "lsp_diagnostics", "lsp_definition", "lsp_references"]);
+const READ_ONLY = new Set(["read", "glob", "grep", "ls", "bash_output", "Skill", "ToolSearch", "ask_user", "task_create", "task_update", "task_list", "task_get", "exit_plan_mode", "enter_plan_mode", "spawn_agent", "send_message", "task_stop", "agent_list", "agent_output", "lsp"]);
 // `computer` (Phase 5 CU) is MUTATING: a computer-use action drives real mouse/keyboard/screen, so
 // it must pass the gate on EVERY call (spec §4.6: "every CU action passes the permission gate") —
 // ask → per-action approval card, auto → allow, plan → deny (CU makes changes). Note this is the

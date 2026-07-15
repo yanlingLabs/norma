@@ -12,12 +12,12 @@ import { Settings } from "../../src/settings";
 import { FakeProvider } from "../../src/agent/fake-provider";
 import { setup } from "./engine-spawn.test";
 
-// Phase 5f Task 4: the closing e2e for LSP integration (T1 LspClient, T2 LspManager, T3 the
-// lsp_diagnostics/lsp_definition/lsp_references tools + daemon wiring). Three beats, per the
-// design doc's own T4 checklist:
-//   1. real engine + T3's registerLspTools + T1's scripted fake server: a model's lsp_diagnostics
-//      call comes back formatted, AND that exact text is what the provider is fed on the NEXT
-//      round (not just something that lands in the session store).
+// Phase 5f Task 4: the closing e2e for LSP integration (T1 LspClient, T2 LspManager, T3 the `lsp`
+// tool — consolidated by lsp-consolidation T2 from the original lsp_diagnostics/lsp_definition/
+// lsp_references three — + daemon wiring). Three beats, per the design doc's own T4 checklist:
+//   1. real engine + T3's registerLspTools + T1's scripted fake server: a model's lsp (action:
+//      diagnostics) call comes back formatted, AND that exact text is what the provider is fed on
+//      the NEXT round (not just something that lands in the session store).
 //   2. settings.lsp.enabled: false mirrors daemon.ts's own boot-time gate (`lspCfg?.enabled !==
 //      false`, daemon.ts phase 5f T4 comment) — registerLspTools is skipped entirely, so the
 //      model's query becomes the registry's ordinary "unknown tool" error, driven through the
@@ -59,9 +59,9 @@ async function withEnv<T>(vars: Record<string, string | undefined>, fn: () => Pr
 type ToolResult = Extract<SessionEvent, { type: "tool_result" }>;
 
 describe.if(isMac)("lsp e2e (phase 5f Task 4): real engine + registerLspTools + T1's fake language server", () => {
-  test("model calls lsp_diagnostics on an in-fence file -> formatted tool_result reaches the provider on the NEXT round", async () => {
+  test("model calls lsp (action: diagnostics) on an in-fence file -> formatted tool_result reaches the provider on the NEXT round", async () => {
     const { engine, sessionId, registry, cwd, dirs, events, provider } = setup([
-      [{ type: "tool_call", callId: "c1", name: "lsp_diagnostics", argsJson: JSON.stringify({ path: "app.ts" }) }, done("tool_calls")],
+      [{ type: "tool_call", callId: "c1", name: "lsp", argsJson: JSON.stringify({ action: "diagnostics", file_path: "app.ts" }) }, done("tool_calls")],
       text("looked into it"),
     ]);
     writeFileSync(join(cwd, "app.ts"), "const x = 1;\n");
@@ -75,8 +75,8 @@ describe.if(isMac)("lsp e2e (phase 5f Task 4): real engine + registerLspTools + 
         ]),
       }, () => engine.runTurn(sessionId));
 
-      // No approval card anywhere — lsp_diagnostics is READ_ONLY (gate.ts), so it never rides the
-      // ordinary ask/auto approval flow regardless of the session's policy.
+      // No approval card anywhere — lsp is READ_ONLY (gate.ts), so it never rides the ordinary
+      // ask/auto approval flow regardless of the session's policy.
       expect(events.some((e) => e.type === "approval_requested")).toBe(false);
 
       const toolResult = events.find((e) => e.type === "tool_result" && e.callId === "c1") as ToolResult;
@@ -137,7 +137,7 @@ describe("lsp settings gating (phase 5f Task 4): enabled:false mirrors daemon.ts
   test("settings.lsp.enabled === false -> registerLspTools is never called -> the model's query is the registry's ordinary \"unknown tool\" error", async () => {
     const settings = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, lsp: { enabled: false } });
     const { engine, sessionId, registry, events } = setup([
-      [{ type: "tool_call", callId: "c1", name: "lsp_diagnostics", argsJson: JSON.stringify({ path: "app.ts" }) }, done("tool_calls")],
+      [{ type: "tool_call", callId: "c1", name: "lsp", argsJson: JSON.stringify({ action: "diagnostics", file_path: "app.ts" }) }, done("tool_calls")],
       text("noted"),
     ]);
 
@@ -155,14 +155,14 @@ describe("lsp settings gating (phase 5f Task 4): enabled:false mirrors daemon.ts
 
     await engine.runTurn(sessionId);
     const toolResult = events.find((e) => e.type === "tool_result" && e.callId === "c1") as ToolResult;
-    expect(toolResult).toMatchObject({ isError: true, output: "unknown tool: lsp_diagnostics" });
+    expect(toolResult).toMatchObject({ isError: true, output: "unknown tool: lsp" });
   });
 
-  test("settings.lsp block absent, and enabled: true, both leave the tools registered (default-ON, same shape as reviewer.enabled/titles.enabled)", async () => {
+  test("settings.lsp block absent, and enabled: true, both leave the tool registered (default-ON, same shape as reviewer.enabled/titles.enabled)", async () => {
     for (const lsp of [undefined, { enabled: true }] as const) {
       const settings = Settings.parse({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" }, ...(lsp ? { lsp } : {}) });
       const { engine, sessionId, registry, events } = setup([
-        [{ type: "tool_call", callId: "c1", name: "lsp_diagnostics", argsJson: JSON.stringify({ path: "app.ts" }) }, done("tool_calls")],
+        [{ type: "tool_call", callId: "c1", name: "lsp", argsJson: JSON.stringify({ action: "diagnostics", file_path: "app.ts" }) }, done("tool_calls")],
         text("noted"),
       ]);
       const lspCfg = settings.lsp;
@@ -208,7 +208,7 @@ describe.if(isMac && hasSourceKitLsp())("OPTIONAL real smoke: sourcekit-lsp diag
     const r = new ToolRegistry();
     registerLspTools(r, { lsp, cwdOf: () => root, rootsOf: () => [root] });
     try {
-      const out = await r.execute("lsp_diagnostics", { path: "Bad.swift" }, { cwd: "/wrong", roots: ["/wrong"], sessionId: "s1" });
+      const out = await r.execute("lsp", { action: "diagnostics", file_path: "Bad.swift" }, { cwd: "/wrong", roots: ["/wrong"], sessionId: "s1" });
       expect(out.isError).toBe(false);
       expect(out.output).toContain("error");
       expect(out.output).toContain("Int"); // the type sourcekit-lsp actually names in this mismatch

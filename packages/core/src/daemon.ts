@@ -528,8 +528,9 @@ export async function startDaemon(opts: {
     // `routineStore` is hoisted above this gate for exactly this sharing (see its own doc comment).
     // Deferred like worktree/notebook/plan above — a specialized tool, not needed in every turn.
     registerScheduleTool(registry, { routines: routineStore }, { deferred: true });
-    // Phase 5f Task 3: lsp_diagnostics/lsp_definition/lsp_references — ONE LspManager for the whole
-    // daemon (mirrors the ONE-MemoryStore/ONE-McpManager precedent above), reaped on shutdown below.
+    // Phase 5f Task 3, consolidated into the single `lsp` tool by lsp-consolidation T2 (design doc
+    // `2026-07-15-lsp-consolidation-design.md`): ONE LspManager for the whole daemon (mirrors the
+    // ONE-MemoryStore/ONE-McpManager precedent above), reaped on shutdown below.
     // NOTE: unlike the SYNCHRONOUS mcp?.stopAll()/pluginSupervisor.stopAll() kills, LspClient's stop
     // is async — so shutdown uses lspManager.killAllNow() (synchronous SIGTERM backstop) BEFORE the
     // graceful `void stopAll()`; see the daemon.stop() body. `cwdOf`/`rootsOf`/`tmpDirOf`
@@ -538,8 +539,8 @@ export async function startDaemon(opts: {
     //
     // Phase 5f Task 4: default ON, same boot-snapshot `cfg?.enabled === false` shape as
     // reviewer/titles above — an explicit `settings.lsp.enabled: false` is the only way to skip
-    // this whole block, so when off the three lsp_* tools are simply never registered (a query for
-    // one becomes the registry's ordinary "unknown tool" error, no special-cased denial).
+    // this whole block, so when off the `lsp` tool is simply never registered (a query for it
+    // becomes the registry's ordinary "unknown tool" error, no special-cased denial).
     // `idleShutdownMs` threads straight from settings into the SAME LspManager constructor call.
     const lspCfg = settings?.lsp;
     // hot-settings T5b: named (not inline-arrow) so a later lsp.enabled hot re-enable (the apply
@@ -731,9 +732,7 @@ export async function startDaemon(opts: {
         registerLspTools(registry, { lsp: mgr, cwdOf, rootsOf, tmpDirOf }); // SAME session-meta sources as the boot registration above
       },
       teardownLsp: async () => {
-        registry.unregister("lsp_diagnostics");
-        registry.unregister("lsp_definition");
-        registry.unregister("lsp_references");
+        registry.unregister("lsp");
         const m = lspManager;
         lspManager = null;
         await m?.stopAll();

@@ -22,7 +22,7 @@ export interface SettingsApplyDeps {
   // lsp:
   buildLspManager: (s: Settings) => LspManager;
   registerLsp: (mgr: LspManager) => void; // registerLspTools(registry, {...})
-  teardownLsp: () => Promise<void> | void; // unregister the 3 lsp tools + lspManager.stopAll()
+  teardownLsp: () => Promise<void> | void; // unregister the `lsp` tool + lspManager.stopAll()
   // File-based memory hot-toggle (T3, design doc follow-up / task-23): re-runs the T2 migration
   // importer (`migrateMemoryStore`, agent/memory-migrate.ts) the moment `memory.enabled` flips
   // false→true on an ALREADY-RUNNING daemon — closing the gap T2 left (boot-time-only migration,

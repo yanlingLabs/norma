@@ -204,7 +204,7 @@ describe("hot-settings T5b e2e: SettingsWatcher wired into a running daemon", ()
     c.close();
   });
 
-  test("LSP disable: writing lsp.enabled:false unregisters the 3 lsp_* tools live", async () => {
+  test("LSP disable: writing lsp.enabled:false unregisters the lsp tool live", async () => {
     const home = mkdtempSync(join(tmpdir(), "norma-hot-e2e-lsp-"));
     writeSettingsFile(home); // lsp absent → default ON
     const secrets = new FileSecretStore(join(home, "test-secrets"));
@@ -218,7 +218,7 @@ describe("hot-settings T5b e2e: SettingsWatcher wired into a running daemon", ()
     await c.request(METHODS.sessionAttach, { sessionId: created.sessionId, fromSeq: 0 });
 
     await driveTurn(c, created.sessionId, "hello");
-    expect(fake.requests[0]!.tools?.map((t) => t.name)).toContain("lsp_diagnostics");
+    expect(fake.requests[0]!.tools?.map((t) => t.name)).toContain("lsp");
 
     writeSettingsFile(home, { lsp: { enabled: false } });
 
@@ -227,7 +227,7 @@ describe("hot-settings T5b e2e: SettingsWatcher wired into a running daemon", ()
     while (Date.now() < deadline) {
       await driveTurn(c, created.sessionId, "poll");
       const names = fake.requests[fake.requests.length - 1]!.tools?.map((t) => t.name) ?? [];
-      if (!names.includes("lsp_diagnostics") && !names.includes("lsp_definition") && !names.includes("lsp_references")) {
+      if (!names.includes("lsp")) {
         lspGone = true;
         break;
       }
