@@ -5,7 +5,9 @@ const DEFAULT_TITLE = "Norma";
 
 const PushNotificationArgs = z.object({
   message: z.string().min(1).max(500),
-  title: z.string().max(100).optional(),
+  // .min(1) mirrors the wire event's own bound (review finding: an explicit "" passed `??` and
+  // surfaced a raw ZodError from the store's event validation instead of a clean tool rejection).
+  title: z.string().min(1).max(100).optional(),
 });
 
 /**
