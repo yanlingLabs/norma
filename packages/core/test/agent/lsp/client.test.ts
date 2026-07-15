@@ -1,6 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { join } from "node:path";
-import { LspClient, LspTimeoutError, LspServerExitedError, LspNotSupportedError } from "../../../src/agent/lsp/client";
+import { LspClient, LspTimeoutError, LspServerExitedError, LspNotSupportedError, LspRequestError } from "../../../src/agent/lsp/client";
 
 const FIXTURE = join(import.meta.dir, "fake-server.ts");
 const isMac = process.platform === "darwin";
@@ -237,6 +237,18 @@ describe.if(isMac)("LspClient", () => {
       const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
       await c.start();
       await expect(c.hover("file:///workspace/a.ts", "const x = 1;", 0, 6)).rejects.toThrow(LspNotSupportedError);
+      await c.stop();
+    });
+  });
+
+  test("hover(): a DIFFERENT RPC error code (-32000) propagates as a plain LspRequestError, NOT LspNotSupportedError — only -32601 means 'unsupported'", async () => {
+    await withEnv({ NORMA_LSP_FAKE_RPC_ERROR: "textDocument/hover:-32000" }, async () => {
+      const c = new LspClient({ command: "bun", args: ["run", FIXTURE], rootUri: ROOT_URI });
+      await c.start();
+      const err = await c.hover("file:///workspace/a.ts", "const x = 1;", 0, 6).then(() => null, (e: unknown) => e);
+      expect(err).toBeInstanceOf(LspRequestError);
+      expect(err).not.toBeInstanceOf(LspNotSupportedError);
+      expect((err as LspRequestError).code).toBe(-32000);
       await c.stop();
     });
   });

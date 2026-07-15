@@ -113,6 +113,32 @@ describe.if(isMac)("autoDiagnosticsSuffix: real fake-server integration", () => 
       await lsp.stopAll();
     }
   });
+
+  test("abort mid-diagnostics-wait -> '' PROMPTLY (well under the diag timeout), write result intact (whole-branch review fast-follow)", async () => {
+    const root = freshDir();
+    writeFileSync(join(root, "slow.ts"), "const x = 1;\n");
+    // The server NEVER publishes (NORMA_LSP_FAKE_NO_DIAGNOSTICS) — without the abort race, this
+    // call would ride out the FULL per-language deadline (DIAG_TUNING.typescript.timeoutMs = 8s,
+    // the manager's default wiring). Pre-warm the client OUTSIDE the timed window so the abort
+    // deterministically lands mid-DIAGNOSTICS-wait, not mid-spawn.
+    const lsp = new RealLspManager({ serverCommands: { typescript: FAKE } });
+    try {
+      await withEnv({ NORMA_LSP_FAKE_NO_DIAGNOSTICS: "1" }, async () => {
+        await lsp.clientFor(root, "typescript"); // pre-warm
+        const ac = new AbortController();
+        setTimeout(() => ac.abort(), 100);
+        const startedAt = Date.now();
+        const out = await autoDiagnosticsSuffix({
+          lsp, toolName: "write", args: { path: "slow.ts" }, cwd: root, roots: [root], signal: ac.signal,
+        });
+        const elapsed = Date.now() - startedAt;
+        expect(out).toBe(""); // never-fail: the write result stays exactly what the tool returned
+        expect(elapsed).toBeLessThan(2000); // resolved at the ~100ms abort, nowhere near the 8s deadline
+      });
+    } finally {
+      await lsp.stopAll();
+    }
+  });
 });
 
 describe("autoDiagnosticsSuffix: never-fail contract (no real process spawned)", () => {
@@ -174,6 +200,17 @@ describe("autoDiagnosticsSuffix: never-fail contract (no real process spawned)",
       clientFor: async () => ({ diagnostics: async () => { throw new Error("diagnostics timed out"); } }),
     } as unknown as LspManager;
     const out = await autoDiagnosticsSuffix({ lsp: timeoutLsp, toolName: "write", args: { path: "app.ts" }, cwd: root, roots: [root] });
+    expect(out).toBe("");
+  });
+
+  test("signal ALREADY aborted at entry -> '' , lsp never touched (no cold-spawn for an interrupted turn)", async () => {
+    const root = freshDir();
+    writeFileSync(join(root, "app.ts"), "x\n");
+    const ac = new AbortController();
+    ac.abort();
+    const out = await autoDiagnosticsSuffix({
+      lsp: untouchableLsp, toolName: "write", args: { path: "app.ts" }, cwd: root, roots: [root], signal: ac.signal,
+    });
     expect(out).toBe("");
   });
 });

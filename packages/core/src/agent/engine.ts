@@ -3258,7 +3258,10 @@ export class AgentEngine {
     if (!result.isError && AUTO_DIAG_TOOL_NAMES.has(call.name)) {
       const mgr = this.cfg.lsp?.();
       if (mgr && this.cfg.autoDiagnosticsEnabled?.() !== false) {
-        const suffix = await autoDiagnosticsSuffix({ lsp: mgr, toolName: call.name, args, cwd, roots });
+        // `signal` (the turn's own abort signal) makes an ESC/interrupt cut the diagnostics wait
+        // short — the suffix resolves "" promptly instead of riding out the full per-language
+        // settle/timeout window (whole-branch review fast-follow).
+        const suffix = await autoDiagnosticsSuffix({ lsp: mgr, toolName: call.name, args, cwd, roots, signal });
         if (suffix) return { ...result, output: result.output + suffix };
       }
     }

@@ -27,6 +27,11 @@
 //                                     implementation are all optional per the LSP spec; definition/
 //                                     references/diagnostics are not, so this repo never exercises
 //                                     them through this toggle).
+//   NORMA_LSP_FAKE_RPC_ERROR          <method>:<code> — answer that method with the given JSON-RPC
+//                                     error code (e.g. "textDocument/hover:-32000"). The vehicle
+//                                     for the -32601-discrimination NEGATIVE test: only -32601
+//                                     means "unsupported", so any OTHER code must propagate as a
+//                                     plain LspRequestError, never LspNotSupportedError.
 //   NORMA_LSP_FAKE_SPLIT=1            split the NEXT definition response body across two
 //                                     stdout writes (20ms apart) — partial-frame reassembly
 //   NORMA_LSP_FAKE_MERGE=1            hold the definition response until the following
@@ -65,6 +70,14 @@ const openUris = new Set<string>(); // tracks didOpen'd docs for NORMA_LSP_FAKE_
 const FORCED_UNSUPPORTED = new Set(
   (process.env.NORMA_LSP_FAKE_UNSUPPORTED ?? "").split(",").map((s) => s.trim()).filter(Boolean),
 );
+// NORMA_LSP_FAKE_RPC_ERROR=<method>:<code> — lastIndexOf, not split(":"), because the method name
+// itself contains no colon but the CODE is negative (e.g. "textDocument/hover:-32000").
+const FORCED_RPC_ERROR = (() => {
+  const raw = process.env.NORMA_LSP_FAKE_RPC_ERROR;
+  if (!raw) return null;
+  const cut = raw.lastIndexOf(":");
+  return { method: raw.slice(0, cut), code: Number(raw.slice(cut + 1)) };
+})();
 
 function canned<T>(envVar: string, fallback: T): T {
   const raw = process.env[envVar];
@@ -81,6 +94,10 @@ function handle(msg: any): void {
   if (FORCED_UNSUPPORTED.has(method)) {
     if (typeof id !== "undefined" && id !== null) send({ jsonrpc: "2.0", id, error: { code: -32601, message: `method not found: ${method}` } });
     return; // simulated missing-capability response — takes priority over any normal handler below
+  }
+  if (FORCED_RPC_ERROR && method === FORCED_RPC_ERROR.method) {
+    if (typeof id !== "undefined" && id !== null) send({ jsonrpc: "2.0", id, error: { code: FORCED_RPC_ERROR.code, message: `forced rpc error for ${method}` } });
+    return; // a NON--32601 error — must surface to callers as a plain LspRequestError
   }
   switch (method) {
     case "initialize":

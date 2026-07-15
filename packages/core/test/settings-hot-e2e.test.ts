@@ -88,9 +88,9 @@ function sleep(ms: number): Promise<void> {
  *  precedent as server.test.ts's own `settingsOverride` doc comment calls out for the reviewer.
  *  `toolSearch: {enabled:false}` is also baked into the base: ToolSearch deferral is default-ON
  *  (engine.ts's `toolSearchEnabled()` — `cfg.toolSearch` is always set by daemon.ts, so an absent
- *  `settings.toolSearch.enabled` resolves `!== false` to true) and the 3 lsp_* tools are registered
- *  `deferred: true` (agent/tools/lsp.ts) — left on, they'd never appear in `req.tools` at all
- *  (deferred out to the "# Deferred tools" instructions section instead), which is a confound
+ *  `settings.toolSearch.enabled` resolves `!== false` to true) and the single `lsp` tool is
+ *  registered `deferred: true` (agent/tools/lsp.ts) — left on, it'd never appear in `req.tools` at
+ *  all (deferred out to the "# Deferred tools" instructions section instead), which is a confound
  *  unrelated to what this suite is testing (live enable/disable, not ToolSearch's own deferral). */
 function writeSettingsFile(home: string, overrides: Record<string, unknown> = {}): void {
   writeFileSync(

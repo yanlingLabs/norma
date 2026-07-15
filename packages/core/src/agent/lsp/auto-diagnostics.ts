@@ -75,6 +75,8 @@ function formatBlock(displayPath: string, diags: LspDiagnostic[]): string {
     .map((d) => `${displayPath}:${d.line + 1}:${d.character + 1} ${severityWord(d.severity)} ${d.message}`);
   const extra = ordered.length - AUTO_DIAG_CAP;
   const list = extra > 0 ? `${shown.join("\n")}\n…and ${extra} more` : shown.join("\n");
+  // `rest.length` DELIBERATELY folds severities 3/4 (info/hint) into the "warnings" count — the
+  // header is two-bucket by spec; entry lines above keep their true severity word. Don't "fix".
   return `\n\ndiagnostics (${errors.length} errors, ${rest.length} warnings):\n${list}`;
 }
 
@@ -84,6 +86,33 @@ export interface AutoDiagnosticsOpts {
   args: unknown; // the tool call's already-parsed args (JSON.parse'd by executeCall)
   cwd: string; // workspace root to spawn/reuse the language server against (executeCall's own `cwd`)
   roots: string[]; // fence roots the file path is resolved against (executeCall's own `roots`)
+  // The TURN's abort signal (executeCall's own `signal` — whole-branch review fast-follow): an
+  // ESC/interrupt mid-diagnostics-wait must not delay the visible abort by up to the per-language
+  // diag timeout (30s for Swift). Optional — absent (a caller/test that doesn't care) behaves
+  // exactly as before this was added.
+  signal?: AbortSignal;
+}
+
+/** Rejects the moment `signal` aborts (or immediately if it already has) — raced against the
+ *  spawn/diagnostics waits below so an interrupt cuts this suffix short WITHOUT touching
+ *  LspClient (whose `diagnostics()` has no signal parameter; the abandoned promise self-cleans
+ *  via the client's own settle/deadline timers, and Promise.race already attached a handler to
+ *  it, so a late rejection is never unhandled). The abort listener is removed in `finally`
+ *  either way: the turn's signal outlives this call, so a leaked once-listener per edit would
+ *  otherwise accumulate for the whole turn. */
+async function raceAbort<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return p;
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new Error("turn aborted"));
+    if (signal.aborted) { onAbort(); return; }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([p, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 /** Returns the block to APPEND to a write/edit/notebook_edit tool_result, or "" when there is
@@ -97,9 +126,13 @@ export async function autoDiagnosticsSuffix(opts: AutoDiagnosticsOpts): Promise<
     const language = languageForPath(filePath);
     if (!language) return ""; // extension has no configured language server (e.g. .ipynb, .md)
     const abs = resolveWithinAny(opts.roots, filePath); // the SAME fence the write/edit itself was held to
-    const client = await opts.lsp.clientFor(opts.cwd, language); // may cold-spawn; bounded by startTimeoutMs
+    if (opts.signal?.aborted) return ""; // already interrupted — don't even cold-spawn a server
+    const client = await raceAbort(opts.lsp.clientFor(opts.cwd, language), opts.signal); // may cold-spawn; bounded by startTimeoutMs
     const text = readFileSync(abs, "utf8");
-    const diags = await client.diagnostics(toFileUri(abs), text); // bounded by DIAG_TUNING[language]
+    // Bounded by DIAG_TUNING[language] AND raced against the turn's abort — an interrupt resolves
+    // "" promptly (raceAbort's rejection lands in this function's never-fail catch below) instead
+    // of riding out the full settle/timeout window.
+    const diags = await raceAbort(client.diagnostics(toFileUri(abs), text), opts.signal);
     return formatBlock(filePath, diags);
   } catch {
     return ""; // never-fail — see this file's own doc comment
