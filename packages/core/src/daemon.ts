@@ -8,7 +8,7 @@ import { KeychainSecretStore, type SecretStore } from "./auth/secret-store";
 import { SessionStore } from "./sessions/store";
 import { SessionHub } from "./sessions/hub";
 import { startIpcServer, type IpcServer, type IpcServerOptions } from "./ipc/server";
-import { loadSettings, loadPermissionDirs, hooksEnabledFrom, memoryEnabledFrom } from "./settings";
+import { loadSettings, loadPermissionDirs, hooksEnabledFrom, memoryEnabledFrom, lspAutoDiagnosticsEnabledFrom } from "./settings";
 import { memoryDirFor, globalMemoryDirFor } from "./agent/memory-dir";
 import { migrateMemoryStore } from "./agent/memory-migrate";
 import { createProvider } from "./providers/manager";
@@ -528,8 +528,9 @@ export async function startDaemon(opts: {
     // `routineStore` is hoisted above this gate for exactly this sharing (see its own doc comment).
     // Deferred like worktree/notebook/plan above — a specialized tool, not needed in every turn.
     registerScheduleTool(registry, { routines: routineStore }, { deferred: true });
-    // Phase 5f Task 3: lsp_diagnostics/lsp_definition/lsp_references — ONE LspManager for the whole
-    // daemon (mirrors the ONE-MemoryStore/ONE-McpManager precedent above), reaped on shutdown below.
+    // Phase 5f Task 3, consolidated into the single `lsp` tool by lsp-consolidation T2 (design doc
+    // `2026-07-15-lsp-consolidation-design.md`): ONE LspManager for the whole daemon (mirrors the
+    // ONE-MemoryStore/ONE-McpManager precedent above), reaped on shutdown below.
     // NOTE: unlike the SYNCHRONOUS mcp?.stopAll()/pluginSupervisor.stopAll() kills, LspClient's stop
     // is async — so shutdown uses lspManager.killAllNow() (synchronous SIGTERM backstop) BEFORE the
     // graceful `void stopAll()`; see the daemon.stop() body. `cwdOf`/`rootsOf`/`tmpDirOf`
@@ -538,8 +539,8 @@ export async function startDaemon(opts: {
     //
     // Phase 5f Task 4: default ON, same boot-snapshot `cfg?.enabled === false` shape as
     // reviewer/titles above — an explicit `settings.lsp.enabled: false` is the only way to skip
-    // this whole block, so when off the three lsp_* tools are simply never registered (a query for
-    // one becomes the registry's ordinary "unknown tool" error, no special-cased denial).
+    // this whole block, so when off the `lsp` tool is simply never registered (a query for it
+    // becomes the registry's ordinary "unknown tool" error, no special-cased denial).
     // `idleShutdownMs` threads straight from settings into the SAME LspManager constructor call.
     const lspCfg = settings?.lsp;
     // hot-settings T5b: named (not inline-arrow) so a later lsp.enabled hot re-enable (the apply
@@ -627,6 +628,10 @@ export async function startDaemon(opts: {
     // settings.json at boot, or a test injecting `agentProvider` directly) — `true` there is the
     // SAME fail-open default the pre-collapse disk-read-failure catch used.
     const hooksEnabledHot = (): boolean => (settings ? hooksEnabledFrom(settings) : true);
+    // lsp-consolidation T3: same live-getter shape as `hooksEnabledHot`/`memoryEnabledHot` above —
+    // `settings` can still be null (malformed settings.json at boot, or a test that injects
+    // `agentProvider` directly), `true` there is the same fail-open default those two use.
+    const lspAutoDiagnosticsHot = (): boolean => (settings ? lspAutoDiagnosticsEnabledFrom(settings) : true);
     const hookFacade = new HookFacade({ registry: hookRegistry, runner: new HookRunner(), hooksEnabled: hooksEnabledHot });
     engine = new AgentEngine({
       store, hub, registry, broker: approvalBroker,
@@ -688,6 +693,14 @@ export async function startDaemon(opts: {
       // T5a — now resolves LIVE: a hot enable/disable is visible on this session's NEXT tool ctx
       // with no engine reconstruction.
       computerUse: () => computerUse,
+      // lsp-consolidation T3: mirrors `computerUse`'s own getter-over-a-hot-rebuilt-holder shape —
+      // `lspManager` is the SAME `let` binding registerLsp/teardownLsp (settings-apply.ts, below)
+      // reassign on an `lsp.enabled` hot flip, so this resolves live: a disable is invisible to a
+      // NEW tool call the instant teardownLsp clears the holder, no engine reconstruction. `??
+      // undefined` just normalizes the `LspManager | null` holder to EngineConfig's `| undefined`
+      // field type (the getter itself, not the holder, is what's optional on EngineConfig).
+      lsp: () => lspManager ?? undefined,
+      autoDiagnosticsEnabled: lspAutoDiagnosticsHot,
       toolSearch: {
         enabled: () => settings?.toolSearch?.enabled,
         deferThreshold: () => settings?.toolSearch?.deferThreshold ?? Number(process.env.NORMA_TOOLSEARCH_THRESHOLD ?? 12),
@@ -731,9 +744,7 @@ export async function startDaemon(opts: {
         registerLspTools(registry, { lsp: mgr, cwdOf, rootsOf, tmpDirOf }); // SAME session-meta sources as the boot registration above
       },
       teardownLsp: async () => {
-        registry.unregister("lsp_diagnostics");
-        registry.unregister("lsp_definition");
-        registry.unregister("lsp_references");
+        registry.unregister("lsp");
         const m = lspManager;
         lspManager = null;
         await m?.stopAll();

@@ -15,6 +15,23 @@
 //                                     window: resolve-on-first-publish would wrongly return [].
 //   NORMA_LSP_FAKE_DEFINITION         JSON array/object result for textDocument/definition
 //   NORMA_LSP_FAKE_REFERENCES         JSON array result for textDocument/references
+//   NORMA_LSP_FAKE_HOVER              JSON Hover-shaped result (or `null`) for textDocument/hover
+//   NORMA_LSP_FAKE_DOCUMENT_SYMBOLS   JSON array result (DocumentSymbol[] or SymbolInformation[])
+//                                     for textDocument/documentSymbol
+//   NORMA_LSP_FAKE_WORKSPACE_SYMBOLS  JSON array result (SymbolInformation[]) for workspace/symbol
+//   NORMA_LSP_FAKE_IMPLEMENTATION     JSON array/object result for textDocument/implementation
+//   NORMA_LSP_FAKE_UNSUPPORTED        comma-separated method names to answer with -32601 "method
+//                                     not found" regardless of any other canned/default handling —
+//                                     simulates a server that doesn't implement an OPTIONAL
+//                                     capability (hover/documentSymbol/workspace/symbol/
+//                                     implementation are all optional per the LSP spec; definition/
+//                                     references/diagnostics are not, so this repo never exercises
+//                                     them through this toggle).
+//   NORMA_LSP_FAKE_RPC_ERROR          <method>:<code> — answer that method with the given JSON-RPC
+//                                     error code (e.g. "textDocument/hover:-32000"). The vehicle
+//                                     for the -32601-discrimination NEGATIVE test: only -32601
+//                                     means "unsupported", so any OTHER code must propagate as a
+//                                     plain LspRequestError, never LspNotSupportedError.
 //   NORMA_LSP_FAKE_SPLIT=1            split the NEXT definition response body across two
 //                                     stdout writes (20ms apart) — partial-frame reassembly
 //   NORMA_LSP_FAKE_MERGE=1            hold the definition response until the following
@@ -50,16 +67,37 @@ function sendSplitBody(msg: unknown): void {
 
 let heldDefinitionFrame: Buffer | null = null;
 const openUris = new Set<string>(); // tracks didOpen'd docs for NORMA_LSP_FAKE_REQUIRE_OPEN
+const FORCED_UNSUPPORTED = new Set(
+  (process.env.NORMA_LSP_FAKE_UNSUPPORTED ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+);
+// NORMA_LSP_FAKE_RPC_ERROR=<method>:<code> — lastIndexOf, not split(":"), because the method name
+// itself contains no colon but the CODE is negative (e.g. "textDocument/hover:-32000").
+const FORCED_RPC_ERROR = (() => {
+  const raw = process.env.NORMA_LSP_FAKE_RPC_ERROR;
+  if (!raw) return null;
+  const cut = raw.lastIndexOf(":");
+  return { method: raw.slice(0, cut), code: Number(raw.slice(cut + 1)) };
+})();
 
 function canned<T>(envVar: string, fallback: T): T {
   const raw = process.env[envVar];
-  return raw ? (JSON.parse(raw) as T) : fallback;
+  // `raw` can legitimately be the literal string "null" (NORMA_LSP_FAKE_HOVER: "null") — JSON.parse
+  // handles that correctly; only an ABSENT env var falls back to `fallback`.
+  return raw !== undefined ? (JSON.parse(raw) as T) : fallback;
 }
 
 function handle(msg: any): void {
   const { id, method, params } = msg;
   if (process.env.NORMA_LSP_FAKE_DIE_ON && method === process.env.NORMA_LSP_FAKE_DIE_ON) {
     process.exit(1); // no response ever written — client must see this as a request-in-flight death
+  }
+  if (FORCED_UNSUPPORTED.has(method)) {
+    if (typeof id !== "undefined" && id !== null) send({ jsonrpc: "2.0", id, error: { code: -32601, message: `method not found: ${method}` } });
+    return; // simulated missing-capability response — takes priority over any normal handler below
+  }
+  if (FORCED_RPC_ERROR && method === FORCED_RPC_ERROR.method) {
+    if (typeof id !== "undefined" && id !== null) send({ jsonrpc: "2.0", id, error: { code: FORCED_RPC_ERROR.code, message: `forced rpc error for ${method}` } });
+    return; // a NON--32601 error — must surface to callers as a plain LspRequestError
   }
   switch (method) {
     case "initialize":
@@ -116,6 +154,35 @@ function handle(msg: any): void {
       } else {
         process.stdout.write(respFrame);
       }
+      break;
+    }
+    case "textDocument/hover": {
+      const result = canned("NORMA_LSP_FAKE_HOVER", { contents: { kind: "markdown", value: "canned hover" } });
+      send({ jsonrpc: "2.0", id, result });
+      break;
+    }
+    case "textDocument/documentSymbol": {
+      const result = canned("NORMA_LSP_FAKE_DOCUMENT_SYMBOLS", [
+        { name: "target", kind: 12, range: { start: { line: 3, character: 0 }, end: { line: 3, character: 20 } }, selectionRange: { start: { line: 3, character: 9 }, end: { line: 3, character: 15 } } },
+      ]);
+      send({ jsonrpc: "2.0", id, result });
+      break;
+    }
+    case "workspace/symbol": {
+      const result = canned("NORMA_LSP_FAKE_WORKSPACE_SYMBOLS", [
+        { name: "target", kind: 12, location: { uri: "file:///workspace/target.ts", range: { start: { line: 3, character: 9 } } } },
+      ]);
+      send({ jsonrpc: "2.0", id, result });
+      break;
+    }
+    case "textDocument/implementation": {
+      if (process.env.NORMA_LSP_FAKE_REQUIRE_OPEN === "1" && !openUris.has(params?.textDocument?.uri)) {
+        send({ jsonrpc: "2.0", id, result: null }); break; // real servers: no answer for an unopened doc
+      }
+      const result = canned("NORMA_LSP_FAKE_IMPLEMENTATION", [
+        { uri: "file:///workspace/impl.ts", range: { start: { line: 14, character: 2 }, end: { line: 14, character: 8 } } },
+      ]);
+      send({ jsonrpc: "2.0", id, result });
       break;
     }
     case "shutdown":
