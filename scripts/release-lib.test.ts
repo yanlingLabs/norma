@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { appcastItem, caskFrom, preflight } from "./release-lib";
+import { appcastItem, caskFrom, dmgStagePlan, preflight, publishGuard } from "./release-lib";
 
 describe("preflight", () => {
   test("every check passing -> ok with no failures", () => {
@@ -95,5 +95,79 @@ end
     expect(rendered).toContain('name "Norma 0.2.002"');
     expect(rendered).not.toContain("{{");
     expect(rendered).not.toContain("}}");
+  });
+});
+
+describe("dmgStagePlan", () => {
+  test("plans a copy of the app plus an /Applications symlink", () => {
+    const ops = dmgStagePlan("/out/release/0.2.002/dd/Build/Products/Release/Norma.app");
+    expect(ops).toEqual([
+      {
+        kind: "copy",
+        source: "/out/release/0.2.002/dd/Build/Products/Release/Norma.app",
+        destName: "Norma.app",
+      },
+      { kind: "symlink", source: "/Applications", destName: "Applications" },
+    ]);
+  });
+
+  test("throws on a path that doesn't end in .app", () => {
+    expect(() => dmgStagePlan("/out/release/0.2.002/Norma.zip")).toThrow();
+  });
+
+  test("tolerates a trailing slash on the app path", () => {
+    const ops = dmgStagePlan("/tmp/Norma.app/");
+    expect(ops[0]).toEqual({ kind: "copy", source: "/tmp/Norma.app/", destName: "Norma.app" });
+  });
+});
+
+describe("publishGuard", () => {
+  const base = { version: "0.2.002" };
+
+  test("--dry-run always skips publish (even with a stale tag/release), reporting a skip-list", () => {
+    const g = publishGuard({ dryRun: true, resumePublish: false, tagExists: true, releaseExists: true, ...base });
+    expect(g.action).toBe("dry-run-skip");
+    expect(g.lines.length).toBeGreaterThan(0);
+    expect(g.lines.join("\n")).toContain("v0.2.002");
+  });
+
+  test("tag already exists -> abort with the exact line", () => {
+    const g = publishGuard({ dryRun: false, resumePublish: false, tagExists: true, releaseExists: false, ...base });
+    expect(g.action).toBe("abort");
+    expect(g.lines).toEqual([
+      "tag v0.2.002 already exists — aborting to avoid double-publish (pass --resume-publish if a prior publish attempt partially completed)",
+    ]);
+  });
+
+  test("release already exists -> abort with the exact line", () => {
+    const g = publishGuard({ dryRun: false, resumePublish: false, tagExists: false, releaseExists: true, ...base });
+    expect(g.action).toBe("abort");
+    expect(g.lines).toEqual([
+      "release v0.2.002 already exists on GitHub — aborting to avoid double-publish (pass --resume-publish if a prior publish attempt partially completed)",
+    ]);
+  });
+
+  test("both tag and release exist -> aggregates both abort lines", () => {
+    const g = publishGuard({ dryRun: false, resumePublish: false, tagExists: true, releaseExists: true, ...base });
+    expect(g.action).toBe("abort");
+    expect(g.lines.length).toBe(2);
+  });
+
+  test("--resume-publish with no existing release -> abort, nothing to resume", () => {
+    const g = publishGuard({ dryRun: false, resumePublish: true, tagExists: false, releaseExists: false, ...base });
+    expect(g.action).toBe("abort");
+    expect(g.lines).toEqual(["--resume-publish given but release v0.2.002 does not exist — nothing to resume"]);
+  });
+
+  test("--resume-publish with an existing release -> resume, no abort lines", () => {
+    const g = publishGuard({ dryRun: false, resumePublish: true, tagExists: true, releaseExists: true, ...base });
+    expect(g.action).toBe("resume");
+    expect(g.lines).toEqual([]);
+  });
+
+  test("clean state, not dry-run, not resuming -> publish", () => {
+    const g = publishGuard({ dryRun: false, resumePublish: false, tagExists: false, releaseExists: false, ...base });
+    expect(g.action).toBe("publish");
+    expect(g.lines).toEqual([]);
   });
 });

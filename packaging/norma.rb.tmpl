@@ -1,0 +1,19 @@
+# Homebrew cask template for Norma. Rendered per release by scripts/release.ts
+# (caskFrom in scripts/release-lib.ts) into out/release/<version>/norma.rb — this .tmpl is
+# the only copy committed to the repo; the rendered file is per-release build output.
+#
+# Slots interpolated at release time: {{version}}, {{sha256}} (of the release DMG),
+# {{url}} (the GitHub release asset URL for that DMG).
+cask "norma" do
+  version "{{version}}"
+  sha256 "{{sha256}}"
+
+  url "{{url}}"
+  name "Norma"
+  desc "Menu bar app for the Norma AI engine"
+  homepage "https://github.com/evaprotocol/norma"
+
+  auto_updates true
+
+  app "Norma.app"
+end
