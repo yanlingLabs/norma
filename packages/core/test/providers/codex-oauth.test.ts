@@ -38,7 +38,7 @@ describe("CodexOAuthProvider", () => {
     expect(headers["authorization"]).toBe("Bearer at_live");
     expect(headers["chatgpt-account-id"]).toBe("acct_7");
     expect(headers["openai-beta"]).toBe("responses=experimental");
-    expect(headers["originator"]).toBe("codex_cli_rs");
+    expect(headers["originator"]).toBe("norma"); // self-identify, not the codex first-party value (ToS mitigation A)
   });
 
   test("401 triggers ONE refresh then retry; refreshed token persisted", async () => {
