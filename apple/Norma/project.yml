@@ -75,7 +75,7 @@ targets:
         # Norma first captures the screen for a computer-use screenshot.
         NSScreenCaptureUsageDescription: "Norma captures your screen for computer-use screenshots you explicitly ask it to take."
         SUFeedURL: "https://raw.githubusercontent.com/evaprotocol/norma/main/releases/appcast.xml"
-        SUPublicEDKey: "z8++xdFBdjTq+kTj5v/5OGP0WRaIJrg3VarFSWVt/jE="
+        SUPublicEDKey: "mmce2Wik1c09oXqBvWp+DjsfwtSAdpaCCDkJ98sgAtg="
         SUEnableAutomaticChecks: true
         SUAutomaticallyUpdate: true
     # Empty entitlements (release-pipeline T1 audit, both variants launch-tested on a
