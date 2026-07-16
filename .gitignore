@@ -28,3 +28,6 @@ out/
 packages/*/src/**/*.js
 packages/*/test/**/*.js
 packages/*/**/*.d.ts
+
+# Internal SDD process docs — kept private, not published
+docs/superpowers/
