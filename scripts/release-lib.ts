@@ -131,6 +131,39 @@ export function appcastInsertPlan(i: AppcastInsertPlanInputs): AppcastInsertPlan
   return { target, action: "insert", updatedXml };
 }
 
+export interface ResolveSigningIdentityInputs {
+  /** release.ts's `NORMA_SIGN_IDENTITY` escape hatch — when set, returned as-is with no lookup
+   * at all (so `identitiesOutput` doesn't even need to be real, letting a differently-provisioned
+   * keychain, e.g. CI, skip `security find-identity` entirely). */
+  envOverride?: string;
+  /** Raw stdout of `security find-identity -v -p codesigning`. */
+  identitiesOutput: string;
+  teamId: string;
+}
+
+/**
+ * Resolves the ONE codesigning identity every `--sign` call in release.ts should use, as a
+ * 40-hex-char SHA-1 hash — never a display name — so no legal/company name needs to live in this
+ * codebase, and the app resign, its nested/embedded binaries, and the DMG are always signed by
+ * the exact same, unambiguous identity (never "whichever Developer ID Application cert happens to
+ * match first," which could pick a different identity, e.g. a personal one alongside the org's,
+ * if more than one is present in the keychain). Scans `identitiesOutput` line by line for one
+ * naming BOTH "Developer ID Application" and `(<teamId>)`, and returns that line's hash. Throws a
+ * clear, actionable error when no such line exists.
+ */
+export function resolveSigningIdentity(i: ResolveSigningIdentityInputs): string {
+  if (i.envOverride) return i.envOverride;
+  for (const line of i.identitiesOutput.split("\n")) {
+    const m = line.match(/([0-9A-Fa-f]{40})\s+"([^"]+)"/);
+    if (!m) continue;
+    const [, hash, name] = m;
+    if (name!.includes("Developer ID Application") && name!.includes(`(${i.teamId})`)) {
+      return hash!;
+    }
+  }
+  throw new Error(`no Developer ID Application identity for team ${i.teamId} — create it in Xcode`);
+}
+
 export interface PublishGuardInputs {
   dryRun: boolean;
   resumePublish: boolean;

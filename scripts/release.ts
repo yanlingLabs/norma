@@ -63,6 +63,7 @@ import {
   dmgStagePlan,
   preflight,
   publishGuard,
+  resolveSigningIdentity,
 } from "./release-lib";
 
 const TEAM_ID = "37N77U9RSZ";
@@ -161,6 +162,24 @@ if (!pre.ok) {
 console.log("Preflight: OK");
 
 // ---------------------------------------------------------------------------
+// 1b. Resolve the signing identity ONCE, up front — every codesign --sign call below (app
+//     resign, its nested/embedded binaries, DMG) uses this same resolved SHA-1 hash, never a
+//     display name, so no legal/company name needs to live in this repo and every signature
+//     comes from the exact same, unambiguous identity. `NORMA_SIGN_IDENTITY` is an escape hatch
+//     (e.g. a differently-provisioned keychain in CI) that skips the `security find-identity`
+//     lookup entirely.
+// ---------------------------------------------------------------------------
+const signIdentityEnv = process.env.NORMA_SIGN_IDENTITY;
+const SIGN_IDENTITY = resolveSigningIdentity({
+  envOverride: signIdentityEnv,
+  identitiesOutput: signIdentityEnv ? "" : sh(`security find-identity -v -p codesigning`),
+  teamId: TEAM_ID,
+});
+console.log(
+  `Signing identity resolved: ${SIGN_IDENTITY}${signIdentityEnv ? " (NORMA_SIGN_IDENTITY override)" : ""}`,
+);
+
+// ---------------------------------------------------------------------------
 // 2. Version bump (unless --no-bump).
 // ---------------------------------------------------------------------------
 if (!NO_BUMP) {
@@ -200,13 +219,12 @@ console.log(`Built: ${app}`);
 //     the SPM binary distribution ships them ad-hoc, which Apple's notary service rejects.
 //     Preserves each target's existing entitlements as-is (extract, then reapply).
 // ---------------------------------------------------------------------------
-const IDENTITY = "Developer ID Application";
 function resignPreservingEntitlements(path: string) {
   const entPlist = join(OUT, `.ent-${path.replace(/[^a-zA-Z0-9]/g, "_")}.plist`);
   rmSync(entPlist, { force: true });
   probe(`codesign -d --entitlements ":${entPlist}" "${path}"`); // best-effort; not every target has one
   const entFlag = existsSync(entPlist) ? `--entitlements "${entPlist}"` : "";
-  sh(`codesign --force --options runtime --timestamp ${entFlag} --sign "${IDENTITY}" "${path}"`);
+  sh(`codesign --force --options runtime --timestamp ${entFlag} --sign "${SIGN_IDENTITY}" "${path}"`);
 }
 const sparkleFramework = join(app, "Contents", "Frameworks", "Sparkle.framework");
 const sparkleVersionsB = join(sparkleFramework, "Versions", "B");
@@ -358,9 +376,8 @@ rmSync(dmgPath, { force: true });
 console.log("Creating DMG (hdiutil)...");
 sh(`hdiutil create -volname "Norma" -srcfolder "${dmgStage}" -ov -format UDZO "${dmgPath}"`);
 
-const DMG_IDENTITY = `Developer ID Application: Norma (${TEAM_ID})`;
 console.log("Signing DMG...");
-sh(`codesign --sign "${DMG_IDENTITY}" --timestamp "${dmgPath}"`);
+sh(`codesign --sign "${SIGN_IDENTITY}" --timestamp "${dmgPath}"`);
 assertSigned(dmgPath, "Norma.dmg");
 
 console.log("Submitting DMG for notarization (second submission this release; can take 1-15 minutes)...");

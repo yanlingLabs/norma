@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { appcastInsertPlan, appcastItem, caskFrom, dmgStagePlan, preflight, publishGuard } from "./release-lib";
+import {
+  appcastInsertPlan,
+  appcastItem,
+  caskFrom,
+  dmgStagePlan,
+  preflight,
+  publishGuard,
+  resolveSigningIdentity,
+} from "./release-lib";
 
 describe("preflight", () => {
   test("every check passing -> ok with no failures", () => {
@@ -189,6 +197,53 @@ describe("appcastInsertPlan", () => {
     expect(() =>
       appcastInsertPlan({ dryRun: false, version: "0.2.002", appcastXml: "<rss></rss>", item }),
     ).toThrow();
+  });
+});
+
+describe("resolveSigningIdentity", () => {
+  const sampleOutput = `Policy: Code Signing
+  1) AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA "Developer ID Application: Norma (37N77U9RSZ)"
+  2) BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB "Apple Development: dev@example.com (37N77U9RSZ)"
+  3) CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC "Developer ID Application: Norma (OTHERTEAM1)"
+     3 valid identities found
+`;
+
+  test("finds the hash of the Developer ID Application identity for the given team", () => {
+    const hash = resolveSigningIdentity({ identitiesOutput: sampleOutput, teamId: "37N77U9RSZ" });
+    expect(hash).toBe("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+  });
+
+  test("ignores a Developer ID Application identity for a DIFFERENT team", () => {
+    const hash = resolveSigningIdentity({ identitiesOutput: sampleOutput, teamId: "OTHERTEAM1" });
+    expect(hash).toBe("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC");
+  });
+
+  test("ignores a matching team on a non-'Developer ID Application' identity", () => {
+    expect(() =>
+      resolveSigningIdentity({
+        identitiesOutput: `  1) BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB "Apple Development: dev@example.com (37N77U9RSZ)"\n`,
+        teamId: "37N77U9RSZ",
+      }),
+    ).toThrow();
+  });
+
+  test("throws a clear error when no identity matches the team", () => {
+    expect(() => resolveSigningIdentity({ identitiesOutput: sampleOutput, teamId: "NOTAREALTEAM" })).toThrow(
+      "no Developer ID Application identity for team NOTAREALTEAM — create it in Xcode",
+    );
+  });
+
+  test("empty identities output throws", () => {
+    expect(() => resolveSigningIdentity({ identitiesOutput: "", teamId: "37N77U9RSZ" })).toThrow();
+  });
+
+  test("envOverride wins immediately — no lookup performed, identitiesOutput can be garbage", () => {
+    const hash = resolveSigningIdentity({
+      envOverride: "DEADBEEF00000000000000000000000000000000",
+      identitiesOutput: "not even real find-identity output",
+      teamId: "37N77U9RSZ",
+    });
+    expect(hash).toBe("DEADBEEF00000000000000000000000000000000");
   });
 });
 
