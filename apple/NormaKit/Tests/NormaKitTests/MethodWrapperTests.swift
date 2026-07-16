@@ -216,6 +216,30 @@ final class MethodWrapperTests: XCTestCase {
         XCTAssertTrue(removed)
     }
 
+    /// BYOK T1 (design doc `2026-07-16-byok-provider-setup-design.md` §1): `configureProvider`
+    /// always sends `type: "openai-compatible"` and round-trips `model` both present and omitted
+    /// (omitted must not send the key at all — same `obj(...)` compactMapValues convention every
+    /// other optional param in this file relies on).
+    func testConfigureProviderWrapper() async throws {
+        let (client, t) = try await connected()
+
+        let (req1, _) = try await roundTrip(t, sentIndex: 1, result: #"{"ok":true}"#) {
+            try await client.configureProvider(baseUrl: "https://api.openai.com/v1", apiKey: "sk-test-123", model: "gpt-4o-mini")
+        }
+        XCTAssertEqual(req1["method"] as? String, "provider.configure")
+        let params1 = req1["params"] as? [String: Any]
+        XCTAssertEqual(params1?["type"] as? String, "openai-compatible")
+        XCTAssertEqual(params1?["baseUrl"] as? String, "https://api.openai.com/v1")
+        XCTAssertEqual(params1?["apiKey"] as? String, "sk-test-123")
+        XCTAssertEqual(params1?["model"] as? String, "gpt-4o-mini")
+
+        let (req2, _) = try await roundTrip(t, sentIndex: 2, result: #"{"ok":true}"#) {
+            try await client.configureProvider(baseUrl: "https://api.openai.com/v1", apiKey: "sk-test-456")
+        }
+        let params2 = req2["params"] as? [String: Any]
+        XCTAssertNil(params2?["model"], "omitted model must not be sent at all")
+    }
+
     func testAttachSeedsDedupeSoReplayIsNotDropped() async throws {
         let (client, t) = try await connected()
         // attach fromSeq 5: events with seq > 5 must flow, seq <= 5 must be dropped

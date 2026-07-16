@@ -69,7 +69,11 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
     /// gate as `MultitouchTrigger`/`HotkeyTrigger`), so every existing call site that omits this
     /// param keeps compiling unchanged. `ShortcutBindingEditorModel.capture(...)` still persists a
     /// binding either way; only the live Carbon re-registration no-ops when this is `nil`.
-    init(client: NormaClient, directory: SessionDirectory, peripheral: PeripheralProvider, helperClient: HelperClient, shortcutRegistry: ShortcutRegistry? = nil, onOpenSessionDetached: @escaping (String) -> Void, frame: NSRect, initialPane: DashboardPane = defaultDashboardPane) {
+    /// BYOK T2: `onConfigured` defaults to a no-op — under unit tests (this file's own
+    /// `DashboardTests.swift` call sites) it's never passed, same "harmless default seam" posture as
+    /// `shortcutRegistry: ShortcutRegistry? = nil` just above. `AppDelegate.openDashboard()` passes
+    /// the real `daemonSupervisor?.restart()` hook.
+    init(client: NormaClient, directory: SessionDirectory, peripheral: PeripheralProvider, helperClient: HelperClient, shortcutRegistry: ShortcutRegistry? = nil, onOpenSessionDetached: @escaping (String) -> Void, frame: NSRect, initialPane: DashboardPane = defaultDashboardPane, onConfigured: @escaping () -> Void = {}) {
         let window = NSWindow(
             contentRect: frame,
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -110,6 +114,12 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
         // above — the Skills pane has no other owner across the app's lifetime, and
         // `SkillsPane.task` refreshes it on every appearance anyway.
         let skillsModel = SkillsPaneModel(client: client)
+        // BYOK T2: same "constructed fresh here, per window-open" posture as `memoryModel`/
+        // `skillsModel` above — the Provider pane has no other owner across the app's lifetime, and
+        // `ProviderPane.task` refreshes its status row on every appearance anyway. `onConfigured` is
+        // baked in here (not carried on `DashboardWiring` itself), mirroring how `shortcutsModel`
+        // bakes in `shortcutRegistry` rather than exposing it on the wiring struct.
+        let providerModel = ProviderPaneModel(client: client, onConfigured: onConfigured)
         let wiring = DashboardWiring(
             directory: directory,
             onOpenSessionDetached: onOpenSessionDetached,
@@ -123,7 +133,8 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
             tilesModel: tilesModel,
             shortcutsModel: shortcutsModel,
             memoryModel: memoryModel,
-            skillsModel: skillsModel
+            skillsModel: skillsModel,
+            providerModel: providerModel
         )
         window.contentView = NSHostingView(rootView: DashboardView(wiring: wiring, selectionModel: selectionModel))
         window.setFrame(frame, display: true)

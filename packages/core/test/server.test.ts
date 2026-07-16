@@ -13,6 +13,7 @@ import { ToolRegistry } from "../src/agent/tools/registry";
 import { PluginSupervisor } from "../src/plugins/supervisor";
 import { PluginContribRegistry } from "../src/plugins/contrib";
 import type { Provider, ProviderEvent } from "../src/providers/types";
+import { OPENAI_API_KEY_SECRET } from "../src/providers/manager";
 import { setup as setupAgentEngine } from "./agent/engine-spawn.test";
 
 /** Minimal raw test client speaking NDJSON JSON-RPC. */
@@ -3492,5 +3493,138 @@ describe("daemon IPC", () => {
       }
       plugin.close(); srv.stop();
     });
+  });
+});
+
+// -----------------------------------------------------------------------------------------
+// provider.configure RPC (BYOK T1, design doc `2026-07-16-byok-provider-setup-design.md` §1): the
+// in-app "bring your own OpenAI API key" path. A bare `startIpcServer` (no full daemon/engine) with
+// `normaHome` + a `FileSecretStore` wired directly — same self-contained precedent as the "plugin
+// lifecycle RPCs" describe block above — so assertions can read back both the secret store and
+// settings.json without exposing `home` off the shared daemon fixture.
+// -----------------------------------------------------------------------------------------
+describe("provider.configure RPC (BYOK T1)", () => {
+  async function bootProviderConfigServer(settingsSeed: Record<string, unknown> = {}): Promise<{
+    home: string; settingsPath: string; socketPath: string; harnessToken: string;
+    secrets: FileSecretStore; store: SessionStore; stop: () => void;
+  }> {
+    const home = mkdtempSync(join(tmpdir(), "norma-provider-configure-"));
+    writeFileSync(join(home, "settings.json"), JSON.stringify({
+      schemaVersion: 2,
+      provider: { type: "codex-oauth", model: "gpt-5.4" },
+      ...settingsSeed,
+    }));
+    const store = new SessionStore(home);
+    const socketPath = join(home, "core.sock");
+    const authority = new TokenAuthority(new FileSecretStore(join(home, "auth-secrets")));
+    const tokens = await authority.ensureTokens();
+    const secrets = new FileSecretStore(join(home, "provider-secrets"));
+    const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, normaHome: home, secrets });
+    return {
+      home, settingsPath: join(home, "settings.json"), socketPath, harnessToken: tokens.harness,
+      secrets, store,
+      stop: () => { server.stop(); store.close(); },
+    };
+  }
+
+  test("writes the API key via the SecretStore and the openai-compatible provider block, preserving other settings fields", async () => {
+    const srv = await bootProviderConfigServer({ reviewer: { enabled: false } });
+    const c = await TestClient.connect(srv.socketPath);
+    await c.hello(srv.harnessToken, "cli-provider-configure");
+
+    const res = await c.request(METHODS.providerConfigure, {
+      type: "openai-compatible", baseUrl: "https://api.openai.com/v1", apiKey: "sk-test-123", model: "gpt-4o-mini",
+    });
+    expect(res.result).toEqual({ ok: true });
+
+    expect(await srv.secrets.get(OPENAI_API_KEY_SECRET)).toBe("sk-test-123");
+
+    const settings = JSON.parse(readFileSync(srv.settingsPath, "utf8"));
+    expect(settings.provider).toEqual({ type: "openai-compatible", baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini" });
+    expect(settings.reviewer).toEqual({ enabled: false }); // other top-level settings fields preserved
+    expect(settings.schemaVersion).toBe(2);
+
+    c.close(); srv.stop();
+  });
+
+  test("model omitted -> defaults to gpt-4o", async () => {
+    const srv = await bootProviderConfigServer();
+    const c = await TestClient.connect(srv.socketPath);
+    await c.hello(srv.harnessToken, "cli-provider-configure-default-model");
+
+    const res = await c.request(METHODS.providerConfigure, {
+      type: "openai-compatible", baseUrl: "https://api.openai.com/v1", apiKey: "sk-test-456",
+    });
+    expect(res.result).toEqual({ ok: true });
+
+    const settings = JSON.parse(readFileSync(srv.settingsPath, "utf8"));
+    expect(settings.provider).toEqual({ type: "openai-compatible", baseUrl: "https://api.openai.com/v1", model: "gpt-4o" });
+
+    c.close(); srv.stop();
+  });
+
+  test("a malformed baseUrl is rejected as INVALID_PARAMS — settings and the secret store are left UNCHANGED", async () => {
+    const srv = await bootProviderConfigServer();
+    const before = readFileSync(srv.settingsPath, "utf8");
+    const c = await TestClient.connect(srv.socketPath);
+    await c.hello(srv.harnessToken, "cli-provider-configure-bad-url");
+
+    const res = await c.request(METHODS.providerConfigure, {
+      type: "openai-compatible", baseUrl: "not-a-url", apiKey: "sk-test-789",
+    });
+    expect(res.error?.code).toBe(ERR.INVALID_PARAMS);
+    expect(readFileSync(srv.settingsPath, "utf8")).toBe(before);
+    expect(await srv.secrets.get(OPENAI_API_KEY_SECRET)).toBeNull();
+
+    c.close(); srv.stop();
+  });
+
+  test("an empty apiKey is rejected as INVALID_PARAMS", async () => {
+    const srv = await bootProviderConfigServer();
+    const c = await TestClient.connect(srv.socketPath);
+    await c.hello(srv.harnessToken, "cli-provider-configure-empty-key");
+
+    const res = await c.request(METHODS.providerConfigure, {
+      type: "openai-compatible", baseUrl: "https://api.openai.com/v1", apiKey: "",
+    });
+    expect(res.error?.code).toBe(ERR.INVALID_PARAMS);
+    expect(await srv.secrets.get(OPENAI_API_KEY_SECRET)).toBeNull();
+
+    c.close(); srv.stop();
+  });
+
+  test("provider.configure is not one of the six plugin-role verbs — a plugin connection is role-rejected before dispatch", async () => {
+    const srv = await bootProviderConfigServer();
+    const raw = srv.store.mintPluginToken("sample-echo");
+    const c = await TestClient.connect(srv.socketPath);
+    await c.request(METHODS.hello, {
+      protocolVersion: PROTOCOL_VERSION, role: "plugin", token: raw, clientName: "sample-echo", pluginId: "sample-echo",
+    });
+    const res = await c.request(METHODS.providerConfigure, {
+      type: "openai-compatible", baseUrl: "https://api.openai.com/v1", apiKey: "sk-test-999",
+    });
+    expect(res.error?.code).toBe(ERR.UNAUTHORIZED);
+
+    c.close(); srv.stop();
+  });
+
+  test("a server with no secret store configured -> typed INTERNAL failure, never a crash", async () => {
+    const home = mkdtempSync(join(tmpdir(), "norma-provider-configure-nostore-"));
+    writeFileSync(join(home, "settings.json"), JSON.stringify({ schemaVersion: 2, provider: { type: "codex-oauth", model: "gpt-5.4" } }));
+    const store = new SessionStore(home);
+    const socketPath = join(home, "core.sock");
+    const authority = new TokenAuthority(new FileSecretStore(join(home, "auth-secrets")));
+    const tokens = await authority.ensureTokens();
+    // normaHome wired, secrets deliberately omitted.
+    const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store, normaHome: home });
+    const c = await TestClient.connect(socketPath);
+    await c.hello(tokens.harness, "cli-provider-configure-nostore");
+
+    const res = await c.request(METHODS.providerConfigure, {
+      type: "openai-compatible", baseUrl: "https://api.openai.com/v1", apiKey: "sk-test-000",
+    });
+    expect(res.error?.code).toBe(ERR.INTERNAL);
+
+    c.close(); server.stop(); store.close();
   });
 });

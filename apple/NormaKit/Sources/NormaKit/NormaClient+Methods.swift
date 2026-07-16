@@ -512,6 +512,23 @@ extension NormaClient {
     public func trustRemove(path: String) async throws -> Bool {
         try await request("trust.remove", params: obj(["path": .string(path)]))["removed"]?.boolValue ?? false
     }
+
+    /// `provider.configure {type, baseUrl, apiKey, model?}` (BYOK T1, design doc
+    /// `2026-07-16-byok-provider-setup-design.md` §1) — the in-app "bring your own OpenAI API key"
+    /// path. Always sends `type: "openai-compatible"` (v1 is BYOK-only — switching back to
+    /// codex-oauth stays CLI-only via `norma login`, out of scope here). The server writes the API
+    /// key to its OWN SecretStore and replaces the `provider` block in settings.json; a plain
+    /// `{ok:true}` on success (no typed outcome union — an invalid baseUrl/empty apiKey throws a
+    /// server-side `RpcFailure`, surfaced here as a thrown `RpcError`, same discipline as
+    /// `setPolicy`/`pluginRestart` above). Provider-TYPE changes need a fresh daemon to take
+    /// effect — the CALLER (T2's Dashboard pane) is responsible for triggering
+    /// `daemonSupervisor?.restart()` after this returns; this wrapper only persists the config.
+    public func configureProvider(baseUrl: String, apiKey: String, model: String? = nil) async throws {
+        _ = try await request("provider.configure", params: obj([
+            "type": .string("openai-compatible"), "baseUrl": .string(baseUrl), "apiKey": .string(apiKey),
+            "model": model.map { .string($0) },
+        ]))
+    }
 }
 
 // MARK: - Memory (Phase 5b Task 3 RPC / Task 5 Dashboard pane)

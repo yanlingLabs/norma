@@ -19,10 +19,13 @@ import {
   PluginsInstallParams, PluginEnableParams, PluginDisableParams, PluginRemoveParams, PluginSetConsentParams,
   RoutinesCreateParams, RoutinesListParams, RoutinesUpdateParams, RoutinesDeleteParams,
   MemoryListParams, MemoryReadParams, MemoryWriteParams, MemoryDeleteParams, MemoryAuditParams,
+  ProviderConfigureParams,
   SYSTEM_SESSION_ID,
   type SessionEvent, ConnWriter, type WritableSocket,
 } from "@norma/protocol";
 import type { TokenAuthority } from "../auth/tokens";
+import type { SecretStore } from "../auth/secret-store";
+import { OPENAI_API_KEY_SECRET } from "../providers/manager";
 import type { RoutineStore } from "../routines/store";
 import type { MemoryStore, MemoryErrorKind } from "../agent/memory";
 import { listMemoryDir, readMemoryDir, writeMemoryDir, deleteMemoryDir, auditTailMemDir } from "../agent/memory-file-ops";
@@ -95,6 +98,15 @@ export interface IpcServerOptions {
   // the five lifecycle RPCs themselves become a typed INTERNAL failure (never a crash) when a
   // caller actually invokes them with no `normaHome` wired.
   normaHome?: string;
+  // BYOK T1 (design doc `2026-07-16-byok-provider-setup-design.md` §1): the daemon's OWN
+  // SecretStore — threaded here so `provider.configure` can write the BYO OpenAI API key
+  // server-side (never a Swift/Keychain write, avoiding the Bun.secrets item-format mismatch the
+  // design doc's recon flagged). Optional, same "typed INTERNAL failure, never a crash" precedent
+  // as `normaHome` above: a server built without one (most existing tests) makes
+  // `provider.configure` a typed failure rather than throwing on construction. daemon.ts always
+  // wires its own `secrets` (KeychainSecretStore by default, `startDaemon({secrets})`-injectable
+  // for tests) into this field.
+  secrets?: SecretStore;
   // Phase 4b Task 4 (spec §3): the plugin tool bridge. `registry` is the SAME ToolRegistry the
   // AgentEngine executes tool calls against (daemon.ts shares the one instance) — tool.register
   // registers `plugin__<pluginId>__<tool>` into it; the socket close() handler and the
@@ -1075,6 +1087,33 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
         const removed = opts.trust?.remove(p.path) ?? false;
         console.error(`[trust.remove] path=${p.path} removed=${removed} by=${socket.data.clientName}`);
         return { removed };
+      }
+
+      // -----------------------------------------------------------------------------------------
+      // provider.configure (BYOK T1, design doc `2026-07-16-byok-provider-setup-design.md` §1): the
+      // in-app "bring your own OpenAI API key" path. Scoped + purpose-specific — NOT a generic
+      // secret-write RPC. Writes the api-key secret via the daemon's OWN SecretStore (`secrets`
+      // above), never a Swift-side Keychain write, then loads settings.json, REPLACES the whole
+      // `provider` block with `{type:"openai-compatible", baseUrl, model: model ?? "gpt-4o"}` (every
+      // other top-level settings field is preserved via the spread), and saves. Provider-TYPE
+      // changes need a daemon restart to actually take effect (providers/manager.ts fixes
+      // `providerType` at boot from the settings snapshot it was constructed with) — this RPC only
+      // persists the new config; triggering that restart is the caller's job (T2's Dashboard pane
+      // calling `daemonSupervisor?.restart()`). `parseParams`'s zod validation above already rejects
+      // a malformed baseUrl or empty apiKey as INVALID_PARAMS before this body ever runs.
+      // -----------------------------------------------------------------------------------------
+      case METHODS.providerConfigure: {
+        const p = parseParams(ProviderConfigureParams, params);
+        if (!opts.normaHome) throw new RpcFailure(ERR.INTERNAL, "provider.configure is not available on this server (no normaHome configured)");
+        if (!opts.secrets) throw new RpcFailure(ERR.INTERNAL, "provider.configure is not available on this server (no secret store configured)");
+        await opts.secrets.set(OPENAI_API_KEY_SECRET, p.apiKey);
+        const settingsPath = join(opts.normaHome, "settings.json");
+        const settings = loadSettings(settingsPath);
+        saveSettings(settingsPath, {
+          ...settings,
+          provider: { type: "openai-compatible", baseUrl: p.baseUrl, model: p.model ?? "gpt-4o" },
+        });
+        return { ok: true };
       }
 
       // -----------------------------------------------------------------------------------------

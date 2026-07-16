@@ -6,7 +6,7 @@ import SwiftUI
 /// future pane — Phase 4's `PluginManagerView`, per spec §B's "the same mountable-pane contract"
 /// — is a plain new case, never a renumbering of existing ones.
 enum DashboardPane: String, CaseIterable, Identifiable, Equatable {
-    case sessions, daemonStatus, quota, trust, peripheral, pluginManager, memory, skills
+    case sessions, daemonStatus, quota, trust, peripheral, pluginManager, memory, skills, provider
     var id: String { rawValue }
 }
 
@@ -15,8 +15,9 @@ enum DashboardPane: String, CaseIterable, Identifiable, Equatable {
 /// Phase 4d-iii Task 2: `.pluginManager` appended at the END — every existing pane keeps its
 /// position, so this is purely additive (no renumbering of `dashboardSidebarWidth`/selection math,
 /// which reads this array, not the enum's raw ordinal). Phase 5b Task 5: `.memory` appended at the
-/// END the same way. Phase 5c Task 4: `.skills` appended at the END the same way again.
-let dashboardPaneOrder: [DashboardPane] = [.sessions, .daemonStatus, .quota, .trust, .peripheral, .pluginManager, .memory, .skills]
+/// END the same way. Phase 5c Task 4: `.skills` appended at the END the same way again. BYOK T2:
+/// `.provider` appended at the END the same way again.
+let dashboardPaneOrder: [DashboardPane] = [.sessions, .daemonStatus, .quota, .trust, .peripheral, .pluginManager, .memory, .skills, .provider]
 
 /// The window's default/initial selection — always the FIRST pane in `dashboardPaneOrder`, so a
 /// pane appended to the end of that list never silently becomes the landing pane just by being
@@ -33,6 +34,7 @@ func dashboardPaneTitle(_ pane: DashboardPane) -> String {
     case .pluginManager: return "Plugins"
     case .memory: return "Memory"
     case .skills: return "Skills"
+    case .provider: return "AI Provider"
     }
 }
 
@@ -46,6 +48,7 @@ func dashboardPaneSystemImage(_ pane: DashboardPane) -> String {
     case .pluginManager: return "puzzlepiece.extension"
     case .memory: return "brain"
     case .skills: return "book.closed"
+    case .provider: return "cpu"
     }
 }
 
@@ -104,6 +107,12 @@ struct DashboardWiring {
     let memoryModel: MemoryPaneModel
     /// Phase 5c Task 4: the Skills pane's own view-model — same posture as `memoryModel`.
     let skillsModel: SkillsPaneModel
+    /// BYOK T2: the Provider pane's own view-model — same "constructed fresh per dashboard window,
+    /// injected here" posture as `memoryModel`/`skillsModel` above. Its `onConfigured` closure
+    /// (fired after a successful `provider.configure`) is baked in at construction time
+    /// (`DashboardWindowController.init`), not carried separately on this struct — mirrors how
+    /// `shortcutsModel` bakes in its own `shortcutRegistry` dependency rather than exposing it here.
+    let providerModel: ProviderPaneModel
 }
 
 /// The Dashboard window's root content: a fixed-width left pane list + the selected pane's
@@ -192,6 +201,8 @@ struct DashboardView: View {
             MemoryPane(model: wiring.memoryModel)
         case .skills:
             SkillsPane(model: wiring.skillsModel)
+        case .provider:
+            ProviderPane(model: wiring.providerModel)
         }
     }
 }
