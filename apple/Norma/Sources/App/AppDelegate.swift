@@ -60,6 +60,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `registerDetachedWindow`'s `onClosed`). `openDashboard()` below is what enforces the
     /// "second invocation focuses the existing window" contract off this single stored ref.
     private(set) var dashboardWindow: DashboardWindowController?
+    /// BYOK T2: the one-time first-run disclosure window (spec §3) — `nil` until (at most once,
+    /// ever, per install) `boot()`'s real-launch path presents it; nil'd again via `onClosed` (same
+    /// one-shot-latch/registry-removal convention as `dashboardWindow`/`detachedWindows` above).
+    private(set) var firstRunDisclosureWindow: FirstRunDisclosureWindowController?
     /// Phase 4d-iii Task 1: the plugin-shortcut multi-hotkey registry — additive to
     /// `HotkeyTrigger.shared` (Hyper+Space summon) and `peripheralProvider`'s panic hotkey, never
     /// touching either. `nil` under unit tests (constructed only inside `boot()`'s
@@ -287,7 +291,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             shortcutRegistry: shortcutRegistry,
             onOpenSessionDetached: { [weak self] sid in self?.openSessionInNewDetachedWindow(sid) },
             frame: centeredDashboardFrame(visibleFrame: visible),
-            initialPane: initialPane ?? defaultDashboardPane
+            initialPane: initialPane ?? defaultDashboardPane,
+            // BYOK T2 (T1 report's "Concerns for T2"): a provider-TYPE change only takes effect on
+            // the NEXT daemon boot (`providers/manager.ts`'s `createProvider` fixes `providerType`
+            // at boot) — `provider.configure` itself only persists the secret + settings. The
+            // Provider pane's model has no `AppDelegate` reference of its own; this is the one
+            // place that closes the loop, same "AppDelegate wires the real side effect, the pane
+            // only fires an injected closure" posture as every other real-side-effect hook in this
+            // file (`onRestartDaemon` on the menu bar, just below in this same method's sibling).
+            onConfigured: { [weak self] in self?.daemonSupervisor?.restart() }
         )
         controller.onClosed = { [weak self] _ in
             self?.dashboardWindow = nil
@@ -583,6 +595,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // round-trip — same `!isRunningUnitTests` gate as `helper.register()` above.
             if !loginItem.hasUserMadeChoice {
                 loginItem.setEnabled(true)
+            }
+
+            // BYOK T2 (spec §3): the one-time first-run disclosure — shown at most once, ever, per
+            // install. `shouldShowFirstRunDisclosure`/`markFirstRunDisclosureShown` are the pure
+            // seam (`FirstRunDisclosure.swift`); marked shown IMMEDIATELY (not deferred to a button
+            // click or the window's close) so a force-quit right after launch can never cause it to
+            // reappear. This whole real-launch gate (`!Self.isRunningUnitTests`) is exactly the
+            // "never under unit tests" contract the brief calls for — every existing `boot()` test
+            // call site runs with this block skipped entirely.
+            if shouldShowFirstRunDisclosure(defaults: .standard) {
+                markFirstRunDisclosureShown(defaults: .standard)
+                let firstRun = FirstRunDisclosureWindowController(
+                    onSetupApiKey: { [weak self] in self?.openDashboard(initialPane: .provider) },
+                    onSignInWithChatGPT: {}
+                )
+                firstRun.onClosed = { [weak self] _ in self?.firstRunDisclosureWindow = nil }
+                firstRunDisclosureWindow = firstRun
+                firstRun.show()
             }
 
             TriggerHub.shared.didTrigger

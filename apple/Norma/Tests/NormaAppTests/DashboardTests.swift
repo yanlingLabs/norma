@@ -16,11 +16,12 @@ import NormaKit
 final class DashboardTests: XCTestCase {
     // MARK: - dashboardPaneOrder / defaultDashboardPane (PURE)
 
-    func testDashboardPaneOrderContainsAllEightPanesInSpecOrder() {
+    func testDashboardPaneOrderContainsAllNinePanesInSpecOrder() {
         // Phase 4d-iii Task 2: `.pluginManager` appended at the END, every pre-existing pane keeps
         // its position (see `dashboardPaneOrder`'s own doc comment). Phase 5b Task 5: `.memory`
-        // appended the same way. Phase 5c Task 4: `.skills` appended the same way again.
-        XCTAssertEqual(dashboardPaneOrder, [.sessions, .daemonStatus, .quota, .trust, .peripheral, .pluginManager, .memory, .skills])
+        // appended the same way. Phase 5c Task 4: `.skills` appended the same way again. BYOK T2:
+        // `.provider` appended the same way again.
+        XCTAssertEqual(dashboardPaneOrder, [.sessions, .daemonStatus, .quota, .trust, .peripheral, .pluginManager, .memory, .skills, .provider])
         XCTAssertEqual(Set(dashboardPaneOrder), Set(DashboardPane.allCases), "every case must appear exactly once")
     }
 
@@ -223,6 +224,22 @@ final class DashboardTests: XCTestCase {
 
     func testSkillsGroupedBySourceEmptyInputProducesNoGroups() {
         XCTAssertTrue(skillsGroupedBySource([]).isEmpty)
+    }
+
+    // MARK: - providerStatusText (PURE, ProviderPane.swift, BYOK T2)
+
+    func testProviderStatusTextWithIdAndModel() {
+        XCTAssertEqual(providerStatusText(providerId: "openai-compatible", providerModel: "gpt-4o"), "openai-compatible (gpt-4o)")
+    }
+
+    /// A providerId present without a model (contract doesn't guarantee they're always paired,
+    /// same posture as `formatDaemonStatus`'s own provider field) — falls back to the bare id.
+    func testProviderStatusTextWithIdOnly() {
+        XCTAssertEqual(providerStatusText(providerId: "codex-oauth", providerModel: nil), "codex-oauth")
+    }
+
+    func testProviderStatusTextWithNeitherReadsAsNoneConfigured() {
+        XCTAssertEqual(providerStatusText(providerId: nil, providerModel: nil), "none configured")
     }
 
     // MARK: - DashboardSelectionModel (PURE — Phase 4d-cleanup Task 3 fix 1)
