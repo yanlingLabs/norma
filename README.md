@@ -43,6 +43,15 @@ Or download the latest `.dmg` directly from [GitHub Releases](https://github.com
 
 Norma requires macOS. Once installed, look for her icon in the menu bar — that's her home. Open a terminal and type `norma` any time you'd rather talk to her there instead.
 
+## Bringing your own AI
+
+Norma is the assistant; the intelligence behind her is your own. You connect her one of two ways:
+
+- **Sign in with your ChatGPT account** — Norma uses your existing ChatGPT subscription, on your machine, with your login.
+- **Bring your own OpenAI API key** — paste a key and Norma talks to OpenAI directly on your behalf.
+
+A note in plain language: **Norma is an independent project and is not affiliated with, endorsed by, or sponsored by OpenAI.** Signing in with a ChatGPT account uses that account under OpenAI's own terms, which don't specifically bless third-party apps — so, as with any tool that isn't OpenAI's own, there's some risk to that account, and it's yours to weigh. If you'd rather not, the API-key option is the straightforward, officially-supported path. Either way, your credentials live only in your Mac's Keychain and Norma keeps no copy.
+
 <details>
 <summary>For developers</summary>
 
