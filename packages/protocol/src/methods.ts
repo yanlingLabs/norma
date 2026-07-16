@@ -741,6 +741,22 @@ export const MemoryAuditParams = z.object({ limit: z.number().int().nonnegative(
  *  contract; the handler reverses the store's slice before returning it. */
 export const MemoryAuditResult = z.object({ lines: z.array(MemoryAuditLineSchema) });
 
+/** BYOK T1 (design doc `2026-07-16-byok-provider-setup-design.md` §1): the in-app "bring your own
+ *  OpenAI API key" path — a scoped, purpose-specific RPC (deliberately NOT a generic secret-write
+ *  verb). `type` is a literal (openai-compatible only, v1) — switching back to codex-oauth stays
+ *  CLI-only (`norma login`), same "out of scope" carve-out as the design doc. `model` defaults to
+ *  "gpt-4o" server-side when omitted (ipc/server.ts's handler), mirroring `ProviderSettings`'s own
+ *  required (non-optional) `model` field for openai-compatible. Provider-TYPE changes need a
+ *  daemon restart to take effect (providers/manager.ts fixes `providerType` at boot) — this RPC
+ *  only persists the new config; triggering the restart is the caller's job (T2's Dashboard pane). */
+export const ProviderConfigureParams = z.object({
+  type: z.literal("openai-compatible"),
+  baseUrl: z.string().url(),
+  apiKey: z.string().min(1),
+  model: z.string().min(1).optional(),
+});
+export const ProviderConfigureResult = z.object({ ok: z.literal(true) });
+
 export const METHODS = {
   hello: "protocol.hello",
   sessionCreate: "session.create",
@@ -810,4 +826,5 @@ export const METHODS = {
   memoryWrite: "memory.write",
   memoryDelete: "memory.delete",
   memoryAudit: "memory.audit",
+  providerConfigure: "provider.configure",
 } as const;

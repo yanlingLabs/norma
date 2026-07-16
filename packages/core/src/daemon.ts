@@ -837,6 +837,10 @@ export async function startDaemon(opts: {
     // both fresh on every call (`livePlugins`, ipc/server.ts) instead of trusting `pluginStore`
     // above's boot-time snapshot.
     normaHome,
+    // BYOK T1: the SAME SecretStore instance `authority`/`createProvider` above already use (one
+    // Keychain, no separate store to keep in sync) — lets `provider.configure` write the BYO
+    // OpenAI API key server-side.
+    secrets,
     mcp: mcp ?? undefined,
     // Phase 4b Task 4: the plugin tool bridge. `registry` is undefined whenever agentProvider is
     // null (see `sharedRegistry`'s doc comment above). `supervisor`, unlike `registry`, is now
