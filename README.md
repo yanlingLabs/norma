@@ -39,7 +39,7 @@ This part matters more than anything else here, so we'll say it plainly:
 brew install --cask norma
 ```
 
-Or download the latest `.dmg` directly from [GitHub Releases](https://github.com/evaprotocol/norma/releases).
+Or download the latest `.dmg` directly from [GitHub Releases](https://github.com/yanlingLabs/norma/releases).
 
 Norma requires macOS. Once installed, look for her icon in the menu bar — that's her home. Open a terminal and type `norma` any time you'd rather talk to her there instead.
 

@@ -27,7 +27,7 @@ export function preflight(opts: { checks: Record<string, () => string | null> })
 // Distribution backbone (design spec 2026-07-15-release-pipeline-design.md) — GitHub Releases
 // is the sole download host; matches the `origin` remote and project.yml's SUFeedURL. Exported
 // so release.ts's publish tail (gh release URL, cask url) shares this single source of truth.
-export const GH_REPO = "evaprotocol/norma";
+export const GH_REPO = "yanlingLabs/norma";
 
 /**
  * Renders one Sparkle appcast `<item>` for the update-check enclosure (the `.zip`). Schema
