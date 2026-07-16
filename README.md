@@ -35,11 +35,16 @@ This part matters more than anything else here, so we'll say it plainly:
 
 ## Install
 
+The easy way: download the latest `.dmg` from [GitHub Releases](https://github.com/yanlingLabs/norma/releases), open it, and drag Norma into your Applications folder.
+
+Prefer Homebrew?
+
 ```sh
+brew tap yanlingLabs/norma
 brew install --cask norma
 ```
 
-Or download the latest `.dmg` directly from [GitHub Releases](https://github.com/yanlingLabs/norma/releases).
+(On newer Homebrew you may be asked to trust the tap once — if so, run `brew trust yanlingLabs/norma` and try again.)
 
 Norma requires macOS. Once installed, look for her icon in the menu bar — that's her home. Open a terminal and type `norma` any time you'd rather talk to her there instead.
 
