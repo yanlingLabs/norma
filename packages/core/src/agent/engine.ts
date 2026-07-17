@@ -30,6 +30,7 @@ import { resolveModelAlias } from "./model-aliases";
 import type { LspManager } from "./lsp/manager";
 import { autoDiagnosticsSuffix, AUTO_DIAG_TOOL_NAMES } from "./lsp/auto-diagnostics";
 import { DISPATCH_ALLOW_TOOLS, DISPATCH_SYSTEM_PROMPT } from "./dispatch-prompt";
+import type { DispatchChildren } from "./dispatch-children";
 
 /** Structural narrowing of BackgroundTaskRegistry (bg-registry.ts) to just what pinnedTools
  *  (below) needs — lets the engine (and tests) work with anything shaped like a per-session task
@@ -41,6 +42,18 @@ export interface BgTaskLister {
 
 const MAIN_THREAD = "main";
 const MAX_TOOL_ITERATIONS = 24; // runaway guard until 1b-ii budgets land
+// Dispatch (Phase 7) Task 4: session_spawn is registered on the SAME shared registry every
+// session's specs() reads from (daemon.ts registers it once, globally, like spawn_agent) — so
+// without an explicit exclusion it would be visible to every non-dispatch session too (a code
+// session's main thread has no `allowTools` restriction at all; a spawn_agent child's own
+// childExcludeTools, below, is the only thing that hides tools from IT). Named once here and
+// reused at both exclusion sites (turn()'s isDispatch ternary, childExcludeTools' initial Set) so
+// they can never drift apart. The bridge's OWN `meta.mode === "dispatch"` gate above is the
+// actual authoritative check; this is tool-list hygiene — a provider that ignored its own tool
+// list and called session_spawn anyway would still just hit the placeholder run() (session-
+// spawn.ts), same belt-and-braces relationship spawn_agent's own depth-cap exclusion has to its
+// own runtime reject.
+const SESSION_SPAWN_TOOL = "session_spawn";
 
 // 4h-i (CC parity: spawn_agent `mode`) — permissiveness order, LEAST to MOST permissive: "plan"
 // is read-only (most restrictive), "ask" is human-gated (middle), "auto" auto-allows non-
@@ -360,6 +373,12 @@ export interface EngineConfig {
   // rather than silently falling back to the synchronous path, so a caller never gets a "running"
   // tool_result for a detached child nothing is actually tracking.
   bgAgents?: BackgroundAgentRegistry;
+  // Dispatch (Phase 7): getter — daemon wires the registry after engine construction (computerUse
+  // precedent: `let dispatchChildren` is declared before `new AgentEngine(...)`, this closure
+  // reads it live, then daemon.ts assigns it right after construction). Absent (every test/config
+  // that doesn't wire dispatch mode) → the session_spawn bridge never activates and session_spawn
+  // calls fall through to the tool's own placeholder run() (session-spawn.ts).
+  dispatch?: () => DispatchChildren | undefined;
   // 4h-i Task 3 (CC parity: configurable nesting depth, settings.subagents.maxDepth): how many
   // levels of spawn_agent nesting are allowed, orthogonal to SubagentManager's maxConcurrent
   // (fan-out width) — this is depth, not count or concurrency. Undefined (getter absent, or
@@ -1327,7 +1346,12 @@ export class AgentEngine {
       depth: 0,
       signal,
       loaded,
-      ...(isDispatch ? { allowTools: DISPATCH_ALLOW_TOOLS } : {}),
+      // Dispatch (Phase 7) Task 4: a dispatch session gets the allowTools whitelist (which already
+      // includes session_spawn — dispatch-prompt.ts); a code session instead gets session_spawn
+      // explicitly EXCLUDED (SESSION_SPAWN_TOOL's own doc comment above) — never both fields at
+      // once (excludeTools would filter session_spawn OUT before allowTools ever got a chance to
+      // filter it back IN, for a dispatch session that somehow had both set).
+      ...(isDispatch ? { allowTools: DISPATCH_ALLOW_TOOLS } : { excludeTools: new Set([SESSION_SPAWN_TOOL]) }),
     });
   }
 
@@ -1570,6 +1594,86 @@ export class AgentEngine {
       // finished-target resume is async (awaited), and there's no benefit to parallelizing them.
       const sendMessageOutcomes = new Map<string, { output: string; isError: boolean }>();
       const sendMessageCalls = opts.depth === 0 ? calls.filter((c) => c.name === "send_message") : [];
+      // Dispatch (Phase 7) Task 4: session_spawn calls in the DISPATCH session's main thread spawn
+      // full first-class CHILD SESSIONS (DispatchChildren.spawnChild) — a completely separate
+      // session with its own turn()/transcript, not a subagent THREAD nested under this one
+      // (spawn_agent's mechanism above). Reuses the SAME `spawnOutcomes` map + the per-call loop's
+      // call-order consumption the spawn_agent bridge already established (that loop's
+      // `preOutcome = spawnOutcomes.get(call.callId) ?? sendMessageOutcomes.get(call.callId)`
+      // check doesn't care WHICH bridge populated the entry) — so a session_spawn callId rides the
+      // identical "never reaches executeCall" exclusion spawn_agent callIds already get, with NO
+      // parallel outcome map / skip-set of its own. Only active for the MAIN thread of a
+      // dispatch-mode session (meta.mode === "dispatch") AND when daemon.ts has wired a
+      // DispatchChildren registry (cfg.dispatch?.()) — absent either condition, session_spawn
+      // calls fall through to the per-call loop below and hit the tool's own placeholder run()
+      // (session-spawn.ts). A plain `for` loop, not Promise.all (spawn_agent's shape above): each
+      // spawnChild() call is fully synchronous (store.createSession/hub.append are sync bun:sqlite
+      // + sync fs appends; only the child's OWN turn is fire-and-forget), so there is no
+      // concurrency to gain from parallelizing N session_spawn calls in one round.
+      const dispatchReg = meta.mode === "dispatch" ? this.cfg.dispatch?.() : undefined;
+      const sessionSpawnCalls = dispatchReg ? calls.filter((c) => c.name === "session_spawn") : [];
+      if (sessionSpawnCalls.length > 0) {
+        for (const call of sessionSpawnCalls) {
+          let parsed: { dir?: unknown; prompt?: unknown; model?: unknown; type?: unknown; title?: unknown } = {};
+          try { parsed = JSON.parse(call.argsJson || "{}"); } catch { /* rejected below — empty dir/prompt */ }
+          const dir = typeof parsed.dir === "string" ? parsed.dir : "";
+          const prompt = typeof parsed.prompt === "string" ? parsed.prompt : "";
+          const type = typeof parsed.type === "string" ? parsed.type : "code";
+          const title = typeof parsed.title === "string" && parsed.title.trim().length > 0
+            ? parsed.title.trim() : prompt.slice(0, 60);
+          // Pre-flight rejections, ALL as isError tool_results, BEFORE any session is created —
+          // same ordering discipline as spawn_agent's own pre-thread_started checks above (a
+          // rejected call must leave no trace: no child session, no user_message, no
+          // child_update). Order: type, then dir shape, then prompt presence, then model.
+          if (type === "cowork") {
+            spawnOutcomes.set(call.callId, { output: "type 'cowork' is not yet available — use 'code'.", isError: true });
+            continue;
+          }
+          if (!dir.startsWith("/") || dir === "/") {
+            spawnOutcomes.set(call.callId, { output: "dir must be an absolute directory path (not '/').", isError: true });
+            continue;
+          }
+          if (!prompt) {
+            spawnOutcomes.set(call.callId, { output: "prompt is required — write the child a complete, self-contained task.", isError: true });
+            continue;
+          }
+          // Model override (v1, decision documented in the task-4 report): turn() resolves
+          // `sel.model` ONCE per turn, GLOBALLY, off cfg.provider.live?.() — there is no
+          // per-session model column (SessionRow, sessions/store.ts) and thus no seam to pin a
+          // model to a specific child session the way spawn_agent pins one to a THREAD via
+          // `resumeCtx.model`/the runThread `model` arg. So a validated override rides as a
+          // `[model: <id>]` trailer on the child's FIRST user_message instead (folded into
+          // `childPrompt` below, before spawnChild ever sees it) — and the tool_result says so, so
+          // the coordinator knows the mechanism rather than assuming a silent, precise override.
+          let effectiveOverride = typeof parsed.model === "string" ? parsed.model : undefined;
+          if (effectiveOverride !== undefined) {
+            const known = this.cfg.provider.provider.models();
+            // Same alias resolution as the spawn_agent bridge above (resolveModelAlias) — daemon.ts
+            // wires registerSessionSpawnTool with the SAME `[...knownModelIds, ...deriveModelAliases(...)]`
+            // list spawn_agent gets, so an alias offered in the tool's own schema enum must resolve
+            // here too, or a caller using the advertised alias would be wrongly rejected as unknown.
+            if (known.length > 0) effectiveOverride = resolveModelAlias(effectiveOverride, known.map((m) => m.id));
+            if (known.length > 0 && !known.some((m) => m.id === effectiveOverride)) {
+              spawnOutcomes.set(call.callId, {
+                output: `unknown model '${effectiveOverride}' — available models: ${known.map((m) => m.id).join(", ")}; omit \`model\` to inherit the default model`,
+                isError: true,
+              });
+              continue;
+            }
+          }
+          const childPrompt = effectiveOverride ? `${prompt}\n\n[model: ${effectiveOverride}]` : prompt;
+          // Non-null: sessionSpawnCalls (and thus this loop) is only ever non-empty when
+          // dispatchReg was truthy at the ternary above that derived it from the SAME expression.
+          const childId = dispatchReg!.spawnChild({ dispatchSessionId: sessionId, dir, prompt: childPrompt, title });
+          const modelNote = effectiveOverride
+            ? ` (model override '${effectiveOverride}' noted in the child's opening prompt — no per-session model override exists yet)`
+            : "";
+          spawnOutcomes.set(call.callId, {
+            output: `spawned session ${childId} ("${title}") in ${dir}${modelNote} — you'll get a child_update when it finishes.`,
+            isError: false,
+          });
+        }
+      }
       if (spawnCalls.length > 0) {
         await Promise.all(spawnCalls.map(async (call) => {
           // [4f pre-tool — Site 1 (bridged)] FIRST statement in the callback, before ANY spawn work
@@ -1824,8 +1928,14 @@ export class AgentEngine {
           // durable-prompt-injection path the card exists to guard — the human would be approving
           // a persistent skill mid-stream of some other task's card traffic. Only the main thread,
           // where the card appears in direct response to the conversation, may author skills.
+          // Dispatch (Phase 7) Task 4: session_spawn is excluded from EVERY spawn_agent child
+          // UNCONDITIONALLY too (SESSION_SPAWN_TOOL's own doc comment above) — a spawn_agent
+          // child only ever exists inside a CODE session (dispatch sessions can't spawn_agent at
+          // all — it's not in DISPATCH_ALLOW_TOOLS), so this is tool-list hygiene consistent with
+          // the main thread's own exclusion, not a new authorization boundary (the bridge's
+          // `meta.mode === "dispatch"` gate above already denies it functionally either way).
           const childDepth = opts.depth + 1;
-          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode", "send_message", "task_stop", "agent_list", "agent_output", "skill_write"]);
+          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode", "send_message", "task_stop", "agent_list", "agent_output", "skill_write", SESSION_SPAWN_TOOL]);
           if (childDepth >= maxDepth) childExcludeTools.add("spawn_agent");
           // 4h-ii-b Task 1: instructionsFull is computed ONCE here — hoisted out of the bg and
           // sync closures below, which used to each build their own copy independently — so it

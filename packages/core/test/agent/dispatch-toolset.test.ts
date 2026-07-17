@@ -12,6 +12,7 @@ import { registerBashTool } from "../../src/agent/tools/bash";
 import { registerTaskStopTool } from "../../src/agent/tools/task-stop";
 import { registerNotebookTool } from "../../src/agent/tools/notebook";
 import { registerSpawnAgentTool } from "../../src/agent/tools/spawn";
+import { registerSessionSpawnTool } from "../../src/agent/tools/session-spawn";
 import { registerSkillWriteTool } from "../../src/agent/tools/skill-write";
 import { registerPushNotificationTool } from "../../src/agent/tools/push-notification";
 import { registerAskUserTool } from "../../src/agent/tools/ask-user";
@@ -31,8 +32,11 @@ import { DISPATCH_ALLOW_TOOLS } from "../../src/agent/dispatch-prompt";
 import type { ProviderEvent } from "../../src/providers/types";
 
 // Full-surface registry: every tool a code session sees, INCLUDING the six that must never be
-// dispatch-visible (write, edit, notebook_edit, spawn_agent, skill_write, lsp) — so the "does NOT
-// include" assertions below are actually exercising the allowTools filter, not a vacuous absence.
+// dispatch-visible (write, edit, notebook_edit, spawn_agent, skill_write, lsp) PLUS session_spawn
+// (Task 4), which flips the OTHER way — dispatch-visible, never code-visible (engine.ts's
+// SESSION_SPAWN_TOOL exclusion) — so the "does NOT include"/"does include" assertions below in
+// BOTH directions are actually exercising the allowTools/excludeTools filters, not a vacuous
+// absence.
 function setup(script: ProviderEvent[][], opts: { mode?: "code" | "dispatch" } = {}) {
   const home = mkdtempSync(join(tmpdir(), "norma-dispatch-toolset-"));
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-dispatch-toolset-cwd-")));
@@ -46,6 +50,7 @@ function setup(script: ProviderEvent[][], opts: { mode?: "code" | "dispatch" } =
   registerTaskStopTool(registry);
   registerNotebookTool(registry);
   registerSpawnAgentTool(registry);
+  registerSessionSpawnTool(registry);
   registerPushNotificationTool(registry);
   registerAskUserTool(registry);
   registerWebTools(registry);
@@ -83,15 +88,15 @@ describe("dispatch mode: toolset + system prompt", () => {
     for (const n of names) expect(DISPATCH_ALLOW_TOOLS.has(n)).toBe(true);
     expect(names.has("bash")).toBe(true);
     expect(names.has("web_fetch")).toBe(true);
-    // session_spawn isn't registered yet (Task 4) — it's whitelisted but absent from this registry.
-    expect(names.has("session_spawn")).toBe(false);
+    // Task 4: session_spawn is now registered AND whitelisted — present for a dispatch session.
+    expect(names.has("session_spawn")).toBe(true);
 
     for (const excluded of ["write", "edit", "lsp", "spawn_agent", "skill_write", "notebook_edit"]) {
       expect(names.has(excluded)).toBe(false);
     }
   });
 
-  test("code session: same registry sees write/edit unchanged (regression)", async () => {
+  test("code session: same registry sees write/edit unchanged (regression), session_spawn excluded", async () => {
     const { engine, sessionId, provider } = setup([text("ok")], { mode: "code" });
     await engine.runTurn(sessionId);
     const names = new Set((provider.requests[0]?.tools ?? []).map((t) => t.name));
@@ -99,6 +104,9 @@ describe("dispatch mode: toolset + system prompt", () => {
     for (const expected of ["write", "edit", "lsp", "spawn_agent", "skill_write", "notebook_edit", "bash", "read"]) {
       expect(names.has(expected)).toBe(true);
     }
+    // Task 4: session_spawn is dispatch-only — a code session must never see it (engine.ts's
+    // SESSION_SPAWN_TOOL exclusion, the mirror image of the six tools excluded above).
+    expect(names.has("session_spawn")).toBe(false);
   });
 
   test("dispatch turn's instructions carry Dispatch-mode doctrine and NOT the code base prompt's file-paths sentence", async () => {

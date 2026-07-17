@@ -27,6 +27,8 @@ import { registerPlanTool } from "./agent/tools/plan";
 import { registerNotebookTool } from "./agent/tools/notebook";
 import { registerWorktreeTools } from "./agent/tools/worktree";
 import { registerSpawnAgentTool } from "./agent/tools/spawn";
+import { registerSessionSpawnTool } from "./agent/tools/session-spawn";
+import { DispatchChildren } from "./agent/dispatch-children";
 import { registerSendMessageTool } from "./agent/tools/send-message";
 import { registerTaskStopTool } from "./agent/tools/task-stop";
 import { registerAgentQueryTools } from "./agent/tools/agent-query";
@@ -483,6 +485,13 @@ export async function startDaemon(opts: {
     // alias offered here is always one the bridge will actually accept.
     const knownModelIds = agentProvider.provider.models().map((m) => m.id);
     registerSpawnAgentTool(registry, { models: [...knownModelIds, ...deriveModelAliases(knownModelIds)] });
+    // Dispatch (Phase 7) Task 4: session_spawn — registered unconditionally alongside spawn_agent
+    // (both live on the SAME shared `registry`; engine.ts's SESSION_SPAWN_TOOL exclusion is what
+    // actually keeps it out of a code session's tool list — registering it here doesn't by itself
+    // make it code-visible). SAME models list as spawn_agent (full ids + their unambiguous short
+    // aliases) so the bridge's alias resolution (engine.ts) always accepts whatever this tool's own
+    // schema enum advertised.
+    registerSessionSpawnTool(registry, { models: [...knownModelIds, ...deriveModelAliases(knownModelIds)] });
     // 4h-ii-b Task 4 (CC SendMessage): registered alongside spawn_agent (only when subagents are
     // available) so the MAIN thread can address a subagent by agentId/name — a running one gets the
     // message at its next step, a finished one is resumed with it. Like spawn_agent it's an engine
@@ -644,6 +653,12 @@ export async function startDaemon(opts: {
     // `agentProvider` directly), `true` there is the same fail-open default those two use.
     const lspAutoDiagnosticsHot = (): boolean => (settings ? lspAutoDiagnosticsEnabledFrom(settings) : true);
     const hookFacade = new HookFacade({ registry: hookRegistry, runner: new HookRunner(), hooksEnabled: hooksEnabledHot });
+    // Dispatch (Phase 7) Task 4: declared BEFORE `engine` is constructed (computerUse precedent —
+    // see EngineConfig.dispatch's own doc comment, engine.ts) so the `dispatch: () =>
+    // dispatchChildren` getter below closes over this SAME binding; assigned right after
+    // `new AgentEngine(...)` returns, since DispatchChildren.spawnChild needs `engine.runTurn`/
+    // `engine.isRunning`, which don't exist until the engine itself does.
+    let dispatchChildren: DispatchChildren | undefined;
     engine = new AgentEngine({
       store, hub, registry, broker: approvalBroker,
       gate: new PermissionGate(),
@@ -728,6 +743,18 @@ export async function startDaemon(opts: {
       // emission time (see engine.ts's executeCall). Boot-constant (no settings gate — v1 keeps
       // this always-on, matching the task's "keep it simple" design).
       notifyFallback: notifyHeadless,
+      dispatch: () => dispatchChildren,
+    });
+    // Dispatch (Phase 7) Task 4: constructed AFTER `engine` exists — its `runTurn`/`isRunning`
+    // deps close over `engine!` (non-null: this whole block only runs once `engine` is assigned
+    // just above, mirroring `registerAgentQueryTools`' own `engine?.transcriptPathFor` lazy-closure
+    // precedent a few dozen lines up). Reassigns the SAME `dispatchChildren` binding the
+    // `dispatch: () => dispatchChildren` getter above already closes over — no engine
+    // reconstruction needed, same shape as `computerUse`'s own post-construction assignment.
+    dispatchChildren = new DispatchChildren({
+      store, hub,
+      runTurn: (sid) => engine!.runTurn(sid),
+      isRunning: (sid) => engine!.isRunning(sid),
     });
 
     // hot-settings T5b (final task of the hot-settings track): compose T2's live getters (already
