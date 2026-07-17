@@ -17,7 +17,22 @@ export class SessionHub {
   // to to pick up its title live.
   onGlobalEvent?: (event: SessionEvent) => void;
 
+  // Dispatch (Phase 7): lightweight in-process observers — fan-out of every appended/broadcast
+  // event of EVERY session. Unlike HubClient attach, observing appends nothing (no
+  // harness_attached), doesn't count toward attachedCount, and spans all sessions. Errors in an
+  // observer are swallowed (an observer must never break the append path).
+  private observers = new Set<(event: SessionEvent) => void>();
+
   constructor(private readonly store: SessionStore) {}
+
+  addObserver(fn: (event: SessionEvent) => void): () => void {
+    this.observers.add(fn);
+    return () => this.observers.delete(fn);
+  }
+
+  private notifyObservers(event: SessionEvent): void {
+    for (const fn of this.observers) { try { fn(event); } catch { /* observer bug must not break append */ } }
+  }
 
   attach(client: HubClient, sessionId: string, fromSeq: number): number {
     // Defense-in-depth: a client can only be attached to one session — re-attach = move.
@@ -81,13 +96,16 @@ export class SessionHub {
     // Narrow on purpose: session_created already has its own server-side broadcast, and every
     // other event type is scoped to a session's own attachments.
     if (event.type === "session_titled") this.onGlobalEvent?.(event);
+    this.notifyObservers(event);
     return event;
   }
 
   /** Broadcast-only TRANSIENT event: fanned out to attached clients, NEVER persisted — absent
    *  from the JSONL log and from attach replay. Stamped with seq = the store's CURRENT lastSeq
    *  (it is not itself sequenced): monotonic-safe for naive lastSeq tracking, but clients must
-   *  exempt transient events from seq-based dedupe. Used for assistant_delta streaming. */
+   *  exempt transient events from seq-based dedupe. Used for assistant_delta streaming.
+   *  Deliberately does NOT call notifyObservers (Phase 7 dispatch): transient deltas are noise
+   *  for the registry — observers only ever see persisted, appended events. */
   broadcastTransient(sessionId: string, input: EventInput): SessionEvent {
     const event = SessionEvent.parse({ ...input, seq: this.store.lastSeq(sessionId), ts: Date.now() });
     this.fanOut(sessionId, event);

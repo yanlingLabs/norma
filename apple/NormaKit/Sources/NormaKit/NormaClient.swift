@@ -266,6 +266,7 @@ extension SessionEvent {
         case .tileAction(let v): return v.seq
         case .toolReview(let v): return v.seq
         case .notificationRequested(let v): return v.seq
+        case .childUpdate(let v): return v.seq
         }
     }
 
@@ -310,6 +311,7 @@ extension SessionEvent {
         case .tileAction(let v): return v.sessionId
         case .toolReview(let v): return v.sessionId
         case .notificationRequested(let v): return v.sessionId
+        case .childUpdate(let v): return v.sessionId
         }
     }
 }

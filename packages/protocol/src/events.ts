@@ -69,9 +69,14 @@ export const ApprovalRequestedEvent = ThreadBase.extend({
   // `summary` instead of the old smashed-in "⚠ safety reviewer: ..." prefix. Additive/optional — an
   // ask-policy or reviewer-less escalation omits it, and older-shaped events still parse.
   reviewerReason: z.string().optional(),
+  // Dispatch relay (Phase 7): set on the MIRRORED copy of a child session's approval living in the
+  // dispatch session's stream — identifies which child to respond into. Absent on native approvals.
+  childSessionId: z.string().optional(),
 });
 export const ApprovalResolvedEvent = ThreadBase.extend({
   type: z.literal("approval_resolved"), callId: z.string().min(1), approved: z.boolean(), by: z.string().min(1),
+  // Dispatch relay (Phase 7): see approval_requested.
+  childSessionId: z.string().optional(),
 });
 export const TurnCompletedEvent = ThreadBase.extend({
   type: z.literal("turn_completed"), stopReason: z.enum(["end_turn", "aborted", "error"]),
@@ -138,12 +143,16 @@ export type Task = z.infer<typeof TaskSchema>;
 
 export const QuestionAskedEvent = ThreadBase.extend({
   type: z.literal("question_asked"), callId: z.string().min(1), questions: z.array(QuestionSchema).min(1).max(4),
+  // Dispatch relay (Phase 7): see approval_requested.
+  childSessionId: z.string().optional(),
 });
 export const QuestionResolvedEvent = ThreadBase.extend({
   type: z.literal("question_resolved"), callId: z.string().min(1), answers: z.record(z.string(), z.string()), by: z.string().min(1),
   // CC AskUserQuestion parity: free-text notes ("press n to add notes"), keyed by question text
   // like `answers`. Optional/additive — older-shaped resolutions without notes still parse.
   notes: z.record(z.string(), z.string()).optional(),
+  // Dispatch relay (Phase 7): see approval_requested.
+  childSessionId: z.string().optional(),
 });
 export const TaskUpdatedEvent = ThreadBase.extend({ type: z.literal("task_updated"), task: TaskSchema });
 
@@ -177,6 +186,18 @@ export const ThreadCompletedEvent = ThreadBase.extend({
   // only ever aborts a CHILD thread from the outside; the main thread's own turn never stalls this
   // way (it has no watchdog of its own).
   type: z.literal("thread_completed"), stopReason: z.enum(["end_turn", "aborted", "error", "stalled"]),
+});
+
+/** Dispatch (Phase 7): appended to the DISPATCH session's stream by the DispatchChildren registry
+ *  whenever a child session's status changes materially (spawned, turn ended, error, stopped).
+ *  `status` is DERIVED daemon-side (never stored). `resultSummary` is the child's final
+ *  assistant message when the update is a turn-end. */
+export const ChildUpdateEvent = ThreadBase.extend({
+  type: z.literal("child_update"),
+  childSessionId: z.string().min(1),
+  status: z.enum(["running", "awaiting_approval", "awaiting_input", "completed", "error"]),
+  title: z.string(),
+  resultSummary: z.string().optional(),
 });
 
 /** Background-agent completion notice (CC parity: <task-notification>), persisted and replayed as a
@@ -376,6 +397,7 @@ export const SessionEvent = z.discriminatedUnion("type", [
   TileActionEvent,
   ToolReviewEvent,
   NotificationRequestedEvent,
+  ChildUpdateEvent,
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 

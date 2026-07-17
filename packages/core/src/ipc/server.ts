@@ -1,9 +1,10 @@
 import { chmodSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { homedir } from "node:os";
 import { z } from "zod";
 import {
   ERR, METHODS, PROTOCOL_VERSION, LineDecoder, encodeLine, parseIncoming,
-  HelloParams, SessionCreateParams, SessionAttachParams, SessionSendParams, ApprovalRespondParams,
+  HelloParams, SessionCreateParams, SessionDispatchParams, SessionAttachParams, SessionSendParams, ApprovalRespondParams,
   SessionAddDirParams, SessionSetCwdParams, TrustDirParams,
   BgListParams, BgPeekParams, BgKillParams, BgKillAllParams,
   SessionSteerParams, SessionInterruptParams, SessionCompactParams, SkillsListParams, McpListParams,
@@ -559,6 +560,10 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
     switch (method) {
       case METHODS.sessionCreate: {
         const p = parseParams(SessionCreateParams, params);
+        // Dispatch (Phase 7): the singleton dispatch session is minted ONLY by session.dispatch's
+        // get-or-create — session.create rejects the mode outright rather than silently minting a
+        // second one (there must only ever be one).
+        if (p.mode === "dispatch") throw new RpcFailure(ERR.INVALID_PARAMS, "dispatch sessions are created via session.dispatch, not session.create");
         const sessionId = opts.store.createSession(p.scope, { cwd: p.cwd, approvalPolicy: p.approvalPolicy, origin: p.origin });
         const trusted = p.cwd ? (opts.trust?.isTrusted(p.cwd) ?? false) : false;
         // Broadcast the session_created event to every authed harness (not just attachments —
@@ -574,6 +579,17 @@ export function startIpcServer(opts: IpcServerOptions): IpcServer {
       }
       case METHODS.sessionList:
         return { sessions: opts.store.list() };
+      case METHODS.sessionDispatch: {
+        parseParams(SessionDispatchParams, params);
+        // Get-or-create is atomic here: the lookup+create sequence is synchronous (bun:sqlite,
+        // no await between), so two concurrent RPCs cannot both create.
+        const existing = opts.store.dispatchSessionId();
+        if (existing) return { sessionId: existing, created: false };
+        const sessionId = opts.store.createSession("global", {
+          cwd: homedir(), approvalPolicy: "auto", origin: "dispatch", mode: "dispatch",
+        });
+        return { sessionId, created: true };
+      }
       case METHODS.sessionAttach: {
         const p = parseParams(SessionAttachParams, params);
         const hubClient: HubClient = {

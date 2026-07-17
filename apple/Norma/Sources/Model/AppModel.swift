@@ -62,7 +62,7 @@ final class AppModel: ObservableObject {
         let feedClient = feed.client
         directory = SessionDirectory(lister: {
             try await feedClient.listSessions().map {
-                SessionSummary(sessionId: $0.sessionId, title: $0.title, createdAt: $0.createdAt, scope: $0.scope, cwd: $0.cwd)
+                SessionSummary(sessionId: $0.sessionId, title: $0.title, createdAt: $0.createdAt, scope: $0.scope, cwd: $0.cwd, mode: $0.mode, parentSessionId: $0.parentSessionId)
             }
         })
         // FINAL-REVIEW FIX (M1): cold-window bootstrap — session.list on construction, not only on
@@ -130,15 +130,17 @@ final class AppModel: ObservableObject {
         return (detachedFeed, detachedSession)
     }
 
-    /// Field summon path: a session to talk to, creating one if none is focused.
+    /// Field summon path: a session to talk to — the ONE permanent dispatch session (Phase 7),
+    /// get-or-created via `session.dispatch` when none is focused.
     ///
-    /// Orb-created sessions run approvalPolicy "auto": the orb has no approval UI until 2d,
-    /// so there's nowhere to surface an "ask" prompt. The daemon's reviewer still gates
+    /// Approval policy is the DAEMON's business now: `session.dispatch` sets the dispatch
+    /// singleton's policy ("auto") server-side, so this client no longer passes one (the old
+    /// `createSession(approvalPolicy: "auto")` call did). The daemon's reviewer still gates
     /// dangerous bash regardless of policy — auto ≠ unguarded. Sessions the orb merely
     /// FOLLOWS (created elsewhere, e.g. the CLI) keep their creator's policy, unchanged.
     func ensureFocusedSession() async -> String? {
         if let sid = focusedSessionId { return sid }
-        guard let created = try? await client.createSession(scope: "global", cwd: NSHomeDirectory(), approvalPolicy: "auto") else { return nil }
+        guard let created = try? await client.dispatchSession() else { return nil }
         // The daemon broadcasts session_created BEFORE the RPC response returns; the pump may
         // have already refocused us onto the new session. Idempotent skip — never double-attach.
         if focusedSessionId == created.sessionId { return focusedSessionId }
@@ -160,7 +162,8 @@ final class AppModel: ObservableObject {
     /// re-derive that from focus state.
     @discardableResult
     func startFreshSession() async -> String? {
-        guard let created = try? await client.createSession(scope: "global", cwd: NSHomeDirectory(), approvalPolicy: "auto") else { return nil }
+        // Dispatch (Phase 7): the orb has exactly ONE permanent session; "fresh" refocuses onto it.
+        guard let created = try? await client.dispatchSession() else { return nil }
         // Same belt as ensureFocusedSession(): the daemon's session_created broadcast can arrive
         // (and refocus us) before this RPC response does — idempotent skip, never double-attach.
         if focusedSessionId == created.sessionId { return focusedSessionId }
@@ -257,13 +260,20 @@ final class AppModel: ObservableObject {
         session.state.pendingInteractions.contains { $0.callId == callId }
     }
 
-    func respondApproval(callId: String, approved: Bool) async -> Bool {
-        guard let sid = focusedSessionId, pendingCallIdIsCurrent(callId) else { return false }
+    /// `childSessionId` (Dispatch, Phase 7): set only on the mirrored copy of a CHILD session's
+    /// approval (`PendingCard`'s own `PendingInteraction.approval` payload) — routes the respond
+    /// RPC straight to the child instead of this focused (dispatch) session. `nil` is the pre-
+    /// Phase-7 behavior, unchanged: respond into whatever session is currently focused.
+    func respondApproval(callId: String, approved: Bool, childSessionId: String? = nil) async -> Bool {
+        let target = childSessionId ?? focusedSessionId
+        guard let sid = target, pendingCallIdIsCurrent(callId) else { return false }
         return (try? await client.approvalRespond(sessionId: sid, callId: callId, approved: approved)) != nil
     }
 
-    func respondQuestion(callId: String, answers: [String: String], notes: [String: String] = [:]) async -> Bool {
-        guard let sid = focusedSessionId, pendingCallIdIsCurrent(callId) else { return false }
+    /// `childSessionId`: same Dispatch/Phase-7 routing as `respondApproval`'s.
+    func respondQuestion(callId: String, answers: [String: String], notes: [String: String] = [:], childSessionId: String? = nil) async -> Bool {
+        let target = childSessionId ?? focusedSessionId
+        guard let sid = target, pendingCallIdIsCurrent(callId) else { return false }
         return (try? await client.askUserRespond(sessionId: sid, callId: callId, answers: answers, notes: notes.isEmpty ? nil : notes)) != nil
     }
 

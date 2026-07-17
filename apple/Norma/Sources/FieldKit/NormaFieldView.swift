@@ -608,6 +608,32 @@ struct NormaFieldView: View {
                 .allowsHitTesting(false)
                 .position(x: chatButtonFinal.midX, y: chatButtonFinal.midY)
 
+            // Dispatch (Phase 7), Task 8: one circle per in-flight child session, laid RIGHT-to-
+            // LEFT starting immediately left of the expand button (`chatButtonFinal.minX`) — the
+            // first child (i=0) sits nearest the expand circle, each later one growing further
+            // leftward. Capped at `FieldStateAdapter.maxVisibleDispatchChildren` visible circles
+            // (v1: no "+N" overflow badge — a 6th+ child simply doesn't render its own circle yet;
+            // Task 9 review hoisted the cap out of an inline `.prefix(5)` here into
+            // `adapter.visibleDispatchChildren`, a testable seam — see FieldStateAdapter). Same
+            // reveal timing / legibility wrap as the expand button just above
+            // (`sideContentReveal`/`GlassForegroundLegibility`) — a v1 ("acceptable v1", per the
+            // brief) fade rather than its own morph interpolation.
+            ForEach(Array(adapter.visibleDispatchChildren.enumerated()), id: \.element.id) { i, child in
+                let d = chatButtonFinal.height * 0.62
+                let cx = chatButtonFinal.minX - CGFloat(i + 1) * (d + 6) - d / 2
+                Circle()
+                    .strokeBorder(childRingColor(child.status), lineWidth: 1.5)
+                    .background(Circle().fill(childRingColor(child.status).opacity(0.25)))
+                    .frame(width: d, height: d)
+                    .position(x: cx, y: chatButtonFinal.midY)
+                    .contentShape(Circle())
+                    .onTapGesture { adapter.onOpenChild(child.sessionId) }
+                    .opacity(sideContentReveal)
+                    .modifier(GlassForegroundLegibility())
+                    .modifier(childPulse(active: child.status == "running"))
+                    .help(child.title)
+            }
+
             if !navSegments.isEmpty {
                 NavigationPill(
                     segments: navSegments,
@@ -1137,6 +1163,52 @@ func chatButtonFinalRect(navFinal: CGRect, interPillGap: CGFloat) -> CGRect {
         width: size,
         height: size
     )
+}
+
+// MARK: - Child-status circles (Dispatch, Phase 7, Task 8)
+
+/// Ring/fill color for one child circle — attention accent for a child waiting on the human
+/// (matches `adapter.interactionNeeded`'s own amber, `NormaFieldView.swift:584`, since a mirrored
+/// child approval/question surfaces through the exact same pending-interaction path), an error
+/// tint for a child that blew up, plain white (same default as every other foreground glyph in
+/// this file) for a running/queued child — no separate color for "running"; `childPulse` below is
+/// what distinguishes it instead.
+private func childRingColor(_ status: String) -> Color {
+    switch status {
+    case "awaiting_approval", "awaiting_input": return Color(red: 1.0, green: 0.72, blue: 0.30)
+    case "error": return Color(red: 1.0, green: 0.35, blue: 0.35)
+    default: return .white
+    }
+}
+
+/// A running child's ring breathes so it reads as "actively working" among its static siblings.
+/// Mirrors `chevronPulse`'s own convention exactly (`NormaFieldView.swift:104-113`'s doc — v1 LAW:
+/// a `repeatForever` animation's state stays scoped to the view chain that owns it, never hoisted
+/// onto an outer/ancestor view) rather than a raw `withAnimation` call at the ForEach call site,
+/// which would hoist the animation's state onto `NormaFieldView` itself and, worse, fire it fresh
+/// on every one of the field's own high-frequency re-renders (the adapter republishes on every
+/// session-state change while a turn runs — see `FieldStateAdapter.init`'s doc) instead of once
+/// per child on its own false→true transition. Scoped as a private `ViewModifier` with its own
+/// `@State` (one instance per `ForEach` row, keyed off `child.id` — same identity the ForEach
+/// already establishes) so each child's pulse starts/stops independently of its siblings and of
+/// the field's own re-renders.
+private struct ChildPulse: ViewModifier {
+    let active: Bool
+    @State private var pulseOn = false
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(pulseOn ? 1.0 : 0.55)
+            .animation(
+                active ? .easeInOut(duration: 1.2).repeatForever(autoreverses: true) : .default,
+                value: pulseOn
+            )
+            .onChange(of: active, initial: true) { _, isActive in pulseOn = isActive }
+    }
+}
+
+private func childPulse(active: Bool) -> some ViewModifier {
+    ChildPulse(active: active)
 }
 
 // MARK: - GlassForegroundLegibility (v1 GlassFieldView.swift:1285-1291, verbatim)

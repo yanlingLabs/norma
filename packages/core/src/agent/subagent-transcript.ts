@@ -51,6 +51,7 @@ const TRANSCRIPT_INCLUDE = {
   notification_requested: true,
   worktree_entered: true,
   worktree_exited: true,
+  child_update: true, // dispatch child status changes (spawned/running/awaiting/completed/error)
   // ---- excluded: allowlist by design — an unknown/future event type must never leak into a
   // model-greppable file; add new types above deliberately (see events.ts:57-63 for why
   // reasoning_item is absent from the written set) ----

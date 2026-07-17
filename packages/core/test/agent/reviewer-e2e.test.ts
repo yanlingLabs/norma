@@ -55,9 +55,12 @@ describe("reviewer maturity e2e (phase 5e T6)", () => {
 
         const denyResult = events.find((e) => e.type === "tool_result") as any;
         // THE byte-pinned template — exact match (not toContain), so any accidental reshaping or
-        // sanitization of this specific reviewer->model channel fails loudly, not silently.
+        // sanitization of this specific reviewer->model channel fails loudly, not silently. The
+        // seconds figure is derived from this test's own 30ms override (whole-branch fix wave —
+        // reviewAndDispatch no longer hardcodes "60s" regardless of the actual window used; see
+        // its own doc comment), rounding to 0s here.
         expect(denyResult.output).toBe(
-          'blocked by the safety reviewer: REASON_E2E_SENTINEL. No approval within 60s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.',
+          'blocked by the safety reviewer: REASON_E2E_SENTINEL. No approval within 0s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.',
         );
         expect(calls.length).toBe(0); // bash never ran
 

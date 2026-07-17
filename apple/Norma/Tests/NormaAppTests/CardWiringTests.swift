@@ -25,10 +25,14 @@ final class CardWiringTests: XCTestCase {
 
     func testCardKeyActionApprovalYN() {
         let approval = PendingInteraction.approval(callId: "a1", toolName: "bash", summary: "rm x")
-        XCTAssertEqual(cardKeyAction(keyCode: 16, chars: "y", topmost: approval, composerDraft: ""), .approve("a1"))
-        XCTAssertEqual(cardKeyAction(keyCode: 45, chars: "n", topmost: approval, composerDraft: ""), .deny("a1"))
+        XCTAssertEqual(cardKeyAction(keyCode: 16, chars: "y", topmost: approval, composerDraft: ""), .approve("a1", nil))
+        XCTAssertEqual(cardKeyAction(keyCode: 45, chars: "n", topmost: approval, composerDraft: ""), .deny("a1", nil))
         // uppercase (shift held) must resolve the same way
-        XCTAssertEqual(cardKeyAction(keyCode: 16, chars: "Y", topmost: approval, composerDraft: ""), .approve("a1"))
+        XCTAssertEqual(cardKeyAction(keyCode: 16, chars: "Y", topmost: approval, composerDraft: ""), .approve("a1", nil))
+
+        // Dispatch (Phase 7): a mirrored child approval's childSessionId rides straight through.
+        let childApproval = PendingInteraction.approval(callId: "a2", toolName: "bash", summary: "rm y", childSessionId: "child_1")
+        XCTAssertEqual(cardKeyAction(keyCode: 16, chars: "y", topmost: childApproval, composerDraft: ""), .approve("a2", "child_1"))
 
         let qs = questions(#"[{"question":"Which db?","header":"DB","options":[{"label":"A","description":null}],"multiSelect":false}]"#)
         let question = PendingInteraction.question(callId: "q1", questions: qs)
@@ -40,7 +44,7 @@ final class CardWiringTests: XCTestCase {
     func testCardKeyActionDigitsSelectOption() {
         let qs = questions(#"[{"question":"Which db?","header":"DB","options":[{"label":"A","description":null},{"label":"B","description":null},{"label":"C","description":null}],"multiSelect":false}]"#)
         let single = PendingInteraction.question(callId: "q1", questions: qs)
-        XCTAssertEqual(cardKeyAction(keyCode: 19, chars: "2", topmost: single, composerDraft: ""), .selectOption("q1", 1))
+        XCTAssertEqual(cardKeyAction(keyCode: 19, chars: "2", topmost: single, composerDraft: ""), .selectOption("q1", 1, nil))
         XCTAssertNil(cardKeyAction(keyCode: 23, chars: "5", topmost: single, composerDraft: ""), "digit past the option count is a no-op")
 
         // multiSelect: stays mouse-only even for a single question.
@@ -77,7 +81,7 @@ final class CardWiringTests: XCTestCase {
         XCTAssertNil(cardKeyAction(keyCode: 16, chars: "y", topmost: approval, composerDraft: " "))
 
         // empty draft: unaffected, falls through to the ordinary routing.
-        XCTAssertEqual(cardKeyAction(keyCode: 16, chars: "y", topmost: approval, composerDraft: ""), .approve("a1"))
+        XCTAssertEqual(cardKeyAction(keyCode: 16, chars: "y", topmost: approval, composerDraft: ""), .approve("a1", nil))
     }
 
     /// T4-review fix: a card's OWN text fields (notes, Other) are local `@State`, never routed
@@ -101,11 +105,11 @@ final class CardWiringTests: XCTestCase {
         // (default `textFieldFocused: false`, matching every call site above).
         XCTAssertEqual(
             cardKeyAction(keyCode: 20, chars: "3", topmost: question, composerDraft: ""),
-            .selectOption("q1", 2)
+            .selectOption("q1", 2, nil)
         )
         XCTAssertEqual(
             cardKeyAction(keyCode: 20, chars: "3", topmost: question, composerDraft: "", textFieldFocused: false),
-            .selectOption("q1", 2)
+            .selectOption("q1", 2, nil)
         )
 
         // y/n (approval cards) while a text field is focused: also suppressed — same guard, not
@@ -166,7 +170,7 @@ final class CardWiringTests: XCTestCase {
         // wired here to a STUB (not a real AppModel/NormaClient) so this test locks down the
         // discipline itself: inFlight inserted synchronously, removed only after the async stub
         // resolves, and an error line set on failure (never on success).
-        adapter.onApprovalRespond = { [adapter] callId, approved in
+        adapter.onApprovalRespond = { [adapter] callId, approved, childSessionId in
             adapter.interactionInFlight.insert(callId)
             adapter.interactionErrors[callId] = nil
             Task { @MainActor in
@@ -178,14 +182,14 @@ final class CardWiringTests: XCTestCase {
             }
         }
 
-        adapter.onApprovalRespond("call1", true)
+        adapter.onApprovalRespond("call1", true, nil)
         XCTAssertTrue(adapter.interactionInFlight.contains("call1"), "inFlight must be inserted SYNCHRONOUSLY, before the RPC resolves")
         await waitUntil { !adapter.interactionInFlight.contains("call1") }
         XCTAssertFalse(adapter.interactionInFlight.contains("call1"))
         XCTAssertNil(adapter.interactionErrors["call1"], "success must not leave an error line behind")
 
         stubSucceeds = false
-        adapter.onApprovalRespond("call2", false)
+        adapter.onApprovalRespond("call2", false, nil)
         XCTAssertTrue(adapter.interactionInFlight.contains("call2"))
         await waitUntil { !adapter.interactionInFlight.contains("call2") }
         XCTAssertFalse(adapter.interactionInFlight.contains("call2"))
@@ -280,5 +284,79 @@ final class CardWiringTests: XCTestCase {
         let ok = await model.respondApproval(callId: "call1", approved: true)
         XCTAssertFalse(ok)
         XCTAssertTrue(t.sent.isEmpty, "no RPC should go out with no focused session")
+    }
+
+    // MARK: - Dispatch (Phase 7), task-7 review fix: childSessionId ROUTING wire proof
+
+    /// Boots a focused session "s_disp" (the dispatch session's stand-in) exactly like
+    /// `testAppModelRespondApprovalWireShape` above — shared by the two routing tests below.
+    /// The `nil`-childSessionId leg of the routing rule (`childSessionId ?? focusedSessionId`)
+    /// is already pinned by that wire-shape test, which never passes one and asserts the RPC
+    /// targets the focused session.
+    @MainActor
+    private func bootFocusedDispatch(_ t: AppScriptedTransport, _ model: AppModel) async {
+        await answerHandshake(t, sessions: #"[{"sessionId":"s_disp","scope":"global","createdAt":1,"lastSeq":0}]"#)
+        await waitUntilSent(t, 3)
+        let attach = lineJSON(t.sent[2])
+        XCTAssertEqual(attach["method"] as? String, "session.attach")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(attach["id"] as! Int),"result":{"ok":true,"lastSeq":0}}"#)
+        await waitUntil { model.session.state.status == .idle }
+    }
+
+    /// A MIRRORED child approval (its event carries `childSessionId`) answered via
+    /// `respondApproval(childSessionId:)` must ship the outgoing `approval.respond` against the
+    /// CHILD's sessionId — not the focused (dispatch) session the card physically lives in.
+    @MainActor
+    func testAppModelRespondApprovalRoutesToChildSessionId() async throws {
+        let t = AppScriptedTransport()
+        let model = AppModel(makeTransport: { t }, token: "tok")
+        let startTask = Task { await model.start() }
+        defer { startTask.cancel(); model.stop() }
+        await bootFocusedDispatch(t, model)
+
+        // The mirrored copy arrives in the DISPATCH session's own stream (sessionId "s_disp"),
+        // tagged with the child it relays for — exactly what the daemon's relay emits.
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"approval_requested","seq":1,"sessionId":"s_disp","ts":1,"threadId":"main","callId":"call1","toolName":"bash","summary":"rm -rf x","childSessionId":"s_child_1"}}"#)
+        await waitUntil { !model.session.state.pendingInteractions.isEmpty }
+
+        async let responded = model.respondApproval(callId: "call1", approved: true, childSessionId: "s_child_1")
+        await waitUntilSent(t, 4)
+        let respond = lineJSON(t.sent[3])
+        XCTAssertEqual(respond["method"] as? String, "approval.respond")
+        let params = respond["params"] as? [String: Any]
+        XCTAssertEqual(params?["sessionId"] as? String, "s_child_1",
+                       "the respond RPC must target the CHILD, not focusedSessionId (s_disp)")
+        XCTAssertEqual(params?["callId"] as? String, "call1")
+        XCTAssertEqual(params?["approved"] as? Bool, true)
+        t.feed(#"{"jsonrpc":"2.0","id":\#(respond["id"] as! Int),"result":{"alreadyResolved":false}}"#)
+        let ok = await responded
+        XCTAssertTrue(ok)
+    }
+
+    /// Same routing proof for the question path: `respondQuestion(childSessionId:)` →
+    /// `ask_user.respond` against the CHILD's sessionId.
+    @MainActor
+    func testAppModelRespondQuestionRoutesToChildSessionId() async throws {
+        let t = AppScriptedTransport()
+        let model = AppModel(makeTransport: { t }, token: "tok")
+        let startTask = Task { await model.start() }
+        defer { startTask.cancel(); model.stop() }
+        await bootFocusedDispatch(t, model)
+
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"question_asked","seq":1,"sessionId":"s_disp","ts":1,"threadId":"main","callId":"q1","questions":[{"question":"Which port?","header":"h","options":[{"label":"80","description":null}],"multiSelect":false}],"childSessionId":"s_child_1"}}"#)
+        await waitUntil { !model.session.state.pendingInteractions.isEmpty }
+
+        async let responded = model.respondQuestion(callId: "q1", answers: ["Which port?": "80"], childSessionId: "s_child_1")
+        await waitUntilSent(t, 4)
+        let respond = lineJSON(t.sent[3])
+        XCTAssertEqual(respond["method"] as? String, "ask_user.respond")
+        let params = respond["params"] as? [String: Any]
+        XCTAssertEqual(params?["sessionId"] as? String, "s_child_1",
+                       "the respond RPC must target the CHILD, not focusedSessionId (s_disp)")
+        XCTAssertEqual(params?["callId"] as? String, "q1")
+        XCTAssertEqual((params?["answers"] as? [String: Any])?["Which port?"] as? String, "80")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(respond["id"] as! Int),"result":{"alreadyResolved":false}}"#)
+        let ok = await responded
+        XCTAssertTrue(ok)
     }
 }

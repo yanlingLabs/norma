@@ -69,6 +69,66 @@ final class DashboardTests: XCTestCase {
         XCTAssertEqual(sessionDisplayTitle("Already trimmed"), "Already trimmed")
     }
 
+    // MARK: - groupedSessionRows (PURE, SessionsPane.swift — Dispatch Phase 7, task-7 review fix)
+
+    private func row(_ id: String, createdAt: Int, mode: String? = nil, parent: String? = nil) -> SessionSummary {
+        SessionSummary(sessionId: id, title: nil, createdAt: createdAt, scope: "global", cwd: nil, mode: mode, parentSessionId: parent)
+    }
+
+    /// (a) Two parentless sessions keep the directory's newest-first relative order — the naive
+    /// `(parentSessionId ?? sessionId, ...)` sort this replaces ordered them by opaque random hex
+    /// ids instead (the reviewed defect).
+    func testGroupedSessionRowsPreservesNewestFirstForParentlessRows() {
+        // Ids chosen so lexicographic order ("a..." < "z...") CONTRADICTS newest-first — the old
+        // sort-by-id bug would emit ["a_old", "z_new"] here.
+        let rows = [row("z_new", createdAt: 30), row("m_mid", createdAt: 20), row("a_old", createdAt: 10)]
+        XCTAssertEqual(groupedSessionRows(rows).map(\.sessionId), ["z_new", "m_mid", "a_old"])
+    }
+
+    /// (b) A child renders immediately after its parent even when a NEWER unrelated session sits
+    /// between them in the directory's own newest-first order; the unrelated rows keep theirs.
+    func testGroupedSessionRowsLiftsChildDirectlyUnderItsParent() {
+        let rows = [
+            row("newest_unrelated", createdAt: 40),
+            row("child", createdAt: 30, parent: "dispatch"),
+            row("other", createdAt: 20),
+            row("dispatch", createdAt: 10, mode: "dispatch"),
+        ]
+        XCTAssertEqual(groupedSessionRows(rows).map(\.sessionId),
+                       ["newest_unrelated", "other", "dispatch", "child"])
+    }
+
+    /// Siblings keep the directory's own relative order under their shared parent.
+    func testGroupedSessionRowsKeepsSiblingOrder() {
+        let rows = [
+            row("child_new", createdAt: 40, parent: "dispatch"),
+            row("child_old", createdAt: 20, parent: "dispatch"),
+            row("dispatch", createdAt: 10, mode: "dispatch"),
+        ]
+        XCTAssertEqual(groupedSessionRows(rows).map(\.sessionId),
+                       ["dispatch", "child_new", "child_old"])
+    }
+
+    /// An ORPHAN child (parentSessionId set, but that parent isn't in the list) keeps its natural
+    /// directory position — never dropped, never floated to the top or bottom.
+    func testGroupedSessionRowsKeepsOrphanChildAtNaturalPosition() {
+        let rows = [
+            row("newest", createdAt: 30),
+            row("orphan", createdAt: 20, parent: "gone"),
+            row("oldest", createdAt: 10),
+        ]
+        XCTAssertEqual(groupedSessionRows(rows).map(\.sessionId), ["newest", "orphan", "oldest"])
+    }
+
+    /// Defensive: no row may ever be dropped, whatever the parent topology (incl. a malformed
+    /// parent cycle) — the pane's regroup degrades to natural order, never to missing rows.
+    func testGroupedSessionRowsNeverDropsRowsEvenOnParentCycle() {
+        let rows = [row("a", createdAt: 30, parent: "b"), row("b", createdAt: 20, parent: "a"), row("c", createdAt: 10)]
+        let grouped = groupedSessionRows(rows)
+        XCTAssertEqual(Set(grouped.map(\.sessionId)), ["a", "b", "c"])
+        XCTAssertEqual(grouped.count, 3)
+    }
+
     // MARK: - formatDaemonStatus (PURE, DaemonStatusPane.swift)
 
     func testFormatDaemonStatusWithFullProvider() {

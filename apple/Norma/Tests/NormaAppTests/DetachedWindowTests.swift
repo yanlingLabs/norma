@@ -236,6 +236,45 @@ final class DetachedWindowTests: XCTestCase {
         XCTAssertEqual(controller.sessionId, "S2")
     }
 
+    /// Dispatch (Phase 7), task-7 review fix: the detached window's own respond wiring routes a
+    /// relayed card's `childSessionId` to the CHILD (`childSessionId ?? self.sessionId`), proven on
+    /// the wire — the DetachedWindowController leg of the same routing rule
+    /// `CardWiringTests.testAppModelRespondApprovalRoutesToChildSessionId` pins for AppModel.
+    /// A second respond with `nil` childSessionId pins the fallback leg (this window's own pinned
+    /// session) in the same run.
+    func testDetachedWindowRespondApprovalRoutesToChildSessionId() async throws {
+        let t = DetachedScriptedTransport()
+        let session = SessionModel()
+        let feed = SessionFeed(makeTransport: { t }, token: "tok", clientName: "orb", mode: .pinned(sessionId: "S_DISP"), session: session)
+        let controller = DetachedWindowController(
+            feed: feed, session: session,
+            frame: NSRect(x: 0, y: 0, width: 560, height: 640), title: "Norma"
+        )
+        defer { controller.close() }
+        controller.show()
+
+        await answerHandshake(t, sessionId: "S_DISP")
+        await feedWaitUntil { session.state.status != .disconnected }
+
+        // Relayed card: childSessionId set → the RPC must target the CHILD, not S_DISP.
+        controller.adapterForTesting.onApprovalRespond("call1", true, "s_child_1")
+        await waitUntilSent(t, 3)
+        let respond = feedLineJSON(t.sent[2])
+        XCTAssertEqual(respond["method"] as? String, "approval.respond")
+        XCTAssertEqual((respond["params"] as? [String: Any])?["sessionId"] as? String, "s_child_1",
+                       "the respond RPC must target the CHILD, not this window's pinned session")
+        XCTAssertEqual((respond["params"] as? [String: Any])?["callId"] as? String, "call1")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(respond["id"] as! Int),"result":{"alreadyResolved":false}}"#)
+
+        // Native card: nil childSessionId → falls back to this window's own pinned session.
+        controller.adapterForTesting.onApprovalRespond("call2", false, nil)
+        await waitUntilSent(t, 4)
+        let native = feedLineJSON(t.sent[3])
+        XCTAssertEqual(native["method"] as? String, "approval.respond")
+        XCTAssertEqual((native["params"] as? [String: Any])?["sessionId"] as? String, "S_DISP")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(native["id"] as! Int),"result":{"alreadyResolved":false}}"#)
+    }
+
     func testAppModelMakeDetachedFeedSharesTokenAndTransport() async throws {
         let t = DetachedScriptedTransport()
         let appModel = AppModel(makeTransport: { t }, token: "shared-tok", clientName: "orb")

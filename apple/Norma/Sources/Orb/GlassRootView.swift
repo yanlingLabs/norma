@@ -31,6 +31,10 @@ struct GlassRootView: View {
         adapter.onClearMessage = { [adapter] in adapter.composerDraft = "" }
         adapter.onCollapse = { [controller] in controller.collapseToOrb() }
         adapter.onExpandToWindow = { [controller] in controller.requestExpandToWindow() }
+        // Dispatch (Phase 7), Task 8: the field's own child-status circles — tapping one asks
+        // upward via `controller.onOpenChild` (`AppDelegate.boot()` wires the real detached-window
+        // spawn), same seam as `onExpandToWindow` just above.
+        adapter.onOpenChild = { [controller] sessionId in controller.onOpenChild?(sessionId) }
         // Gate r7 (same-panel window morph): the window's traffic lights / zoom route back to the
         // controller — red collapses to the orb, green toggles zoom. Esc + the 4-finger tap use
         // `collapseWindowToOrb()` directly (key monitor / AppDelegate summon router).
@@ -55,20 +59,20 @@ struct GlassRootView: View {
         // discipline: insert + clear any stale error SYNCHRONOUSLY (before the await), remove
         // in-flight once the RPC settles, set an error line ONLY on failure — a success does
         // nothing further, the resolved event removes the card via the reducer.
-        adapter.onApprovalRespond = { [adapter, controller] callId, approved in
+        adapter.onApprovalRespond = { [adapter, controller] callId, approved, childSessionId in
             adapter.interactionInFlight.insert(callId)
             adapter.interactionErrors[callId] = nil
             Task { @MainActor in
-                let ok = await controller.onApprovalRespond?(callId, approved) ?? false
+                let ok = await controller.onApprovalRespond?(callId, approved, childSessionId) ?? false
                 adapter.interactionInFlight.remove(callId)
                 if !ok { adapter.interactionErrors[callId] = "couldn't send — try again" }
             }
         }
-        adapter.onQuestionRespond = { [adapter, controller] callId, answers, notes in
+        adapter.onQuestionRespond = { [adapter, controller] callId, answers, notes, childSessionId in
             adapter.interactionInFlight.insert(callId)
             adapter.interactionErrors[callId] = nil
             Task { @MainActor in
-                let ok = await controller.onQuestionRespond?(callId, answers, notes) ?? false
+                let ok = await controller.onQuestionRespond?(callId, answers, notes, childSessionId) ?? false
                 adapter.interactionInFlight.remove(callId)
                 if !ok { adapter.interactionErrors[callId] = "couldn't send — try again" }
             }

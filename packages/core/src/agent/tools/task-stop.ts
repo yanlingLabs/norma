@@ -28,14 +28,25 @@ import type { BackgroundTaskRegistry } from "../bg-registry";
  */
 export function registerTaskStopTool(
   r: ToolRegistry,
-  deps: { bgAgents?: BackgroundAgentRegistry; bgRegistry?: BackgroundTaskRegistry; deferred?: boolean } = {},
+  deps: {
+    bgAgents?: BackgroundAgentRegistry;
+    bgRegistry?: BackgroundTaskRegistry;
+    deferred?: boolean;
+    // Dispatch (Phase 7) Task 5: the dispatch session's own children are ALSO stoppable via
+    // task_stop — inserted between the bgAgents and bgRegistry branches (agent ids keep
+    // precedence over a dispatch child id; bash tasks stay last). Only the live dispatch session
+    // may stop one of its own children (see DispatchChildren.stopChild); every other caller, or an
+    // id that isn't a tracked child, resolves to undefined here and falls through unchanged.
+    dispatch?: { stopChild(callerSessionId: string, id: string): string | undefined };
+  } = {},
 ): void {
-  const { bgAgents, bgRegistry, deferred } = deps;
+  const { bgAgents, bgRegistry, deferred, dispatch } = deps;
   r.register({
     name: "task_stop",
     description:
       "Stop a running background agent (by agentId or name) or a background bash task (by taskId). " +
-      "Stopping an already-finished agent is not an error — it just reports its current status.",
+      "Stopping an already-finished agent is not an error — it just reports its current status. " +
+      "In the dispatch session, child session ids are also stoppable.",
     args: z.object({ task_id: z.string().min(1) }),
     deferred,
     run({ task_id }, { sessionId }) {
@@ -56,11 +67,13 @@ export function registerTaskStopTool(
         }
         return `agent '${task_id}' already ${entry.status}`;
       }
+      const stopped = dispatch?.stopChild(sessionId, task_id);
+      if (stopped) return stopped;
       if (bgRegistry?.has(sessionId, task_id)) {
         bgRegistry.kill(sessionId, task_id);
         return `killed ${task_id}`;
       }
-      throw new Error(`no running agent or background task '${task_id}'`);
+      throw new Error(`no running agent, dispatch child, or background task '${task_id}'`);
     },
   });
 }

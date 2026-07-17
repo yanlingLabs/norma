@@ -40,6 +40,10 @@ export const SessionCreateParams = z.object({
   // the other). Additive/optional so every existing caller (CLI, NormaKit) that never sends it is
   // unaffected — SessionStore.createSession defaults it to `undefined`/NULL on the row.
   origin: z.string().min(1).optional(),
+  // Dispatch (Phase 7): "code" (default) | "dispatch". The handler REJECTS "dispatch" — the
+  // singleton is minted only by session.dispatch. Accepted here so the wire shape documents the
+  // axis; passing "code" is a no-op.
+  mode: z.enum(["code", "dispatch"]).optional(),
 });
 export const SessionCreateResult = z.object({ sessionId: z.string(), trusted: z.boolean() });
 
@@ -52,6 +56,8 @@ export const SessionListResult = z.object({
     // Additive (phase 5 routines T3): round-trips SessionCreateParams.origin — undefined for
     // every session created before this field existed, or created without one.
     origin: z.string().optional(),
+    mode: z.string().optional(),            // "dispatch" for the singleton; absent = code
+    parentSessionId: z.string().optional(), // set on dispatch children
   })),
 });
 
@@ -66,6 +72,10 @@ export const SessionSendParams = z.object({
   text: z.string().min(1),
 });
 export const SessionSendResult = z.object({ seq: z.number().int() });
+
+/** Dispatch (Phase 7): get-or-create the ONE permanent dispatch session. No params. */
+export const SessionDispatchParams = z.object({});
+export const SessionDispatchResult = z.object({ sessionId: z.string(), created: z.boolean() });
 
 export const ApprovalRespondParams = z.object({
   sessionId: z.string(),
@@ -763,6 +773,7 @@ export const METHODS = {
   sessionList: "session.list",
   sessionAttach: "session.attach",
   sessionSend: "session.send",
+  sessionDispatch: "session.dispatch",
   approvalRespond: "approval.respond",
   sessionAddDir: "session.addDir",
   sessionSetCwd: "session.setCwd",

@@ -28,10 +28,11 @@ ToolSearch deferral is on (which it is in the production daemon).
 | `bash_kill` | Yes | Stop a running background bash task. |
 | **Agents & tasks** | | |
 | `spawn_agent` | No | Launch a child agent to handle a task autonomously in its own context and return its report. |
+| `session_spawn` | No | Spawn a full first-class child session (own transcript, own session-list entry) — dispatch-session-only. |
 | `agent_list` | Yes | List your background subagents with status, elapsed time, and description. |
 | `agent_output` | Yes | Fetch a subagent's output (or latest message while running) plus its transcript path. |
 | `send_message` | No | Send a message to a subagent by id/name to re-task or resume it (fire-and-forget). |
-| `task_stop` | Yes | Stop a running background agent or background bash task. |
+| `task_stop` | Yes | Stop a running background agent, a background bash task, or — in the dispatch session — a dispatch child session. |
 | `task_create` | No | Create a task on the session's live to-do list (starts pending). |
 | `task_update` | No | Update a task's status, fields, owner, or task-graph links. |
 | `task_list` | No | List the session's tasks with their statuses. |
@@ -65,8 +66,8 @@ ToolSearch deferral is on (which it is in the production daemon).
 | `computer` | No* | Control the Mac: read the AX tree, screenshot, click/drag/type/scroll, wait. |
 | `ToolSearch` | — | Load deferred tools' schemas so they become callable. |
 
-**39 built-in tools total** (task-30 adds `push_notification` — the final CC-parity tool item).
-Notes:
+**40 built-in tools total** (Dispatch mode's `session_spawn` is the latest addition, after
+task-30's `push_notification`). Notes:
 
 - `computer` (`No*`) is only *registered* when `settings.computerUse.enabled` is on; when
   present it's not deferred.
@@ -76,6 +77,14 @@ Notes:
   per-tool `deferred` flag.
 - All deferred built-ins ride one predicate in `registry.ts` (`isDeferred`), so `specs()`,
   the ToolSearch index, and `execute()`'s guard can never disagree about what's hidden.
+- `session_spawn` is **dispatch-session-only** — the mirror image of `spawn_agent`/`skill_write`/
+  `write`/`edit`/`lsp`/`notebook_edit`, which are excluded FROM a dispatch session; a code
+  session never sees `session_spawn` at all. Its CC analogue is Cowork's "Dispatch" child
+  creation — but unlike `spawn_agent`'s in-session subagent THREAD, a spawned dispatch child is
+  a full first-class sibling SESSION (own transcript, own `session.list` entry, independently
+  attachable/resumable), not a nested thread of the caller's own session. `task_stop`'s dispatch
+  branch is the corresponding teardown: from the dispatch session only, it can stop one of its
+  own children by session id, alongside its existing bg-agent/bg-bash-task targets.
 
 ---
 

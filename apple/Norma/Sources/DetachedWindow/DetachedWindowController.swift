@@ -90,7 +90,7 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
         let feedClient = feed.client
         let sessionDirectory = SessionDirectory(lister: {
             try await feedClient.listSessions().map {
-                SessionSummary(sessionId: $0.sessionId, title: $0.title, createdAt: $0.createdAt, scope: $0.scope, cwd: $0.cwd)
+                SessionSummary(sessionId: $0.sessionId, title: $0.title, createdAt: $0.createdAt, scope: $0.scope, cwd: $0.cwd, mode: $0.mode, parentSessionId: $0.parentSessionId)
             }
         })
         directory = sessionDirectory
@@ -163,24 +163,28 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
         // outlive that repin (they're stored on the adapter for the window's whole lifetime). A
         // captured `sid` would keep targeting the OLD session forever after a repin.
         let client = feed.client
-        adapter.onApprovalRespond = { [weak self, weak adapter] callId, approved in
+        adapter.onApprovalRespond = { [weak self, weak adapter] callId, approved, childSessionId in
             guard let adapter else { return }
             adapter.interactionInFlight.insert(callId)
             adapter.interactionErrors[callId] = nil
             Task { @MainActor [weak self, weak adapter] in
                 guard let self else { return }
-                let ok = (try? await client.approvalRespond(sessionId: self.sessionId, callId: callId, approved: approved)) != nil
+                // Dispatch (Phase 7): route to the child when this card is a mirrored copy —
+                // same `childSessionId ?? <this surface's own session>` rule as AppModel's.
+                let target = childSessionId ?? self.sessionId
+                let ok = (try? await client.approvalRespond(sessionId: target, callId: callId, approved: approved)) != nil
                 adapter?.interactionInFlight.remove(callId)
                 if !ok { adapter?.interactionErrors[callId] = "couldn't send — try again" }
             }
         }
-        adapter.onQuestionRespond = { [weak self, weak adapter] callId, answers, notes in
+        adapter.onQuestionRespond = { [weak self, weak adapter] callId, answers, notes, childSessionId in
             guard let adapter else { return }
             adapter.interactionInFlight.insert(callId)
             adapter.interactionErrors[callId] = nil
             Task { @MainActor [weak self, weak adapter] in
                 guard let self else { return }
-                let ok = (try? await client.askUserRespond(sessionId: self.sessionId, callId: callId, answers: answers, notes: notes.isEmpty ? nil : notes)) != nil
+                let target = childSessionId ?? self.sessionId
+                let ok = (try? await client.askUserRespond(sessionId: target, callId: callId, answers: answers, notes: notes.isEmpty ? nil : notes)) != nil
                 adapter?.interactionInFlight.remove(callId)
                 if !ok { adapter?.interactionErrors[callId] = "couldn't send — try again" }
             }
@@ -300,13 +304,13 @@ final class DetachedWindowController: NSObject, NSWindowDelegate {
     /// method's doc for why `.selectOption` both selects AND submits in one call.
     private func dispatchCardKeyAction(_ action: CardKeyAction, topmost: PendingInteraction?) {
         switch action {
-        case .approve(let callId):
-            adapter.onApprovalRespond(callId, true)
-        case .deny(let callId):
-            adapter.onApprovalRespond(callId, false)
-        case .selectOption(let callId, let index):
-            guard case .question(_, let questions) = topmost else { return }
-            adapter.onQuestionRespond(callId, questionAnswers(for: questions, selections: [0: [index]], otherTexts: [:]), [:])
+        case .approve(let callId, let childSessionId):
+            adapter.onApprovalRespond(callId, true, childSessionId)
+        case .deny(let callId, let childSessionId):
+            adapter.onApprovalRespond(callId, false, childSessionId)
+        case .selectOption(let callId, let index, let childSessionId):
+            guard case .question(_, let questions, _) = topmost else { return }
+            adapter.onQuestionRespond(callId, questionAnswers(for: questions, selections: [0: [index]], otherTexts: [:]), [:], childSessionId)
         }
     }
 

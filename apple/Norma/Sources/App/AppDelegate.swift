@@ -465,11 +465,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Task 3 (2d-iii): the same seam as `onSubmit` above — the orb's own focused-session
         // respond RPCs, mirrored one-for-one onto `AppModel`'s three new methods.
-        orb.onApprovalRespond = { [weak self] callId, approved in
-            await self?.appModel?.respondApproval(callId: callId, approved: approved) ?? false
+        orb.onApprovalRespond = { [weak self] callId, approved, childSessionId in
+            await self?.appModel?.respondApproval(callId: callId, approved: approved, childSessionId: childSessionId) ?? false
         }
-        orb.onQuestionRespond = { [weak self] callId, answers, notes in
-            await self?.appModel?.respondQuestion(callId: callId, answers: answers, notes: notes) ?? false
+        orb.onQuestionRespond = { [weak self] callId, answers, notes, childSessionId in
+            await self?.appModel?.respondQuestion(callId: callId, answers: answers, notes: notes, childSessionId: childSessionId) ?? false
         }
         orb.onPlanRespond = { [weak self] callId, approved, autoAccept, feedback in
             await self?.appModel?.respondPlan(callId: callId, approved: approved, autoAccept: autoAccept, feedback: feedback) ?? false
@@ -479,6 +479,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // closures above.
         orb.onSetPolicy = { [weak self] policy in
             await self?.appModel?.setSessionPolicy(policy) ?? false
+        }
+
+        // Dispatch (Phase 7), Task 8: the field's child-status circles — tapping one opens that
+        // child session in a detached window via the SAME path the Dashboard's SessionsPane / the
+        // sidebar's ⌘-click already use (`openSessionInNewDetachedWindow`, defined below).
+        orb.onOpenChild = { [weak self] sessionId in
+            self?.openSessionInNewDetachedWindow(sessionId)
         }
 
         // Task 4 (detach choreography): the yellow traffic light. `requestWindowDetach()` OWNS the

@@ -29,6 +29,8 @@ import { SubagentTranscripts } from "./subagent-transcript";
 import { resolveModelAlias } from "./model-aliases";
 import type { LspManager } from "./lsp/manager";
 import { autoDiagnosticsSuffix, AUTO_DIAG_TOOL_NAMES } from "./lsp/auto-diagnostics";
+import { DISPATCH_ALLOW_TOOLS, DISPATCH_SYSTEM_PROMPT } from "./dispatch-prompt";
+import type { DispatchChildren } from "./dispatch-children";
 
 /** Structural narrowing of BackgroundTaskRegistry (bg-registry.ts) to just what pinnedTools
  *  (below) needs — lets the engine (and tests) work with anything shaped like a per-session task
@@ -40,6 +42,18 @@ export interface BgTaskLister {
 
 const MAIN_THREAD = "main";
 const MAX_TOOL_ITERATIONS = 24; // runaway guard until 1b-ii budgets land
+// Dispatch (Phase 7) Task 4: session_spawn is registered on the SAME shared registry every
+// session's specs() reads from (daemon.ts registers it once, globally, like spawn_agent) — so
+// without an explicit exclusion it would be visible to every non-dispatch session too (a code
+// session's main thread has no `allowTools` restriction at all; a spawn_agent child's own
+// childExcludeTools, below, is the only thing that hides tools from IT). Named once here and
+// reused at both exclusion sites (turn()'s isDispatch ternary, childExcludeTools' initial Set) so
+// they can never drift apart. The bridge's OWN `meta.mode === "dispatch"` gate above is the
+// actual authoritative check; this is tool-list hygiene — a provider that ignored its own tool
+// list and called session_spawn anyway would still just hit the placeholder run() (session-
+// spawn.ts), same belt-and-braces relationship spawn_agent's own depth-cap exclusion has to its
+// own runtime reject.
+const SESSION_SPAWN_TOOL = "session_spawn";
 
 // 4h-i (CC parity: spawn_agent `mode`) — permissiveness order, LEAST to MOST permissive: "plan"
 // is read-only (most restrictive), "ask" is human-gated (middle), "auto" auto-allows non-
@@ -359,6 +373,25 @@ export interface EngineConfig {
   // rather than silently falling back to the synchronous path, so a caller never gets a "running"
   // tool_result for a detached child nothing is actually tracking.
   bgAgents?: BackgroundAgentRegistry;
+  // Dispatch (Phase 7): getter — daemon wires the registry after engine construction (computerUse
+  // precedent: `let dispatchChildren` is declared before `new AgentEngine(...)`, this closure
+  // reads it live, then daemon.ts assigns it right after construction). Absent (every test/config
+  // that doesn't wire dispatch mode) → the session_spawn bridge never activates and session_spawn
+  // calls fall through to the tool's own placeholder run() (session-spawn.ts).
+  dispatch?: () => DispatchChildren | undefined;
+  // Dispatch (Phase 7) Task 5: fired in runTurn's `finally`, AFTER `runningTurns.delete`, for
+  // EVERY session (the dispatch session's own turns included, not just its children's) — the
+  // registry's onTurnEnd derives a finished child's terminal status, appends a `child_update` to
+  // the dispatch stream, and wakes the dispatch session (immediately if idle, or coalesced into a
+  // single pending wake if it's still busy — see dispatch-children.ts). Absent (every config that
+  // doesn't wire dispatch mode) → no-op, byte-identical to pre-Task-5 behavior.
+  onTurnEnd?: (sessionId: string) => void;
+  // Dispatch (Phase 7) Task 5: per-turn live roster for the DISPATCH session only — same
+  // <system-reminder> user-message injection shape/point as taskListReminder (turn(), right after
+  // the task-list reminder is pushed). The registry returns undefined for every session that isn't
+  // the live dispatch session (or has no children yet), so a non-dispatch turn's input stays
+  // byte-identical to before this field existed.
+  dispatchRoster?: (sessionId: string) => string | undefined;
   // 4h-i Task 3 (CC parity: configurable nesting depth, settings.subagents.maxDepth): how many
   // levels of spawn_agent nesting are allowed, orthogonal to SubagentManager's maxConcurrent
   // (fan-out width) — this is depth, not count or concurrency. Undefined (getter absent, or
@@ -596,6 +629,8 @@ export class AgentEngine {
           if (key.startsWith(`${sessionId}|`)) this.pendingImages.delete(key);
         }
       }
+      // Dispatch (Phase 7): child turn-end → registry appends child_update + wakes the dispatch session.
+      this.cfg.onTurnEnd?.(sessionId);
       if (this.retriggerPending.delete(sessionId) && !ac.signal.aborted) {
         // A detached agent finished mid-turn; its task_notification is already persisted. Drain it
         // now (CC parity: between-turns queue drain) so the model reacts without a user message.
@@ -1233,6 +1268,10 @@ export class AgentEngine {
   private async turn(sessionId: string, signal: AbortSignal): Promise<void> {
     const meta = this.cfg.store.meta(sessionId);
     const threadId = MAIN_THREAD;
+    // Dispatch mode (Phase 7): the singleton coordinator session — meta.mode is set once at
+    // createSession (Task 2) and never changes mid-session, so this is safe to read once per turn
+    // like everything else built from `meta` below (sel.model, instructions, instructionsFull).
+    const isDispatch = meta.mode === "dispatch";
     // Resolved ONCE per turn (spec: "changing models must NOT require a daemon restart") — a
     // settings.json edit mid-turn does not retroactively change THIS turn's model, only the
     // NEXT one's, mirroring how `instructions`/`instructionsFull` below are also computed once
@@ -1259,7 +1298,11 @@ export class AgentEngine {
     // same-turn tool write to <cwd>/NORMA.md (under `auto` policy) get injected as trusted
     // system instructions in a later round of the SAME turn. A NORMA.md change only takes
     // effect starting the NEXT turn.
-    const instructions = this.cfg.assembler.assemble({ cwd, loadedSkills: [...(this.loadedSkills.get(sessionId) ?? [])] });
+    const instructions = this.cfg.assembler.assemble({
+      cwd,
+      loadedSkills: [...(this.loadedSkills.get(sessionId) ?? [])],
+      basePromptOverride: isDispatch ? DISPATCH_SYSTEM_PROMPT : undefined,
+    });
     // NOTE (correctness-critical): `loaded` MUST be THE ONE LIVE SET for this session — never a
     // snapshot/copy. It's read here to build specs()/deferredIndex() for round 0, and the SAME
     // object is handed to executeCall's ctx below; markToolLoaded (called by the ToolSearch tool)
@@ -1279,6 +1322,11 @@ export class AgentEngine {
     // persisted event) and why it's a "user" message rather than a new TurnInputItem role.
     const taskReminder = this.taskListReminder(sessionId);
     if (taskReminder) input.push(taskReminder);
+    // Dispatch (Phase 7) Task 5: same assembled-input-only <system-reminder> user-message shape as
+    // taskListReminder just above — non-undefined only for the live dispatch session (see
+    // DispatchChildren.rosterFor), so every other session's input is unaffected.
+    const dispatchRoster = this.cfg.dispatchRoster?.(sessionId);
+    if (dispatchRoster) input.push({ type: "message", role: "user", content: dispatchRoster });
     // NOTE (bg-retrigger Task 1): the old per-turn bg-completion reminder call site lived here
     // (buildBgCompletionReminder) — retired. A detached child's completion is now PERSISTED as a
     // task_notification event at settle time (notifyBgCompletion, called from the detached
@@ -1318,6 +1366,12 @@ export class AgentEngine {
       depth: 0,
       signal,
       loaded,
+      // Dispatch (Phase 7) Task 4: a dispatch session gets the allowTools whitelist (which already
+      // includes session_spawn — dispatch-prompt.ts); a code session instead gets session_spawn
+      // explicitly EXCLUDED (SESSION_SPAWN_TOOL's own doc comment above) — never both fields at
+      // once (excludeTools would filter session_spawn OUT before allowTools ever got a chance to
+      // filter it back IN, for a dispatch session that somehow had both set).
+      ...(isDispatch ? { allowTools: DISPATCH_ALLOW_TOOLS } : { excludeTools: new Set([SESSION_SPAWN_TOOL]) }),
     });
   }
 
@@ -1544,6 +1598,18 @@ export class AgentEngine {
       // bridge, recursively, so a depth-1 child can itself spawn a depth-2 grandchild when
       // maxDepth allows it.
       const spawnOutcomes = new Map<string, { output: string; isError: boolean }>();
+      // Task 9 (dispatch integration test) ordering fix: a session_spawn call's `child_update`
+      // ("running") used to be appended to the dispatch stream INSIDE DispatchChildren.spawnChild
+      // itself — which runs synchronously in the sessionSpawnCalls loop below, BEFORE this round's
+      // tool_call/tool_result for that very call are emitted (the per-call loop further down is
+      // what emits those). That left the dispatch stream reading child_update(running) BEFORE the
+      // tool_call that caused it — backwards for any client rendering the conversation in order.
+      // Fix: spawnChild no longer appends that event itself; a successful spawn's childId is
+      // recorded here instead, and the per-call loop's `preOutcome` branch calls
+      // `dispatchReg.announceChild(childId)` right after emitting THIS call's own tool_result —
+      // giving tool_call → tool_result → child_update(running), the order a coordinator's own
+      // actions actually happened in.
+      const spawnedChildIds = new Map<string, string>();
       // [4f] callIds a pre-tool BLOCK short-circuited this round (Site 1 for bridged spawn_agent/
       // send_message, Site 2 for normal calls). Consulted by firePostTool so a blocked call — which
       // NEVER ran — gets no post-tool observe. Round-scoped (a fresh Set per provider round).
@@ -1560,6 +1626,87 @@ export class AgentEngine {
       // finished-target resume is async (awaited), and there's no benefit to parallelizing them.
       const sendMessageOutcomes = new Map<string, { output: string; isError: boolean }>();
       const sendMessageCalls = opts.depth === 0 ? calls.filter((c) => c.name === "send_message") : [];
+      // Dispatch (Phase 7) Task 4: session_spawn calls in the DISPATCH session's main thread spawn
+      // full first-class CHILD SESSIONS (DispatchChildren.spawnChild) — a completely separate
+      // session with its own turn()/transcript, not a subagent THREAD nested under this one
+      // (spawn_agent's mechanism above). Reuses the SAME `spawnOutcomes` map + the per-call loop's
+      // call-order consumption the spawn_agent bridge already established (that loop's
+      // `preOutcome = spawnOutcomes.get(call.callId) ?? sendMessageOutcomes.get(call.callId)`
+      // check doesn't care WHICH bridge populated the entry) — so a session_spawn callId rides the
+      // identical "never reaches executeCall" exclusion spawn_agent callIds already get, with NO
+      // parallel outcome map / skip-set of its own. Only active for the MAIN thread of a
+      // dispatch-mode session (meta.mode === "dispatch") AND when daemon.ts has wired a
+      // DispatchChildren registry (cfg.dispatch?.()) — absent either condition, session_spawn
+      // calls fall through to the per-call loop below and hit the tool's own placeholder run()
+      // (session-spawn.ts). A plain `for` loop, not Promise.all (spawn_agent's shape above): each
+      // spawnChild() call is fully synchronous (store.createSession/hub.append are sync bun:sqlite
+      // + sync fs appends; only the child's OWN turn is fire-and-forget), so there is no
+      // concurrency to gain from parallelizing N session_spawn calls in one round.
+      const dispatchReg = meta.mode === "dispatch" ? this.cfg.dispatch?.() : undefined;
+      const sessionSpawnCalls = dispatchReg ? calls.filter((c) => c.name === "session_spawn") : [];
+      if (sessionSpawnCalls.length > 0) {
+        for (const call of sessionSpawnCalls) {
+          let parsed: { dir?: unknown; prompt?: unknown; model?: unknown; type?: unknown; title?: unknown } = {};
+          try { parsed = JSON.parse(call.argsJson || "{}"); } catch { /* rejected below — empty dir/prompt */ }
+          const dir = typeof parsed.dir === "string" ? parsed.dir : "";
+          const prompt = typeof parsed.prompt === "string" ? parsed.prompt : "";
+          const type = typeof parsed.type === "string" ? parsed.type : "code";
+          const title = typeof parsed.title === "string" && parsed.title.trim().length > 0
+            ? parsed.title.trim() : prompt.slice(0, 60);
+          // Pre-flight rejections, ALL as isError tool_results, BEFORE any session is created —
+          // same ordering discipline as spawn_agent's own pre-thread_started checks above (a
+          // rejected call must leave no trace: no child session, no user_message, no
+          // child_update). Order: type, then dir shape, then prompt presence, then model.
+          if (type === "cowork") {
+            spawnOutcomes.set(call.callId, { output: "type 'cowork' is not yet available — use 'code'.", isError: true });
+            continue;
+          }
+          if (!dir.startsWith("/") || dir === "/") {
+            spawnOutcomes.set(call.callId, { output: "dir must be an absolute directory path (not '/').", isError: true });
+            continue;
+          }
+          if (!prompt) {
+            spawnOutcomes.set(call.callId, { output: "prompt is required — write the child a complete, self-contained task.", isError: true });
+            continue;
+          }
+          // Model override (v1, decision documented in the task-4 report): turn() resolves
+          // `sel.model` ONCE per turn, GLOBALLY, off cfg.provider.live?.() — there is no
+          // per-session model column (SessionRow, sessions/store.ts) and thus no seam to pin a
+          // model to a specific child session the way spawn_agent pins one to a THREAD via
+          // `resumeCtx.model`/the runThread `model` arg. So a validated override rides as a
+          // `[model: <id>]` trailer on the child's FIRST user_message instead (folded into
+          // `childPrompt` below, before spawnChild ever sees it) — and the tool_result says so, so
+          // the coordinator knows the mechanism rather than assuming a silent, precise override.
+          let effectiveOverride = typeof parsed.model === "string" ? parsed.model : undefined;
+          if (effectiveOverride !== undefined) {
+            const known = this.cfg.provider.provider.models();
+            // Same alias resolution as the spawn_agent bridge above (resolveModelAlias) — daemon.ts
+            // wires registerSessionSpawnTool with the SAME `[...knownModelIds, ...deriveModelAliases(...)]`
+            // list spawn_agent gets, so an alias offered in the tool's own schema enum must resolve
+            // here too, or a caller using the advertised alias would be wrongly rejected as unknown.
+            if (known.length > 0) effectiveOverride = resolveModelAlias(effectiveOverride, known.map((m) => m.id));
+            if (known.length > 0 && !known.some((m) => m.id === effectiveOverride)) {
+              spawnOutcomes.set(call.callId, {
+                output: `unknown model '${effectiveOverride}' — available models: ${known.map((m) => m.id).join(", ")}; omit \`model\` to inherit the default model`,
+                isError: true,
+              });
+              continue;
+            }
+          }
+          const childPrompt = effectiveOverride ? `${prompt}\n\n[model: ${effectiveOverride}]` : prompt;
+          // Non-null: sessionSpawnCalls (and thus this loop) is only ever non-empty when
+          // dispatchReg was truthy at the ternary above that derived it from the SAME expression.
+          const childId = dispatchReg!.spawnChild({ dispatchSessionId: sessionId, dir, prompt: childPrompt, title });
+          spawnedChildIds.set(call.callId, childId); // announced AFTER this call's own tool_result — see doc comment above
+          const modelNote = effectiveOverride
+            ? ` (model override '${effectiveOverride}' noted in the child's opening prompt — no per-session model override exists yet)`
+            : "";
+          spawnOutcomes.set(call.callId, {
+            output: `spawned session ${childId} ("${title}") in ${dir}${modelNote} — you'll get a child_update when it finishes.`,
+            isError: false,
+          });
+        }
+      }
       if (spawnCalls.length > 0) {
         await Promise.all(spawnCalls.map(async (call) => {
           // [4f pre-tool — Site 1 (bridged)] FIRST statement in the callback, before ANY spawn work
@@ -1814,8 +1961,14 @@ export class AgentEngine {
           // durable-prompt-injection path the card exists to guard — the human would be approving
           // a persistent skill mid-stream of some other task's card traffic. Only the main thread,
           // where the card appears in direct response to the conversation, may author skills.
+          // Dispatch (Phase 7) Task 4: session_spawn is excluded from EVERY spawn_agent child
+          // UNCONDITIONALLY too (SESSION_SPAWN_TOOL's own doc comment above) — a spawn_agent
+          // child only ever exists inside a CODE session (dispatch sessions can't spawn_agent at
+          // all — it's not in DISPATCH_ALLOW_TOOLS), so this is tool-list hygiene consistent with
+          // the main thread's own exclusion, not a new authorization boundary (the bridge's
+          // `meta.mode === "dispatch"` gate above already denies it functionally either way).
           const childDepth = opts.depth + 1;
-          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode", "send_message", "task_stop", "agent_list", "agent_output", "skill_write"]);
+          const childExcludeTools = new Set(["ask_user", "exit_plan_mode", "enter_plan_mode", "send_message", "task_stop", "agent_list", "agent_output", "skill_write", SESSION_SPAWN_TOOL]);
           if (childDepth >= maxDepth) childExcludeTools.add("spawn_agent");
           // 4h-ii-b Task 1: instructionsFull is computed ONCE here — hoisted out of the bg and
           // sync closures below, which used to each build their own copy independently — so it
@@ -2247,6 +2400,12 @@ export class AgentEngine {
           outcome = preOutcome;
           this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
           input.push({ type: "tool_result", callId: call.callId, output: outcome.output, isError: outcome.isError });
+          // Task 9 ordering fix (see spawnedChildIds' doc comment above): a successful session_spawn
+          // call's child_update(running) is announced HERE, right after ITS OWN tool_result — so the
+          // dispatch stream always reads tool_call → tool_result → child_update(running), never the
+          // reverse. No-op for every other bridged callId (send_message, an errored session_spawn).
+          const announceChildId = spawnedChildIds.get(call.callId);
+          if (announceChildId) dispatchReg?.announceChild(announceChildId);
           // [4f post-tool — bridged outcome] observe a spawn_agent/send_message call's result.
           // firePostTool SKIPS a pre-tool-blocked call (hookBlockedCallIds) — that call never ran.
           if (this.cfg.hooks) await this.firePostTool(sessionId, threadId, call, outcome, hookBlockedCallIds, signal); // [4f I1] interrupt cuts the chain
@@ -2387,7 +2546,7 @@ export class AgentEngine {
           const onCwd = (next: string) => { newCwd = next; };
           if (decision === "ask") {
             outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
-              timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
+              timeoutMs: this.approvalTimeoutFor(meta),
               summary: approvalCardSummary(call),
               // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
             }, loaded, async () => this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd), pins, rootsOverride, visionCapable);
@@ -2404,7 +2563,7 @@ export class AgentEngine {
           // write). Denial rides requestApproval's deniedByHuman path unchanged.
           const grant = dirGrant; // narrow for the closure
           outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
-            timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
+            timeoutMs: this.approvalTimeoutFor(meta),
             summary: `${call.name} ${grant.path} — outside the allowed directories; grant write access to ${grant.dir}?`,
             // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
           }, loaded, async () => {
@@ -2414,7 +2573,7 @@ export class AgentEngine {
           }, pins, rootsOverride, visionCapable);
         } else if (decision === "ask") {
           outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
-            timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
+            timeoutMs: this.approvalTimeoutFor(meta),
             summary: approvalCardSummary(call),
             // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
           }, loaded, undefined, pins, rootsOverride, visionCapable);
@@ -2443,7 +2602,7 @@ export class AgentEngine {
           } else {
             outcome = await this.reviewAndDispatch(
               { class: "bash", command, justification }, `${call.name} ${command}`,
-              call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable,
+              call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable, meta,
             );
           }
         } else if (
@@ -2467,7 +2626,7 @@ export class AgentEngine {
             const precis = fsWritePrecis(call, resolved);
             outcome = await this.reviewAndDispatch(
               { class: "fs", precis }, precis,
-              call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable,
+              call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable, meta,
             );
           } else {
             outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
@@ -2481,7 +2640,7 @@ export class AgentEngine {
           const precis = externalPrecis(call);
           outcome = await this.reviewAndDispatch(
             { class: "external", precis }, precis,
-            call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable,
+            call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable, meta,
           );
         } else {
           outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
@@ -2836,6 +2995,11 @@ export class AgentEngine {
     pins: Set<string>,
     rootsOverride: string[] | undefined,
     visionCapable: boolean | undefined,
+    // Whole-branch fix wave: a dispatch child is unattended by design (see approvalTimeoutFor's own
+    // doc comment) — this is the HIGHEST-risk approval path (the reviewer already flagged the call
+    // unsafe/errored), so it must never hand a dispatch child the SHORTEST window. `meta.origin`
+    // is all this needs (mirrors approvalTimeoutFor's own signature).
+    meta: { origin?: string },
   ): Promise<{ output: string; isError: boolean; deniedByHuman?: boolean }> {
     // "error" (phase 5e T2): review() THREW (fail-closed) — distinct from a genuine "unsafe"
     // verdict for tool_review observability, though both escalate identically.
@@ -2856,12 +3020,21 @@ export class AgentEngine {
     if (v.verdict === "safe") {
       return await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
     }
+    // Whole-branch fix wave: env can still WIDEN a dispatch child's window beyond 10 minutes, but
+    // never narrows it below that floor (same "env widens, never narrows the child floor" contract
+    // approvalTimeoutFor documents for the ask-path/worktree sites above) — a non-child session's
+    // window is exactly `reviewTimeoutMs`, unchanged. The denial message is derived from whichever
+    // value is ACTUALLY used here, never a hardcoded "60s" — so a client is never told a shorter
+    // wait than what's really about to happen (the bug this fix closes).
+    const reviewTimeoutMs = Number(process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS ?? 60_000);
+    const timeoutMs = meta.origin === "dispatch-child" ? Math.max(reviewTimeoutMs, 600_000) : reviewTimeoutMs;
+    const timeoutSec = Math.round(timeoutMs / 1000);
     const denialMessage =
       reviewInput.class === "fs" || reviewInput.class === "external"
-        ? `blocked by the safety reviewer: ${v.reason}. No approval within 60s.`
-        : `blocked by the safety reviewer: ${v.reason}. No approval within 60s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.`;
+        ? `blocked by the safety reviewer: ${v.reason}. No approval within ${timeoutSec}s.`
+        : `blocked by the safety reviewer: ${v.reason}. No approval within ${timeoutSec}s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.`;
     return await this.requestApproval(call, cwd, sessionId, threadId, signal, {
-      timeoutMs: Number(process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS ?? 60_000),
+      timeoutMs,
       // Plain call summary (approvalCardSummary, same as every other card) — reviewerReason below
       // carries the reason for clients to render distinctly.
       summary: approvalCardSummary(call),
@@ -2925,6 +3098,19 @@ export class AgentEngine {
    *  lands on the thread that actually asked, not always the session-scoped map.
    *  `rootsOverride` (4h-i Task 4) — forwarded unchanged to executeCall's default path; callers
    *  that pass their own `onApprove` (the worktree bridge) don't need it. */
+
+  /** Dispatch (Phase 7) Task 6: relayed child approvals fail closed after 10 minutes (CC parity —
+   *  there's no live human necessarily watching the child directly, so the mirrored card in the
+   *  dispatch stream needs a longer fuse than a directly-attended session's default 5); everything
+   *  else keeps the configured/default 5. The broker already resolves {approved:false, by:
+   *  "timeout"} on expiry (approvals.ts) — this only widens the WINDOW for dispatch children, the
+   *  fail-closed behavior itself is unchanged. Used at all three requestApproval call sites below
+   *  that previously inlined `this.cfg.approvalTimeoutMs ?? 5 * 60_000` directly. */
+  private approvalTimeoutFor(meta: { origin?: string }): number {
+    if (meta.origin === "dispatch-child") return 600_000;
+    return this.cfg.approvalTimeoutMs ?? 5 * 60_000;
+  }
+
   private async requestApproval(
     call: { callId: string; name: string; argsJson: string },
     cwd: string,
@@ -3188,7 +3374,14 @@ export class AgentEngine {
     // session-wide map instead of the `childLoaded` set the child's own specs()/guard consult,
     // AND polluted the session-wide set for good measure). See `loaded`'s doc comment above.
     const markToolLoaded = (n: string) => { loaded.add(n); };
-    const askTimeoutMs = Number(process.env.NORMA_ASK_TIMEOUT_MS ?? 300_000);
+    // Dispatch (Phase 7) Task 6: a dispatch child's question waits "indefinitely" (spec §6 — the
+    // child just sits in awaiting_input, mirrored into the dispatch stream, until answered).
+    // setTimeout caps at 2^31-1 ms (~24.8 days) — that IS our indefinite; a comment, not a
+    // behavior knob. Every other session keeps the existing env/default window.
+    const meta = this.cfg.store.meta(sessionId);
+    const askTimeoutMs = meta.origin === "dispatch-child"
+      ? 2 ** 31 - 1
+      : Number(process.env.NORMA_ASK_TIMEOUT_MS ?? 300_000);
     const ask = this.cfg.questions
       ? async (questions: Question[]) => {
           // Register the wait BEFORE emitting: broadcast is synchronous, so a watcher that

@@ -127,9 +127,17 @@ final class OrbWindowController: ObservableObject {
     /// `respondQuestion`/`respondPlan` (the focused-session surface), exactly mirroring the
     /// `onSubmit` chain (`FieldStateAdapter.onXRespond` → `GlassRootView.wireCallbacks()` → these
     /// closures → `AppDelegate` → `AppModel`) so this controller stays model-free.
-    var onApprovalRespond: ((String, Bool) async -> Bool)?
-    var onQuestionRespond: ((String, [String: String], [String: String]) async -> Bool)?
+    var onApprovalRespond: ((String, Bool, String?) async -> Bool)?
+    var onQuestionRespond: ((String, [String: String], [String: String], String?) async -> Bool)?
     var onPlanRespond: ((String, Bool, Bool, String?) async -> Bool)?
+
+    /// Dispatch (Phase 7), Task 8: fired by `GlassRootView.wireCallbacks()` (relaying
+    /// `FieldStateAdapter.onOpenChild`) when the field's own child-status circle is tapped —
+    /// `AppDelegate.boot()` wires this to the SAME detached-window-open path
+    /// `registerDetachedWindow`'s `onOpenSessionDetached` uses (`openSessionInNewDetachedWindow`),
+    /// same "controller exposes a hook, AppDelegate wires the real side effect" seam as
+    /// `onApprovalRespond` et al above.
+    var onOpenChild: ((String) -> Void)?
 
     /// Task 4 (2d-iii): the ⋯ menu's approval-mode picker — SAME seam as `onApprovalRespond` et al
     /// just above (`AppDelegate.boot()` wires this to `AppModel.setSessionPolicy`). New policy
@@ -583,13 +591,13 @@ final class OrbWindowController: ObservableObject {
     /// against, in the same synchronous key-handling pass.
     private func dispatchCardKeyAction(_ action: CardKeyAction, topmost: PendingInteraction?) {
         switch action {
-        case .approve(let callId):
-            fieldAdapter.onApprovalRespond(callId, true)
-        case .deny(let callId):
-            fieldAdapter.onApprovalRespond(callId, false)
-        case .selectOption(let callId, let index):
-            guard case .question(_, let questions) = topmost else { return }
-            fieldAdapter.onQuestionRespond(callId, questionAnswers(for: questions, selections: [0: [index]], otherTexts: [:]), [:])
+        case .approve(let callId, let childSessionId):
+            fieldAdapter.onApprovalRespond(callId, true, childSessionId)
+        case .deny(let callId, let childSessionId):
+            fieldAdapter.onApprovalRespond(callId, false, childSessionId)
+        case .selectOption(let callId, let index, let childSessionId):
+            guard case .question(_, let questions, _) = topmost else { return }
+            fieldAdapter.onQuestionRespond(callId, questionAnswers(for: questions, selections: [0: [index]], otherTexts: [:]), [:], childSessionId)
         }
     }
 
@@ -1520,9 +1528,12 @@ func windowEscAction(keyCode: UInt16, escConsumed: () -> Bool) -> WindowEscActio
 /// Defaults `false` so every pre-existing call site (and the tests above) is byte-identical; only
 /// the two live monitors below pass a real value, computed from AppKit's `firstResponder`.
 enum CardKeyAction: Equatable {
-    case approve(String)
-    case deny(String)
-    case selectOption(String, Int)
+    /// Dispatch (Phase 7): each action carries the card's own `childSessionId` straight through —
+    /// see `PendingInteraction.approval`/`.question`'s doc — so `dispatchCardKeyAction` can route
+    /// the respond to the child exactly like a mouse click on the same card would.
+    case approve(String, String?)
+    case deny(String, String?)
+    case selectOption(String, Int, String?)
 }
 
 func cardKeyAction(
@@ -1533,11 +1544,11 @@ func cardKeyAction(
     guard composerDraft.isEmpty else { return nil }
     guard let topmost, let chars, let ch = chars.lowercased().first else { return nil }
     switch topmost {
-    case .approval(let callId, _, _, _):
-        if ch == "y" { return .approve(callId) }
-        if ch == "n" { return .deny(callId) }
+    case .approval(let callId, _, _, _, let childSessionId):
+        if ch == "y" { return .approve(callId, childSessionId) }
+        if ch == "n" { return .deny(callId, childSessionId) }
         return nil
-    case .question(let callId, let questions):
+    case .question(let callId, let questions, let childSessionId):
         // Digit-select v1 (documented, per the task-3 brief): only a SINGLE-question, SINGLE-
         // select card is "complete by construction" the instant one option is chosen, so a digit
         // both SELECTS and SUBMITS in one press, via the same `questionAnswers` helper the card's
@@ -1549,7 +1560,7 @@ func cardKeyAction(
         guard questions.count == 1, let question = questions.first, !question.multiSelect,
               let digit = ch.wholeNumberValue, (1...9).contains(digit),
               question.options.indices.contains(digit - 1) else { return nil }
-        return .selectOption(callId, digit - 1)
+        return .selectOption(callId, digit - 1, childSessionId)
     case .plan:
         return nil // approve/deny/feedback all need more than one bare keystroke — mouse only.
     }

@@ -241,6 +241,32 @@ final class FieldStateAdapter: ObservableObject {
         return anySubagentAlive(subagents.map(\.status)) ? subagents : []
     }
 
+    /// Dispatch (Phase 7), Task 8: in-flight children for the field's top-row circles. Terminal
+    /// children are pruned by the reducer on the next turn_started (see `OrbSessionState.children`'s
+    /// own doc), so this is "what's in flight" — a straight passthrough, UNLIKE `liveSubagents`
+    /// above, which additionally filters an all-done batch to empty: the reducer's own prune
+    /// already keeps this list honest, no second filter needed here.
+    var dispatchChildren: [ChildItem] { session.state.children }
+
+    /// Dispatch (Phase 7), Task 9 review carry-over: the visible-cap that used to live as an
+    /// inline `.prefix(5)` in `NormaFieldView`'s ForEach — hoisted here so it's a testable seam
+    /// (`DispatchChildrenAdapterTests`) instead of a magic number baked into the view. Behavior is
+    /// unchanged: still the first `maxVisibleDispatchChildren` of `dispatchChildren`, order
+    /// preserved, no "+N" overflow badge for a 6th+ child (v1, see `dispatchChildren`'s own doc).
+    static let maxVisibleDispatchChildren = 5
+
+    var visibleDispatchChildren: [ChildItem] {
+        Array(dispatchChildren.prefix(Self.maxVisibleDispatchChildren))
+    }
+
+    /// Wired by whichever surface owns this adapter (`GlassRootView.wireCallbacks()` — the orb/
+    /// field's single app-lifetime adapter, the only surface that renders the circles — see
+    /// `NormaFieldView`'s child-circle ForEach) to open a detached window on the tapped child's
+    /// sessionId, same "controller exposes a hook, AppDelegate wires the real side effect" seam as
+    /// `onExpandToWindow` below. Default no-op so a not-yet-wired adapter (previews/tests) never
+    /// crashes on a stray tap.
+    var onOpenChild: (String) -> Void = { _ in }
+
     /// Task B hook (mirrors `OrbWindowController.exchangeIndex`): which historical exchange, if
     /// any, `visibleResponse` should read instead of the live stream / most recent reply. `nil`
     /// = live/most-recent. Wired by `GlassRootView`'s `.onChange(of: controller.exchangeIndex)`
@@ -438,11 +464,14 @@ final class FieldStateAdapter: ObservableObject {
     @Published var interactionErrors: [String: String] = [:]
 
     /// Wired by whichever surface owns this adapter (see `interactionInFlight`'s doc) to reach
-    /// the daemon's `approval.respond` — callId, approved.
-    var onApprovalRespond: (String, Bool) -> Void = { _, _ in }
+    /// the daemon's `approval.respond` — callId, approved, childSessionId (Dispatch, Phase 7: set
+    /// only when this card is the mirrored copy of a CHILD session's approval — `nil` routes to
+    /// whatever session this surface already targets, unchanged from before Phase 7).
+    var onApprovalRespond: (String, Bool, String?) -> Void = { _, _, _ in }
     /// callId, answers, notes (both keyed by question text — see `PendingCards.swift`'s
-    /// `questionAnswers`/`questionNotes`).
-    var onQuestionRespond: (String, [String: String], [String: String]) -> Void = { _, _, _ in }
+    /// `questionAnswers`/`questionNotes`), childSessionId (same Dispatch/Phase-7 meaning as
+    /// `onApprovalRespond`'s).
+    var onQuestionRespond: (String, [String: String], [String: String], String?) -> Void = { _, _, _, _ in }
     /// callId, approved, autoAccept, feedback.
     var onPlanRespond: (String, Bool, Bool, String?) -> Void = { _, _, _, _ in }
 
