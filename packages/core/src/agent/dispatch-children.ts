@@ -29,9 +29,10 @@ interface ChildState {
 
 /** Dispatch (Phase 7): tracks the dispatch session's children. Task 4 ships spawnChild; Task 5
  *  adds derived status, completion wake (with same-drain coalescing), the roster reminder, and
- *  task_stop's dispatch-child branch. Task 6 adds the approval/question relay (mirroring child
- *  approval/question events into the dispatch stream) — onEvent below ONLY tracks state for now,
- *  it does not mirror anything yet. */
+ *  task_stop's dispatch-child branch. Task 6 adds the approval/question relay: onEvent below both
+ *  tracks state AND mirrors the four relay-eligible event types into the dispatch stream (see
+ *  `mirror` below) so a client attached ONLY to the dispatch session still sees/answers a child's
+ *  approval or question. */
 export class DispatchChildren {
   private children = new Map<string, ChildState>();
   private dispatchId?: string;
@@ -87,19 +88,52 @@ export class DispatchChildren {
   /** hub observer (every appended/broadcast event of EVERY session — see SessionHub.addObserver):
    *  narrowed to events whose sessionId is a TRACKED child; anything else (the dispatch session's
    *  own events, an unrelated code session, a detached child's events after it's been forgotten)
-   *  is a no-op. State tracking ONLY — no mirroring into the dispatch stream (Task 6). */
+   *  is a no-op. THIS is also what makes mirroring loop-safe (Task 6): `mirror()` below appends its
+   *  copy under the DISPATCH session's own sessionId, which is never a tracked child — so when that
+   *  append re-enters this same observer, the guard above discards it just like any other
+   *  dispatch-session event, instead of mirroring it a second time. */
   private onEvent(e: SessionEvent): void {
     const c = this.children.get(e.sessionId);
     if (!c) return;
     switch (e.type) {
-      case "approval_requested": c.status = "awaiting_approval"; break;
-      case "approval_resolved": c.status = "running"; break;
-      case "question_asked": c.status = "awaiting_input"; break;
-      case "question_resolved": c.status = "running"; break;
+      case "approval_requested":
+        c.status = "awaiting_approval";
+        this.mirror({ ...e, sessionId: this.dispatchId!, childSessionId: e.sessionId });
+        break;
+      case "approval_resolved":
+        c.status = "running";
+        this.mirror({ ...e, sessionId: this.dispatchId!, childSessionId: e.sessionId });
+        break;
+      case "question_asked":
+        c.status = "awaiting_input";
+        this.mirror({ ...e, sessionId: this.dispatchId!, childSessionId: e.sessionId });
+        break;
+      case "question_resolved":
+        c.status = "running";
+        this.mirror({ ...e, sessionId: this.dispatchId!, childSessionId: e.sessionId });
+        break;
       case "assistant_message": c.lastAssistant = e.text; break;
       case "agent_error": c.sawError = true; break;
       default: break;
     }
+  }
+
+  /** Mirror a child's approval/question event into the dispatch stream. seq/ts are re-stamped by
+   *  the store on append (stripped here first — hub.append's EventInput type is seq/ts-less); the
+   *  copy carries childSessionId (already set by each case above) so a client that only sees the
+   *  dispatch session can still answer at the CHILD's sessionId via the existing approval.respond/
+   *  askUser.respond RPCs (broker/QuestionBroker are keyed sessionId:callId, daemon-global — no new
+   *  RPC needed). */
+  private mirror(e: Record<string, unknown> & { type: string }): void {
+    // Double cast (via unknown): the widened Record<string, unknown> parameter has no statically
+    // known seq/ts, so TS won't narrow it directly — but every real call (the four cases above)
+    // always carries both (they're spread straight off a persisted SessionEvent).
+    const { seq: _seq, ts: _ts, ...rest } = e as unknown as { seq: number; ts: number };
+    // Cast: EventInput is a discriminated union keyed on `type`; the widened Record<string,
+    // unknown> parameter above can't structurally narrow back to it, but every call site (the four
+    // cases above) always passes an object shaped exactly like its own protocol schema plus the
+    // optional childSessionId field (Task 1) — which the parse in store.append accepts.
+    this.deps.hub.append(this.dispatchId!, rest as never);
   }
 
   /** Engine calls this from runTurn's `finally` for EVERY session (dispatch's own turns included —

@@ -2527,7 +2527,7 @@ export class AgentEngine {
           const onCwd = (next: string) => { newCwd = next; };
           if (decision === "ask") {
             outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
-              timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
+              timeoutMs: this.approvalTimeoutFor(meta),
               summary: approvalCardSummary(call),
               // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
             }, loaded, async () => this.runWorktreeBridge(call, sessionId, threadId, cwd, onCwd), pins, rootsOverride, visionCapable);
@@ -2544,7 +2544,7 @@ export class AgentEngine {
           // write). Denial rides requestApproval's deniedByHuman path unchanged.
           const grant = dirGrant; // narrow for the closure
           outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
-            timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
+            timeoutMs: this.approvalTimeoutFor(meta),
             summary: `${call.name} ${grant.path} — outside the allowed directories; grant write access to ${grant.dir}?`,
             // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
           }, loaded, async () => {
@@ -2554,7 +2554,7 @@ export class AgentEngine {
           }, pins, rootsOverride, visionCapable);
         } else if (decision === "ask") {
           outcome = await this.requestApproval(call, cwd, sessionId, threadId, signal, {
-            timeoutMs: this.cfg.approvalTimeoutMs ?? 5 * 60_000,
+            timeoutMs: this.approvalTimeoutFor(meta),
             summary: approvalCardSummary(call),
             // no denialMessage → the helper defaults to `denied by ${res.by}` (unchanged behavior)
           }, loaded, undefined, pins, rootsOverride, visionCapable);
@@ -3065,6 +3065,19 @@ export class AgentEngine {
    *  lands on the thread that actually asked, not always the session-scoped map.
    *  `rootsOverride` (4h-i Task 4) — forwarded unchanged to executeCall's default path; callers
    *  that pass their own `onApprove` (the worktree bridge) don't need it. */
+
+  /** Dispatch (Phase 7) Task 6: relayed child approvals fail closed after 10 minutes (CC parity —
+   *  there's no live human necessarily watching the child directly, so the mirrored card in the
+   *  dispatch stream needs a longer fuse than a directly-attended session's default 5); everything
+   *  else keeps the configured/default 5. The broker already resolves {approved:false, by:
+   *  "timeout"} on expiry (approvals.ts) — this only widens the WINDOW for dispatch children, the
+   *  fail-closed behavior itself is unchanged. Used at all three requestApproval call sites below
+   *  that previously inlined `this.cfg.approvalTimeoutMs ?? 5 * 60_000` directly. */
+  private approvalTimeoutFor(meta: { origin?: string }): number {
+    if (meta.origin === "dispatch-child") return 600_000;
+    return this.cfg.approvalTimeoutMs ?? 5 * 60_000;
+  }
+
   private async requestApproval(
     call: { callId: string; name: string; argsJson: string },
     cwd: string,
@@ -3328,7 +3341,14 @@ export class AgentEngine {
     // session-wide map instead of the `childLoaded` set the child's own specs()/guard consult,
     // AND polluted the session-wide set for good measure). See `loaded`'s doc comment above.
     const markToolLoaded = (n: string) => { loaded.add(n); };
-    const askTimeoutMs = Number(process.env.NORMA_ASK_TIMEOUT_MS ?? 300_000);
+    // Dispatch (Phase 7) Task 6: a dispatch child's question waits "indefinitely" (spec §6 — the
+    // child just sits in awaiting_input, mirrored into the dispatch stream, until answered).
+    // setTimeout caps at 2^31-1 ms (~24.8 days) — that IS our indefinite; a comment, not a
+    // behavior knob. Every other session keeps the existing env/default window.
+    const meta = this.cfg.store.meta(sessionId);
+    const askTimeoutMs = meta.origin === "dispatch-child"
+      ? 2 ** 31 - 1
+      : Number(process.env.NORMA_ASK_TIMEOUT_MS ?? 300_000);
     const ask = this.cfg.questions
       ? async (questions: Question[]) => {
           // Register the wait BEFORE emitting: broadcast is synchronous, so a watcher that
