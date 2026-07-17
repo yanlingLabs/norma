@@ -285,4 +285,78 @@ final class CardWiringTests: XCTestCase {
         XCTAssertFalse(ok)
         XCTAssertTrue(t.sent.isEmpty, "no RPC should go out with no focused session")
     }
+
+    // MARK: - Dispatch (Phase 7), task-7 review fix: childSessionId ROUTING wire proof
+
+    /// Boots a focused session "s_disp" (the dispatch session's stand-in) exactly like
+    /// `testAppModelRespondApprovalWireShape` above — shared by the two routing tests below.
+    /// The `nil`-childSessionId leg of the routing rule (`childSessionId ?? focusedSessionId`)
+    /// is already pinned by that wire-shape test, which never passes one and asserts the RPC
+    /// targets the focused session.
+    @MainActor
+    private func bootFocusedDispatch(_ t: AppScriptedTransport, _ model: AppModel) async {
+        await answerHandshake(t, sessions: #"[{"sessionId":"s_disp","scope":"global","createdAt":1,"lastSeq":0}]"#)
+        await waitUntilSent(t, 3)
+        let attach = lineJSON(t.sent[2])
+        XCTAssertEqual(attach["method"] as? String, "session.attach")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(attach["id"] as! Int),"result":{"ok":true,"lastSeq":0}}"#)
+        await waitUntil { model.session.state.status == .idle }
+    }
+
+    /// A MIRRORED child approval (its event carries `childSessionId`) answered via
+    /// `respondApproval(childSessionId:)` must ship the outgoing `approval.respond` against the
+    /// CHILD's sessionId — not the focused (dispatch) session the card physically lives in.
+    @MainActor
+    func testAppModelRespondApprovalRoutesToChildSessionId() async throws {
+        let t = AppScriptedTransport()
+        let model = AppModel(makeTransport: { t }, token: "tok")
+        let startTask = Task { await model.start() }
+        defer { startTask.cancel(); model.stop() }
+        await bootFocusedDispatch(t, model)
+
+        // The mirrored copy arrives in the DISPATCH session's own stream (sessionId "s_disp"),
+        // tagged with the child it relays for — exactly what the daemon's relay emits.
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"approval_requested","seq":1,"sessionId":"s_disp","ts":1,"threadId":"main","callId":"call1","toolName":"bash","summary":"rm -rf x","childSessionId":"s_child_1"}}"#)
+        await waitUntil { !model.session.state.pendingInteractions.isEmpty }
+
+        async let responded = model.respondApproval(callId: "call1", approved: true, childSessionId: "s_child_1")
+        await waitUntilSent(t, 4)
+        let respond = lineJSON(t.sent[3])
+        XCTAssertEqual(respond["method"] as? String, "approval.respond")
+        let params = respond["params"] as? [String: Any]
+        XCTAssertEqual(params?["sessionId"] as? String, "s_child_1",
+                       "the respond RPC must target the CHILD, not focusedSessionId (s_disp)")
+        XCTAssertEqual(params?["callId"] as? String, "call1")
+        XCTAssertEqual(params?["approved"] as? Bool, true)
+        t.feed(#"{"jsonrpc":"2.0","id":\#(respond["id"] as! Int),"result":{"alreadyResolved":false}}"#)
+        let ok = await responded
+        XCTAssertTrue(ok)
+    }
+
+    /// Same routing proof for the question path: `respondQuestion(childSessionId:)` →
+    /// `ask_user.respond` against the CHILD's sessionId.
+    @MainActor
+    func testAppModelRespondQuestionRoutesToChildSessionId() async throws {
+        let t = AppScriptedTransport()
+        let model = AppModel(makeTransport: { t }, token: "tok")
+        let startTask = Task { await model.start() }
+        defer { startTask.cancel(); model.stop() }
+        await bootFocusedDispatch(t, model)
+
+        t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"question_asked","seq":1,"sessionId":"s_disp","ts":1,"threadId":"main","callId":"q1","questions":[{"question":"Which port?","header":"h","options":[{"label":"80","description":null}],"multiSelect":false}],"childSessionId":"s_child_1"}}"#)
+        await waitUntil { !model.session.state.pendingInteractions.isEmpty }
+
+        async let responded = model.respondQuestion(callId: "q1", answers: ["Which port?": "80"], childSessionId: "s_child_1")
+        await waitUntilSent(t, 4)
+        let respond = lineJSON(t.sent[3])
+        XCTAssertEqual(respond["method"] as? String, "ask_user.respond")
+        let params = respond["params"] as? [String: Any]
+        XCTAssertEqual(params?["sessionId"] as? String, "s_child_1",
+                       "the respond RPC must target the CHILD, not focusedSessionId (s_disp)")
+        XCTAssertEqual(params?["callId"] as? String, "q1")
+        XCTAssertEqual((params?["answers"] as? [String: Any])?["Which port?"] as? String, "80")
+        t.feed(#"{"jsonrpc":"2.0","id":\#(respond["id"] as! Int),"result":{"alreadyResolved":false}}"#)
+        let ok = await responded
+        XCTAssertTrue(ok)
+    }
 }

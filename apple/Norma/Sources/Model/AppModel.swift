@@ -130,10 +130,12 @@ final class AppModel: ObservableObject {
         return (detachedFeed, detachedSession)
     }
 
-    /// Field summon path: a session to talk to, creating one if none is focused.
+    /// Field summon path: a session to talk to — the ONE permanent dispatch session (Phase 7),
+    /// get-or-created via `session.dispatch` when none is focused.
     ///
-    /// Orb-created sessions run approvalPolicy "auto": the orb has no approval UI until 2d,
-    /// so there's nowhere to surface an "ask" prompt. The daemon's reviewer still gates
+    /// Approval policy is the DAEMON's business now: `session.dispatch` sets the dispatch
+    /// singleton's policy ("auto") server-side, so this client no longer passes one (the old
+    /// `createSession(approvalPolicy: "auto")` call did). The daemon's reviewer still gates
     /// dangerous bash regardless of policy — auto ≠ unguarded. Sessions the orb merely
     /// FOLLOWS (created elsewhere, e.g. the CLI) keep their creator's policy, unchanged.
     func ensureFocusedSession() async -> String? {
