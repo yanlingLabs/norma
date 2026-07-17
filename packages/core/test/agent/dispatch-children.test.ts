@@ -191,6 +191,107 @@ describe("DispatchChildren (Task 5): stopChild", () => {
   });
 });
 
+describe("DispatchChildren (Task 9): notifyUnattended", () => {
+  // NOTE on call order: `start()` runs BEFORE `spawnChild()` in every test below (production order
+  // — daemon.ts always calls `dispatchChildren.start()` once at boot, before any session_spawn can
+  // possibly fire). The OLDER Task 5/6 tests above call `spawnChild()` then `start()` — harmless
+  // there since they only assert `status`, which onEvent/onTurnEnd overwrite unconditionally either
+  // way — but `start()`'s restart-reconstruction (`childrenOf` loop) rebuilds an ALREADY-tracked
+  // child from the store's OWN title metadata (auto-derived from the opening prompt, e.g. "do
+  // work" — never `opts.title`) if it runs AFTER spawnChild, silently clobbering the freshly-set
+  // ChildState. That only surfaces once a test actually checks `title` (as these do), so the
+  // start()-before-spawnChild order here isn't stylistic — it's required for the title assertions
+  // below to reflect what spawnChild was actually called with.
+  test("onTurnEnd(child, completed), nobody attached to dispatch: notification_requested {title, 'finished'}", () => {
+    const { store, hub, registry, setRunning } = setup();
+    const dispatchId = store.createSession("global", { mode: "dispatch" });
+    registry.start();
+    const childId = registry.spawnChild({ dispatchSessionId: dispatchId, dir: "/tmp/a", prompt: "do work", title: "Task A" });
+    setRunning(dispatchId, false);
+
+    hub.append(childId, { type: "assistant_message", sessionId: childId, threadId: "main", text: "all done" });
+    registry.onTurnEnd(childId);
+
+    const n = readDispatch(store, dispatchId).find((e) => e.type === "notification_requested");
+    expect(n).toMatchObject({ sessionId: dispatchId, threadId: "main", title: "Task A", message: "finished" });
+  });
+
+  test("onTurnEnd(child, errored), nobody attached: notification_requested {title, 'hit an error'}", () => {
+    const { store, hub, registry, setRunning } = setup();
+    const dispatchId = store.createSession("global", { mode: "dispatch" });
+    registry.start();
+    const childId = registry.spawnChild({ dispatchSessionId: dispatchId, dir: "/tmp/a", prompt: "do work", title: "Task A" });
+    setRunning(dispatchId, false);
+
+    hub.append(childId, { type: "agent_error", sessionId: childId, threadId: "main", message: "boom" });
+    registry.onTurnEnd(childId);
+
+    const n = readDispatch(store, dispatchId).find((e) => e.type === "notification_requested");
+    expect(n).toMatchObject({ title: "Task A", message: "hit an error" });
+  });
+
+  test("onEvent(approval_requested on a tracked child), nobody attached: notification_requested {title, 'needs your input'}", () => {
+    const { store, hub, registry } = setup();
+    const dispatchId = store.createSession("global", { mode: "dispatch" });
+    registry.start();
+    const childId = registry.spawnChild({ dispatchSessionId: dispatchId, dir: "/tmp/a", prompt: "do work", title: "Task A" });
+
+    hub.append(childId, { type: "approval_requested", sessionId: childId, threadId: "main", callId: "c1", toolName: "bash", summary: "run rm" });
+
+    const n = readDispatch(store, dispatchId).find((e) => e.type === "notification_requested");
+    expect(n).toMatchObject({ title: "Task A", message: "needs your input" });
+  });
+
+  test("onEvent(question_asked on a tracked child), nobody attached: notification_requested {title, 'needs your input'}", () => {
+    const { store, hub, registry } = setup();
+    const dispatchId = store.createSession("global", { mode: "dispatch" });
+    registry.start();
+    const childId = registry.spawnChild({ dispatchSessionId: dispatchId, dir: "/tmp/a", prompt: "do work", title: "Task A" });
+
+    hub.append(childId, {
+      type: "question_asked", sessionId: childId, threadId: "main", callId: "q1",
+      questions: [{ question: "which?", header: "Choice", options: [{ label: "A" }, { label: "B" }], multiSelect: false }],
+    });
+
+    const n = readDispatch(store, dispatchId).find((e) => e.type === "notification_requested");
+    expect(n).toMatchObject({ title: "Task A", message: "needs your input" });
+  });
+
+  test("a title over NotificationRequestedEvent's 100-char bound is clamped, not thrown (session_spawn's own title arg has no length cap)", () => {
+    const { store, hub, registry, setRunning } = setup();
+    const dispatchId = store.createSession("global", { mode: "dispatch" });
+    registry.start();
+    const longTitle = "x".repeat(150);
+    const childId = registry.spawnChild({ dispatchSessionId: dispatchId, dir: "/tmp/a", prompt: "do work", title: longTitle });
+    setRunning(dispatchId, false);
+
+    hub.append(childId, { type: "assistant_message", sessionId: childId, threadId: "main", text: "done" });
+    registry.onTurnEnd(childId); // must not throw despite the 150-char title
+
+    const n = readDispatch(store, dispatchId).find((e) => e.type === "notification_requested") as { title: string };
+    expect(n.title).toBe("x".repeat(100));
+  });
+
+  test("a client IS attached to the dispatch session: neither seam emits notification_requested", () => {
+    const { store, hub, registry, setRunning } = setup();
+    const dispatchId = store.createSession("global", { mode: "dispatch" });
+    registry.start();
+    const childId = registry.spawnChild({ dispatchSessionId: dispatchId, dir: "/tmp/a", prompt: "do work", title: "Task A" });
+    setRunning(dispatchId, false);
+    hub.attach({ clientName: "watcher", deliver: () => true }, dispatchId, 0);
+
+    // Approval seam.
+    hub.append(childId, { type: "approval_requested", sessionId: childId, threadId: "main", callId: "c1", toolName: "bash", summary: "run rm" });
+    expect(readDispatch(store, dispatchId).find((e) => e.type === "notification_requested")).toBeUndefined();
+    hub.append(childId, { type: "approval_resolved", sessionId: childId, threadId: "main", callId: "c1", approved: true, by: "user" });
+
+    // onTurnEnd (completed) seam.
+    hub.append(childId, { type: "assistant_message", sessionId: childId, threadId: "main", text: "done" });
+    registry.onTurnEnd(childId);
+    expect(readDispatch(store, dispatchId).find((e) => e.type === "notification_requested")).toBeUndefined();
+  });
+});
+
 describe("DispatchChildren (Task 5): start() restart semantics", () => {
   test("children rebuilt from the store on start() resume as 'completed' (live state is unrecoverable)", () => {
     const home = mkdtempSync(join(tmpdir(), "norma-dispatch-children-restart-"));

@@ -1598,6 +1598,18 @@ export class AgentEngine {
       // bridge, recursively, so a depth-1 child can itself spawn a depth-2 grandchild when
       // maxDepth allows it.
       const spawnOutcomes = new Map<string, { output: string; isError: boolean }>();
+      // Task 9 (dispatch integration test) ordering fix: a session_spawn call's `child_update`
+      // ("running") used to be appended to the dispatch stream INSIDE DispatchChildren.spawnChild
+      // itself — which runs synchronously in the sessionSpawnCalls loop below, BEFORE this round's
+      // tool_call/tool_result for that very call are emitted (the per-call loop further down is
+      // what emits those). That left the dispatch stream reading child_update(running) BEFORE the
+      // tool_call that caused it — backwards for any client rendering the conversation in order.
+      // Fix: spawnChild no longer appends that event itself; a successful spawn's childId is
+      // recorded here instead, and the per-call loop's `preOutcome` branch calls
+      // `dispatchReg.announceChild(childId)` right after emitting THIS call's own tool_result —
+      // giving tool_call → tool_result → child_update(running), the order a coordinator's own
+      // actions actually happened in.
+      const spawnedChildIds = new Map<string, string>();
       // [4f] callIds a pre-tool BLOCK short-circuited this round (Site 1 for bridged spawn_agent/
       // send_message, Site 2 for normal calls). Consulted by firePostTool so a blocked call — which
       // NEVER ran — gets no post-tool observe. Round-scoped (a fresh Set per provider round).
@@ -1685,6 +1697,7 @@ export class AgentEngine {
           // Non-null: sessionSpawnCalls (and thus this loop) is only ever non-empty when
           // dispatchReg was truthy at the ternary above that derived it from the SAME expression.
           const childId = dispatchReg!.spawnChild({ dispatchSessionId: sessionId, dir, prompt: childPrompt, title });
+          spawnedChildIds.set(call.callId, childId); // announced AFTER this call's own tool_result — see doc comment above
           const modelNote = effectiveOverride
             ? ` (model override '${effectiveOverride}' noted in the child's opening prompt — no per-session model override exists yet)`
             : "";
@@ -2387,6 +2400,12 @@ export class AgentEngine {
           outcome = preOutcome;
           this.emit(sessionId, { type: "tool_result", sessionId, threadId, callId: call.callId, output: outcome.output, isError: outcome.isError });
           input.push({ type: "tool_result", callId: call.callId, output: outcome.output, isError: outcome.isError });
+          // Task 9 ordering fix (see spawnedChildIds' doc comment above): a successful session_spawn
+          // call's child_update(running) is announced HERE, right after ITS OWN tool_result — so the
+          // dispatch stream always reads tool_call → tool_result → child_update(running), never the
+          // reverse. No-op for every other bridged callId (send_message, an errored session_spawn).
+          const announceChildId = spawnedChildIds.get(call.callId);
+          if (announceChildId) dispatchReg?.announceChild(announceChildId);
           // [4f post-tool — bridged outcome] observe a spawn_agent/send_message call's result.
           // firePostTool SKIPS a pre-tool-blocked call (hookBlockedCallIds) — that call never ran.
           if (this.cfg.hooks) await this.firePostTool(sessionId, threadId, call, outcome, hookBlockedCallIds, signal); // [4f I1] interrupt cuts the chain

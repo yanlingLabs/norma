@@ -77,12 +77,28 @@ export class DispatchChildren {
     this.dispatchId = opts.dispatchSessionId;
     this.children.set(childId, { title: opts.title, dir: opts.dir, spawnedAt: Date.now(), status: "running" });
     this.deps.hub.append(childId, { type: "user_message", sessionId: childId, threadId: "main", text: opts.prompt, clientName: "dispatch" });
-    this.deps.hub.append(opts.dispatchSessionId, {
-      type: "child_update", sessionId: opts.dispatchSessionId, threadId: "main",
-      childSessionId: childId, status: "running", title: opts.title,
-    });
+    // Task 9 ordering fix: the "child_update: running" announcement does NOT happen here anymore —
+    // it used to, but that made it land on the dispatch stream BEFORE the session_spawn call's own
+    // tool_call/tool_result (this method runs synchronously, entirely before the engine's per-call
+    // loop emits either). The engine now calls `announceChild` itself, right after THIS call's
+    // tool_result — see announceChild's own doc comment and engine.ts's session_spawn bridge.
     void this.deps.runTurn(childId).catch((e) => console.error("dispatch child turn failed:", e));
     return childId;
+  }
+
+  /** Task 9: appends the spawned child's first `child_update` ("running") to the dispatch stream.
+   *  Split out of `spawnChild` (which used to append this itself, too early relative to that call's
+   *  own tool_call/tool_result — see spawnChild's doc comment) so the engine can call it AFTER
+   *  emitting session_spawn's tool_result, giving clients a coherent tool_call → tool_result →
+   *  child_update(running) order. No-op if `childId` isn't a tracked child (defensive; the engine's
+   *  only call site always passes back an id `spawnChild` itself just returned). */
+  announceChild(childId: string): void {
+    const c = this.children.get(childId);
+    if (!c || !this.dispatchId) return;
+    this.deps.hub.append(this.dispatchId, {
+      type: "child_update", sessionId: this.dispatchId, threadId: "main",
+      childSessionId: childId, status: "running", title: c.title,
+    });
   }
 
   /** hub observer (every appended/broadcast event of EVERY session — see SessionHub.addObserver):
@@ -99,6 +115,7 @@ export class DispatchChildren {
       case "approval_requested":
         c.status = "awaiting_approval";
         this.mirror({ ...e, sessionId: this.dispatchId!, childSessionId: e.sessionId });
+        this.notifyUnattended(c.title, "needs your input");
         break;
       case "approval_resolved":
         c.status = "running";
@@ -107,6 +124,7 @@ export class DispatchChildren {
       case "question_asked":
         c.status = "awaiting_input";
         this.mirror({ ...e, sessionId: this.dispatchId!, childSessionId: e.sessionId });
+        this.notifyUnattended(c.title, "needs your input");
         break;
       case "question_resolved":
         c.status = "running";
@@ -160,6 +178,7 @@ export class DispatchChildren {
       childSessionId: sessionId, status, title: c.title,
       ...(c.lastAssistant ? { resultSummary: c.lastAssistant.slice(0, 2000) } : {}),
     });
+    this.notifyUnattended(c.title, status === "error" ? "hit an error" : "finished");
     // Reset per-turn scratch state AFTER building this turn's update (see ChildState doc):
     // children are real resumable sessions, so a LATER turn that ends without a fresh
     // assistant_message must not resurrect this turn's text as its resultSummary (nor inherit
@@ -197,5 +216,24 @@ export class DispatchChildren {
     if (!c) return undefined;
     this.deps.interrupt(id);
     return `stopped child session ${id} ("${c.title}")`;
+  }
+
+  /** Task 9: emit a `notification_requested` into the dispatch stream when NOBODY is attached to
+   *  watch it happen live — the app/engine notification machinery (incl. the headless osascript
+   *  fallback, `agent/notify-fallback.ts`) takes it from there, same as `push_notification`'s own
+   *  engine bridge (`engine.ts`'s `notify` bridge checks the identical `hub.attachedCount(...) ===
+   *  0` gate). Called from BOTH seams: onTurnEnd's child branch (a child finished or errored) and
+   *  onEvent's approval_requested/question_asked cases (a child needs input). `this.dispatchId`
+   *  absent is defensive-only (spawnChild always sets it before either seam can fire). `title` is
+   *  clamped to `NotificationRequestedEvent`'s own `max(100)` bound (events.ts) — UNLIKE
+   *  `child_update.title` (unbounded), a title a model handed to `session_spawn` with no length
+   *  cap of its own could otherwise fail this event's stricter zod parse inside `hub.append`
+   *  (`SessionStore.append` throws on an invalid shape), silently losing the notification. */
+  private notifyUnattended(title: string, message: string): void {
+    if (!this.dispatchId || this.deps.hub.attachedCount(this.dispatchId) > 0) return;
+    this.deps.hub.append(this.dispatchId, {
+      type: "notification_requested", sessionId: this.dispatchId, threadId: "main",
+      title: title.slice(0, 100), message,
+    });
   }
 }

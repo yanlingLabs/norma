@@ -248,6 +248,17 @@ final class FieldStateAdapter: ObservableObject {
     /// already keeps this list honest, no second filter needed here.
     var dispatchChildren: [ChildItem] { session.state.children }
 
+    /// Dispatch (Phase 7), Task 9 review carry-over: the visible-cap that used to live as an
+    /// inline `.prefix(5)` in `NormaFieldView`'s ForEach — hoisted here so it's a testable seam
+    /// (`DispatchChildrenAdapterTests`) instead of a magic number baked into the view. Behavior is
+    /// unchanged: still the first `maxVisibleDispatchChildren` of `dispatchChildren`, order
+    /// preserved, no "+N" overflow badge for a 6th+ child (v1, see `dispatchChildren`'s own doc).
+    static let maxVisibleDispatchChildren = 5
+
+    var visibleDispatchChildren: [ChildItem] {
+        Array(dispatchChildren.prefix(Self.maxVisibleDispatchChildren))
+    }
+
     /// Wired by whichever surface owns this adapter (`GlassRootView.wireCallbacks()` — the orb/
     /// field's single app-lifetime adapter, the only surface that renders the circles — see
     /// `NormaFieldView`'s child-circle ForEach) to open a detached window on the tapped child's

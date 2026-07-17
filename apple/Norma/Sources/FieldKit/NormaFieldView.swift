@@ -611,11 +611,14 @@ struct NormaFieldView: View {
             // Dispatch (Phase 7), Task 8: one circle per in-flight child session, laid RIGHT-to-
             // LEFT starting immediately left of the expand button (`chatButtonFinal.minX`) — the
             // first child (i=0) sits nearest the expand circle, each later one growing further
-            // leftward. Capped at 5 visible circles (v1: no "+N" overflow badge — a 6th+ child
-            // simply doesn't render its own circle yet). Same reveal timing / legibility wrap as
-            // the expand button just above (`sideContentReveal`/`GlassForegroundLegibility`) — a
-            // v1 ("acceptable v1", per the brief) fade rather than its own morph interpolation.
-            ForEach(Array(adapter.dispatchChildren.prefix(5).enumerated()), id: \.element.id) { i, child in
+            // leftward. Capped at `FieldStateAdapter.maxVisibleDispatchChildren` visible circles
+            // (v1: no "+N" overflow badge — a 6th+ child simply doesn't render its own circle yet;
+            // Task 9 review hoisted the cap out of an inline `.prefix(5)` here into
+            // `adapter.visibleDispatchChildren`, a testable seam — see FieldStateAdapter). Same
+            // reveal timing / legibility wrap as the expand button just above
+            // (`sideContentReveal`/`GlassForegroundLegibility`) — a v1 ("acceptable v1", per the
+            // brief) fade rather than its own morph interpolation.
+            ForEach(Array(adapter.visibleDispatchChildren.enumerated()), id: \.element.id) { i, child in
                 let d = chatButtonFinal.height * 0.62
                 let cx = chatButtonFinal.minX - CGFloat(i + 1) * (d + 6) - d / 2
                 Circle()

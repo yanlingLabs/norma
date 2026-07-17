@@ -35,6 +35,19 @@ final class DispatchChildrenAdapterTests: XCTestCase {
         XCTAssertEqual(a.dispatchChildren, [child])
     }
 
+    /// Task 9 review carry-over: the visible-cap NormaFieldView's ForEach consumes (hoisted out of
+    /// an inline `.prefix(5)` into this testable seam — see FieldStateAdapter.visibleDispatchChildren).
+    /// 7 tracked children → only the first 5 are visible, in `dispatchChildren`'s own order.
+    func testVisibleDispatchChildrenCapsAtFiveInOrder() {
+        let session = SessionModel()
+        let a = FieldStateAdapter(session: session)
+        let children = (1...7).map { ChildItem(sessionId: "c\($0)", title: "child \($0)", status: "running") }
+        session.applyForTesting { s in s.children = children }
+        XCTAssertEqual(FieldStateAdapter.maxVisibleDispatchChildren, 5)
+        XCTAssertEqual(a.visibleDispatchChildren, Array(children.prefix(5)))
+        XCTAssertEqual(a.visibleDispatchChildren.map(\.sessionId), ["c1", "c2", "c3", "c4", "c5"])
+    }
+
     func testOnOpenChildDefaultsToNoOpWithoutCrashing() {
         let a = FieldStateAdapter(session: SessionModel())
         a.onOpenChild("c1") // must not crash — default no-op (previews/unwired adapters)
