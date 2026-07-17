@@ -19,6 +19,9 @@ export interface SessionRow {
    *  below, NOT derived from the event log the way title/first_message are), so it resets to
    *  undefined on a full index rebuild (see recoverAll's pass-2 INSERT). */
   origin?: string;
+  // Dispatch (Phase 7): index-only metadata like origin — resets on full index rebuild.
+  mode?: string;
+  parentSessionId?: string;
 }
 
 /** Derives a fallback title from the first line of the session's first main-thread
@@ -46,7 +49,9 @@ export class SessionStore {
       created_at INTEGER NOT NULL,
       last_seq INTEGER NOT NULL,
       cwd TEXT,
-      approval_policy TEXT NOT NULL DEFAULT 'ask'
+      approval_policy TEXT NOT NULL DEFAULT 'ask',
+      mode TEXT,
+      parent_session_id TEXT
     )`);
     // Handle pre-existing index.db files by adding missing columns
     for (const ddl of [
@@ -55,6 +60,8 @@ export class SessionStore {
       "ALTER TABLE sessions ADD COLUMN title TEXT",
       "ALTER TABLE sessions ADD COLUMN first_message TEXT",
       "ALTER TABLE sessions ADD COLUMN origin TEXT",
+      "ALTER TABLE sessions ADD COLUMN mode TEXT",
+      "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT",
     ]) {
       try { this.db.run(ddl); }
       catch (e) {
@@ -170,13 +177,16 @@ export class SessionStore {
     return join(this.homeDir, "sessions", scope, `${sessionId}.jsonl`);
   }
 
-  createSession(scope: string, opts: { cwd?: string; approvalPolicy?: "ask" | "auto" | "plan"; origin?: string } = {}): string {
+  createSession(
+    scope: string,
+    opts: { cwd?: string; approvalPolicy?: "ask" | "auto" | "plan"; origin?: string; mode?: "code" | "dispatch"; parentSessionId?: string } = {},
+  ): string {
     if (!SCOPE_RE.test(scope)) throw new Error(`invalid scope: ${scope}`);
     const sessionId = `s_${randomBytes(6).toString("hex")}`;
     mkdirSync(join(this.homeDir, "sessions", scope), { recursive: true });
     this.db.run(
-      "INSERT INTO sessions (session_id, scope, created_at, last_seq, cwd, approval_policy, origin) VALUES (?, ?, ?, 0, ?, ?, ?)",
-      [sessionId, scope, Date.now(), opts.cwd ?? null, opts.approvalPolicy ?? "ask", opts.origin ?? null],
+      "INSERT INTO sessions (session_id, scope, created_at, last_seq, cwd, approval_policy, origin, mode, parent_session_id) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)",
+      [sessionId, scope, Date.now(), opts.cwd ?? null, opts.approvalPolicy ?? "ask", opts.origin ?? null, opts.mode ?? null, opts.parentSessionId ?? null],
     );
     this.append(sessionId, { type: "session_created", sessionId, scope });
     return sessionId;
@@ -219,8 +229,8 @@ export class SessionStore {
   }
 
   list(): SessionRow[] {
-    return (this.db.query("SELECT session_id, scope, created_at, last_seq, title, first_message, cwd, origin FROM sessions ORDER BY created_at").all() as
-      { session_id: string; scope: string; created_at: number; last_seq: number; title: string | null; first_message: string | null; cwd: string | null; origin: string | null }[])
+    return (this.db.query("SELECT session_id, scope, created_at, last_seq, title, first_message, cwd, origin, mode, parent_session_id FROM sessions ORDER BY created_at").all() as
+      { session_id: string; scope: string; created_at: number; last_seq: number; title: string | null; first_message: string | null; cwd: string | null; origin: string | null; mode: string | null; parent_session_id: string | null }[])
       .map((r) => ({
         sessionId: r.session_id,
         scope: r.scope,
@@ -229,6 +239,8 @@ export class SessionStore {
         title: r.title ?? fallbackTitle(r.first_message),
         cwd: r.cwd ?? undefined,
         origin: r.origin ?? undefined,
+        mode: r.mode ?? undefined,
+        parentSessionId: r.parent_session_id ?? undefined,
       }));
   }
 
@@ -252,13 +264,30 @@ export class SessionStore {
     if (res.changes === 0) throw new Error(`unknown session: ${sessionId}`);
   }
 
-  meta(sessionId: string): { sessionId: string; scope: string; cwd: string | null; approvalPolicy: "ask" | "auto" | "plan" } {
-    const row = this.db.query("SELECT scope, cwd, approval_policy FROM sessions WHERE session_id = ?").get(sessionId) as
-      | { scope: string; cwd: string | null; approval_policy: string } | null;
+  meta(sessionId: string): {
+    sessionId: string; scope: string; cwd: string | null; approvalPolicy: "ask" | "auto" | "plan";
+    origin?: string; mode?: string; parentSessionId?: string;
+  } {
+    const row = this.db.query("SELECT scope, cwd, approval_policy, origin, mode, parent_session_id FROM sessions WHERE session_id = ?").get(sessionId) as
+      | { scope: string; cwd: string | null; approval_policy: string; origin: string | null; mode: string | null; parent_session_id: string | null } | null;
     if (!row) throw new Error(`unknown session: ${sessionId}`);
     const p = row.approval_policy;
     const approvalPolicy: "ask" | "auto" | "plan" = p === "auto" ? "auto" : p === "plan" ? "plan" : "ask";
-    return { sessionId, scope: row.scope, cwd: row.cwd, approvalPolicy };
+    return {
+      sessionId, scope: row.scope, cwd: row.cwd, approvalPolicy,
+      origin: row.origin ?? undefined, mode: row.mode ?? undefined, parentSessionId: row.parent_session_id ?? undefined,
+    };
+  }
+
+  /** Dispatch (Phase 7): the ONE dispatch session, if it exists. session.dispatch's lookup. */
+  dispatchSessionId(): string | undefined {
+    const r = this.db.query("SELECT session_id FROM sessions WHERE mode = 'dispatch' LIMIT 1").get() as { session_id: string } | null;
+    return r?.session_id;
+  }
+
+  /** Dispatch (Phase 7): children of a dispatch session, creation order. */
+  childrenOf(parentSessionId: string): SessionRow[] {
+    return this.list().filter((r) => r.parentSessionId === parentSessionId);
   }
 
   // -----------------------------------------------------------------------------------------

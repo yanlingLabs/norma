@@ -1,0 +1,136 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir, homedir } from "node:os";
+import { join } from "node:path";
+import { LineDecoder, encodeLine, METHODS, PROTOCOL_VERSION, ConnWriter, ERR, type WritableSocket } from "@norma/protocol";
+import { startIpcServer } from "../../src/ipc/server";
+import { SessionStore } from "../../src/sessions/store";
+import { FileSecretStore } from "../../src/auth/secret-store";
+import { TokenAuthority } from "../../src/auth/tokens";
+
+// Dispatch (Phase 7) Task 2: session.dispatch's get-or-create RPC, exercised over a bare IPC
+// server (own SessionStore + TokenAuthority, no AgentEngine/etc) — same harness shape as
+// server.test.ts's bootPluginTestServer, copied here (not imported: no shared test-harness
+// module exists in this codebase — every *.test.ts in test/ipc and test/ carries its own copy).
+
+/** Minimal raw test client speaking NDJSON JSON-RPC — duplicated from server.test.ts's copy. */
+class TestClient {
+  private decoder = new LineDecoder();
+  private nextId = 1;
+  private pending = new Map<number, (msg: any) => void>();
+  private socket!: Awaited<ReturnType<typeof Bun.connect>>;
+  private writer!: ConnWriter;
+
+  static async connect(socketPath: string): Promise<TestClient> {
+    const c = new TestClient();
+    c.socket = await Bun.connect({
+      unix: socketPath,
+      socket: {
+        data(_s, chunk) {
+          for (const line of c.decoder.push(chunk)) {
+            const msg = JSON.parse(line);
+            if (msg.id !== undefined && c.pending.has(msg.id)) {
+              c.pending.get(msg.id)!(msg);
+              c.pending.delete(msg.id);
+            }
+          }
+        },
+        drain(_s) {
+          c.writer.onDrain();
+        },
+      },
+    });
+    c.writer = new ConnWriter(c.socket as unknown as WritableSocket);
+    return c;
+  }
+
+  request(method: string, params?: unknown): Promise<any> {
+    const id = this.nextId++;
+    this.writer.enqueue(encodeLine({ jsonrpc: "2.0", id, method, params }));
+    return new Promise((resolve) => this.pending.set(id, resolve));
+  }
+
+  async hello(token: string, clientName: string, role = "harness"): Promise<any> {
+    return this.request(METHODS.hello, { protocolVersion: PROTOCOL_VERSION, role, token, clientName });
+  }
+
+  close(): void { this.socket.end(); }
+}
+
+describe("session.dispatch get-or-create RPC (Phase 7 dispatch mode Task 2)", () => {
+  let stop: (() => void) | undefined;
+
+  afterEach(() => { stop?.(); stop = undefined; });
+
+  async function boot(): Promise<{ store: SessionStore; socketPath: string; harnessToken: string }> {
+    const home = mkdtempSync(join(tmpdir(), "norma-dispatch-rpc-"));
+    const store = new SessionStore(home);
+    const socketPath = join(home, "core.sock");
+    const authority = new TokenAuthority(new FileSecretStore(join(home, "secrets.json")));
+    const tokens = await authority.ensureTokens();
+    const server = startIpcServer({ socketPath, serverVersion: "test", tokens: authority, store });
+    stop = () => { server.stop(); store.close(); };
+    return { store, socketPath, harnessToken: tokens.harness };
+  }
+
+  test("first call creates the singleton with the fixed dispatch values", async () => {
+    const { store, socketPath, harnessToken } = await boot();
+    const c = await TestClient.connect(socketPath);
+    await c.hello(harnessToken, "dispatch-tester");
+
+    const res = await c.request(METHODS.sessionDispatch, {});
+    expect(res.error).toBeUndefined();
+    expect(res.result.created).toBe(true);
+    expect(res.result.sessionId).toMatch(/^s_/);
+
+    const meta = store.meta(res.result.sessionId);
+    expect(meta.mode).toBe("dispatch");
+    expect(meta.origin).toBe("dispatch");
+    expect(meta.approvalPolicy).toBe("auto");
+    expect(meta.cwd).toBe(homedir());
+    c.close();
+  });
+
+  test("second call get-or-creates: same sessionId, created: false", async () => {
+    const { socketPath, harnessToken } = await boot();
+    const c = await TestClient.connect(socketPath);
+    await c.hello(harnessToken, "dispatch-tester");
+
+    const first = await c.request(METHODS.sessionDispatch, {});
+    const second = await c.request(METHODS.sessionDispatch, {});
+    expect(second.error).toBeUndefined();
+    expect(second.result.sessionId).toBe(first.result.sessionId);
+    expect(second.result.created).toBe(false);
+    c.close();
+  });
+
+  test("session.create rejects mode: dispatch with INVALID_PARAMS mentioning session.dispatch", async () => {
+    const { socketPath, harnessToken } = await boot();
+    const c = await TestClient.connect(socketPath);
+    await c.hello(harnessToken, "dispatch-tester");
+
+    const res = await c.request(METHODS.sessionCreate, { scope: "global", mode: "dispatch" });
+    expect(res.error).toBeTruthy();
+    expect(res.error.code).toBe(ERR.INVALID_PARAMS);
+    expect(res.error.message).toContain("session.dispatch");
+    c.close();
+  });
+
+  test("session.list rows carry mode/parentSessionId passthrough", async () => {
+    const { store, socketPath, harnessToken } = await boot();
+    const c = await TestClient.connect(socketPath);
+    await c.hello(harnessToken, "dispatch-tester");
+
+    const dispatched = await c.request(METHODS.sessionDispatch, {});
+    const dispatchId: string = dispatched.result.sessionId;
+    const childId = store.createSession("global", { origin: "dispatch-child", parentSessionId: dispatchId });
+
+    const listed = await c.request(METHODS.sessionList, {});
+    expect(listed.error).toBeUndefined();
+    const dRow = listed.result.sessions.find((r: any) => r.sessionId === dispatchId);
+    const cRow = listed.result.sessions.find((r: any) => r.sessionId === childId);
+    expect(dRow.mode).toBe("dispatch");
+    expect(cRow.parentSessionId).toBe(dispatchId);
+    c.close();
+  });
+});
