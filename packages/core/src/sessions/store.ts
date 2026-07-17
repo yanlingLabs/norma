@@ -19,7 +19,11 @@ export interface SessionRow {
    *  below, NOT derived from the event log the way title/first_message are), so it resets to
    *  undefined on a full index rebuild (see recoverAll's pass-2 INSERT). */
   origin?: string;
-  // Dispatch (Phase 7): index-only metadata like origin — resets on full index rebuild.
+  // Dispatch (Phase 7): unlike origin/cwd (index-only, reset on full index rebuild — see
+  // recoverAll's pass-2 INSERT), mode ALSO rides the session_created event (SessionCreatedEvent's
+  // optional `mode`, durability follow-up) and IS restored on a full index rebuild — required so
+  // the dispatch-singleton invariant (dispatchSessionId's SELECT WHERE mode='dispatch') survives
+  // a complete index.db loss.
   mode?: string;
   parentSessionId?: string;
 }
@@ -144,10 +148,17 @@ export class SessionStore {
         const createdAt = firstEvent.ts;
         const lastSeq = (JSON.parse(good[good.length - 1]!) as SessionEvent).seq;
         const { title, firstMessage } = this.deriveIndexFields(parsed);
+        // mode (Phase 7 durability follow-up): unlike cwd/approval_policy (never carried by the
+        // event log, so they reset to defaults below), mode rides the session_created event
+        // (parsed[0], already validated by readGoodLines above) specifically so the
+        // dispatch-singleton invariant (dispatchSessionId's SELECT WHERE mode='dispatch') survives
+        // a full index rebuild. Absent on old-format logs → NULL, same as before this feature.
+        const firstParsed = parsed[0];
+        const mode = firstParsed?.type === "session_created" ? (firstParsed.mode ?? null) : null;
         // cwd/approval_policy are index-only metadata: after index loss they reset to defaults.
         this.db.run(
-          "INSERT INTO sessions (session_id, scope, created_at, last_seq, cwd, approval_policy, title, first_message) VALUES (?, ?, ?, ?, NULL, 'ask', ?, ?)",
-          [sessionId, scope, createdAt, lastSeq, title, firstMessage],
+          "INSERT INTO sessions (session_id, scope, created_at, last_seq, cwd, approval_policy, mode, title, first_message) VALUES (?, ?, ?, ?, NULL, 'ask', ?, ?, ?)",
+          [sessionId, scope, createdAt, lastSeq, mode, title, firstMessage],
         );
         known.add(sessionId);
       }
@@ -188,7 +199,7 @@ export class SessionStore {
       "INSERT INTO sessions (session_id, scope, created_at, last_seq, cwd, approval_policy, origin, mode, parent_session_id) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)",
       [sessionId, scope, Date.now(), opts.cwd ?? null, opts.approvalPolicy ?? "ask", opts.origin ?? null, opts.mode ?? null, opts.parentSessionId ?? null],
     );
-    this.append(sessionId, { type: "session_created", sessionId, scope });
+    this.append(sessionId, { type: "session_created", sessionId, scope, ...(opts.mode ? { mode: opts.mode } : {}) });
     return sessionId;
   }
 

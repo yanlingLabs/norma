@@ -20,6 +20,14 @@ export const SYSTEM_SESSION_ID = "$system";
 export const SessionCreatedEvent = Base.extend({
   type: z.literal("session_created"),
   scope: z.string().min(1),
+  // Dispatch (Phase 7 durability follow-up): carried so a full index.db rebuild (SessionStore's
+  // recoverAll pass 2, which derives a rebuilt row ONLY from this event) can restore the
+  // dispatch-singleton invariant — dispatchSessionId()'s SELECT WHERE mode='dispatch' is how
+  // session.dispatch's get-or-create finds the ONE permanent dispatch session; without this, an
+  // index rebuild would null out `mode` and mint a second dispatch session, orphaning the
+  // original's whole conversation history. Additive/optional — older-shaped events still parse;
+  // absent means "code" (same convention as SessionRow.mode/opts.mode elsewhere).
+  mode: z.enum(["code", "dispatch"]).optional(),
 });
 
 export const HarnessAttachedEvent = Base.extend({

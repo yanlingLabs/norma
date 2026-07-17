@@ -15,6 +15,10 @@ writeFileSync(join(outDir, "session-event.schema.json"), JSON.stringify(schema, 
 const base = { seq: 7, sessionId: "s_fixture", ts: 1781270000000 };
 const fixtures: Record<string, unknown> = {
   "session_created": { ...base, type: "session_created", scope: "global" },
+  // Dispatch durability follow-up: mode is additive/optional on the EXISTING session_created
+  // shape — a dedicated fixture (distinct from session_created.json above) so Swift round-trips
+  // one carrying it, mirroring approval_requested_with_reviewer_reason's with/without pattern.
+  "session_created_with_mode": { ...base, type: "session_created", scope: "global", mode: "dispatch" },
   "harness_attached": { ...base, type: "harness_attached", clientName: "orb" },
   "harness_detached": { ...base, type: "harness_detached", clientName: "orb" },
   "user_message": { ...base, type: "user_message", threadId: "main", text: "héllo \"world\" — done ✓", clientName: "cli-1" },
