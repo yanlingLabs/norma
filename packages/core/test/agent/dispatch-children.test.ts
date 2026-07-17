@@ -118,6 +118,27 @@ describe("DispatchChildren (Task 5): completion wake", () => {
     expect(runTurnCalls.filter((id) => id === dispatchId).length).toBe(1);
   });
 
+  test("stale-summary guard (review fix): a second turn ending with NO new assistant_message emits a child_update WITHOUT resultSummary — never the previous turn's text", () => {
+    const { store, hub, registry, setRunning } = setup();
+    const dispatchId = store.createSession("global", { mode: "dispatch" });
+    const childId = registry.spawnChild({ dispatchSessionId: dispatchId, dir: "/tmp/a", prompt: "do work", title: "Task A" });
+    registry.start();
+    setRunning(dispatchId, false);
+
+    // Turn 1: ends with an assistant_message — its child_update carries that summary.
+    hub.append(childId, { type: "assistant_message", sessionId: childId, threadId: "main", text: "first result" });
+    registry.onTurnEnd(childId);
+    const afterTurn1 = readDispatch(store, dispatchId).findLast((e) => e.type === "child_update" && e.childSessionId === childId);
+    expect((afterTurn1 as { resultSummary?: string }).resultSummary).toBe("first result");
+
+    // Turn 2 (child resumed): ends with NO new assistant_message (pure tool-call end / error) —
+    // the update must NOT resurrect turn 1's text as this turn's resultSummary.
+    registry.onTurnEnd(childId);
+    const afterTurn2 = readDispatch(store, dispatchId).findLast((e) => e.type === "child_update" && e.childSessionId === childId);
+    expect(afterTurn2).toBeDefined();
+    expect((afterTurn2 as { resultSummary?: string }).resultSummary).toBeUndefined();
+  });
+
   test("6) error path: last event agent_error (no assistant_message) → child_update status 'error'", () => {
     const { store, hub, registry, setRunning } = setup();
     const dispatchId = store.createSession("global", { mode: "dispatch" });

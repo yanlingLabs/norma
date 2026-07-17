@@ -121,12 +121,17 @@ export class DispatchChildren {
     if (!c) return;
     const status: ChildStatus = c.sawError ? "error" : "completed";
     c.status = status;
-    c.sawError = false; // reset — a later re-run of this same child starts clean (see ChildState doc)
     this.deps.hub.append(this.dispatchId!, {
       type: "child_update", sessionId: this.dispatchId!, threadId: "main",
       childSessionId: sessionId, status, title: c.title,
       ...(c.lastAssistant ? { resultSummary: c.lastAssistant.slice(0, 2000) } : {}),
     });
+    // Reset per-turn scratch state AFTER building this turn's update (see ChildState doc):
+    // children are real resumable sessions, so a LATER turn that ends without a fresh
+    // assistant_message must not resurrect this turn's text as its resultSummary (nor inherit
+    // this turn's error flag).
+    c.sawError = false;
+    c.lastAssistant = undefined;
     if (!this.deps.isRunning(this.dispatchId!)) {
       void this.deps.runTurn(this.dispatchId!).catch((e) => console.error("dispatch wake failed:", e));
     } else {
