@@ -70,5 +70,11 @@ struct SessionSummary: Equatable, Identifiable {
     var createdAt: Int
     var scope: String
     var cwd: String?
+    // Dispatch (Phase 7) scaffolding: threaded through from listSessions() but not yet consumed by
+    // any UI — a later task wires the dispatch session's distinct sidebar treatment. Defaulted
+    // (unlike title/cwd above) so existing memberwise-init call sites (SessionDirectoryTests)
+    // don't all need touching for an additive field neither test currently cares about.
+    var mode: String? = nil
+    var parentSessionId: String? = nil
     var id: String { sessionId }
 }

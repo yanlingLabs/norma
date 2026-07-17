@@ -225,12 +225,21 @@ extension NormaClient {
         return (id, trusted)
     }
 
-    public func listSessions() async throws -> [(sessionId: String, scope: String, createdAt: Int, lastSeq: Int, title: String?, cwd: String?)] {
+    /// `session.dispatch {}` (Phase 7): get-or-create the ONE permanent dispatch session.
+    public func dispatchSession() async throws -> (sessionId: String, created: Bool) {
+        let r = try await request("session.dispatch", params: nil)
+        guard let id = r["sessionId"]?.stringValue, let created = r["created"]?.boolValue else {
+            throw RpcError(code: -3, message: "invalid result from server for session.dispatch")
+        }
+        return (id, created)
+    }
+
+    public func listSessions() async throws -> [(sessionId: String, scope: String, createdAt: Int, lastSeq: Int, title: String?, cwd: String?, mode: String?, parentSessionId: String?)] {
         let r = try await request("session.list", params: nil)
         return (r["sessions"]?.arrayValue ?? []).compactMap { s in
             guard let id = s["sessionId"]?.stringValue, let scope = s["scope"]?.stringValue,
                   let created = s["createdAt"]?.intValue, let last = s["lastSeq"]?.intValue else { return nil }
-            return (id, scope, created, last, s["title"]?.stringValue, s["cwd"]?.stringValue)
+            return (id, scope, created, last, s["title"]?.stringValue, s["cwd"]?.stringValue, s["mode"]?.stringValue, s["parentSessionId"]?.stringValue)
         }
     }
 

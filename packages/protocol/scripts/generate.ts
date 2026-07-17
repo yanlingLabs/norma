@@ -92,6 +92,14 @@ const fixtures: Record<string, unknown> = {
   // variant, same full switch-trap discipline as tool_review above. NOT sensitive — a normal
   // fixture.
   notification_requested: { type: "notification_requested", sessionId: "s_1", threadId: "t_1", seq: 33, ts: 1700000000023, title: "Norma", message: "Long-running migration finished — 12,004 rows updated." },
+  "child_update": { ...base, threadId: "main", type: "child_update", childSessionId: "s_child000001", status: "completed", title: "Fix login bug", resultSummary: "Fixed the null token check; tests pass." },
+  // Dispatch relay (Phase 7): childSessionId is additive/optional on the four existing
+  // approval/question shapes — dedicated with-fixtures so Swift round-trips carriers, mirroring
+  // approval_requested_with_reviewer_reason's with/without pattern.
+  "approval_requested_with_child_session": { ...base, threadId: "main", type: "approval_requested", callId: "call_40", toolName: "bash", summary: "run rm -rf node_modules", childSessionId: "s_child000001" },
+  "approval_resolved_with_child_session": { ...base, threadId: "main", type: "approval_resolved", callId: "call_40", approved: true, by: "orb", childSessionId: "s_child000001" },
+  "question_asked_with_child_session": { ...base, threadId: "main", type: "question_asked", callId: "call_41", questions: [{ question: "Which package manager?", header: "PkgMgr", options: [{ label: "pnpm", description: "workspace default" }, { label: "npm", description: "plain" }], multiSelect: false }], childSessionId: "s_child000001" },
+  "question_resolved_with_child_session": { ...base, threadId: "main", type: "question_resolved", callId: "call_41", answers: { "Which package manager?": "pnpm" }, by: "orb", childSessionId: "s_child000001" },
 };
 for (const [name, value] of Object.entries(fixtures)) {
   SessionEvent.parse(value); // fixtures must be valid by construction

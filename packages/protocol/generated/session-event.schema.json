@@ -440,6 +440,9 @@
         },
         "reviewerReason": {
           "type": "string"
+        },
+        "childSessionId": {
+          "type": "string"
         }
       },
       "required": [
@@ -489,6 +492,9 @@
         "by": {
           "type": "string",
           "minLength": 1
+        },
+        "childSessionId": {
+          "type": "string"
         }
       },
       "required": [
@@ -916,6 +922,9 @@
             ],
             "additionalProperties": false
           }
+        },
+        "childSessionId": {
+          "type": "string"
         }
       },
       "required": [
@@ -979,6 +988,9 @@
           "additionalProperties": {
             "type": "string"
           }
+        },
+        "childSessionId": {
+          "type": "string"
         }
       },
       "required": [
@@ -2011,6 +2023,64 @@
         "type",
         "title",
         "message"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "threadId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "child_update"
+        },
+        "childSessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "running",
+            "awaiting_approval",
+            "awaiting_input",
+            "completed",
+            "error"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "resultSummary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "seq",
+        "sessionId",
+        "ts",
+        "threadId",
+        "type",
+        "childSessionId",
+        "status",
+        "title"
       ],
       "additionalProperties": false
     }

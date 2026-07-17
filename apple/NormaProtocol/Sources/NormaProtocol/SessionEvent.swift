@@ -39,6 +39,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
     case tileAction(TileAction)
     case toolReview(ToolReview)
     case notificationRequested(NotificationRequested)
+    case childUpdate(ChildUpdate)
 
     public struct SessionCreated: Codable, Equatable, Sendable {
         public let seq: Int
@@ -127,6 +128,10 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         /// reviewer's own sentence, distinct from `summary`. Optional/additive — decode only,
         /// absent for ask-policy/reviewer-less escalations and older-shaped payloads.
         public let reviewerReason: String?
+        /// Dispatch relay (Phase 7): set on the MIRRORED copy of a child session's approval living
+        /// in the dispatch session's stream — identifies which child to respond into. Optional/
+        /// additive — decode only, absent on native approvals.
+        public let childSessionId: String?
     }
 
     public struct ApprovalResolved: Codable, Equatable, Sendable {
@@ -137,6 +142,8 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         public let callId: String
         public let approved: Bool
         public let by: String
+        /// Dispatch relay (Phase 7): see ApprovalRequested.
+        public let childSessionId: String?
     }
 
     public struct TurnCompleted: Codable, Equatable, Sendable {
@@ -242,6 +249,8 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         public let threadId: String
         public let callId: String
         public let questions: [Question]
+        /// Dispatch relay (Phase 7): see ApprovalRequested.
+        public let childSessionId: String?
     }
 
     public struct QuestionResolved: Codable, Equatable, Sendable {
@@ -255,6 +264,8 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         /// CC AskUserQuestion parity: free-text notes ("press n to add notes"), keyed by question
         /// text like `answers`. Optional/additive — decode only, absent in older-shaped payloads.
         public let notes: [String: String]?
+        /// Dispatch relay (Phase 7): see ApprovalRequested.
+        public let childSessionId: String?
     }
 
     public struct TaskUpdated: Codable, Equatable, Sendable {
@@ -519,6 +530,22 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         public let message: String
     }
 
+    /// Dispatch (Phase 7): appended to the DISPATCH session's stream whenever a child session's
+    /// status changes materially (spawned, turn ended, error, stopped). `status` is a plain
+    /// String (like `ThreadCompleted.stopReason` above) — validation of its allowed values lives
+    /// on the TS producer side. `resultSummary` is the child's final assistant message when the
+    /// update is a turn-end.
+    public struct ChildUpdate: Codable, Equatable, Sendable {
+        public let seq: Int
+        public let sessionId: String
+        public let ts: Int
+        public let threadId: String
+        public let childSessionId: String
+        public let status: String
+        public let title: String
+        public let resultSummary: String?
+    }
+
     private enum Discriminator: String, Codable {
         case session_created
         case harness_attached
@@ -558,6 +585,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         case tile_action
         case tool_review
         case notification_requested
+        case child_update
     }
 
     private enum TypeKey: String, CodingKey { case type }
@@ -603,6 +631,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         case .tile_action:          self = .tileAction(try TileAction(from: decoder))
         case .tool_review:          self = .toolReview(try ToolReview(from: decoder))
         case .notification_requested: self = .notificationRequested(try NotificationRequested(from: decoder))
+        case .child_update:         self = .childUpdate(try ChildUpdate(from: decoder))
         }
     }
 
@@ -760,6 +789,10 @@ public enum SessionEvent: Codable, Equatable, Sendable {
             try v.encode(to: encoder)
             var c = encoder.container(keyedBy: TypeKey.self)
             try c.encode(Discriminator.notification_requested.rawValue, forKey: .type)
+        case .childUpdate(let v):
+            try v.encode(to: encoder)
+            var c = encoder.container(keyedBy: TypeKey.self)
+            try c.encode(Discriminator.child_update.rawValue, forKey: .type)
         }
     }
 }
