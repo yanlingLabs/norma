@@ -379,6 +379,19 @@ export interface EngineConfig {
   // that doesn't wire dispatch mode) → the session_spawn bridge never activates and session_spawn
   // calls fall through to the tool's own placeholder run() (session-spawn.ts).
   dispatch?: () => DispatchChildren | undefined;
+  // Dispatch (Phase 7) Task 5: fired in runTurn's `finally`, AFTER `runningTurns.delete`, for
+  // EVERY session (the dispatch session's own turns included, not just its children's) — the
+  // registry's onTurnEnd derives a finished child's terminal status, appends a `child_update` to
+  // the dispatch stream, and wakes the dispatch session (immediately if idle, or coalesced into a
+  // single pending wake if it's still busy — see dispatch-children.ts). Absent (every config that
+  // doesn't wire dispatch mode) → no-op, byte-identical to pre-Task-5 behavior.
+  onTurnEnd?: (sessionId: string) => void;
+  // Dispatch (Phase 7) Task 5: per-turn live roster for the DISPATCH session only — same
+  // <system-reminder> user-message injection shape/point as taskListReminder (turn(), right after
+  // the task-list reminder is pushed). The registry returns undefined for every session that isn't
+  // the live dispatch session (or has no children yet), so a non-dispatch turn's input stays
+  // byte-identical to before this field existed.
+  dispatchRoster?: (sessionId: string) => string | undefined;
   // 4h-i Task 3 (CC parity: configurable nesting depth, settings.subagents.maxDepth): how many
   // levels of spawn_agent nesting are allowed, orthogonal to SubagentManager's maxConcurrent
   // (fan-out width) — this is depth, not count or concurrency. Undefined (getter absent, or
@@ -616,6 +629,8 @@ export class AgentEngine {
           if (key.startsWith(`${sessionId}|`)) this.pendingImages.delete(key);
         }
       }
+      // Dispatch (Phase 7): child turn-end → registry appends child_update + wakes the dispatch session.
+      this.cfg.onTurnEnd?.(sessionId);
       if (this.retriggerPending.delete(sessionId) && !ac.signal.aborted) {
         // A detached agent finished mid-turn; its task_notification is already persisted. Drain it
         // now (CC parity: between-turns queue drain) so the model reacts without a user message.
@@ -1307,6 +1322,11 @@ export class AgentEngine {
     // persisted event) and why it's a "user" message rather than a new TurnInputItem role.
     const taskReminder = this.taskListReminder(sessionId);
     if (taskReminder) input.push(taskReminder);
+    // Dispatch (Phase 7) Task 5: same assembled-input-only <system-reminder> user-message shape as
+    // taskListReminder just above — non-undefined only for the live dispatch session (see
+    // DispatchChildren.rosterFor), so every other session's input is unaffected.
+    const dispatchRoster = this.cfg.dispatchRoster?.(sessionId);
+    if (dispatchRoster) input.push({ type: "message", role: "user", content: dispatchRoster });
     // NOTE (bg-retrigger Task 1): the old per-turn bg-completion reminder call site lived here
     // (buildBgCompletionReminder) — retired. A detached child's completion is now PERSISTED as a
     // task_notification event at settle time (notifyBgCompletion, called from the detached

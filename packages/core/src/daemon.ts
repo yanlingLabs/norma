@@ -504,7 +504,11 @@ export async function startDaemon(opts: {
     // is a PLAIN TOOL (no engine bridge — see task-stop.ts's own doc comment), deferred like
     // bash_output (registerBackgroundTools above) — CC parity: one generic stop tool, no separate
     // bash_kill (removed; task_stop's bash-unify path is now the only way to kill a bg bash task).
-    registerTaskStopTool(registry, { bgAgents, bgRegistry, deferred: true });
+    // Dispatch (Phase 7) Task 5: `dispatch` closes over the `dispatchChildren` binding declared
+    // further down (before `new AgentEngine(...)`) — safe (same later-assigned-closure shape as
+    // `engine?.transcriptPathFor` a few lines below): this closure is only ever INVOKED at a real
+    // task_stop call, long after boot finishes assigning it.
+    registerTaskStopTool(registry, { bgAgents, bgRegistry, deferred: true, dispatch: { stopChild: (caller, id) => dispatchChildren?.stopChild(caller, id) } });
     // phase 5a Task 1: agent_list/agent_output — the read-only "collect your subagents"
     // counterpart to spawn_agent/send_message/task_stop above, same bgAgents instance so what
     // they report is exactly what the engine's own pin/completion bookkeeping sees. `deferred:
@@ -744,6 +748,11 @@ export async function startDaemon(opts: {
       // this always-on, matching the task's "keep it simple" design).
       notifyFallback: notifyHeadless,
       dispatch: () => dispatchChildren,
+      // Dispatch (Phase 7) Task 5: both getters — same live-closure-over-`dispatchChildren` shape
+      // as `dispatch` just above, so a call before `dispatchChildren` is assigned (can't happen:
+      // no turn runs before construction finishes) would just no-op via `?.`.
+      onTurnEnd: (sid) => dispatchChildren?.onTurnEnd(sid),
+      dispatchRoster: (sid) => dispatchChildren?.rosterFor(sid),
     });
     // Dispatch (Phase 7) Task 4: constructed AFTER `engine` exists — its `runTurn`/`isRunning`
     // deps close over `engine!` (non-null: this whole block only runs once `engine` is assigned
@@ -751,11 +760,16 @@ export async function startDaemon(opts: {
     // precedent a few dozen lines up). Reassigns the SAME `dispatchChildren` binding the
     // `dispatch: () => dispatchChildren` getter above already closes over — no engine
     // reconstruction needed, same shape as `computerUse`'s own post-construction assignment.
+    // Task 5 adds `interrupt` (engine.interrupt, the SAME mechanism task_stop already uses for bg
+    // agents) — stopChild's dep — and, once constructed, `start()`: rebuilds the child set from
+    // the store (daemon-restart recovery) and subscribes to the hub's observer fan-out.
     dispatchChildren = new DispatchChildren({
       store, hub,
       runTurn: (sid) => engine!.runTurn(sid),
       isRunning: (sid) => engine!.isRunning(sid),
+      interrupt: (sid) => { engine!.interrupt(sid); },
     });
+    dispatchChildren.start();
 
     // hot-settings T5b (final task of the hot-settings track): compose T2's live getters (already
     // reading `settings` above), T3's SettingsWatcher, and T4's makeApply diff-applier into one

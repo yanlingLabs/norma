@@ -156,14 +156,14 @@ describe("task_stop tool (4h-ii-c Task 2)", () => {
     registerTaskStopTool(r, { bgAgents });
 
     const out = await r.execute("task_stop", { task_id: "ghost" }, ctx("s1"));
-    expect(out).toMatchObject({ isError: true, output: "no running agent or background task 'ghost'" });
+    expect(out).toMatchObject({ isError: true, output: "no running agent, dispatch child, or background task 'ghost'" });
   });
 
   test("(e2) unknown id with no deps at all (defaults) → typed isError, never throws unexpectedly", async () => {
     const r = new ToolRegistry();
     registerTaskStopTool(r);
     const out = await r.execute("task_stop", { task_id: "ghost" }, ctx("s1"));
-    expect(out).toMatchObject({ isError: true, output: "no running agent or background task 'ghost'" });
+    expect(out).toMatchObject({ isError: true, output: "no running agent, dispatch child, or background task 'ghost'" });
   });
 
   test("agent lookup is session-scoped: a running agent in a DIFFERENT session is not found by id, falls through to not-found", async () => {
@@ -174,7 +174,7 @@ describe("task_stop tool (4h-ii-c Task 2)", () => {
     registerTaskStopTool(r, { bgAgents });
 
     const out = await r.execute("task_stop", { task_id: "th_foreign" }, ctx("s1"));
-    expect(out).toMatchObject({ isError: true, output: "no running agent or background task 'th_foreign'" });
+    expect(out).toMatchObject({ isError: true, output: "no running agent, dispatch child, or background task 'th_foreign'" });
     expect(abort.signal.aborted).toBe(false);
   });
 

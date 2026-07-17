@@ -60,6 +60,7 @@ function setup(
       store, hub,
       runTurn: (sid) => engine.runTurn(sid),
       isRunning: (sid) => engine.isRunning(sid),
+      interrupt: (sid) => engine.interrupt(sid),
     });
   }
   const sessionId = store.createSession("global", { cwd, approvalPolicy: "auto", mode: opts.mode });
