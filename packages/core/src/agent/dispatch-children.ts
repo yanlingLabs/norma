@@ -166,15 +166,22 @@ export class DispatchChildren {
       if (this.pendingWake) {
         this.pendingWake = false;
         void this.deps.runTurn(this.dispatchId).catch((e) => console.error("dispatch wake failed:", e));
+        // Whole-branch fix wave residual: the drained wake turn launched just above is the turn
+        // that REPORTS the coalesced completion — and it reads rosterFor on a LATER microtask
+        // (that `void runTurn(...)` is fire-and-forget), so pruning synchronously here would strip
+        // the child from the very roster that turn is about to render. Return WITHOUT pruning;
+        // the prune below fires when the drained turn's own onTurnEnd arrives instead.
+        return;
       }
       // Whole-branch fix wave (bounded roster): a terminal child (completed/error) survives in the
       // roster/map EXACTLY until the end of the dispatch turn that had the chance to report it —
-      // that turn either just drained above (pendingWake) or already saw the child_update in its
-      // own roster earlier this turn. Either way, by the time THIS turn ends there is nothing left
-      // for the dispatch session to do with a finished child, so it's dropped here — otherwise the
-      // roster (and this map) would grow without bound on a session that lives forever. A
-      // running/awaiting_approval/awaiting_input child is untouched — only a TERMINAL status is
-      // ever pruned.
+      // the turn ending HERE was either woken directly by the child's completion (idle path) or is
+      // the drained wake turn the pendingWake branch above launched (coalesced path; that branch
+      // returned early precisely so the prune lands here, one turn later). Either way, by the time
+      // THIS turn ends there is nothing left for the dispatch session to do with a finished child,
+      // so it's dropped here — otherwise the roster (and this map) would grow without bound on a
+      // session that lives forever. A running/awaiting_approval/awaiting_input child is untouched
+      // — only a TERMINAL status is ever pruned.
       for (const [id, c] of this.children) {
         if (c.status === "completed" || c.status === "error") this.children.delete(id);
       }

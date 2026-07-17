@@ -350,6 +350,29 @@ describe("DispatchChildren (whole-branch fix wave): bounded roster — prune ter
     expect(registry.rosterFor(dispatchId)).toBeUndefined();
   });
 
+  test("coalesced path: a child completing DURING a busy dispatch turn survives into the DRAINED wake turn's roster, and is pruned only when THAT turn ends", () => {
+    const { store, hub, registry, runTurnCalls, setRunning } = setup();
+    const dispatchId = store.createSession("global", { mode: "dispatch" });
+    registry.start();
+    const childId = registry.spawnChild({ dispatchSessionId: dispatchId, dir: "/tmp/a", prompt: "do work", title: "Task A" });
+    setRunning(dispatchId, true); // dispatch BUSY — completion coalesces into pendingWake
+
+    hub.append(childId, { type: "assistant_message", sessionId: childId, threadId: "main", text: "done" });
+    registry.onTurnEnd(childId); // terminal, but dispatch busy → pendingWake set, no immediate wake
+    expect(runTurnCalls).not.toContain(dispatchId);
+
+    registry.onTurnEnd(dispatchId); // the busy turn ends → drain fires (wake turn launched)
+    expect(runTurnCalls.filter((id) => id === dispatchId).length).toBe(1);
+    // The DRAINED wake turn is the one that reports this child — it reads rosterFor on a later
+    // microtask (the `void runTurn(...)` launched just above), so the child must STILL be listed
+    // here, not pruned out from under it by the very drain that launched the reporting turn.
+    expect(registry.rosterFor(dispatchId)).toContain(childId);
+
+    registry.onTurnEnd(dispatchId); // the drained wake turn itself ends → NOW the prune fires
+    expect(registry.rosterFor(dispatchId)).toBeUndefined();
+    expect(runTurnCalls.filter((id) => id === dispatchId).length).toBe(1); // no spurious re-wake either
+  });
+
   test("an errored child is pruned the same way as a completed one", () => {
     const { store, hub, registry, setRunning } = setup();
     const dispatchId = store.createSession("global", { mode: "dispatch" });
