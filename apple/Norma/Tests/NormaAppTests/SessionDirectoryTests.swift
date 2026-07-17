@@ -39,6 +39,11 @@ final class SessionDirectoryTests: XCTestCase {
     func sessionTitled(sessionId: String, title: String, seq: Int = 1) -> SessionEvent {
         ev(#"{"type":"session_titled","seq":\#(seq),"sessionId":"\#(sessionId)","ts":0,"threadId":"main","title":"\#(title)"}"#)
     }
+    /// Dispatch (Phase 7): a mirrored child-lifecycle update landing in the dispatch session's
+    /// own stream.
+    func childUpdate(sessionId: String, childSessionId: String, status: String, seq: Int = 1) -> SessionEvent {
+        ev(#"{"type":"child_update","seq":\#(seq),"sessionId":"\#(sessionId)","ts":0,"threadId":"main","childSessionId":"\#(childSessionId)","status":"\#(status)","title":"child","resultSummary":null}"#)
+    }
 
     func testRefreshSortsRowsNewestFirst() async {
         let stub = StubSessionLister()
@@ -81,6 +86,25 @@ final class SessionDirectoryTests: XCTestCase {
 
         await waitUntilDirectory { directory.rows.count == 1 }
         XCTAssertEqual(directory.rows.first?.sessionId, "s1")
+    }
+
+    /// Dispatch (Phase 7), Task 7 step 3(a): `child_update` kicks a refresh exactly like
+    /// `session_created` above — a new child (or a status change on an existing one) must show up
+    /// in the directory without waiting on an unrelated broadcast.
+    func testHandleChildUpdateKicksARefresh() async {
+        let stub = StubSessionLister()
+        let directory = SessionDirectory(lister: stub.list)
+        await directory.refresh()
+        XCTAssertTrue(directory.rows.isEmpty)
+
+        stub.rows = [
+            SessionSummary(sessionId: "dispatch1", title: nil, createdAt: 1, scope: "global", cwd: nil, mode: "dispatch"),
+            SessionSummary(sessionId: "child1", title: nil, createdAt: 2, scope: "global", cwd: nil, mode: nil, parentSessionId: "dispatch1"),
+        ]
+        directory.handle(childUpdate(sessionId: "dispatch1", childSessionId: "child1", status: "working"))
+
+        await waitUntilDirectory { directory.rows.count == 2 }
+        XCTAssertEqual(Set(directory.rows.map(\.sessionId)), ["dispatch1", "child1"])
     }
 
     func testHandleSessionTitledKicksARefresh() async {

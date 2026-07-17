@@ -64,7 +64,8 @@ final class StandaloneWindowTests: XCTestCase {
     }
 
     /// Booted but degraded (unit-test boot never starts the feed, so `client.transport` stays nil):
-    /// `startFreshSession()`'s `createSession` RPC throws immediately, its `nil` return catches it,
+    /// `startFreshSession()`'s `dispatchSession` RPC (Dispatch, Phase 7 — was `createSession`)
+    /// throws immediately, its `nil` return catches it,
     /// and no window spawns — the whole chain (create → guard → would-be spawn) runs end-to-end
     /// without crashing or hanging.
     ///
@@ -133,7 +134,9 @@ final class StandaloneWindowTests: XCTestCase {
         delegate.openStandaloneNormaWindow()
         await waitUntilSent(t, 4)
         let create = lineJSON(t.sent[3])
-        XCTAssertEqual(create["method"] as? String, "session.create")
+        // Dispatch (Phase 7): `startFreshSession()` (the orb's own AppModel) now dispatches the
+        // ONE permanent singleton rather than creating a brand-new session.
+        XCTAssertEqual(create["method"] as? String, "session.dispatch")
         // The RPC FAILS — the exact scenario the old code silently mishandled.
         t.feed(#"{"jsonrpc":"2.0","id":\#(create["id"] as! Int),"error":{"code":1,"message":"boom"}}"#)
 
@@ -190,9 +193,9 @@ final class StandaloneWindowTests: XCTestCase {
         delegate.openStandaloneNormaWindow()
         await waitUntilSent(t, 4)
         let create = lineJSON(t.sent[3])
-        XCTAssertEqual(create["method"] as? String, "session.create")
-        // session.create SUCCEEDS this time — a brand-new session really is created server-side.
-        t.feed(#"{"jsonrpc":"2.0","id":\#(create["id"] as! Int),"result":{"sessionId":"s_new","trusted":true}}"#)
+        XCTAssertEqual(create["method"] as? String, "session.dispatch")
+        // session.dispatch SUCCEEDS this time — the singleton really is (re)created server-side.
+        t.feed(#"{"jsonrpc":"2.0","id":\#(create["id"] as! Int),"result":{"sessionId":"s_new","created":true}}"#)
 
         // refocus(onto: "s_new") now fires session.attach("s_new") — THIS is the RPC that fails.
         await waitUntilSent(t, 5)

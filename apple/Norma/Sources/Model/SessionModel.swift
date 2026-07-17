@@ -33,6 +33,20 @@ struct SubagentItem: Equatable {
     var activeSince: Int? = nil
 }
 
+/// One child SESSION spawned by a dispatch session (Phase 7) — tracked via the mirrored
+/// `child_update` events that land in the dispatch session's own stream (`session_spawn`/
+/// `DispatchChildren` on the daemon side). Sibling to `SubagentItem` above (that one tracks
+/// in-process child THREADS of the CURRENT turn; this tracks child SESSIONS, which outlive any
+/// single turn and are never pruned wholesale on turn end — see `children`'s own doc on
+/// `OrbSessionState` for the prune rule that DOES apply). `Identifiable` (not just `Equatable`,
+/// unlike `PendingInteraction`) so `SessionsPane`/a future roster view can `ForEach` directly.
+struct ChildItem: Equatable, Identifiable {
+    let sessionId: String
+    let title: String
+    var status: String
+    var id: String { sessionId }
+}
+
 /// A single outstanding human-in-the-loop interaction the daemon is waiting on — approval,
 /// question, or plan — carrying the payload cards need to render (2d-iii task 1). Replaces the
 /// old `pendingApprovalIds: Set<String>`, which tracked only callIds and dropped everything else
@@ -41,14 +55,18 @@ struct SubagentItem: Equatable {
 enum PendingInteraction: Equatable {
     /// `reviewerReason` (phase 5e T5): additive, mirrors `SessionEvent.ApprovalRequested.reviewerReason`
     /// — set only when this escalation came from the safety reviewer, `nil` for an ask-policy card.
-    case approval(callId: String, toolName: String, summary: String, reviewerReason: String? = nil)
-    case question(callId: String, questions: [SessionEvent.Question])
+    /// `childSessionId` (Dispatch, Phase 7): additive, mirrors `SessionEvent.ApprovalRequested.childSessionId`
+    /// — set only on the MIRRORED copy of a child session's approval living in the dispatch
+    /// session's stream; `nil` for a native (non-relayed) approval. Both default `nil` so existing
+    /// construction/pattern-match call sites written before either field existed stay untouched.
+    case approval(callId: String, toolName: String, summary: String, reviewerReason: String? = nil, childSessionId: String? = nil)
+    case question(callId: String, questions: [SessionEvent.Question], childSessionId: String? = nil)
     case plan(callId: String, plan: String)
 
     var callId: String {
         switch self {
-        case .approval(let callId, _, _, _): return callId
-        case .question(let callId, _): return callId
+        case .approval(let callId, _, _, _, _): return callId
+        case .question(let callId, _, _): return callId
         case .plan(let callId, _): return callId
         }
     }
@@ -101,6 +119,14 @@ struct OrbSessionState: Equatable {
     /// ends (children always finish first: the parent tool loop awaits the batch), so a replayed
     /// finished session correctly shows none.
     var subagents: [SubagentItem] = []
+    /// Dispatch (Phase 7): child SESSIONS this dispatch session has spawned, upserted by
+    /// `child_update` (see the reducer's explicit case below). UNLIKE `subagents` above, this is
+    /// NOT pruned wholesale at turn end — a child session's lifecycle is independent of any single
+    /// main-thread turn. Instead, a finished child (`status == "completed" || "error"`) is dropped
+    /// on the NEXT main `turn_started` (subagent-roster precedent — see the CLI TUI's own
+    /// `turn_started` prune of `state.agents`), so a completed child's status is still visible for
+    /// at least the rest of the turn it finished in, but doesn't accumulate forever.
+    var children: [ChildItem] = []
     /// Ordered (oldest first), replay-rebuildable list of outstanding approvals/questions/plans —
     /// 2d-iii task 1. `*_requested`/`*_asked`/`*_presented` append (skipping a callId already
     /// present, so a replayed duplicate event is a no-op, not a second card); the matching
@@ -203,6 +229,9 @@ enum SessionReducer {
             s.status = .thinking
             s.streamingText = ""
             s.lastTurnAborted = false // a fresh turn clears any prior interrupt flag
+            // Dispatch (Phase 7): prune finished children on the NEXT main turn — same cadence as
+            // the CLI TUI's `state.agents` prune on `turn_started` (subagent-roster precedent).
+            s.children.removeAll { $0.status == "completed" || $0.status == "error" }
         case .turnStarted(let v):
             // CHILD thread got a SubagentManager slot — the active timer starts here, not at
             // thread_started (queued-but-idle time must NOT count — spec §2).
@@ -216,10 +245,10 @@ enum SessionReducer {
         case .toolResult(let v) where v.threadId == mainThread:
             if s.pendingInteractions.isEmpty { s.status = .thinking }
         case .approvalRequested(let v) where v.threadId == mainThread:
-            appendPending(.approval(callId: v.callId, toolName: v.toolName, summary: v.summary, reviewerReason: v.reviewerReason), to: &s)
+            appendPending(.approval(callId: v.callId, toolName: v.toolName, summary: v.summary, reviewerReason: v.reviewerReason, childSessionId: v.childSessionId), to: &s)
             appendActivity(.interaction(v.summary), to: &s)
         case .questionAsked(let v) where v.threadId == mainThread:
-            appendPending(.question(callId: v.callId, questions: v.questions), to: &s)
+            appendPending(.question(callId: v.callId, questions: v.questions, childSessionId: v.childSessionId), to: &s)
             appendActivity(.interaction(v.questions.first?.question ?? "question"), to: &s)
         case .planPresented(let v) where v.threadId == mainThread:
             appendPending(.plan(callId: v.callId, plan: v.plan), to: &s)
@@ -230,6 +259,16 @@ enum SessionReducer {
             s = resolvePending(s, callId: v.callId)
         case .planResolved(let v):
             s = resolvePending(s, callId: v.callId)
+        case .childUpdate(let v):
+            // Dispatch (Phase 7): upsert by childSessionId — a brand-new child appends, a known
+            // one is replaced wholesale (title can change, e.g. once the daemon assigns one).
+            // Pruning finished entries is the SEPARATE `turnStarted` rule above, not here — a
+            // `completed`/`error` update still needs to land and be visible first.
+            if let i = s.children.firstIndex(where: { $0.sessionId == v.childSessionId }) {
+                s.children[i] = ChildItem(sessionId: v.childSessionId, title: v.title, status: v.status)
+            } else {
+                s.children.append(ChildItem(sessionId: v.childSessionId, title: v.title, status: v.status))
+            }
         case .assistantDelta(let v) where v.threadId == mainThread:
             s.streamingText += v.delta
         case .assistantMessage(let v) where v.threadId == mainThread:

@@ -55,6 +55,11 @@ final class SessionDirectory: ObservableObject {
             Task { await refresh() }
         case .sessionCreated:
             Task { await refresh() }
+        case .childUpdate:
+            // Dispatch (Phase 7): a child session just spawned/finished — refresh so the list
+            // picks up its row (mode/parentSessionId, already threaded through `lister`'s mapping)
+            // and status changes, same cadence as `sessionCreated` above.
+            Task { await refresh() }
         default:
             break // every other event type is irrelevant to the session list itself
         }
@@ -70,10 +75,11 @@ struct SessionSummary: Equatable, Identifiable {
     var createdAt: Int
     var scope: String
     var cwd: String?
-    // Dispatch (Phase 7) scaffolding: threaded through from listSessions() but not yet consumed by
-    // any UI — a later task wires the dispatch session's distinct sidebar treatment. Defaulted
-    // (unlike title/cwd above) so existing memberwise-init call sites (SessionDirectoryTests)
-    // don't all need touching for an additive field neither test currently cares about.
+    // Dispatch (Phase 7): threaded through from listSessions() — `SessionsPane` (Task 7) consumes
+    // both: `mode == "dispatch"` drives the row's badge, `parentSessionId` drives the child-follows-
+    // parent grouping/indent. Defaulted (unlike title/cwd above) so existing memberwise-init call
+    // sites (SessionDirectoryTests) don't all need touching for an additive field older tests never
+    // set.
     var mode: String? = nil
     var parentSessionId: String? = nil
     var id: String { sessionId }

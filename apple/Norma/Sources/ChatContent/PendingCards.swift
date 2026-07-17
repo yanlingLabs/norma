@@ -14,8 +14,8 @@ struct PendingCardsView: View {
     let interactions: [PendingInteraction]
     let inFlight: Set<String>                       // callIds with an RPC awaiting
     let errorLines: [String: String]                // callId → inline error text
-    let onApproval: (String, Bool) -> Void          // callId, approved
-    let onQuestion: (String, [String: String], [String: String]) -> Void  // callId, answers, notes (both keyed by question text)
+    let onApproval: (String, Bool, String?) -> Void          // callId, approved, childSessionId
+    let onQuestion: (String, [String: String], [String: String], String?) -> Void  // callId, answers, notes (both keyed by question text), childSessionId
     let onPlan: (String, Bool, Bool, String?) -> Void   // callId, approved, autoAccept, feedback
 
     var body: some View {
@@ -126,9 +126,9 @@ func questionFocusedPreview(_ question: SessionEvent.Question, selected: Set<Int
 /// itself, not a header field, is the body).
 func cardTitle(_ interaction: PendingInteraction) -> String {
     switch interaction {
-    case .approval(_, let toolName, _, _):
+    case .approval(_, let toolName, _, _, _):
         return "Approval needed — \(toolName)"
-    case .question(_, let questions):
+    case .question(_, let questions, _):
         return questions.first?.header ?? ""
     case .plan:
         return "Plan for approval"
@@ -167,8 +167,8 @@ private struct PendingCard: View {
     let interaction: PendingInteraction
     let isInFlight: Bool
     let errorLine: String?
-    let onApproval: (String, Bool) -> Void
-    let onQuestion: (String, [String: String], [String: String]) -> Void
+    let onApproval: (String, Bool, String?) -> Void
+    let onQuestion: (String, [String: String], [String: String], String?) -> Void
     let onPlan: (String, Bool, Bool, String?) -> Void
 
     var body: some View {
@@ -196,10 +196,10 @@ private struct PendingCard: View {
     @ViewBuilder
     private var cardBody: some View {
         switch interaction {
-        case .approval(let callId, _, let summary, let reviewerReason):
-            PendingApprovalBody(callId: callId, summary: summary, reviewerReason: reviewerReason, isInFlight: isInFlight, onApproval: onApproval)
-        case .question(let callId, let questions):
-            PendingQuestionBody(callId: callId, questions: questions, isInFlight: isInFlight, onQuestion: onQuestion)
+        case .approval(let callId, _, let summary, let reviewerReason, let childSessionId):
+            PendingApprovalBody(callId: callId, summary: summary, reviewerReason: reviewerReason, childSessionId: childSessionId, isInFlight: isInFlight, onApproval: onApproval)
+        case .question(let callId, let questions, let childSessionId):
+            PendingQuestionBody(callId: callId, questions: questions, childSessionId: childSessionId, isInFlight: isInFlight, onQuestion: onQuestion)
         case .plan(let callId, let plan):
             PendingPlanBody(callId: callId, plan: plan, isInFlight: isInFlight, onPlan: onPlan)
         }
@@ -218,8 +218,12 @@ private struct PendingApprovalBody: View {
     /// Phase 5e T5: additive/optional — set only when this escalation came from the safety
     /// reviewer (`PendingInteraction.approval`'s 4th associated value).
     let reviewerReason: String?
+    /// Dispatch relay (Phase 7): additive/optional — set only on the mirrored copy of a child
+    /// session's approval (`PendingInteraction.approval`'s 5th associated value); threaded straight
+    /// into `onApproval` so the respond routes to the child, not this card's own dispatch session.
+    let childSessionId: String?
     let isInFlight: Bool
-    let onApproval: (String, Bool) -> Void
+    let onApproval: (String, Bool, String?) -> Void
 
     @State private var isExpanded = false
 
@@ -255,9 +259,9 @@ private struct PendingApprovalBody: View {
             }
 
             HStack(spacing: 8) {
-                Button("Approve") { onApproval(callId, true) }
+                Button("Approve") { onApproval(callId, true, childSessionId) }
                     .buttonStyle(.borderedProminent)
-                Button("Deny") { onApproval(callId, false) }
+                Button("Deny") { onApproval(callId, false, childSessionId) }
                     .buttonStyle(.bordered)
             }
             .controlSize(.small)
@@ -279,8 +283,11 @@ private struct PendingApprovalBody: View {
 private struct PendingQuestionBody: View {
     let callId: String
     let questions: [SessionEvent.Question]
+    /// Dispatch relay (Phase 7): see `PendingApprovalBody.childSessionId`'s doc — same meaning,
+    /// threaded into `onQuestion` on submit.
+    let childSessionId: String?
     let isInFlight: Bool
-    let onQuestion: (String, [String: String], [String: String]) -> Void
+    let onQuestion: (String, [String: String], [String: String], String?) -> Void
 
     @State private var selections: [Int: Set<Int>] = [:]
     @State private var otherTexts: [Int: String] = [:]
@@ -337,7 +344,8 @@ private struct PendingQuestionBody: View {
         onQuestion(
             callId,
             questionAnswers(for: questions, selections: selections, otherTexts: otherTexts),
-            questionNotes(for: questions, notes: notes)
+            questionNotes(for: questions, notes: notes),
+            childSessionId
         )
     }
 }

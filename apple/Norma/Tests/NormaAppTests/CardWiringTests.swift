@@ -25,10 +25,14 @@ final class CardWiringTests: XCTestCase {
 
     func testCardKeyActionApprovalYN() {
         let approval = PendingInteraction.approval(callId: "a1", toolName: "bash", summary: "rm x")
-        XCTAssertEqual(cardKeyAction(keyCode: 16, chars: "y", topmost: approval, composerDraft: ""), .approve("a1"))
-        XCTAssertEqual(cardKeyAction(keyCode: 45, chars: "n", topmost: approval, composerDraft: ""), .deny("a1"))
+        XCTAssertEqual(cardKeyAction(keyCode: 16, chars: "y", topmost: approval, composerDraft: ""), .approve("a1", nil))
+        XCTAssertEqual(cardKeyAction(keyCode: 45, chars: "n", topmost: approval, composerDraft: ""), .deny("a1", nil))
         // uppercase (shift held) must resolve the same way
-        XCTAssertEqual(cardKeyAction(keyCode: 16, chars: "Y", topmost: approval, composerDraft: ""), .approve("a1"))
+        XCTAssertEqual(cardKeyAction(keyCode: 16, chars: "Y", topmost: approval, composerDraft: ""), .approve("a1", nil))
+
+        // Dispatch (Phase 7): a mirrored child approval's childSessionId rides straight through.
+        let childApproval = PendingInteraction.approval(callId: "a2", toolName: "bash", summary: "rm y", childSessionId: "child_1")
+        XCTAssertEqual(cardKeyAction(keyCode: 16, chars: "y", topmost: childApproval, composerDraft: ""), .approve("a2", "child_1"))
 
         let qs = questions(#"[{"question":"Which db?","header":"DB","options":[{"label":"A","description":null}],"multiSelect":false}]"#)
         let question = PendingInteraction.question(callId: "q1", questions: qs)
@@ -40,7 +44,7 @@ final class CardWiringTests: XCTestCase {
     func testCardKeyActionDigitsSelectOption() {
         let qs = questions(#"[{"question":"Which db?","header":"DB","options":[{"label":"A","description":null},{"label":"B","description":null},{"label":"C","description":null}],"multiSelect":false}]"#)
         let single = PendingInteraction.question(callId: "q1", questions: qs)
-        XCTAssertEqual(cardKeyAction(keyCode: 19, chars: "2", topmost: single, composerDraft: ""), .selectOption("q1", 1))
+        XCTAssertEqual(cardKeyAction(keyCode: 19, chars: "2", topmost: single, composerDraft: ""), .selectOption("q1", 1, nil))
         XCTAssertNil(cardKeyAction(keyCode: 23, chars: "5", topmost: single, composerDraft: ""), "digit past the option count is a no-op")
 
         // multiSelect: stays mouse-only even for a single question.
@@ -77,7 +81,7 @@ final class CardWiringTests: XCTestCase {
         XCTAssertNil(cardKeyAction(keyCode: 16, chars: "y", topmost: approval, composerDraft: " "))
 
         // empty draft: unaffected, falls through to the ordinary routing.
-        XCTAssertEqual(cardKeyAction(keyCode: 16, chars: "y", topmost: approval, composerDraft: ""), .approve("a1"))
+        XCTAssertEqual(cardKeyAction(keyCode: 16, chars: "y", topmost: approval, composerDraft: ""), .approve("a1", nil))
     }
 
     /// T4-review fix: a card's OWN text fields (notes, Other) are local `@State`, never routed
@@ -101,11 +105,11 @@ final class CardWiringTests: XCTestCase {
         // (default `textFieldFocused: false`, matching every call site above).
         XCTAssertEqual(
             cardKeyAction(keyCode: 20, chars: "3", topmost: question, composerDraft: ""),
-            .selectOption("q1", 2)
+            .selectOption("q1", 2, nil)
         )
         XCTAssertEqual(
             cardKeyAction(keyCode: 20, chars: "3", topmost: question, composerDraft: "", textFieldFocused: false),
-            .selectOption("q1", 2)
+            .selectOption("q1", 2, nil)
         )
 
         // y/n (approval cards) while a text field is focused: also suppressed — same guard, not
@@ -166,7 +170,7 @@ final class CardWiringTests: XCTestCase {
         // wired here to a STUB (not a real AppModel/NormaClient) so this test locks down the
         // discipline itself: inFlight inserted synchronously, removed only after the async stub
         // resolves, and an error line set on failure (never on success).
-        adapter.onApprovalRespond = { [adapter] callId, approved in
+        adapter.onApprovalRespond = { [adapter] callId, approved, childSessionId in
             adapter.interactionInFlight.insert(callId)
             adapter.interactionErrors[callId] = nil
             Task { @MainActor in
@@ -178,14 +182,14 @@ final class CardWiringTests: XCTestCase {
             }
         }
 
-        adapter.onApprovalRespond("call1", true)
+        adapter.onApprovalRespond("call1", true, nil)
         XCTAssertTrue(adapter.interactionInFlight.contains("call1"), "inFlight must be inserted SYNCHRONOUSLY, before the RPC resolves")
         await waitUntil { !adapter.interactionInFlight.contains("call1") }
         XCTAssertFalse(adapter.interactionInFlight.contains("call1"))
         XCTAssertNil(adapter.interactionErrors["call1"], "success must not leave an error line behind")
 
         stubSucceeds = false
-        adapter.onApprovalRespond("call2", false)
+        adapter.onApprovalRespond("call2", false, nil)
         XCTAssertTrue(adapter.interactionInFlight.contains("call2"))
         await waitUntil { !adapter.interactionInFlight.contains("call2") }
         XCTAssertFalse(adapter.interactionInFlight.contains("call2"))

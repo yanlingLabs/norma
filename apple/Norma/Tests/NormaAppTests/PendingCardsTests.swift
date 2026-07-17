@@ -188,11 +188,28 @@ final class PendingCardsTests: XCTestCase {
 
     func testApprovalReviewerReasonDefaultsNilAndIsPreservedWhenSet() {
         let withoutReason = PendingInteraction.approval(callId: "a1", toolName: "bash", summary: "rm x")
-        guard case .approval(_, _, _, let reviewerReason) = withoutReason else { return XCTFail("expected .approval") }
+        guard case .approval(_, _, _, let reviewerReason, _) = withoutReason else { return XCTFail("expected .approval") }
         XCTAssertNil(reviewerReason)
 
         let withReason = PendingInteraction.approval(callId: "a1", toolName: "bash", summary: "rm x", reviewerReason: "reviewer says no")
-        guard case .approval(_, _, _, let reviewerReason2) = withReason else { return XCTFail("expected .approval") }
+        guard case .approval(_, _, _, let reviewerReason2, _) = withReason else { return XCTFail("expected .approval") }
         XCTAssertEqual(reviewerReason2, "reviewer says no")
+    }
+
+    // MARK: - PendingInteraction childSessionId threading (Dispatch, Phase 7)
+
+    func testApprovalAndQuestionChildSessionIdDefaultsNilAndIsPreservedWhenSet() {
+        let nativeApproval = PendingInteraction.approval(callId: "a1", toolName: "bash", summary: "rm x")
+        guard case .approval(_, _, _, _, let childId) = nativeApproval else { return XCTFail("expected .approval") }
+        XCTAssertNil(childId)
+
+        let relayedApproval = PendingInteraction.approval(callId: "a1", toolName: "bash", summary: "rm x", childSessionId: "child_1")
+        guard case .approval(_, _, _, _, let childId2) = relayedApproval else { return XCTFail("expected .approval") }
+        XCTAssertEqual(childId2, "child_1")
+
+        let qs = questions(#"[{"question":"Which db?","header":"DB","options":[{"label":"A","description":null}],"multiSelect":false}]"#)
+        let relayedQuestion = PendingInteraction.question(callId: "q1", questions: qs, childSessionId: "child_2")
+        guard case .question(_, _, let questionChildId) = relayedQuestion else { return XCTFail("expected .question") }
+        XCTAssertEqual(questionChildId, "child_2")
     }
 }

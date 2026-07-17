@@ -143,15 +143,15 @@ final class AppModelTests: XCTestCase {
         async let sent = model.sendOrSteer("hello")
         await waitUntilSent(t, 3)
         let create = lineJSON(t.sent[2])
-        XCTAssertEqual(create["method"] as? String, "session.create")
-        // Orb-created sessions run auto-approval: no approval UI exists in the orb until 2d.
-        let createParams = create["params"] as? [String: Any]
-        XCTAssertEqual(createParams?["approvalPolicy"] as? String, "auto")
+        // Dispatch (Phase 7): the orb's own session-creation path is now the ONE permanent
+        // dispatch singleton (`session.dispatch`, no params) rather than a fresh ask/auto session
+        // per summon — see AppModelTests below for the dedicated dispatch-shape coverage.
+        XCTAssertEqual(create["method"] as? String, "session.dispatch")
         // REAL daemon wire order: broadcast BEFORE the RPC response. The broadcast also kicks an
         // unawaited directory refresh (2e-iii Task 5, a session.list RPC) — `waitUntilMethod` below
         // finds the attach/send calls by METHOD rather than a fixed index, tolerant of that.
         t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"session_created","seq":1,"sessionId":"s_new","ts":0,"scope":"global"}}"#)
-        t.feed(#"{"jsonrpc":"2.0","id":\#(create["id"] as! Int),"result":{"sessionId":"s_new","trusted":true}}"#)
+        t.feed(#"{"jsonrpc":"2.0","id":\#(create["id"] as! Int),"result":{"sessionId":"s_new","created":true}}"#)
         // exactly ONE attach must follow (either path — never both)
         let attach = await waitUntilMethod(t, "session.attach")
         t.feed(#"{"jsonrpc":"2.0","id":\#(attach["id"] as! Int),"result":{"ok":true,"lastSeq":1}}"#)
@@ -266,16 +266,16 @@ final class AppModelTests: XCTestCase {
         async let _: Void = model.startFreshSessionAfterDetach()
         await waitUntilSent(t, 4)
         let create = lineJSON(t.sent[3])
-        XCTAssertEqual(create["method"] as? String, "session.create", "must create unconditionally despite the existing focus")
-        let createParams = create["params"] as? [String: Any]
-        XCTAssertEqual(createParams?["approvalPolicy"] as? String, "auto")
+        // Dispatch (Phase 7): "fresh" now collapses onto the ONE permanent dispatch singleton —
+        // `session.dispatch`, not a brand-new `session.create` per summon.
+        XCTAssertEqual(create["method"] as? String, "session.dispatch", "must dispatch unconditionally despite the existing focus")
 
         // REAL daemon wire order: broadcast BEFORE the RPC response. The broadcast also kicks an
         // unawaited directory refresh (2e-iii Task 5, a session.list RPC) that can interleave here
         // — `waitUntilMethod` finds the SECOND session.attach (the first was the initial s_old
         // attach above) by method rather than a fixed sent-array index.
         t.feed(#"{"jsonrpc":"2.0","method":"event","params":{"type":"session_created","seq":1,"sessionId":"s_new","ts":0,"scope":"global"}}"#)
-        t.feed(#"{"jsonrpc":"2.0","id":\#(create["id"] as! Int),"result":{"sessionId":"s_new","trusted":true}}"#)
+        t.feed(#"{"jsonrpc":"2.0","id":\#(create["id"] as! Int),"result":{"sessionId":"s_new","created":true}}"#)
 
         let attach = await waitUntilMethod(t, "session.attach", occurrence: 2)
         XCTAssertEqual((attach["params"] as? [String: Any])?["sessionId"] as? String, "s_new", "must attach to the NEW id, not stay on s_old")
@@ -283,10 +283,10 @@ final class AppModelTests: XCTestCase {
 
         await waitUntil { model.focusedSessionId == "s_new" }
         XCTAssertEqual(model.focusedSessionId, "s_new")
-        // settle: no SECOND attach/create thrash may trail in
+        // settle: no SECOND attach/dispatch thrash may trail in
         try? await Task.sleep(nanoseconds: 300_000_000)
-        let creates = t.sent.filter { lineJSON($0)["method"] as? String == "session.create" }
-        XCTAssertEqual(creates.count, 1, "double create: \(t.sent)")
+        let creates = t.sent.filter { lineJSON($0)["method"] as? String == "session.dispatch" }
+        XCTAssertEqual(creates.count, 1, "double dispatch: \(t.sent)")
     }
 
     func testNoSessionsMeansConnectedIdleUnattached() async throws {
