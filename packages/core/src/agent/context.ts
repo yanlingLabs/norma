@@ -123,10 +123,13 @@ export class ContextAssembler {
     };
   }
 
-  assemble(input: { cwd: string | null; loadedSkills?: string[] }): string {
+  assemble(input: { cwd: string | null; loadedSkills?: string[]; basePromptOverride?: string }): string {
     const cwd = input.cwd;
     const trusted = cwd ? this.trust.isTrusted(cwd) : false;
-    const sections: string[] = [this.basePrompt];
+    // Dispatch mode (Phase 7, spec §7): the coordinator gets its OWN base prompt — swapped in
+    // whole, not patched — while every other section below (date, user/project instructions,
+    // memory, capabilities) still applies unchanged regardless of caller.
+    const sections: string[] = [input.basePromptOverride ?? this.basePrompt];
 
     // F2 (4e gate ledger): the model has no other way to know the current date — recomputed each
     // assemble() call (once per turn) so it stays current across long sessions. LOCAL time, not

@@ -29,6 +29,7 @@ import { SubagentTranscripts } from "./subagent-transcript";
 import { resolveModelAlias } from "./model-aliases";
 import type { LspManager } from "./lsp/manager";
 import { autoDiagnosticsSuffix, AUTO_DIAG_TOOL_NAMES } from "./lsp/auto-diagnostics";
+import { DISPATCH_ALLOW_TOOLS, DISPATCH_SYSTEM_PROMPT } from "./dispatch-prompt";
 
 /** Structural narrowing of BackgroundTaskRegistry (bg-registry.ts) to just what pinnedTools
  *  (below) needs — lets the engine (and tests) work with anything shaped like a per-session task
@@ -1233,6 +1234,10 @@ export class AgentEngine {
   private async turn(sessionId: string, signal: AbortSignal): Promise<void> {
     const meta = this.cfg.store.meta(sessionId);
     const threadId = MAIN_THREAD;
+    // Dispatch mode (Phase 7): the singleton coordinator session — meta.mode is set once at
+    // createSession (Task 2) and never changes mid-session, so this is safe to read once per turn
+    // like everything else built from `meta` below (sel.model, instructions, instructionsFull).
+    const isDispatch = meta.mode === "dispatch";
     // Resolved ONCE per turn (spec: "changing models must NOT require a daemon restart") — a
     // settings.json edit mid-turn does not retroactively change THIS turn's model, only the
     // NEXT one's, mirroring how `instructions`/`instructionsFull` below are also computed once
@@ -1259,7 +1264,11 @@ export class AgentEngine {
     // same-turn tool write to <cwd>/NORMA.md (under `auto` policy) get injected as trusted
     // system instructions in a later round of the SAME turn. A NORMA.md change only takes
     // effect starting the NEXT turn.
-    const instructions = this.cfg.assembler.assemble({ cwd, loadedSkills: [...(this.loadedSkills.get(sessionId) ?? [])] });
+    const instructions = this.cfg.assembler.assemble({
+      cwd,
+      loadedSkills: [...(this.loadedSkills.get(sessionId) ?? [])],
+      basePromptOverride: isDispatch ? DISPATCH_SYSTEM_PROMPT : undefined,
+    });
     // NOTE (correctness-critical): `loaded` MUST be THE ONE LIVE SET for this session — never a
     // snapshot/copy. It's read here to build specs()/deferredIndex() for round 0, and the SAME
     // object is handed to executeCall's ctx below; markToolLoaded (called by the ToolSearch tool)
@@ -1318,6 +1327,7 @@ export class AgentEngine {
       depth: 0,
       signal,
       loaded,
+      ...(isDispatch ? { allowTools: DISPATCH_ALLOW_TOOLS } : {}),
     });
   }
 
