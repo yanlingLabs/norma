@@ -25,6 +25,13 @@
         "scope": {
           "type": "string",
           "minLength": 1
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "code",
+            "dispatch"
+          ]
         }
       },
       "required": [

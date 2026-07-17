@@ -46,6 +46,10 @@ public enum SessionEvent: Codable, Equatable, Sendable {
         public let sessionId: String
         public let ts: Int
         public let scope: String
+        // Dispatch (Phase 7 durability follow-up): carried so a full index.db rebuild can restore
+        // the dispatch-singleton invariant (see events.ts's SessionCreatedEvent doc comment).
+        // Additive/optional — pure Codable synthesis, no Discriminator/decode/encode changes.
+        public let mode: String?
     }
 
     public struct HarnessAttached: Codable, Equatable, Sendable {
