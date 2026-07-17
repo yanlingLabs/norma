@@ -170,10 +170,12 @@ describe("engine + safety reviewer (auto-policy bash)", () => {
       expect(requested.reviewerReason).toBe("REASON_TIMEOUT");
       const result = events.find((e) => e.type === "tool_result") as any;
       expect(result.isError).toBe(true);
-      // denialMessage stays BYTE-IDENTICAL to pre-T2 (the one deliberate reviewer->model channel) —
-      // exact match, not just toContain, so any accidental sanitization/reshaping fails loudly.
+      // denialMessage's shape stays BYTE-IDENTICAL to pre-T2 (the one deliberate reviewer->model
+      // channel) EXCEPT the seconds figure — whole-branch fix wave: that figure is now derived
+      // from the ACTUAL timeoutMs used (this test's own 30ms override, rounding to 0s), never a
+      // hardcoded "60s" a client could be lied to by (see reviewAndDispatch's own doc comment).
       expect(result.output).toBe(
-        'blocked by the safety reviewer: REASON_TIMEOUT. No approval within 60s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.',
+        'blocked by the safety reviewer: REASON_TIMEOUT. No approval within 0s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.',
       );
       expect(calls.length).toBe(0);
     } finally {
@@ -411,7 +413,9 @@ describe("engine + safety reviewer (auto-policy fs coverage, phase 5e T3)", () =
       expect(result.isError).toBe(true);
       // fs/external denial text: plain "blocked by..." + timeout sentence — NO bash's
       // justification-reconsideration sentence (there's no `justification` param on write/edit).
-      expect(result.output).toBe("blocked by the safety reviewer: REASON_FS. No approval within 60s.");
+      // Seconds figure derived from this test's own 30ms override (whole-branch fix wave), not a
+      // hardcoded "60s" — see reviewAndDispatch's doc comment.
+      expect(result.output).toBe("blocked by the safety reviewer: REASON_FS. No approval within 0s.");
       expect(result.output.toLowerCase()).not.toContain("justification");
       expect(existsSync(join(cwd, ".ssh", "config"))).toBe(false); // blocked — never written
     } finally {
@@ -704,7 +708,9 @@ describe("engine + safety reviewer (auto-policy external coverage, phase 5e T3)"
       expect(requested.reviewerReason).toBe("RISKY_EXTERNAL");
       const result = events.find((e) => e.type === "tool_result") as any;
       expect(result.isError).toBe(true);
-      expect(result.output).toBe("blocked by the safety reviewer: RISKY_EXTERNAL. No approval within 60s.");
+      // Seconds figure derived from this test's own 30ms override (whole-branch fix wave), not a
+      // hardcoded "60s" — see reviewAndDispatch's doc comment.
+      expect(result.output).toBe("blocked by the safety reviewer: RISKY_EXTERNAL. No approval within 0s.");
       expect(result.output.toLowerCase()).not.toContain("justification");
       expect(calls.length).toBe(0); // never ran
     } finally {

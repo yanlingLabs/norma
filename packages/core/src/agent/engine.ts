@@ -2602,7 +2602,7 @@ export class AgentEngine {
           } else {
             outcome = await this.reviewAndDispatch(
               { class: "bash", command, justification }, `${call.name} ${command}`,
-              call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable,
+              call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable, meta,
             );
           }
         } else if (
@@ -2626,7 +2626,7 @@ export class AgentEngine {
             const precis = fsWritePrecis(call, resolved);
             outcome = await this.reviewAndDispatch(
               { class: "fs", precis }, precis,
-              call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable,
+              call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable, meta,
             );
           } else {
             outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
@@ -2640,7 +2640,7 @@ export class AgentEngine {
           const precis = externalPrecis(call);
           outcome = await this.reviewAndDispatch(
             { class: "external", precis }, precis,
-            call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable,
+            call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable, meta,
           );
         } else {
           outcome = await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
@@ -2995,6 +2995,11 @@ export class AgentEngine {
     pins: Set<string>,
     rootsOverride: string[] | undefined,
     visionCapable: boolean | undefined,
+    // Whole-branch fix wave: a dispatch child is unattended by design (see approvalTimeoutFor's own
+    // doc comment) — this is the HIGHEST-risk approval path (the reviewer already flagged the call
+    // unsafe/errored), so it must never hand a dispatch child the SHORTEST window. `meta.origin`
+    // is all this needs (mirrors approvalTimeoutFor's own signature).
+    meta: { origin?: string },
   ): Promise<{ output: string; isError: boolean; deniedByHuman?: boolean }> {
     // "error" (phase 5e T2): review() THREW (fail-closed) — distinct from a genuine "unsafe"
     // verdict for tool_review observability, though both escalate identically.
@@ -3015,12 +3020,21 @@ export class AgentEngine {
     if (v.verdict === "safe") {
       return await this.executeCall(call, cwd, sessionId, threadId, signal, loaded, pins, rootsOverride, visionCapable);
     }
+    // Whole-branch fix wave: env can still WIDEN a dispatch child's window beyond 10 minutes, but
+    // never narrows it below that floor (same "env widens, never narrows the child floor" contract
+    // approvalTimeoutFor documents for the ask-path/worktree sites above) — a non-child session's
+    // window is exactly `reviewTimeoutMs`, unchanged. The denial message is derived from whichever
+    // value is ACTUALLY used here, never a hardcoded "60s" — so a client is never told a shorter
+    // wait than what's really about to happen (the bug this fix closes).
+    const reviewTimeoutMs = Number(process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS ?? 60_000);
+    const timeoutMs = meta.origin === "dispatch-child" ? Math.max(reviewTimeoutMs, 600_000) : reviewTimeoutMs;
+    const timeoutSec = Math.round(timeoutMs / 1000);
     const denialMessage =
       reviewInput.class === "fs" || reviewInput.class === "external"
-        ? `blocked by the safety reviewer: ${v.reason}. No approval within 60s.`
-        : `blocked by the safety reviewer: ${v.reason}. No approval within 60s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.`;
+        ? `blocked by the safety reviewer: ${v.reason}. No approval within ${timeoutSec}s.`
+        : `blocked by the safety reviewer: ${v.reason}. No approval within ${timeoutSec}s. If this command is genuinely necessary, call bash again with a "justification" explaining why — the reviewer will reconsider.`;
     return await this.requestApproval(call, cwd, sessionId, threadId, signal, {
-      timeoutMs: Number(process.env.NORMA_REVIEW_APPROVAL_TIMEOUT_MS ?? 60_000),
+      timeoutMs,
       // Plain call summary (approvalCardSummary, same as every other card) — reviewerReason below
       // carries the reason for clients to render distinctly.
       summary: approvalCardSummary(call),

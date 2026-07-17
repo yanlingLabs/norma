@@ -20,6 +20,8 @@ import { TrustStore } from "../../src/agent/trust";
 import { SkillStore } from "../../src/agent/skills";
 import { Compactor } from "../../src/agent/compactor";
 import type { ProviderEvent } from "../../src/providers/types";
+import type { BashReviewer } from "../../src/agent/reviewer";
+import { stubRegistry, bashTurn, stubReviewer } from "./engine-reviewer.test";
 
 // Task 6 (Dispatch mode, Phase 7): approval/question relay — a dispatch child's approval_requested/
 // approval_resolved/question_asked/question_resolved events mirror INTO the dispatch stream (so a
@@ -174,12 +176,20 @@ describe("Task 6: dispatch relay — no loops", () => {
 // wait out (mirrors engine.test.ts's real-timeout approach for the SHORT, waitable defaults).
 // ---------------------------------------------------------------------------------------------
 
-function setupEngine(script: ProviderEvent[][], opts: { origin?: string; questions?: boolean; approvalTimeoutMs?: number } = {}) {
+function setupEngine(script: ProviderEvent[][], opts: {
+  origin?: string; questions?: boolean; approvalTimeoutMs?: number;
+  // whole-branch fix wave (reviewer-escalation window): opts.registry lets the reviewer-escalation
+  // tests below supply a registry with a stub bash tool registered (stubRegistry(), same helper
+  // engine-reviewer.test.ts's own bash-review tests use) on top of the write/ask-user tools this
+  // helper always registers; opts.reviewer/opts.approvalPolicy thread straight into the engine/
+  // session, same shape as engine-steer.test.ts's own setupEngine.
+  registry?: ToolRegistry; reviewer?: BashReviewer; approvalPolicy?: "ask" | "auto" | "plan";
+} = {}) {
   const home = mkdtempSync(join(tmpdir(), "norma-dispatch-relay-engine-"));
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "norma-dispatch-relay-engine-cwd-")));
   const store = new SessionStore(home);
   const hub = new SessionHub(store);
-  const registry = new ToolRegistry();
+  const registry = opts.registry ?? new ToolRegistry();
   registerWriteTools(registry);
   if (opts.questions) registerAskUserTool(registry);
   const questions = opts.questions ? new QuestionBroker() : undefined;
@@ -199,8 +209,9 @@ function setupEngine(script: ProviderEvent[][], opts: { origin?: string; questio
     assembler,
     compactor,
     questions,
+    reviewer: opts.reviewer,
   });
-  const sessionId = store.createSession("global", { cwd, approvalPolicy: "ask", origin: opts.origin });
+  const sessionId = store.createSession("global", { cwd, approvalPolicy: opts.approvalPolicy ?? "ask", origin: opts.origin });
   return { engine, store, hub, broker, questions, sessionId, cwd, provider };
 }
 
@@ -265,5 +276,53 @@ describe("Task 6: engine timeout windows — questions", () => {
     const waitSpy = spyOn(questions!, "wait").mockResolvedValue({ answers: { "which?": "A" }, by: "test" });
     await engine.runTurn(sessionId);
     expect(waitSpy).toHaveBeenCalledWith(sessionId, "q1", 300_000);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Whole-branch fix wave: reviewer-escalation approvals (engine.ts's reviewAndDispatch, the
+// safety-reviewer's ask-a-human path for an "unsafe"/"error" verdict) previously hardcoded
+// `NORMA_REVIEW_APPROVAL_TIMEOUT_MS ?? 60_000` for EVERY session, dispatch children included —
+// meaning an unattended dispatch child got the SHORTEST approval window on the HIGHEST-risk path
+// (reviewer flagged the call as unsafe), contradicting the 10-minute relay window every OTHER
+// approval site (Part B above) already gives a dispatch child. Fixed the same way: for
+// meta.origin === "dispatch-child", the window floors at 600_000ms (env can still widen beyond
+// it, never narrow below it); the denial message must say the REAL window, not a hardcoded "60s".
+// Same spy-on-wait technique as Part B (bun:test has no fake-timer advance primitive).
+// ---------------------------------------------------------------------------------------------
+describe("Task 6/whole-branch fix: reviewer-escalation timeout window", () => {
+  test("dispatch-child session: reviewer-escalation approval waits 600_000ms (env unset)", async () => {
+    const { registry } = stubRegistry();
+    const reviewer = stubReviewer({ verdict: "unsafe", reason: "REASON_SENTINEL" });
+    const { engine, broker, sessionId } = setupEngine(bashTurn("rm -rf x"), {
+      origin: "dispatch-child", reviewer: reviewer as any, approvalPolicy: "auto", registry,
+    });
+    const waitSpy = spyOn(broker, "wait").mockResolvedValue({ approved: true, by: "test" });
+    await engine.runTurn(sessionId);
+    expect(waitSpy).toHaveBeenCalledWith(sessionId, "c1", 600_000);
+  });
+
+  test("non-child session: reviewer-escalation approval still waits 60_000ms (env unset) — unchanged behavior", async () => {
+    const { registry } = stubRegistry();
+    const reviewer = stubReviewer({ verdict: "unsafe", reason: "REASON_SENTINEL" });
+    const { engine, broker, sessionId } = setupEngine(bashTurn("rm -rf x"), {
+      reviewer: reviewer as any, approvalPolicy: "auto", registry,
+    });
+    const waitSpy = spyOn(broker, "wait").mockResolvedValue({ approved: true, by: "test" });
+    await engine.runTurn(sessionId);
+    expect(waitSpy).toHaveBeenCalledWith(sessionId, "c1", 60_000);
+  });
+
+  test("dispatch-child session: denial message states the REAL window (600s), not the hardcoded 60s", async () => {
+    const { registry } = stubRegistry();
+    const reviewer = stubReviewer({ verdict: "unsafe", reason: "REASON_SENTINEL" });
+    const { engine, broker, store, sessionId } = setupEngine(bashTurn("rm -rf x"), {
+      origin: "dispatch-child", reviewer: reviewer as any, approvalPolicy: "auto", registry,
+    });
+    spyOn(broker, "wait").mockResolvedValue({ approved: false, by: "timeout" });
+    await engine.runTurn(sessionId);
+    const result = store.read(sessionId).find((e) => e.type === "tool_result") as any;
+    expect(result.output).toContain("No approval within 600s.");
+    expect(result.output).not.toContain("No approval within 60s.");
   });
 });

@@ -292,8 +292,13 @@ describe("DispatchChildren (Task 9): notifyUnattended", () => {
   });
 });
 
-describe("DispatchChildren (Task 5): start() restart semantics", () => {
-  test("children rebuilt from the store on start() resume as 'completed' (live state is unrecoverable)", () => {
+describe("DispatchChildren (whole-branch fix wave): start() restart semantics — UPDATED", () => {
+  // Old semantics (pre-fix): start() rebuilt EVERY historical child from the store as "completed",
+  // so the roster/map grew forever across restarts of a session that lives forever. New semantics:
+  // start() tracks NOTHING from the store — a pre-restart child is simply no longer tracked (its
+  // session still lives on in the store/session list; statusOf/stopChild on the now-untracked id
+  // already behave safely — see their own doc comments — so nothing downstream breaks).
+  test("start() does NOT resurrect historical children from the store — rosterFor lists none of them", () => {
     const home = mkdtempSync(join(tmpdir(), "norma-dispatch-children-restart-"));
     const store = new SessionStore(home);
     const hub = new SessionHub(store);
@@ -309,9 +314,80 @@ describe("DispatchChildren (Task 5): start() restart semantics", () => {
     });
     registry.start();
 
+    // Untracked-id fallbacks stay honest/safe (unchanged contracts — see statusOf/stopChild docs).
     expect(registry.statusOf(childId)).toBe("completed");
-    const roster = registry.rosterFor(dispatchId);
-    expect(roster).toContain(childId);
-    expect(roster).toContain("/tmp/restart");
+    expect(registry.stopChild(dispatchId, childId)).toBeUndefined();
+    // The roster itself must not mention a child start() never tracked — size 0 → undefined,
+    // not a roster string that happens to omit it (proves it's genuinely untracked, not filtered).
+    expect(registry.rosterFor(dispatchId)).toBeUndefined();
+  });
+});
+
+describe("DispatchChildren (whole-branch fix wave): bounded roster — prune terminal children post-report", () => {
+  // start() BEFORE spawnChild() in every test below — same call-order requirement as the Task 9
+  // notifyUnattended tests above (see that describe block's own NOTE): start()-after-spawnChild
+  // would have start()'s (now-removed) store reconstruction clobber the freshly-set ChildState.
+  // Calling start() first sidesteps that entirely and keeps these tests isolated to ONLY the
+  // onTurnEnd(dispatchId) pruning behavior under test here.
+  test("a completed child survives in the roster through the wake window, then is pruned (roster AND map) once the dispatch turn that reported it ends", () => {
+    const { store, hub, registry, setRunning } = setup();
+    const dispatchId = store.createSession("global", { mode: "dispatch" });
+    registry.start();
+    const childId = registry.spawnChild({ dispatchSessionId: dispatchId, dir: "/tmp/a", prompt: "do work", title: "Task A" });
+    setRunning(dispatchId, false); // dispatch idle — child completion wakes it immediately
+
+    hub.append(childId, { type: "assistant_message", sessionId: childId, threadId: "main", text: "done" });
+    registry.onTurnEnd(childId); // child's own turn ends → status "completed", child_update appended, dispatch woken
+
+    // Still present DURING the wake window — the dispatch turn that was just woken hasn't ended yet.
+    expect(registry.rosterFor(dispatchId)).toContain(childId);
+
+    registry.onTurnEnd(dispatchId); // the dispatch turn that had the chance to report it now ends
+
+    // Pruned from BOTH the roster's rendering AND the underlying map: with this the only child ever
+    // tracked, an emptied map makes rosterFor fall back to undefined (its own size===0 contract) —
+    // not merely a roster string that omits the (still-present) entry.
+    expect(registry.rosterFor(dispatchId)).toBeUndefined();
+  });
+
+  test("an errored child is pruned the same way as a completed one", () => {
+    const { store, hub, registry, setRunning } = setup();
+    const dispatchId = store.createSession("global", { mode: "dispatch" });
+    registry.start();
+    const childId = registry.spawnChild({ dispatchSessionId: dispatchId, dir: "/tmp/a", prompt: "do work", title: "Task A" });
+    setRunning(dispatchId, false);
+
+    hub.append(childId, { type: "agent_error", sessionId: childId, threadId: "main", message: "boom" });
+    registry.onTurnEnd(childId);
+    expect(registry.statusOf(childId)).toBe("error");
+    expect(registry.rosterFor(dispatchId)).toContain(childId);
+
+    registry.onTurnEnd(dispatchId);
+    expect(registry.rosterFor(dispatchId)).toBeUndefined();
+  });
+
+  test("a RUNNING child is never pruned by a dispatch turn-end", () => {
+    const { store, registry } = setup();
+    const dispatchId = store.createSession("global", { mode: "dispatch" });
+    registry.start();
+    const childId = registry.spawnChild({ dispatchSessionId: dispatchId, dir: "/tmp/a", prompt: "do work", title: "Task A" });
+
+    registry.onTurnEnd(dispatchId); // dispatch's own turn ends while the child is still "running"
+
+    expect(registry.statusOf(childId)).toBe("running");
+    expect(registry.rosterFor(dispatchId)).toContain(childId);
+  });
+
+  test("an awaiting_approval child (not yet terminal) survives a dispatch turn-end", () => {
+    const { store, hub, registry } = setup();
+    const dispatchId = store.createSession("global", { mode: "dispatch" });
+    registry.start();
+    const childId = registry.spawnChild({ dispatchSessionId: dispatchId, dir: "/tmp/a", prompt: "do work", title: "Task A" });
+    hub.append(childId, { type: "approval_requested", sessionId: childId, threadId: "main", callId: "c1", toolName: "bash", summary: "run rm" });
+
+    registry.onTurnEnd(dispatchId);
+
+    expect(registry.statusOf(childId)).toBe("awaiting_approval");
+    expect(registry.rosterFor(dispatchId)).toContain(childId);
   });
 });

@@ -44,20 +44,20 @@ export class DispatchChildren {
 
   constructor(private readonly deps: DispatchChildrenDeps) {}
 
-  /** Daemon boot: rebuild the child set from the store (so a restart doesn't lose the roster) and
-   *  subscribe to every future event via the hub's observer fan-out. Restart semantics (deliberate,
-   *  per spec): a child's LIVE state (was it running, awaiting approval, mid-turn?) died with the
-   *  old process — there is no way to recover it — so every child rebuilt here starts as
-   *  "completed", the honest "we don't actually know, but it's not still running" default. */
+  /** Daemon boot: resolve the dispatch session id and subscribe to every future event via the
+   *  hub's observer fan-out. Restart semantics (whole-branch fix wave — bounded roster): this used
+   *  to also rebuild every historical child from the store as "completed", but the dispatch session
+   *  lives forever, so that made the in-memory roster/map grow WITHOUT BOUND across restarts (on
+   *  top of the per-turn pinned reminder already listing every child ever spawned — see
+   *  onTurnEnd's pruning below for the other half of the fix). A child's LIVE state (was it
+   *  running, awaiting approval, mid-turn?) died with the old process anyway — there is no way to
+   *  recover it — so a pre-restart child is now simply left UNTRACKED: its session still lives on
+   *  in the store/session list (still resumable/attachable like any other session), just no longer
+   *  in this registry's roster. statusOf/stopChild already treat an untracked id safely (statusOf
+   *  falls back to "completed" — the closest honest "definitely not running" reading; stopChild
+   *  returns undefined, same as any id it never tracked) — see their own doc comments. */
   start(): void {
     this.dispatchId = this.deps.store.dispatchSessionId();
-    if (this.dispatchId) {
-      for (const r of this.deps.store.childrenOf(this.dispatchId)) {
-        this.children.set(r.sessionId, {
-          title: r.title ?? r.sessionId, dir: r.cwd ?? "?", spawnedAt: r.createdAt, status: "completed",
-        });
-      }
-    }
     this.off = this.deps.hub.addObserver((e) => this.onEvent(e));
   }
 
@@ -166,6 +166,17 @@ export class DispatchChildren {
       if (this.pendingWake) {
         this.pendingWake = false;
         void this.deps.runTurn(this.dispatchId).catch((e) => console.error("dispatch wake failed:", e));
+      }
+      // Whole-branch fix wave (bounded roster): a terminal child (completed/error) survives in the
+      // roster/map EXACTLY until the end of the dispatch turn that had the chance to report it —
+      // that turn either just drained above (pendingWake) or already saw the child_update in its
+      // own roster earlier this turn. Either way, by the time THIS turn ends there is nothing left
+      // for the dispatch session to do with a finished child, so it's dropped here — otherwise the
+      // roster (and this map) would grow without bound on a session that lives forever. A
+      // running/awaiting_approval/awaiting_input child is untouched — only a TERMINAL status is
+      // ever pruned.
+      for (const [id, c] of this.children) {
+        if (c.status === "completed" || c.status === "error") this.children.delete(id);
       }
       return;
     }
