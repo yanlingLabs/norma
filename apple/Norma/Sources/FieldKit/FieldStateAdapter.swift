@@ -241,6 +241,21 @@ final class FieldStateAdapter: ObservableObject {
         return anySubagentAlive(subagents.map(\.status)) ? subagents : []
     }
 
+    /// Dispatch (Phase 7), Task 8: in-flight children for the field's top-row circles. Terminal
+    /// children are pruned by the reducer on the next turn_started (see `OrbSessionState.children`'s
+    /// own doc), so this is "what's in flight" — a straight passthrough, UNLIKE `liveSubagents`
+    /// above, which additionally filters an all-done batch to empty: the reducer's own prune
+    /// already keeps this list honest, no second filter needed here.
+    var dispatchChildren: [ChildItem] { session.state.children }
+
+    /// Wired by whichever surface owns this adapter (`GlassRootView.wireCallbacks()` — the orb/
+    /// field's single app-lifetime adapter, the only surface that renders the circles — see
+    /// `NormaFieldView`'s child-circle ForEach) to open a detached window on the tapped child's
+    /// sessionId, same "controller exposes a hook, AppDelegate wires the real side effect" seam as
+    /// `onExpandToWindow` below. Default no-op so a not-yet-wired adapter (previews/tests) never
+    /// crashes on a stray tap.
+    var onOpenChild: (String) -> Void = { _ in }
+
     /// Task B hook (mirrors `OrbWindowController.exchangeIndex`): which historical exchange, if
     /// any, `visibleResponse` should read instead of the live stream / most recent reply. `nil`
     /// = live/most-recent. Wired by `GlassRootView`'s `.onChange(of: controller.exchangeIndex)`

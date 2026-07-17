@@ -131,6 +131,14 @@ final class OrbWindowController: ObservableObject {
     var onQuestionRespond: ((String, [String: String], [String: String], String?) async -> Bool)?
     var onPlanRespond: ((String, Bool, Bool, String?) async -> Bool)?
 
+    /// Dispatch (Phase 7), Task 8: fired by `GlassRootView.wireCallbacks()` (relaying
+    /// `FieldStateAdapter.onOpenChild`) when the field's own child-status circle is tapped —
+    /// `AppDelegate.boot()` wires this to the SAME detached-window-open path
+    /// `registerDetachedWindow`'s `onOpenSessionDetached` uses (`openSessionInNewDetachedWindow`),
+    /// same "controller exposes a hook, AppDelegate wires the real side effect" seam as
+    /// `onApprovalRespond` et al above.
+    var onOpenChild: ((String) -> Void)?
+
     /// Task 4 (2d-iii): the ⋯ menu's approval-mode picker — SAME seam as `onApprovalRespond` et al
     /// just above (`AppDelegate.boot()` wires this to `AppModel.setSessionPolicy`). New policy
     /// string in, success out.

@@ -31,6 +31,10 @@ struct GlassRootView: View {
         adapter.onClearMessage = { [adapter] in adapter.composerDraft = "" }
         adapter.onCollapse = { [controller] in controller.collapseToOrb() }
         adapter.onExpandToWindow = { [controller] in controller.requestExpandToWindow() }
+        // Dispatch (Phase 7), Task 8: the field's own child-status circles — tapping one asks
+        // upward via `controller.onOpenChild` (`AppDelegate.boot()` wires the real detached-window
+        // spawn), same seam as `onExpandToWindow` just above.
+        adapter.onOpenChild = { [controller] sessionId in controller.onOpenChild?(sessionId) }
         // Gate r7 (same-panel window morph): the window's traffic lights / zoom route back to the
         // controller — red collapses to the orb, green toggles zoom. Esc + the 4-finger tap use
         // `collapseWindowToOrb()` directly (key monitor / AppDelegate summon router).

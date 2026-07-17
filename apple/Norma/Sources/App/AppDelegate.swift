@@ -481,6 +481,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await self?.appModel?.setSessionPolicy(policy) ?? false
         }
 
+        // Dispatch (Phase 7), Task 8: the field's child-status circles — tapping one opens that
+        // child session in a detached window via the SAME path the Dashboard's SessionsPane / the
+        // sidebar's ⌘-click already use (`openSessionInNewDetachedWindow`, defined below).
+        orb.onOpenChild = { [weak self] sessionId in
+            self?.openSessionInNewDetachedWindow(sessionId)
+        }
+
         // Task 4 (detach choreography): the yellow traffic light. `requestWindowDetach()` OWNS the
         // ordering — it fires this closure (spawning the detached window SYNCHRONOUSLY via
         // `show()`, before this closure returns) and only THEN runs its own no-animation exit
