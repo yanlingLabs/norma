@@ -143,22 +143,22 @@ describe("dispatch mode: toolset + system prompt", () => {
     mkdirSync(assistantMemoryDirFor({ normaHome: dispatchHarness.assemblerHome }), { recursive: true });
     writeFileSync(
       join(assistantMemoryDirFor({ normaHome: dispatchHarness.assemblerHome }), "MEMORY.md"),
-      "- [karim](karim.md) — builds Norma\n",
+      "- [alex](alex.md) — builds Norma\n",
     );
     await dispatchHarness.engine.runTurn(dispatchHarness.sessionId);
     const dispatchInstructions = dispatchHarness.provider.requests[0]?.instructions ?? "";
     expect(dispatchInstructions).toContain("Assistant memory index");
-    expect(dispatchInstructions).toContain("karim");
+    expect(dispatchInstructions).toContain("alex");
 
     const codeHarness = setup([text("ok")], { mode: "code" });
     mkdirSync(assistantMemoryDirFor({ normaHome: codeHarness.assemblerHome }), { recursive: true });
     writeFileSync(
       join(assistantMemoryDirFor({ normaHome: codeHarness.assemblerHome }), "MEMORY.md"),
-      "- [karim](karim.md) — builds Norma\n",
+      "- [alex](alex.md) — builds Norma\n",
     );
     await codeHarness.engine.runTurn(codeHarness.sessionId);
     const codeInstructions = codeHarness.provider.requests[0]?.instructions ?? "";
     expect(codeInstructions).not.toContain("Assistant memory index");
-    expect(codeInstructions).not.toContain("karim");
+    expect(codeInstructions).not.toContain("alex");
   });
 });

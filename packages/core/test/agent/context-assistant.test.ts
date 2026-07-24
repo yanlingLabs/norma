@@ -32,7 +32,7 @@ describe("ContextAssembler + _assistant bucket (Dreaming Task 1)", () => {
     const cwd = realDir();
     const assistantDir = assistantMemoryDirFor({ normaHome: home });
     mkdirSync(assistantDir, { recursive: true });
-    writeFileSync(join(assistantDir, "MEMORY.md"), "- [Karim](karim.md) — builds Norma\n");
+    writeFileSync(join(assistantDir, "MEMORY.md"), "- [Alex](alex.md) — builds Norma\n");
 
     const projectDir = join(home, "projects", "some-project-key", "memory");
     mkdirSync(projectDir, { recursive: true });
@@ -45,7 +45,7 @@ describe("ContextAssembler + _assistant bucket (Dreaming Task 1)", () => {
     const out = a.assemble({ cwd, memoryBucket: "assistant" });
 
     expect(out).toContain("Assistant memory index");
-    expect(out).toContain("Karim");
+    expect(out).toContain("Alex");
     expect(out).toContain("builds Norma");
     expect(out).not.toContain(PROTOCOL_MARKER);
     expect(out).not.toContain("PROJECT_ONLY_LINE_MUST_NOT_LEAK");
@@ -56,7 +56,7 @@ describe("ContextAssembler + _assistant bucket (Dreaming Task 1)", () => {
     const cwd = realDir();
     const assistantDir = assistantMemoryDirFor({ normaHome: home });
     mkdirSync(assistantDir, { recursive: true });
-    writeFileSync(join(assistantDir, "MEMORY.md"), "- [Karim](karim.md) — builds Norma\n");
+    writeFileSync(join(assistantDir, "MEMORY.md"), "- [Alex](alex.md) — builds Norma\n");
 
     const projectDir = join(home, "projects", "some-project-key", "memory");
     mkdirSync(projectDir, { recursive: true });
@@ -80,7 +80,7 @@ describe("ContextAssembler + _assistant bucket (Dreaming Task 1)", () => {
     const cwd = realDir();
     const assistantDir = assistantMemoryDirFor({ normaHome: home });
     mkdirSync(assistantDir, { recursive: true });
-    writeFileSync(join(assistantDir, "MEMORY.md"), "- [Karim](karim.md) — builds Norma\n");
+    writeFileSync(join(assistantDir, "MEMORY.md"), "- [Alex](alex.md) — builds Norma\n");
 
     const a = new ContextAssembler({
       normaHome: home, trust, skills,

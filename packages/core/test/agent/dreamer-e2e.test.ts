@@ -60,8 +60,8 @@ describe("Dreaming end-to-end (Task 5): teach / forget / tombstone-survival / te
       // Cycle 1 (A - TEACH): the model writes two new memory files.
       [
         { type: "text_delta", delta: JSON.stringify({ ops: [
-          { op: "write", file: "karim.md", content: "---\nrevised: 2026-07-10\n---\nKarim is the user; he is building Norma, an agentic Mac assistant." },
-          { op: "write", file: "norma-project.md", content: "---\nrevised: 2026-07-10\n---\nNorma is Karim's agentic assistant project, in active development." },
+          { op: "write", file: "alex.md", content: "---\nrevised: 2026-07-10\n---\nAlex is the user; he is building Norma, an agentic Mac assistant." },
+          { op: "write", file: "norma-project.md", content: "---\nrevised: 2026-07-10\n---\nNorma is Alex's agentic assistant project, in active development." },
         ] }) },
         { type: "done", stopReason: "end_turn" },
       ],
@@ -98,14 +98,14 @@ describe("Dreaming end-to-end (Task 5): teach / forget / tombstone-survival / te
 
     // ---- Cycle 1 (A): TEACH ----
     fillSubstantive(store, dispatchId, 45, "cycle1");
-    store.append(dispatchId, { type: "user_message", sessionId: dispatchId, threadId: "main", text: "CYCLE1_MARKER my name is Karim and I'm building Norma", clientName: "test" });
+    store.append(dispatchId, { type: "user_message", sessionId: dispatchId, threadId: "main", text: "CYCLE1_MARKER my name is Alex and I'm building Norma", clientName: "test" });
     await dreamer.tick();
 
     expect(provider.requests).toHaveLength(1);
-    expect(readFileSync(join(dir, "karim.md"), "utf8")).toContain("Karim is the user");
-    expect(readFileSync(join(dir, "norma-project.md"), "utf8")).toContain("Norma is Karim's agentic assistant project");
+    expect(readFileSync(join(dir, "alex.md"), "utf8")).toContain("Alex is the user");
+    expect(readFileSync(join(dir, "norma-project.md"), "utf8")).toContain("Norma is Alex's agentic assistant project");
     const memoryAfterA = readFileSync(join(dir, "MEMORY.md"), "utf8");
-    expect(memoryAfterA).toContain("karim.md");
+    expect(memoryAfterA).toContain("alex.md");
     expect(memoryAfterA).toContain("norma-project.md");
 
     // Close the loop: what dreams write is what dispatch loads. Build a REAL ContextAssembler
@@ -119,10 +119,10 @@ describe("Dreaming end-to-end (Task 5): teach / forget / tombstone-survival / te
     });
     const assembled = assembler.assemble({ cwd: null, memoryBucket: "assistant" });
     expect(assembled).toContain("Assistant memory index");
-    expect(assembled).toContain("karim.md");
-    expect(assembled).toContain("Karim is the user");
+    expect(assembled).toContain("alex.md");
+    expect(assembled).toContain("Alex is the user");
     expect(assembled).toContain("norma-project.md");
-    expect(assembled).toContain("Norma is Karim's agentic assistant project");
+    expect(assembled).toContain("Norma is Alex's agentic assistant project");
 
     // ---- Cycle 2 (B): FORGET ----
     currentNow += DREAM_MIN_SPACING_MS + 3_600_000; // > 2h spacing elapsed
@@ -136,7 +136,7 @@ describe("Dreaming end-to-end (Task 5): teach / forget / tombstone-survival / te
     expect(tombstonesAfterB).toContain("the user's home address");
     const memoryAfterB = readFileSync(join(dir, "MEMORY.md"), "utf8");
     expect(memoryAfterB).not.toContain("home.md");
-    expect(memoryAfterB).toContain("karim.md"); // untouched files survive the prune
+    expect(memoryAfterB).toContain("alex.md"); // untouched files survive the prune
 
     // ---- Cycle 3 (C): TOMBSTONE SURVIVAL ----
     currentNow += DREAM_MIN_SPACING_MS + 3_600_000;

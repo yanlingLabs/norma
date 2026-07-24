@@ -39,7 +39,7 @@ describe("Dreamer.tick", () => {
   test("1) event filtering: window carries only user_message/assistant_message/child_update text, never tool/reasoning/harness noise", async () => {
     const { store, dispatchId, dir } = setup("norma-dreamer-filter-");
     fillSubstantive(store, dispatchId, DREAM_MIN_EVENTS - 3);
-    store.append(dispatchId, { type: "user_message", sessionId: dispatchId, threadId: "main", text: "my name is Karim", clientName: "test" });
+    store.append(dispatchId, { type: "user_message", sessionId: dispatchId, threadId: "main", text: "my name is Alex", clientName: "test" });
     store.append(dispatchId, { type: "assistant_message", sessionId: dispatchId, threadId: "main", text: "noted" });
     store.append(dispatchId, {
       type: "child_update", sessionId: dispatchId, threadId: "main", childSessionId: "s_child",
@@ -60,7 +60,7 @@ describe("Dreamer.tick", () => {
 
     expect(provider.requests).toHaveLength(1);
     const content = firstInputContent(provider);
-    expect(content).toContain("my name is Karim");
+    expect(content).toContain("my name is Alex");
     expect(content).toContain("noted");
     expect(content).toContain("built the site");
     expect(content).not.toContain("SECRET_TOOL_OUTPUT");
@@ -90,8 +90,8 @@ describe("Dreamer.tick", () => {
   test("3) prompt carries state: memory file content, tombstones, and today's date (from injected now()) all appear", async () => {
     const { store, dispatchId, dir } = setup("norma-dreamer-state-");
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, "karim.md"), "Karim builds Norma.\n");
-    writeFileSync(join(dir, "MEMORY.md"), "# Assistant memory index\n\n- [karim](karim.md) — Karim builds Norma.\n");
+    writeFileSync(join(dir, "alex.md"), "Alex builds Norma.\n");
+    writeFileSync(join(dir, "MEMORY.md"), "# Assistant memory index\n\n- [alex](alex.md) — Alex builds Norma.\n");
     writeFileSync(join(dir, "tombstones.md"), "- never remember the user's address\n");
     fillSubstantive(store, dispatchId, DREAM_MIN_EVENTS);
 
@@ -104,7 +104,7 @@ describe("Dreamer.tick", () => {
     await dreamer.tick();
 
     const content = firstInputContent(provider);
-    expect(content).toContain("Karim builds Norma.");
+    expect(content).toContain("Alex builds Norma.");
     expect(content).toContain("never remember the user's address");
     expect(content).toContain("2026-07-18");
   });
@@ -114,7 +114,7 @@ describe("Dreamer.tick", () => {
     fillSubstantive(store, dispatchId, DREAM_MIN_EVENTS);
 
     const opsJson = JSON.stringify({
-      ops: [{ op: "write", file: "karim.md", content: "---\nrevised: 2026-07-18\n---\nKarim builds Norma." }],
+      ops: [{ op: "write", file: "alex.md", content: "---\nrevised: 2026-07-18\n---\nAlex builds Norma." }],
     });
     const fixedNow = 1_753_000_000_000;
     const provider = okProvider(opsJson);
@@ -124,8 +124,8 @@ describe("Dreamer.tick", () => {
     });
     await dreamer.tick();
 
-    expect(readFileSync(join(dir, "karim.md"), "utf8")).toBe("---\nrevised: 2026-07-18\n---\nKarim builds Norma.");
-    expect(readFileSync(join(dir, "MEMORY.md"), "utf8")).toContain("karim.md");
+    expect(readFileSync(join(dir, "alex.md"), "utf8")).toBe("---\nrevised: 2026-07-18\n---\nAlex builds Norma.");
+    expect(readFileSync(join(dir, "MEMORY.md"), "utf8")).toContain("alex.md");
     const state = JSON.parse(readFileSync(join(dir, "dream-state.json"), "utf8")) as { watermarkSeq: number; lastDreamAt: number };
     expect(state.watermarkSeq).toBe(store.lastSeq(dispatchId));
     expect(state.lastDreamAt).toBe(fixedNow);
